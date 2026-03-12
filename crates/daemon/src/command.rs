@@ -16,6 +16,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+// Used by fetch_latest_github_version and daemon_update_url (version-pinned downloads).
+use reqwest;
+
 /// All commands that the Daemon handles without forwarding to the Agent.
 const DAEMON_COMMANDS: &[&str] = &[
     "help",
@@ -83,7 +86,10 @@ pub async fn execute_daemon_command(
         "repair" => repair_memory(data_dir).await,
 
         "status" => match docker {
-            Some(d) => { let s = d.status().await?; Ok(s) }
+            Some(d) => {
+                let s = d.status().await?;
+                Ok(s)
+            }
             None => Ok("remi-daemon running in **local mode** (no Docker).".to_string()),
         },
 
@@ -107,10 +113,7 @@ pub async fn execute_daemon_command(
 
         "logs" => {
             let d = require_docker!(docker);
-            let tail: usize = args
-                .first()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50);
+            let tail: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(50);
             let log_text = d.logs(tail).await?;
             if log_text.is_empty() {
                 Ok("(no recent logs)".to_string())
@@ -119,10 +122,19 @@ pub async fn execute_daemon_command(
             }
         }
 
-        "version" => Ok(format!(
-            "remi-daemon **{}**",
-            env!("CARGO_PKG_VERSION")
-        )),
+        "version" => {
+            let current = env!("CARGO_PKG_VERSION");
+            let latest_tag = fetch_latest_github_version().await;
+            match latest_tag {
+                Some(ref latest) if latest == current => {
+                    Ok(format!("remi-daemon **v{current}**（已是最新）"))
+                }
+                Some(ref latest) => Ok(format!(
+                    "remi-daemon **v{current}**（最新可用: **v{latest}**，可运行 `/update` 升级）"
+                )),
+                None => Ok(format!("remi-daemon **v{current}**")),
+            }
+        }
 
         "restart-all" => {
             // Restart Agent container first (if available), then restart Daemon.
@@ -137,39 +149,34 @@ pub async fn execute_daemon_command(
         }
 
         "update" => {
-            // 1. Pull latest Agent Docker image (if Docker available).
-            let pull_summary = if let Some(d) = docker {
-                let pull_lines = d.pull_image().await?;
-                let s = pull_lines
-                    .iter()
-                    .filter(|l| l.contains("Pull complete") || l.contains("up to date"))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // 2. Restart Agent container using the new image.
-                d.restart().await?;
-                s
-            } else {
-                String::new()
-            };
+            // Optional explicit version: /update v1.2.3
+            let requested_version: Option<&str> = args.first().map(String::as_str);
 
-            // 3. Download new Daemon binary (if configured) and restart self.
-            let download_url = daemon_update_url();
-            match download_url {
-                None => {
-                    let agent_part = if pull_summary.is_empty() {
-                        if docker.is_some() { "Image already up to date.".to_string() }
-                        else { "(no Docker — agent not updated)".to_string() }
-                    } else {
-                        pull_summary
-                    };
-                    Ok(format!(
-                        "✅ Update done.\n{agent_part}\n\n⚠️ `DAEMON_UPDATE_URL` not set — Daemon binary not updated."
-                    ))
+            // Without an explicit version, check GitHub for the latest tag and
+            // skip the update if we're already on it.
+            if requested_version.is_none() {
+                let current = env!("CARGO_PKG_VERSION");
+                if let Some(latest) = fetch_latest_github_version().await {
+                    if latest == current {
+                        return Ok(format!("✅ 已是最新版本 **v{current}**，无需更新。"));
+                    }
                 }
+            }
+
+            // 1. Restart Agent container (Docker sandbox) if available.
+            if let Some(d) = docker {
+                d.restart().await?;
+            }
+
+            // 2. Download new Daemon binary (if configured) and restart self.
+            let download_url = daemon_update_url(requested_version);
+            match download_url {
+                None => Ok(
+                    "✅ Agent 容器已重启。⚠️ `GITHUB_REPO`/`DAEMON_UPDATE_URL` 未配置，Daemon 未更新。".to_string()
+                ),
                 Some(url) => {
                     restart_handle.spawn_restart(Some(url)).await?;
-                    Ok("🔄 Daemon downloading update and restarting…".to_string())
+                    Ok("🔄 Daemon 正在下载更新并重启…".to_string())
                 }
             }
         }
@@ -179,8 +186,12 @@ pub async fn execute_daemon_command(
             match args.first().map(String::as_str) {
                 // /secrets set KEY VALUE
                 Some("set") => {
-                    let key = args.get(1).ok_or_else(|| anyhow::anyhow!("/secrets set <KEY> <VALUE>: KEY missing"))?;
-                    let val = args.get(2).ok_or_else(|| anyhow::anyhow!("/secrets set <KEY> <VALUE>: VALUE missing"))?;
+                    let key = args.get(1).ok_or_else(|| {
+                        anyhow::anyhow!("/secrets set <KEY> <VALUE>: KEY missing")
+                    })?;
+                    let val = args.get(2).ok_or_else(|| {
+                        anyhow::anyhow!("/secrets set <KEY> <VALUE>: VALUE missing")
+                    })?;
                     secret_store.write().await.set(key, val)?;
                     info!(key, "secret set via command");
                     rpc.sync_secrets_to_agent().await;
@@ -188,7 +199,9 @@ pub async fn execute_daemon_command(
                 }
                 // /secrets delete KEY
                 Some("delete") | Some("del") | Some("rm") => {
-                    let key = args.get(1).ok_or_else(|| anyhow::anyhow!("/secrets delete <KEY>: KEY missing"))?;
+                    let key = args
+                        .get(1)
+                        .ok_or_else(|| anyhow::anyhow!("/secrets delete <KEY>: KEY missing"))?;
                     secret_store.write().await.delete(key)?;
                     info!(key, "secret deleted via command");
                     rpc.sync_secrets_to_agent().await;
@@ -196,8 +209,13 @@ pub async fn execute_daemon_command(
                 }
                 // /secrets (no subcommand) — render interactive card
                 _ => {
-                    let keys_owned: Vec<String> = secret_store.read().await.keys()
-                        .into_iter().map(str::to_string).collect();
+                    let keys_owned: Vec<String> = secret_store
+                        .read()
+                        .await
+                        .keys()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
                     let keys_ref: Vec<&str> = keys_owned.iter().map(String::as_str).collect();
                     let card = build_secret_manager_card(&keys_ref);
                     if let Err(e) = gateway.reply_card_raw(reply_to_id, card).await {
@@ -233,7 +251,8 @@ fn help_text() -> String {
 `/secrets delete KEY` — 删除 Secret
 
 **会话指令（由 Agent 处理，不调用 LLM）：**
-`/compact` — 立即将短期记忆压缩为中期记忆"#.to_string()
+`/compact` — 立即将短期记忆压缩为中期记忆"#
+        .to_string()
 }
 
 /// Scan memory files and report health status for each conversation thread.
@@ -258,14 +277,17 @@ async fn diagnose_memory(data_dir: &Path) -> Result<String> {
         // Short-term
         let short_path = entry.path().join("short_term.jsonl");
         if short_path.exists() {
-            let text = tokio::fs::read_to_string(&short_path).await.unwrap_or_default();
+            let text = tokio::fs::read_to_string(&short_path)
+                .await
+                .unwrap_or_default();
             let values: Vec<serde_json::Value> = text
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
             let count = values.len();
-            let first_role = values.first()
+            let first_role = values
+                .first()
                 .and_then(|v| v["role"].as_str().map(str::to_string))
                 .unwrap_or_else(|| "empty".to_string());
             let health = if count == 0 || first_role == "user" || first_role == "system" {
@@ -273,7 +295,10 @@ async fn diagnose_memory(data_dir: &Path) -> Result<String> {
             } else {
                 "⚠️ 头部损坏"
             };
-            output.push_str(&format!("  短期记忆: {} 条（首条 role: {}）{}\n", count, first_role, health));
+            output.push_str(&format!(
+                "  短期记忆: {} 条（首条 role: {}）{}\n",
+                count, first_role, health
+            ));
         } else {
             output.push_str("  短期记忆: 无\n");
         }
@@ -281,7 +306,9 @@ async fn diagnose_memory(data_dir: &Path) -> Result<String> {
         // Mid-term
         let mid_index = entry.path().join("mid_term").join("index.json");
         if mid_index.exists() {
-            let text = tokio::fs::read_to_string(&mid_index).await.unwrap_or_default();
+            let text = tokio::fs::read_to_string(&mid_index)
+                .await
+                .unwrap_or_default();
             let count = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|v| v["entries"].as_array().map(|a| a.len()))
@@ -294,7 +321,9 @@ async fn diagnose_memory(data_dir: &Path) -> Result<String> {
         // Long-term
         let long_index = entry.path().join("long_term").join("index.json");
         if long_index.exists() {
-            let text = tokio::fs::read_to_string(&long_index).await.unwrap_or_default();
+            let text = tokio::fs::read_to_string(&long_index)
+                .await
+                .unwrap_or_default();
             let count = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|v| v["entries"].as_array().map(|a| a.len()))
@@ -340,31 +369,38 @@ async fn repair_memory(data_dir: &Path) -> Result<String> {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
 
         // Find the first User or System message
-        let start = lines.iter().position(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .and_then(|v| v["role"].as_str().map(str::to_string))
-                .map(|r| r == "user" || r == "system")
-                .unwrap_or(false)
-        }).unwrap_or(lines.len());
+        let start = lines
+            .iter()
+            .position(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()
+                    .and_then(|v| v["role"].as_str().map(str::to_string))
+                    .map(|r| r == "user" || r == "system")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(lines.len());
 
         if start > 0 {
-            let cleaned: String = lines[start..].iter()
-                .map(|l| format!("{l}\n"))
-                .collect();
+            let cleaned: String = lines[start..].iter().map(|l| format!("{l}\n")).collect();
             tokio::fs::write(&short_path, cleaned).await?;
             repaired += 1;
         }
     }
 
     if repaired == 0 {
-        Ok(format!("✅ 检查了 {total} 个会话，记忆状态正常，无需修复。"))
+        Ok(format!(
+            "✅ 检查了 {total} 个会话，记忆状态正常，无需修复。"
+        ))
     } else {
-        Ok(format!("🔧 修复完成：{repaired}/{total} 个会话的短期记忆头部损坏已清除。"))
+        Ok(format!(
+            "🔧 修复完成：{repaired}/{total} 个会话的短期记忆头部损坏已清除。"
+        ))
     }
 }
 
-fn daemon_update_url() -> Option<String> {
+/// Construct the download URL for the daemon binary.
+/// `version` — explicit tag like `"v1.2.3"`; `None` means latest release.
+fn daemon_update_url(version: Option<&str>) -> Option<String> {
     if let Ok(url) = std::env::var("DAEMON_UPDATE_URL") {
         if !url.is_empty() {
             return Some(url);
@@ -372,12 +408,42 @@ fn daemon_update_url() -> Option<String> {
     }
     if let Ok(repo) = std::env::var("GITHUB_REPO") {
         if !repo.is_empty() {
-            return Some(format!(
-                "https://github.com/{repo}/releases/latest/download/remi-daemon-linux-x86_64"
-            ));
+            let url = match version {
+                Some(tag) => format!(
+                    "https://github.com/{repo}/releases/download/{tag}/remi-daemon-linux-x86_64"
+                ),
+                None => format!(
+                    "https://github.com/{repo}/releases/latest/download/remi-daemon-linux-x86_64"
+                ),
+            };
+            return Some(url);
         }
     }
     None
+}
+
+/// Query the GitHub Releases API and return the latest tag name (without
+/// the leading `v`), e.g. `"0.2.0"`. Returns `None` if `GITHUB_REPO` is
+/// not set or the request fails.
+async fn fetch_latest_github_version() -> Option<String> {
+    let repo = std::env::var("GITHUB_REPO")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "remi-daemon")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let tag = json["tag_name"].as_str()?;
+    Some(tag.trim_start_matches('v').to_string())
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {

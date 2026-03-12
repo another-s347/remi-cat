@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev protobuf-compiler
+
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --bin remi-daemon \
+            --bin remi-cat-agent \
+            --bin remi-admin
+
+      - name: Prepare artifacts
+        run: |
+          cd target/release
+          for bin in remi-daemon remi-cat-agent remi-admin; do
+            cp "${bin}" "${bin}-linux-x86_64"
+            sha256sum "${bin}-linux-x86_64" > "${bin}-linux-x86_64.sha256"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            target/release/remi-daemon-linux-x86_64
+            target/release/remi-daemon-linux-x86_64.sha256
+            target/release/remi-cat-agent-linux-x86_64
+            target/release/remi-cat-agent-linux-x86_64.sha256
+            target/release/remi-admin-linux-x86_64
+            target/release/remi-admin-linux-x86_64.sha256

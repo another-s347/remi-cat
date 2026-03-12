@@ -13,6 +13,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        RELEASE_TAG: ${RELEASE_TAG:-latest}
+        GITHUB_REPO: ${GITHUB_REPO:-another-s347/remi-cat}
     image: remi-cat:latest
     container_name: remi-cat
 

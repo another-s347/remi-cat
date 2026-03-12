@@ -15,7 +15,9 @@ use std::time::Duration;
 use aho_corasick::{AhoCorasick, MatchKind};
 use async_stream::stream;
 use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult, ResumePayload};
+use remi_agentloop::prelude::{
+    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
+};
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
@@ -38,7 +40,10 @@ pub struct SecretRedactor {
 impl SecretRedactor {
     /// Construct a redactor with no patterns (identity transform).
     pub fn empty() -> Self {
-        Self { ac: None, labels: Vec::new() }
+        Self {
+            ac: None,
+            labels: Vec::new(),
+        }
     }
 
     /// (Re-)build from a `key → value` map.
@@ -47,7 +52,7 @@ impl SecretRedactor {
     /// skipped to avoid spurious matches of very short strings.
     pub fn from_entries(entries: &HashMap<String, String>) -> Self {
         let mut patterns: Vec<&str> = Vec::new();
-        let mut labels:   Vec<String> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
 
         for (key, val) in entries {
             if val.len() < 4 {
@@ -66,16 +71,21 @@ impl SecretRedactor {
             .build(patterns)
             .expect("AhoCorasick build failed");
 
-        Self { ac: Some(ac), labels }
+        Self {
+            ac: Some(ac),
+            labels,
+        }
     }
 
     /// Replace all secret values in `text` with `[REDACTED:<KEY>]`.
     /// Returns the original string unchanged when no secrets are configured.
     pub fn redact(&self, text: &str) -> String {
-        let Some(ac) = &self.ac else { return text.to_string() };
+        let Some(ac) = &self.ac else {
+            return text.to_string();
+        };
 
         let mut result = String::with_capacity(text.len());
-        let mut last   = 0usize;
+        let mut last = 0usize;
 
         for m in ac.find_iter(text) {
             result.push_str(&text[last..m.start()]);
@@ -92,24 +102,65 @@ impl SecretRedactor {
 /// Convenience alias used by `CatBot`.
 pub type SharedRedactor = Arc<RwLock<SecretRedactor>>;
 
+// ── BashMode ──────────────────────────────────────────────────────────────────
+
+/// Controls how [`WorkspaceBashTool`] executes commands and what working
+/// directory it uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashMode {
+    /// Local (development) mode.
+    ///
+    /// `cwd` is set to the agent data directory so relative paths resolve
+    /// inside the workspace.  The data directory is created on demand.
+    Local,
+
+    /// Docker (production) mode.
+    ///
+    /// `cwd` is `/` — the full container filesystem is accessible without
+    /// any path indirection.  The container filesystem is ephemeral and
+    /// resets on every restart.
+    Docker,
+}
+
 // ── WorkspaceBashTool ─────────────────────────────────────────────────────────
 
 pub struct WorkspaceBashTool {
     pub root: PathBuf,
     pub redactor: SharedRedactor,
+    pub mode: BashMode,
 }
 
 impl WorkspaceBashTool {
-    pub fn new(root: impl Into<PathBuf>, redactor: SharedRedactor) -> Self {
-        Self { root: root.into(), redactor }
+    pub fn new(root: impl Into<PathBuf>, redactor: SharedRedactor, mode: BashMode) -> Self {
+        Self {
+            root: root.into(),
+            redactor,
+            mode,
+        }
     }
 }
 
 impl Tool for WorkspaceBashTool {
-    fn name(&self) -> &str { "bash" }
+    fn name(&self) -> &str {
+        "bash"
+    }
     fn description(&self) -> &str {
-        "Execute a bash shell command. Working directory is the agent data folder. \
-         Relative paths resolve there."
+        match self.mode {
+            BashMode::Local => {
+                "Execute a bash command in the agent workspace (local mode). \
+                 Working directory is the agent data folder; relative paths resolve there. \
+                 ⚠️ Each invocation is a fresh one-time session — no state \
+                 (variables, directory changes, background processes) persists \
+                 between calls. Write results to files if you need them later."
+            }
+            BashMode::Docker => {
+                "Execute a bash command inside the Docker container. \
+                 Working directory is the container root (/). \
+                 ⚠️ Each invocation is a fresh one-time session — no state \
+                 (variables, directory changes, background processes) persists \
+                 between calls. The container filesystem is ephemeral and resets on restart."
+            }
+        }
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -121,11 +172,16 @@ impl Tool for WorkspaceBashTool {
             "required": ["command"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         let redactor = Arc::clone(&self.redactor);
+        let mode = self.mode;
         async move {
             let command = arguments["command"]
                 .as_str()
@@ -134,12 +190,19 @@ impl Tool for WorkspaceBashTool {
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
-                let _ = std::fs::create_dir_all(&root);
-                tracing::debug!(cmd = %command, timeout_ms, "bash: running");
-                let run = tokio::process::Command::new("bash")
-                    .arg("-c").arg(&command)
-                    .current_dir(&root)
-                    .output();
+                tracing::debug!(cmd = %command, timeout_ms, ?mode, "bash: running");
+                let mut cmd = tokio::process::Command::new("bash");
+                cmd.arg("-c").arg(&command);
+                match mode {
+                    BashMode::Local => {
+                        let _ = std::fs::create_dir_all(&root);
+                        cmd.current_dir(&root);
+                    }
+                    BashMode::Docker => {
+                        cmd.current_dir("/");
+                    }
+                }
+                let run = cmd.output();
                 match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
                     Err(_) => {
                         tracing::warn!(cmd = %command, timeout_ms, "bash: timed out");
@@ -157,7 +220,6 @@ impl Tool for WorkspaceBashTool {
                             r.push_str("[stderr] "); r.push_str(&stderr);
                         }
                         if code != 0 { r.push_str(&format!("\n[exit {code}]")); }
-                        // Redact any secrets that appear in the output.
                         let r = redactor.read().unwrap().redact(&r);
                         yield ToolOutput::text(r);
                     }
@@ -175,7 +237,9 @@ pub struct RootedFsReadTool {
 }
 
 impl Tool for RootedFsReadTool {
-    fn name(&self) -> &str { "fs_read" }
+    fn name(&self) -> &str {
+        "fs_read"
+    }
     fn description(&self) -> &str {
         "Read a file in the workspace. Supports `offset` + `length` for chunked reading. \
          Always check `[total_bytes]` in the result and call again with offset += length if needed."
@@ -191,14 +255,20 @@ impl Tool for RootedFsReadTool {
             "required": ["path"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         let redactor = Arc::clone(&self.redactor);
         async move {
-            let path_str = arguments["path"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_read", "missing 'path'"))?.to_string();
+            let path_str = arguments["path"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_read", "missing 'path'"))?
+                .to_string();
             let offset = arguments["offset"].as_u64().unwrap_or(0) as usize;
             let length = arguments["length"].as_u64().unwrap_or(8192) as usize;
             let full = resolve(&root, &path_str);
@@ -227,10 +297,14 @@ impl Tool for RootedFsReadTool {
 
 // ── RootedFsWriteTool ─────────────────────────────────────────────────────────
 
-pub struct RootedFsWriteTool { pub root: PathBuf }
+pub struct RootedFsWriteTool {
+    pub root: PathBuf,
+}
 
 impl Tool for RootedFsWriteTool {
-    fn name(&self) -> &str { "fs_write" }
+    fn name(&self) -> &str {
+        "fs_write"
+    }
     fn description(&self) -> &str {
         "Write text to a file in the workspace. Path is relative to workspace root. \
          Parent directories must already exist."
@@ -245,15 +319,23 @@ impl Tool for RootedFsWriteTool {
             "required": ["path", "content"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         async move {
-            let path_str = arguments["path"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_write", "missing 'path'"))?.to_string();
-            let content = arguments["content"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_write", "missing 'content'"))?.to_string();
+            let path_str = arguments["path"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_write", "missing 'path'"))?
+                .to_string();
+            let content = arguments["content"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_write", "missing 'content'"))?
+                .to_string();
             let bytes = content.len();
             let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
@@ -268,10 +350,14 @@ impl Tool for RootedFsWriteTool {
 
 // ── RootedFsReplaceTool ───────────────────────────────────────────────────────
 
-pub struct RootedFsReplaceTool { pub root: PathBuf }
+pub struct RootedFsReplaceTool {
+    pub root: PathBuf,
+}
 
 impl Tool for RootedFsReplaceTool {
-    fn name(&self) -> &str { "fs_replace" }
+    fn name(&self) -> &str {
+        "fs_replace"
+    }
     fn description(&self) -> &str {
         "Replace the first (and only) occurrence of `old` with `new` inside a file. \
          Returns an error if `old` is not found, or if it matches more than once \
@@ -288,17 +374,27 @@ impl Tool for RootedFsReplaceTool {
             "required": ["path", "old", "new"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         async move {
-            let path_str = arguments["path"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'path'"))?.to_string();
-            let old = arguments["old"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'old'"))?.to_string();
-            let new = arguments["new"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'new'"))?.to_string();
+            let path_str = arguments["path"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'path'"))?
+                .to_string();
+            let old = arguments["old"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'old'"))?
+                .to_string();
+            let new = arguments["new"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'new'"))?
+                .to_string();
             let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
                 match tokio::fs::read_to_string(&full).await {
@@ -330,10 +426,14 @@ impl Tool for RootedFsReplaceTool {
 
 // ── RootedFsCreateTool ────────────────────────────────────────────────────────
 
-pub struct RootedFsCreateTool { pub root: PathBuf }
+pub struct RootedFsCreateTool {
+    pub root: PathBuf,
+}
 
 impl Tool for RootedFsCreateTool {
-    fn name(&self) -> &str { "fs_mkdir" }
+    fn name(&self) -> &str {
+        "fs_mkdir"
+    }
     fn description(&self) -> &str {
         "Create a directory in the workspace. Set recursive=true for mkdir -p behaviour."
     }
@@ -347,13 +447,19 @@ impl Tool for RootedFsCreateTool {
             "required": ["path"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         async move {
-            let path_str = arguments["path"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_mkdir", "missing 'path'"))?.to_string();
+            let path_str = arguments["path"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_mkdir", "missing 'path'"))?
+                .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
             let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
@@ -373,10 +479,14 @@ impl Tool for RootedFsCreateTool {
 
 // ── RootedFsRemoveTool ────────────────────────────────────────────────────────
 
-pub struct RootedFsRemoveTool { pub root: PathBuf }
+pub struct RootedFsRemoveTool {
+    pub root: PathBuf,
+}
 
 impl Tool for RootedFsRemoveTool {
-    fn name(&self) -> &str { "fs_remove" }
+    fn name(&self) -> &str {
+        "fs_remove"
+    }
     fn description(&self) -> &str {
         "Remove a file or directory in the workspace. Set recursive=true to remove a directory tree."
     }
@@ -390,13 +500,19 @@ impl Tool for RootedFsRemoveTool {
             "required": ["path"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         async move {
-            let path_str = arguments["path"].as_str()
-                .ok_or_else(|| AgentError::tool("fs_remove", "missing 'path'"))?.to_string();
+            let path_str = arguments["path"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("fs_remove", "missing 'path'"))?
+                .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
             let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
@@ -424,7 +540,9 @@ pub struct RootedFsLsTool {
 }
 
 impl Tool for RootedFsLsTool {
-    fn name(&self) -> &str { "fs_ls" }
+    fn name(&self) -> &str {
+        "fs_ls"
+    }
     fn description(&self) -> &str {
         "List the contents of a directory in the workspace."
     }
@@ -436,8 +554,12 @@ impl Tool for RootedFsLsTool {
             }
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         let redactor = Arc::clone(&self.redactor);
@@ -469,11 +591,17 @@ impl Tool for RootedFsLsTool {
 
 const EXA_API_URL: &str = "https://api.exa.ai/search";
 
-pub struct ExaSearchTool { api_key: String, num_results: usize }
+pub struct ExaSearchTool {
+    api_key: String,
+    num_results: usize,
+}
 
 impl ExaSearchTool {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { api_key: api_key.into(), num_results: 5 }
+        Self {
+            api_key: api_key.into(),
+            num_results: 5,
+        }
     }
     /// Construct from `EXA_API_KEY` env var; returns `None` if not set.
     pub fn from_env() -> Option<Self> {
@@ -482,7 +610,9 @@ impl ExaSearchTool {
 }
 
 impl Tool for ExaSearchTool {
-    fn name(&self) -> &str { "web_search" }
+    fn name(&self) -> &str {
+        "web_search"
+    }
     fn description(&self) -> &str {
         "Search the web via Exa. Returns titles, URLs, and content highlights. \
          Use for current events, documentation, or any topic needing fresh data."
@@ -497,15 +627,24 @@ impl Tool for ExaSearchTool {
             "required": ["query"]
         })
     }
-    fn execute(&self, arguments: serde_json::Value, _resume: Option<ResumePayload>, _ctx: &ToolContext)
-        -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let api_key = self.api_key.clone();
         let default_n = self.num_results;
         async move {
-            let query = arguments["query"].as_str()
-                .ok_or_else(|| AgentError::tool("web_search", "missing 'query'"))?.to_string();
-            let num = arguments["num_results"].as_u64().map(|n| n as usize).unwrap_or(default_n);
+            let query = arguments["query"]
+                .as_str()
+                .ok_or_else(|| AgentError::tool("web_search", "missing 'query'"))?
+                .to_string();
+            let num = arguments["num_results"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(default_n);
 
             Ok(ToolResult::Output(stream! {
                 tracing::debug!(query = %query, "web_search: querying");

@@ -29,6 +29,7 @@ impl LocalAgentSupervisor {
         info!(bin = %self.agent_bin.display(), addr = %self.daemon_addr, "starting remi-cat");
         Command::new(&self.agent_bin)
             .env("DAEMON_ADDR", &self.daemon_addr)
+            .env("REMI_BASH_MODE", "local")
             // Inherit stdout/stderr so agent logs appear in the same terminal.
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())

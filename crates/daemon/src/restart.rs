@@ -27,7 +27,6 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info, warn};
-
 /// Name of the environment variable used to pass the ready-FIFO path.
 pub const READY_FIFO_ENV: &str = "REMI_DAEMON_READY_FIFO";
 
@@ -112,7 +111,9 @@ impl RestartHandle {
             }
             Ok(Ok(Ok(false))) => {
                 error!("new daemon process sent unexpected signal — restart aborted");
-                Err(anyhow::anyhow!("unexpected startup signal from child process"))
+                Err(anyhow::anyhow!(
+                    "unexpected startup signal from child process"
+                ))
             }
             Ok(Ok(Err(e))) => {
                 error!("FIFO read error: {e:#}");
@@ -154,9 +155,10 @@ pub fn signal_ready() {
 
 // ── Binary download ───────────────────────────────────────────────────────────
 
-/// Download the binary at `url`, write it to a temporary file, set executable
-/// permissions, then atomically rename it over the current executable.
+/// Download the binary at `url`, verify its SHA-256 checksum against
+/// `{url}.sha256`, then atomically rename it over the current executable.
 async fn download_and_replace(url: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
 
@@ -170,6 +172,7 @@ async fn download_and_replace(url: &str) -> Result<()> {
 
     let tmp_path = format!("/tmp/remi-daemon-new-{}", std::process::id());
 
+    let mut hasher = Sha256::new();
     {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -183,22 +186,50 @@ async fn download_and_replace(url: &str) -> Result<()> {
         use futures::StreamExt;
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("download stream error")?;
+            hasher.update(&chunk);
             file.write_all(&chunk).await.context("write temp file")?;
         }
         file.flush().await.context("flush temp file")?;
     }
 
+    let actual_hash = hex::encode(hasher.finalize());
+
+    // ── Fetch and verify checksum ─────────────────────────────────────────
+    let sha256_url = format!("{url}.sha256");
+    info!(sha256_url, "fetching checksum");
+    let checksum_text = reqwest::get(&sha256_url)
+        .await
+        .with_context(|| format!("GET {sha256_url}"))?
+        .error_for_status()
+        .with_context(|| format!("server error downloading {sha256_url}"))?
+        .text()
+        .await
+        .context("reading checksum response")?;
+
+    // sha256sum format: "<hash>  <filename>\n" — we only need the first word.
+    let expected_hash = checksum_text
+        .split_whitespace()
+        .next()
+        .with_context(|| format!("could not parse checksum from: {checksum_text:?}"))?
+        .to_lowercase();
+
+    if actual_hash != expected_hash {
+        // Clean up before bailing so we don't leave a corrupt file.
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::bail!(
+            "SHA-256 mismatch — download aborted (expected {expected_hash}, got {actual_hash})"
+        );
+    }
+    info!("checksum verified ok");
+
     // Make executable.
-    tokio::fs::set_permissions(
-        &tmp_path,
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .await
-    .context("chmod temp binary")?;
+    tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+        .await
+        .context("chmod temp binary")?;
 
     // Atomic rename over the current exe.
-    let current_exe = std::fs::read_link("/proc/self/exe")
-        .unwrap_or_else(|_| std::env::current_exe().unwrap());
+    let current_exe =
+        std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| std::env::current_exe().unwrap());
 
     tokio::fs::rename(&tmp_path, &current_exe)
         .await

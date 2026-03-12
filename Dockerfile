@@ -1,83 +1,48 @@
-# Dockerfile for remi-cat-agent (runs inside Docker).
-# remi-daemon runs on the host and is built separately.
+# Dockerfile for remi-cat-agent (runs inside Docker as an isolation sandbox).
+# The binary is downloaded from GitHub Releases — no Rust toolchain needed.
+#
+# Build args:
+#   GITHUB_REPO   — owner/repo  (default: another-s347/remi-cat)
+#   RELEASE_TAG   — vX.Y.Z or "latest"  (default: latest)
+#
+# Examples:
+#   docker build .                                    # pull latest release
+#   docker build --build-arg RELEASE_TAG=v0.2.0 .    # pin a specific version
 
-# ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM rust:1.85-slim AS builder
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# ── Dependency layer (cache-friendly) ────────────────────────────────────────
-COPY Cargo.toml Cargo.lock ./
-COPY crates/im-gateway/Cargo.toml  crates/im-gateway/Cargo.toml
-COPY crates/im-feishu/Cargo.toml   crates/im-feishu/Cargo.toml
-COPY crates/matcher/Cargo.toml     crates/matcher/Cargo.toml
-COPY crates/bot-core/Cargo.toml    crates/bot-core/Cargo.toml
-COPY crates/proto/Cargo.toml       crates/proto/Cargo.toml
-COPY crates/daemon/Cargo.toml      crates/daemon/Cargo.toml
-COPY crates/agent/Cargo.toml       crates/agent/Cargo.toml
-# Proto file is needed at build time for tonic-build.
-COPY crates/proto/proto/           crates/proto/proto/
-COPY crates/proto/build.rs         crates/proto/build.rs
-COPY crates/daemon/build.rs        crates/daemon/build.rs 2>/dev/null || true
-
-RUN mkdir -p src \
-    crates/im-gateway/src \
-    crates/im-feishu/src \
-    crates/matcher/src \
-    crates/bot-core/src \
-    crates/proto/src \
-    crates/daemon/src \
-    crates/agent/src \
-    && echo 'fn main() {}' > src/main.rs \
-    && echo '' > crates/im-gateway/src/lib.rs \
-    && echo '' > crates/im-feishu/src/lib.rs \
-    && echo '' > crates/matcher/src/lib.rs \
-    && echo '' > crates/bot-core/src/lib.rs \
-    && echo '' > crates/proto/src/lib.rs \
-    && echo 'fn main() {}' > crates/daemon/src/main.rs \
-    && echo 'fn main() {}' > crates/agent/src/main.rs
-
-RUN cargo build --release --bin remi-cat-agent 2>&1 | tail -5 || true
-
-# ── Full source build ─────────────────────────────────────────────────────────
-COPY src/           src/
-COPY crates/im-gateway/src/  crates/im-gateway/src/
-COPY crates/im-feishu/src/   crates/im-feishu/src/
-COPY crates/matcher/src/     crates/matcher/src/
-COPY crates/bot-core/src/    crates/bot-core/src/
-COPY crates/proto/src/       crates/proto/src/
-COPY crates/daemon/src/      crates/daemon/src/
-COPY crates/agent/src/       crates/agent/src/
-
-RUN touch crates/im-gateway/src/lib.rs \
-    crates/im-feishu/src/lib.rs \
-    crates/matcher/src/lib.rs \
-    crates/bot-core/src/lib.rs \
-    crates/proto/src/lib.rs \
-    crates/agent/src/main.rs
-
-RUN cargo build --release --bin remi-cat-agent
-
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+ARG GITHUB_REPO=another-s347/remi-cat
+ARG RELEASE_TAG=latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-COPY --from=builder /build/target/release/remi-cat-agent /app/remi-cat-agent
+# Resolve the download base URL depending on whether a specific tag was given.
+# "latest" → .../releases/latest/download/
+# "vX.Y.Z" → .../releases/download/vX.Y.Z/
+RUN set -eux; \
+    if [ "${RELEASE_TAG}" = "latest" ]; then \
+    BASE_URL="https://github.com/${GITHUB_REPO}/releases/latest/download"; \
+    else \
+    BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"; \
+    fi; \
+    BIN="remi-cat-agent-linux-x86_64"; \
+    curl -fsSL "${BASE_URL}/${BIN}"        -o /usr/local/bin/remi-cat-agent; \
+    curl -fsSL "${BASE_URL}/${BIN}.sha256" -o /tmp/remi-cat-agent.sha256; \
+    # Verify checksum (sha256sum file format: "<hash>  <filename>") \
+    EXPECTED=$(awk '{print $1}' /tmp/remi-cat-agent.sha256); \
+    ACTUAL=$(sha256sum /usr/local/bin/remi-cat-agent | awk '{print $1}'); \
+    if [ "${EXPECTED}" != "${ACTUAL}" ]; then \
+    echo "SHA256 mismatch: expected ${EXPECTED}, got ${ACTUAL}"; \
+    exit 1; \
+    fi; \
+    chmod +x /usr/local/bin/remi-cat-agent; \
+    rm /tmp/remi-cat-agent.sha256
 
 VOLUME ["/app/data"]
 WORKDIR /app/data
 
-ENTRYPOINT ["/app/remi-cat-agent"]
+ENTRYPOINT ["/usr/local/bin/remi-cat-agent"]
 

@@ -42,8 +42,8 @@ use remi_agentloop::tool::registry::DefaultToolRegistry;
 
 use memory::{build_injected_history, LlmCompressor, MemoryGetDetailTool};
 use tools::{
-    ExaSearchTool, RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool,
-    RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, WorkspaceBashTool,
+    BashMode, ExaSearchTool, RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool,
+    RootedFsRemoveTool, RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, WorkspaceBashTool,
 };
 
 // -- StreamOptions ----------------------------------------------------------
@@ -298,6 +298,7 @@ pub struct CatBotBuilder {
     /// None → derive from model profile.
     overflow_bytes: Option<usize>,
     memory_days: u64,
+    bash_mode: BashMode,
 }
 
 impl CatBotBuilder {
@@ -321,6 +322,10 @@ impl CatBotBuilder {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(7_u64);
+        let bash_mode = match std::env::var("REMI_BASH_MODE").as_deref() {
+            Ok("local") => BashMode::Local,
+            _ => BashMode::Docker,
+        };
         Ok(Self {
             api_key,
             base_url,
@@ -331,6 +336,7 @@ impl CatBotBuilder {
             short_term_tokens,
             overflow_bytes,
             memory_days,
+            bash_mode,
         })
     }
 
@@ -423,6 +429,7 @@ impl CatBotBuilder {
         local_tools.register(WorkspaceBashTool::new(
             data_dir.clone(),
             Arc::clone(&redactor),
+            self.bash_mode,
         ));
         local_tools.register(RootedFsReadTool {
             root: data_dir.clone(),
