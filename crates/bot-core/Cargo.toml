@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-remi-agentloop = { path = "../../../remi-agentloop/remi-agentloop", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", branch = "main", features = [
     "http-client",
 ] }
 tokio = { version = "1", features = ["full"] }
