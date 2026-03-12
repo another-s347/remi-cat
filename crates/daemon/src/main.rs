@@ -1,0 +1,509 @@
+//! `remi-daemon` — IM gateway daemon (runs outside Docker).
+//!
+//! Responsibilities:
+//! - Connects to Feishu via WebSocket long connection.
+//! - Parses `/commands`, handles system commands locally (Docker container
+//!   lifecycle + self-update), forwards ordinary messages to the Agent via gRPC.
+//! - Manages a single Agent connection via the `DaemonService` gRPC server.
+//!
+//! # Configuration (environment variables)
+//!
+//! # CLI flags
+//!
+//! | Flag      | Description                                                               |
+//! |-----------|---------------------------------------------------------------------------|
+//! | `--local` | Local mode: skip Docker entirely (useful for local debugging).            |
+//!
+//! # Configuration (environment variables)
+//!
+//! | Variable               | Required | Description                                      |
+//! |------------------------|----------|--------------------------------------------------|
+//! | `FEISHU_APP_ID`        | Yes      | Feishu enterprise app ID                         |
+//! | `FEISHU_APP_SECRET`    | Yes      | Feishu enterprise app secret                     |
+//! | `DAEMON_GRPC_ADDR`     | No       | gRPC listen address (default: `0.0.0.0:50051`)   |
+//! | `DAEMON_MGMT_ADDR`     | No       | Management WS address (default: `0.0.0.0:50052`) |
+//! | `AGENT_CONTAINER`      | No       | Docker container name (default: `remi-cat`)      |
+//! | `AGENT_BIN`            | No       | Path to `remi-cat-agent` binary (local mode only)|
+//! | `DAEMON_UPDATE_URL`    | No       | URL to download new daemon binary for `/update`  |
+//! | `GITHUB_REPO`          | No       | `owner/repo` for auto-constructing update URL    |
+//! | `REMI_CAT_OWNER_ID`    | No       | Pre-configure owner (skip `/pair`)               |
+//! | `RUST_LOG`             | No       | Log filter (default: `remi_daemon=info`)         |
+
+mod command;
+mod docker;
+mod local_agent;
+mod mgmt_server;
+mod restart;
+mod rpc_server;
+mod secret_store;
+
+use anyhow::Result;
+use base64::Engine as _;
+use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
+use matcher::{OwnerMatcher, OwnerStatus, PAIR_COMMAND};
+use mgmt_server::MgmtContext;
+use restart::{signal_ready, RestartHandle};
+use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
+use secret_store::SecretStore;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tonic::transport::Server;
+use tracing::{debug, error, info, warn};
+
+/// Maximum number of messages that can be queued per chat before new messages
+/// are rejected with a backpressure reply.
+const CHAT_QUEUE_CAPACITY: usize = 5;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // ── CLI flags ─────────────────────────────────────────────────────────
+    let local_mode = std::env::args().any(|a| a == "--local");
+
+    // ── Logging ───────────────────────────────────────────────────────────
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "remi_daemon=info,im_feishu=info".into()),
+        )
+        .init();
+
+    // ── Config ────────────────────────────────────────────────────────────
+    let app_id = std::env::var("FEISHU_APP_ID")
+        .map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
+    let app_secret = std::env::var("FEISHU_APP_SECRET")
+        .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
+
+    let grpc_addr: SocketAddr = std::env::var("DAEMON_GRPC_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50051".into())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid DAEMON_GRPC_ADDR: {e}"))?;
+
+    let agent_container = std::env::var("AGENT_CONTAINER")
+        .unwrap_or_else(|_| "remi-cat".into());
+
+    // ── Components ────────────────────────────────────────────────────────
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into())
+    );
+
+    let gateway = FeishuGateway::new(&app_id, &app_secret);
+    let matcher = OwnerMatcher::load();
+    let docker: Option<docker::DockerManager> = if local_mode {
+        info!("--local flag set — running without Docker");
+        None
+    } else {
+        let d = docker::DockerManager::new(&agent_container)
+            .map_err(|e| anyhow::anyhow!("failed to connect to Docker daemon: {e:#}\n  (pass --local to run without Docker)"))?;
+        info!(container = %agent_container, "connected to Docker daemon");
+        Some(d)
+    };
+    let restart = RestartHandle::new();
+    let start_time = Instant::now();
+    let secret_store = Arc::new(RwLock::new(
+        SecretStore::load(SecretStore::resolve_path())?
+    ));
+    let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
+
+    // Per-chat serial queues: one bounded mpsc channel per chat_id.
+    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<FeishuMessage>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    info!("remi-daemon starting up");
+    if let Some(id) = matcher.owner_id() {
+        info!("owner: {id}");
+    } else {
+        info!("no owner set — send '{PAIR_COMMAND}' to claim ownership");
+    }
+
+    // ── Start gRPC server ─────────────────────────────────────────────────
+    let rpc_clone = rpc.clone();
+    let grpc_server = Server::builder()
+        .add_service(rpc_clone.into_server());
+
+    // Bind the listener so we can signal readiness before serving.
+    let listener = tokio::net::TcpListener::bind(grpc_addr).await
+        .map_err(|e| anyhow::anyhow!("failed to bind gRPC addr {grpc_addr}: {e}"))?;
+
+    info!(addr = %grpc_addr, "gRPC server listening");
+
+    // ── Start management server ───────────────────────────────────────────
+    let mgmt_addr: SocketAddr = std::env::var("DAEMON_MGMT_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50052".into())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid DAEMON_MGMT_ADDR: {e}"))?;
+
+    let mgmt_ctx = MgmtContext {
+        docker: docker.clone(),
+        owner: matcher.clone(),
+        secret_store: Arc::clone(&secret_store),
+        rpc: rpc.clone(),
+        data_dir: data_dir.clone(),
+        start_time,
+        sys: Arc::new(std::sync::Mutex::new(sysinfo::System::new())),
+    };
+    let mgmt = mgmt_server::MgmtServer::new(mgmt_ctx)?;
+    info!("mgmt token: {}", mgmt.token().await);
+    info!("mgmt fingerprint: {}", mgmt.fingerprint());
+    tokio::spawn(async move {
+        if let Err(e) = mgmt.serve(mgmt_addr).await {
+            error!("mgmt server error: {e:#}");
+        }
+    });
+
+    // ── Signal readiness to parent (if this is a restart child) ──────────
+    signal_ready();
+
+    // ── Auto-start agent in local mode ───────────────────────────────────
+    if local_mode {
+        // Replace 0.0.0.0 with 127.0.0.1 so the agent connects to localhost.
+        let connect_addr = format!(
+            "http://{}",
+            grpc_addr.to_string().replace("0.0.0.0", "127.0.0.1")
+        );
+        let supervisor = local_agent::LocalAgentSupervisor::new(connect_addr)?;
+        tokio::spawn(supervisor.supervise());
+    }
+
+    // Spawn gRPC serve task.
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        if let Err(e) = grpc_server.serve_with_incoming(incoming).await {
+            error!("gRPC server error: {e:#}");
+        }
+    });
+
+    // ── Start Feishu gateway ──────────────────────────────────────────────
+    let mut rx = gateway.start().await?;
+
+    info!("remi-daemon ready");
+
+    // ── Main event loop ───────────────────────────────────────────────────
+    while let Some(event) = rx.recv().await {
+        match event {
+            FeishuEvent::MessageReceived(msg) => {
+                let text = msg.text.trim().to_string();
+
+                // ── Group chat: only handle @-mentions ────────────────────
+                if msg.chat_type == "group" && !msg.at_bot {
+                    debug!(
+                        sender = %msg.sender_open_id,
+                        chat   = %msg.chat_id,
+                        "group message without @bot — skipping",
+                    );
+                    continue;
+                }
+
+                info!(
+                    sender = %msg.sender_open_id,
+                    chat   = %msg.chat_id,
+                    "received: {text}",
+                );
+
+                // ── Pairing command ────────────────────────────────────────
+                if text.trim() == PAIR_COMMAND {
+                    let reply = match matcher.check(&msg.sender_open_id) {
+                        OwnerStatus::NeedPairing => {
+                            if matcher.try_pair(&msg.sender_open_id) {
+                                format!(
+                                    "配对成功！您已成为我的主人。\nYour ID: {}",
+                                    msg.sender_open_id
+                                )
+                            } else {
+                                "配对失败，请重试。".into()
+                            }
+                        }
+                        OwnerStatus::Owner   => "您已是我的主人。".into(),
+                        OwnerStatus::NotOwner => "我已有主人 :)".into(),
+                    };
+                    send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                    continue;
+                }
+
+                // ── Command detection ──────────────────────────────────────
+                if let Some(cmd) = im_gateway::ImCommand::parse(
+                    &msg.message_id,
+                    &msg.sender_open_id,
+                    &msg.chat_id,
+                    &text,
+                ) {
+                    if command::is_daemon_command(&cmd.name) {
+                        // Daemon commands: owner-only AND private chat (单聊) only.
+                        if msg.chat_type != "p2p" {
+                            send_reply(
+                                &gateway,
+                                &msg.message_id,
+                                &msg.chat_id,
+                                "⚠️ 系统指令只能在单聊中执行。",
+                            ).await;
+                            continue;
+                        }
+                        if !is_owner(&matcher, &msg.sender_open_id) {
+                            send_reply(
+                                &gateway,
+                                &msg.message_id,
+                                &msg.chat_id,
+                                "⚠️ 仅主人可以执行系统指令。",
+                            ).await;
+                            continue;
+                        }
+                        let docker       = docker.clone();
+                        let restart      = restart.clone();
+                        let gateway      = gateway.clone();
+                        let rpc          = rpc.clone();
+                        let secret_store = Arc::clone(&secret_store);
+                        let msg_id       = msg.message_id.clone();
+                        let chat_id      = msg.chat_id.clone();
+                        tokio::spawn(async move {
+                            let reply = command::execute_daemon_command(
+                                &cmd.name,
+                                &cmd.args,
+                                docker.as_ref(),
+                                &restart,
+                                &secret_store,
+                                &rpc,
+                                &gateway,
+                                &msg_id,
+                            )
+                            .await
+                            .unwrap_or_else(|e| format!("❌ 命令失败: {e:#}"));
+                            if !reply.is_empty() {
+                                send_reply(&gateway, &msg_id, &chat_id, &reply).await;
+                            }
+                        });
+                        continue;
+                    }
+                    // Non-daemon commands: no owner/chat restriction — forward to Agent.
+                } else {
+                    // Regular (non-command) message: owner-only.
+                    if !is_owner(&matcher, &msg.sender_open_id) {
+                        warn!("ignoring message from non-owner {}", msg.sender_open_id);
+                        continue;
+                    }
+                }
+
+                // ── Forward to Agent ───────────────────────────────────────
+                let chat_id = msg.chat_id.clone();
+                let msg_id  = msg.message_id.clone();
+                let queue_tx = {
+                    let mut queues = chat_queues.lock().await;
+                    // Respawn worker if the channel was closed.
+                    if queues.get(&chat_id).map(|tx| tx.is_closed()).unwrap_or(true) {
+                        let tx = spawn_queue_worker(
+                            chat_id.clone(),
+                            gateway.clone(),
+                            rpc.clone(),
+                        );
+                        queues.insert(chat_id.clone(), tx);
+                    }
+                    queues[&chat_id].clone()
+                };
+                match queue_tx.try_send(msg) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
+                        send_reply(
+                            &gateway,
+                            &msg_id,
+                            &chat_id,
+                            &format!(
+                                "⚠️ 消息队列已满（最多 {CHAT_QUEUE_CAPACITY} 条待处理），请等当前消息处理完成后再发送。"
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(chat = %chat_id, msg = %msg_id, "chat queue worker died");
+                        chat_queues.lock().await.remove(&chat_id);
+                        send_reply(&gateway, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。").await;
+                    }
+                }
+            }
+
+            FeishuEvent::ReactionReceived(reaction) => {
+                info!(
+                    sender = %reaction.sender_open_id,
+                    emoji  = %reaction.emoji_type,
+                    msg    = %reaction.message_id,
+                    "reaction received",
+                );
+
+                if !is_owner(&matcher, &reaction.sender_open_id) {
+                    warn!(
+                        "ignoring reaction from non-owner {}",
+                        reaction.sender_open_id
+                    );
+                    continue;
+                }
+
+                let daemon_msg = daemon_msg_im_reaction(&reaction);
+                if !rpc.send_to_agent(daemon_msg).await {
+                    // Reaction with no agent — silently drop.
+                }
+            }
+
+            FeishuEvent::CardAction { card_message_id, action_value, user_open_id } => {
+                info!(user = %user_open_id, card = %card_message_id, "card action received");
+
+                if !is_owner(&matcher, &user_open_id) {
+                    warn!("ignoring card action from non-owner {user_open_id}");
+                    continue;
+                }
+
+                let gateway      = gateway.clone();
+                let rpc          = rpc.clone();
+                let secret_store = Arc::clone(&secret_store);
+                tokio::spawn(async move {
+                    let action = action_value.get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("").to_string();
+
+                    let result: anyhow::Result<()> = async {
+                        match action.as_str() {
+                            "delete" => {
+                                let key = action_value["key"].as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("missing key in delete action"))?;
+                                secret_store.write().await.delete(key)?;
+                                info!(key, "secret deleted via card");
+                                rpc.sync_secrets_to_agent().await;
+                            }
+                            "set" => {
+                                // form_value is nested under action.form_value
+                                let fv = &action_value["form_value"];
+                                let key = fv["new_key"].as_str()
+                                    .or_else(|| action_value["new_key"].as_str())
+                                    .ok_or_else(|| anyhow::anyhow!("missing new_key in set action"))?;
+                                let val = fv["new_value"].as_str()
+                                    .or_else(|| action_value["new_value"].as_str())
+                                    .ok_or_else(|| anyhow::anyhow!("missing new_value in set action"))?;
+                                secret_store.write().await.set(key, val)?;
+                                info!(key, "secret set via card");
+                                rpc.sync_secrets_to_agent().await;
+                            }
+                            other => {
+                                warn!("unknown card action: {other}");
+                                return Ok(());
+                            }
+                        }
+                        // Refresh card with updated key list.
+                        let keys_owned: Vec<String> = secret_store.read().await.keys()
+                            .into_iter().map(str::to_string).collect();
+                        let keys_ref: Vec<&str> = keys_owned.iter().map(String::as_str).collect();
+                        let card = im_feishu::client::build_secret_manager_card(&keys_ref);
+                        if let Err(e) = gateway.update_card_raw(&card_message_id, card).await {
+                            warn!("update_card_raw after action failed: {e:#}");
+                        }
+                        Ok(())
+                    }.await;
+
+                    if let Err(e) = result {
+                        warn!("card action handler error: {e:#}");
+                    }
+                });
+            }
+
+            FeishuEvent::Unknown { event_type, .. } => {
+                info!("ignored event type: {event_type}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Chat queue worker ─────────────────────────────────────────────────────────
+
+/// Spawn a serial queue worker for `chat_id`.
+///
+/// The worker blocks on one message at a time (enrich → react → agent →
+/// await completion) so messages from the same chat are processed in order.
+fn spawn_queue_worker(
+    chat_id: String,
+    gateway: FeishuGateway,
+    rpc: RpcServer,
+) -> mpsc::Sender<FeishuMessage> {
+    let (tx, mut rx) = mpsc::channel::<FeishuMessage>(CHAT_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let message_id = msg.message_id.clone();
+            let enriched = enrich_message(&gateway, msg).await;
+
+            let reaction_id = gateway
+                .add_reaction(&enriched.message_id, "THINKING")
+                .await
+                .map_err(|e| warn!("add_reaction failed: {e:#}"))
+                .ok();
+
+            let daemon_msg = daemon_msg_im_message(&enriched);
+            if let Some(completion_rx) = rpc
+                .send_to_agent_and_await(daemon_msg, &message_id)
+                .await
+            {
+                if let Some(rid) = reaction_id {
+                    rpc.record_reaction(&message_id, rid).await;
+                }
+                // Block until the Agent signals Done/Error for this message.
+                completion_rx.await.ok();
+            } else {
+                // Agent not connected.
+                if let Some(rid) = reaction_id {
+                    gateway.delete_reaction(&message_id, &rid).await.ok();
+                }
+                rpc.reply_agent_unavailable(&message_id).await;
+            }
+        }
+        info!(chat = %chat_id, "chat queue worker exiting");
+    });
+    tx
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn is_owner(matcher: &OwnerMatcher, sender_id: &str) -> bool {
+    matches!(matcher.check(sender_id), OwnerStatus::Owner)
+}
+
+async fn send_reply(
+    gateway: &FeishuGateway,
+    message_id: &str,
+    chat_id: &str,
+    text: &str,
+) {
+    if let Err(e) = gateway.reply_text(message_id, text).await {
+        warn!("reply_text failed: {e:#}");
+        gateway.send_text(chat_id, text).await.ok();
+    }
+}
+
+/// Fetch quoted/parent text and download images, returning an enriched message.
+/// Image keys are replaced with base64 data URLs so the Agent doesn't need
+/// Feishu credentials.
+async fn enrich_message(gateway: &FeishuGateway, mut msg: FeishuMessage) -> FeishuMessage {
+    // ── Parent message text ─────────────────────────────────────────────
+    if let Some(parent_id) = &msg.parent_id {
+        match gateway.fetch_message_text(parent_id).await {
+            Ok(Some(parent_text)) => {
+                msg.text = format!("[引用]\n{parent_text}\n\n[回复]\n{}", msg.text);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("fetch parent message failed: {e:#}"),
+        }
+    }
+
+    // ── Images → base64 data URLs ───────────────────────────────────────
+    let mut data_urls: Vec<String> = Vec::new();
+    for image_key in &msg.images {
+        match gateway.download_image(&msg.message_id, image_key).await {
+            Ok((content_type, bytes)) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                data_urls.push(format!("data:{content_type};base64,{b64}"));
+            }
+            Err(e) => warn!("download_image {image_key} failed: {e:#}"),
+        }
+    }
+    msg.images = data_urls;
+
+    msg
+}

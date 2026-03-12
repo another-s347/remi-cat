@@ -1,0 +1,47 @@
+
+# docker-compose.yml — runs the remi-cat container only.
+#
+# remi-daemon runs on the HOST (outside Docker) and manages this container.
+# Run daemon on the host:
+#   FEISHU_APP_ID=xxx FEISHU_APP_SECRET=xxx ./remi-daemon
+#
+# To build and start the agent container:
+#   docker compose up -d --build
+
+services:
+  remi-cat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remi-cat:latest
+    container_name: remi-cat
+
+    # Daemon will restart this container; Docker's own restart policy is a
+    # safety net for unexpected crashes.
+    restart: unless-stopped
+
+    environment:
+      # ── Daemon gRPC address (host machine) ────────────────────────────
+      # On Linux Docker: use host network gateway (172.17.0.1 by default),
+      # or set host.docker.internal via extra_hosts below.
+      DAEMON_ADDR: "${DAEMON_ADDR:-http://host.docker.internal:50051}"
+
+      # ── OpenAI-compatible LLM (required) ──────────────────────────────
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o}"
+
+      # ── Log level ─────────────────────────────────────────────────────
+      RUST_LOG: "${RUST_LOG:-remi_cat_agent=info,bot_core=info}"
+
+    extra_hosts:
+      # Allows containers to reach the host machine as host.docker.internal.
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # Persist memory / skill / owner data across container restarts.
+      - remi-cat-data:/app/data
+
+volumes:
+  remi-cat-data:
+

@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remi Admin</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --surface2: #252836;
+            --border: #2e3347;
+            --accent: #7eb8f7;
+            --accent2: #5294e0;
+            --success: #4ade80;
+            --danger: #f87171;
+            --warning: #fbbf24;
+            --text: #e2e8f0;
+            --text2: #94a3b8;
+            --radius: 8px;
+            --shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            font-size: 14px;
+        }
+
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        button {
+            cursor: pointer;
+            border: none;
+            border-radius: var(--radius);
+            padding: 6px 14px;
+            font-size: 13px;
+            font-weight: 500;
+            transition: opacity .15s;
+        }
+
+        button:hover {
+            opacity: .85;
+        }
+
+        button:disabled {
+            opacity: .4;
+            cursor: not-allowed;
+        }
+
+        button.primary {
+            background: var(--accent2);
+            color: #fff;
+        }
+
+        button.danger {
+            background: #7f1d1d;
+            color: var(--danger);
+            border: 1px solid var(--danger);
+        }
+
+        button.ghost {
+            background: transparent;
+            color: var(--text2);
+            border: 1px solid var(--border);
+        }
+
+        button.ghost:hover {
+            color: var(--text);
+            border-color: var(--text2);
+        }
+
+        input,
+        textarea,
+        select {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text);
+            padding: 7px 10px;
+            font-size: 13px;
+            width: 100%;
+            outline: none;
+            font-family: inherit;
+        }
+
+        input:focus,
+        textarea:focus,
+        select:focus {
+            border-color: var(--accent2);
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 120px;
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            font-size: 13px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            color: var(--text2);
+            margin-bottom: 4px;
+        }
+
+        .form-row {
+            margin-bottom: 14px;
+        }
+
+        .form-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-top: 16px;
+        }
+
+        /* layout */
+        #app {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        #sidebar {
+            width: 220px;
+            min-width: 220px;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        #sidebar-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        #sidebar-header h1 {
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        #daemon-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+
+        .daemon-item {
+            padding: 10px 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-left: 3px solid transparent;
+            transition: background .1s;
+        }
+
+        .daemon-item:hover {
+            background: var(--surface2);
+        }
+
+        .daemon-item.active {
+            background: var(--surface2);
+            border-left-color: var(--accent2);
+        }
+
+        .daemon-item .name {
+            font-weight: 500;
+            font-size: 13px;
+        }
+
+        .daemon-item .addr {
+            font-size: 11px;
+            color: var(--text2);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            background: var(--text2);
+        }
+
+        .status-dot.connected {
+            background: var(--success);
+            box-shadow: 0 0 6px var(--success);
+        }
+
+        .status-dot.disconnected {
+            background: var(--danger);
+        }
+
+        #main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        #topbar {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: var(--surface);
+        }
+
+        #topbar .daemon-title {
+            font-size: 15px;
+            font-weight: 600;
+            flex: 1;
+        }
+
+        #topbar .daemon-addr {
+            font-size: 12px;
+            color: var(--text2);
+        }
+
+        #topbar .fp-badge {
+            font-size: 10px;
+            color: var(--text2);
+            font-family: monospace;
+            background: var(--surface2);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        #content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        /* tabs */
+        .tabs {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .tab-btn {
+            padding: 8px 16px;
+            background: transparent;
+            color: var(--text2);
+            border: none;
+            border-radius: 0;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            font-size: 13px;
+            transition: color .15s;
+        }
+
+        .tab-btn:hover {
+            color: var(--text);
+        }
+
+        .tab-btn.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+            font-weight: 600;
+        }
+
+        .tab-panel {
+            display: none;
+        }
+
+        .tab-panel.active {
+            display: block;
+        }
+
+        /* cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text2);
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            margin-bottom: 12px;
+        }
+
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 12px;
+        }
+
+        .stat-box {
+            background: var(--surface2);
+            border-radius: var(--radius);
+            padding: 12px 14px;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--text2);
+            margin-bottom: 4px;
+        }
+
+        .stat-value {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        /* table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            padding: 8px 12px;
+            font-size: 11px;
+            color: var(--text2);
+            text-transform: uppercase;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: var(--surface2);
+        }
+
+        /* modal */
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        .modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            width: 420px;
+            box-shadow: var(--shadow);
+        }
+
+        .modal h2 {
+            font-size: 16px;
+            margin-bottom: 16px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* toast */
+        #toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 200;
+        }
+
+        .toast {
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 10px 16px;
+            font-size: 13px;
+            box-shadow: var(--shadow);
+            max-width: 320px;
+            animation: slideIn .2s ease;
+        }
+
+        .toast.success {
+            border-color: var(--success);
+            color: var(--success);
+        }
+
+        .toast.error {
+            border-color: var(--danger);
+            color: var(--danger);
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* empty state */
+        .empty {
+            text-align: center;
+            color: var(--text2);
+            padding: 60px 20px;
+        }
+
+        .empty h2 {
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: var(--text);
+        }
+
+        .container-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            gap: 10px;
+        }
+
+        .secret-value {
+            font-family: monospace;
+            font-size: 12px;
+            color: var(--text2);
+        }
+
+        .file-selector {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+            align-items: center;
+        }
+
+        .mono {
+            font-family: monospace;
+        }
+
+        .tag {
+            display: inline-block;
+            background: var(--surface2);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            color: var(--text2);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <nav id="sidebar">
+            <div id="sidebar-header">
+                <h1>🐱 Remi</h1>
+                <button class="ghost" onclick="openAddModal()" title="Add daemon">＋</button>
+            </div>
+            <div id="daemon-list">
+                <div class="empty" style="padding:30px 10px;font-size:12px;">No daemons yet.<br>Click ＋ to add one.
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main panel -->
+        <main id="main">
+            <div id="topbar">
+                <div class="daemon-title" id="topbar-title" style="color:var(--text2)">Select a daemon</div>
+                <div class="daemon-addr" id="topbar-addr"></div>
+                <div class="fp-badge mono" id="topbar-fp" title="daemon fingerprint"></div>
+                <button class="ghost" id="btn-refresh" onclick="refreshCurrent()" style="display:none">↻
+                    Refresh</button>
+            </div>
+            <div id="content">
+                <div class="empty">
+                    <h2>No daemon selected</h2>
+                    <p>Add a daemon using the ＋ button, then click it to manage.</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Add Daemon modal -->
+    <div id="modal-add" class="modal-backdrop hidden">
+        <div class="modal">
+            <h2>Add Daemon</h2>
+            <div class="form-row">
+                <label>Label</label>
+                <input id="add-label" placeholder="Production server" />
+            </div>
+            <div class="form-row">
+                <label>Address <span style="color:var(--text2)">(host:50052)</span></label>
+                <input id="add-addr" placeholder="192.168.1.100:50052" />
+            </div>
+            <div class="form-row">
+                <label>Management token <span style="color:var(--text2)">(from daemon startup log)</span></label>
+                <input id="add-token" placeholder="a1b2c3d4..." autocomplete="off" />
+            </div>
+            <div class="form-actions">
+                <button class="ghost" onclick="closeAddModal()">Cancel</button>
+                <button class="primary" onclick="submitAddDaemon()" id="btn-add-submit">Connect &amp; Add</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm remove modal -->
+    <div id="modal-remove" class="modal-backdrop hidden">
+        <div class="modal">
+            <h2>Remove Daemon</h2>
+            <p style="color:var(--text2);margin-bottom:20px">Remove this daemon from the list? The daemon itself is not
+                affected.</p>
+            <div class="form-actions">
+                <button class="ghost" onclick="closeRemoveModal()">Cancel</button>
+                <button class="danger" onclick="confirmRemove()">Remove</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script>
+        /* ── State ────────────────────────────────────────────────────────────────── */
+        let daemons = [];
+        let selectedId = null;
+        let pendingRemoveId = null;
+
+        /* ── Init ─────────────────────────────────────────────────────────────────── */
+        (async () => {
+            await loadDaemons();
+        })();
+
+        /* ── API helpers ─────────────────────────────────────────────────────────── */
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body !== undefined) opts.body = JSON.stringify(body);
+            const r = await fetch('/api' + path, opts);
+            const json = await r.json().catch(() => ({ error: r.statusText }));
+            if (!r.ok) throw new Error(json.error || r.statusText);
+            return json;
+        }
+
+        /* ── Daemon list ─────────────────────────────────────────────────────────── */
+        async function loadDaemons() {
+            daemons = await api('GET', '/daemons');
+            renderSidebar();
+        }
+
+        function renderSidebar() {
+            const el = document.getElementById('daemon-list');
+            if (!daemons.length) {
+                el.innerHTML = '<div class="empty" style="padding:30px 10px;font-size:12px;">No daemons yet.<br>Click ＋ to add one.</div>';
+                return;
+            }
+            el.innerHTML = daemons.map(d => `
+    <div class="daemon-item${d.id === selectedId ? ' active' : ''}" onclick="selectDaemon('${d.id}')">
+      <span class="status-dot" id="dot-${d.id}"></span>
+      <div>
+        <div class="name">${esc(d.label)}</div>
+        <div class="addr">${esc(d.addr)}</div>
+      </div>
+    </div>
+  `).join('');
+        }
+
+        async function selectDaemon(id) {
+            selectedId = id;
+            renderSidebar();
+            const d = daemons.find(x => x.id === id);
+            if (!d) return;
+            document.getElementById('topbar-title').textContent = d.label;
+            document.getElementById('topbar-addr').textContent = d.addr;
+            document.getElementById('topbar-fp').textContent = d.fingerprint ? d.fingerprint.slice(0, 16) + '…' : '';
+            document.getElementById('topbar-fp').title = d.fingerprint || '';
+            document.getElementById('btn-refresh').style.display = '';
+            renderDaemonPanel(id);
+            await loadStatus(id);
+        }
+
+        function refreshCurrent() {
+            if (selectedId) selectDaemon(selectedId);
+        }
+
+        /* ── Daemon panel ─────────────────────────────────────────────────────────── */
+        function renderDaemonPanel(id) {
+            const d = daemons.find(x => x.id === id);
+            document.getElementById('content').innerHTML = `
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('status')">Status</button>
+      <button class="tab-btn" onclick="switchTab('container')">Container</button>
+      <button class="tab-btn" onclick="switchTab('owner')">Owner</button>
+      <button class="tab-btn" onclick="switchTab('secrets')">Secrets</button>
+      <button class="tab-btn" onclick="switchTab('files')">Files</button>
+      <div style="flex:1"></div>
+      <button class="danger" style="margin:0 0 6px" onclick="askRemove('${id}')">Remove daemon</button>
+    </div>
+    <div id="tab-status" class="tab-panel active"><div class="empty"><p>Loading…</p></div></div>
+    <div id="tab-container" class="tab-panel"></div>
+    <div id="tab-owner" class="tab-panel"></div>
+    <div id="tab-secrets" class="tab-panel"></div>
+    <div id="tab-files" class="tab-panel"></div>
+  `;
+        }
+
+        function switchTab(name) {
+            document.querySelectorAll('.tab-btn').forEach((b, i) => {
+                const names = ['status', 'container', 'owner', 'secrets', 'files'];
+                b.classList.toggle('active', names[i] === name);
+            });
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            const panel = document.getElementById('tab-' + name);
+            if (panel) {
+                panel.classList.add('active');
+                if (panel.innerHTML.trim() === '' || panel.dataset.loaded !== '1') {
+                    loadTabContent(name);
+                }
+            }
+        }
+
+        async function loadTabContent(name) {
+            if (!selectedId) return;
+            switch (name) {
+                case 'status': return loadStatus(selectedId);
+                case 'container': return loadContainer(selectedId);
+                case 'owner': return loadOwner(selectedId);
+                case 'secrets': return loadSecrets(selectedId);
+                case 'files': return loadFiles(selectedId);
+            }
+        }
+
+        /* ── Status tab ──────────────────────────────────────────────────────────── */
+        async function loadStatus(id) {
+            const panel = document.getElementById('tab-status');
+            if (!panel) return;
+            panel.innerHTML = '<div style="color:var(--text2);padding:20px">Loading…</div>';
+            panel.dataset.loaded = '1';
+            try {
+                const s = await api('GET', `/daemons/${id}/status`);
+                const dot = document.getElementById('dot-' + id);
+                if (dot) dot.className = 'status-dot ' + (s.agent_connected ? 'connected' : 'disconnected');
+                panel.innerHTML = `
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="stat-label">Agent</div>
+          <div class="stat-value" style="color:${s.agent_connected ? 'var(--success)' : 'var(--danger)'}">
+            ${s.agent_connected ? '● Connected' : '○ Offline'}
+          </div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Container</div>
+          <div class="stat-value" style="color:${s.container_running === true ? 'var(--success)' : s.container_running === false ? 'var(--danger)' : 'var(--text2)'}">
+            ${s.container_running === true ? '● Running' : s.container_running === false ? '○ Stopped' : '— local mode'}
+          </div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Uptime</div>
+          <div class="stat-value">${fmtUptime(s.uptime_secs)}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Daemon version</div>
+          <div class="stat-value mono" style="font-size:14px">${esc(s.daemon_version)}</div>
+        </div>
+      </div>
+      ${s.owner_id ? `<div class="card" style="margin-top:16px"><div class="card-title">Owner</div><code class="mono">${esc(s.owner_id)}</code></div>` : ''}
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">Resource usage</div>
+        <div class="stat-grid">
+          <div class="stat-box">
+            <div class="stat-label">Daemon memory</div>
+            <div class="stat-value mono">${fmtMem(s.daemon_mem_kb ?? 0)}</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Daemon CPU</div>
+            <div class="stat-value mono">${(s.daemon_cpu_pct ?? 0).toFixed(1)}%</div>
+          </div>
+          ${s.agent_mem_kb != null ? `<div class="stat-box"><div class="stat-label">Agent memory</div><div class="stat-value mono">${fmtMem(s.agent_mem_kb)}</div></div>` : ''}
+          ${s.agent_cpu_pct != null ? `<div class="stat-box"><div class="stat-label">Agent CPU</div><div class="stat-value mono">${s.agent_cpu_pct.toFixed(1)}%</div></div>` : ''}
+        </div>
+      </div>
+    `;
+            } catch (e) {
+                panel.innerHTML = `<div class="card" style="border-color:var(--danger);color:var(--danger)">
+      <strong>Connection failed</strong><br><small>${esc(e.message)}</small></div>`;
+                const dot = document.getElementById('dot-' + id);
+                if (dot) dot.className = 'status-dot disconnected';
+            }
+        }
+
+        /* ── Container tab ───────────────────────────────────────────────────────── */
+        async function loadContainer(id) {
+            const p = document.getElementById('tab-container');
+            p.dataset.loaded = '1';
+            p.innerHTML = `
+    <div class="card">
+      <div class="card-title">Container lifecycle</div>
+      <div class="container-grid">
+        <button class="primary" onclick="doContainerOp('${id}','restart')">↺ Restart</button>
+        <button class="ghost" onclick="doContainerOp('${id}','start')">▶ Start</button>
+        <button class="ghost" onclick="doContainerOp('${id}','stop')">■ Stop</button>
+        <button class="ghost" onclick="doContainerOp('${id}','pull')">⬇ Pull image</button>
+      </div>
+      <div id="container-msg-${id}" style="margin-top:12px;font-size:13px;color:var(--text2)"></div>
+    </div>
+  `;
+        }
+
+        async function doContainerOp(id, op) {
+            const msgEl = document.getElementById(`container-msg-${id}`);
+            if (msgEl) msgEl.textContent = `Running ${op}…`;
+            try {
+                const r = await api('POST', `/daemons/${id}/container`, { op });
+                toast(r.message || 'Done', 'success');
+                if (msgEl) msgEl.textContent = '✓ ' + (r.message || 'Done');
+            } catch (e) {
+                toast(e.message, 'error');
+                if (msgEl) msgEl.textContent = '✗ ' + e.message;
+            }
+        }
+
+        /* ── Owner tab ───────────────────────────────────────────────────────────── */
+        async function loadOwner(id) {
+            const p = document.getElementById('tab-owner');
+            p.dataset.loaded = '1';
+            try {
+                const o = await api('GET', `/daemons/${id}/owner`);
+                p.innerHTML = `
+      <div class="card">
+        <div class="card-title">Owner binding</div>
+        ${o.owner_id
+                        ? `<div style="margin-bottom:14px">
+              <label>Owner open_id</label>
+              <code class="mono" style="display:block;padding:8px;background:var(--surface2);border-radius:4px">${esc(o.owner_id)}</code>
+             </div>
+             <button class="danger" onclick="doOwnerReset('${id}')">Reset owner (allow re-pairing)</button>`
+                        : `<p style="color:var(--text2);margin-bottom:12px">No owner set. Send <code>/pair</code> to the bot to claim ownership.</p>`
+                    }
+      </div>
+    `;
+            } catch (e) {
+                p.innerHTML = `<div class="card" style="color:var(--danger)">${esc(e.message)}</div>`;
+            }
+        }
+
+        async function doOwnerReset(id) {
+            if (!confirm('Reset owner? The bot will be unpaired and accept a new /pair command.')) return;
+            try {
+                await api('DELETE', `/daemons/${id}/owner`);
+                toast('Owner reset', 'success');
+                loadOwner(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        /* ── Secrets tab ─────────────────────────────────────────────────────────── */
+        async function loadSecrets(id) {
+            const p = document.getElementById('tab-secrets');
+            p.dataset.loaded = '1';
+            try {
+                const entries = await api('GET', `/daemons/${id}/secrets`);
+                p.innerHTML = `
+      <div class="card">
+        <div class="card-title">Secrets</div>
+        ${entries.length ? `
+          <table>
+            <thead><tr><th>Key</th><th></th></tr></thead>
+            <tbody>
+              ${entries.map(e => `
+                <tr>
+                  <td class="mono">${esc(e.key)}</td>
+                  <td style="text-align:right">
+                    <button class="danger" style="padding:3px 10px;font-size:12px"
+                      onclick="doDeleteSecret('${id}','${esc(e.key)}')">Delete</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        ` : '<p style="color:var(--text2);margin-bottom:12px">No secrets stored.</p>'}
+      </div>
+      <div class="card">
+        <div class="card-title">Add / update secret</div>
+        <div class="form-row"><label>Key</label><input id="secret-key-${id}" placeholder="OPENAI_API_KEY" /></div>
+        <div class="form-row"><label>Value</label><input id="secret-val-${id}" type="password" placeholder="sk-…" /></div>
+        <div class="form-actions"><button class="primary" onclick="doSetSecret('${id}')">Save secret</button></div>
+      </div>
+    `;
+            } catch (e) {
+                p.innerHTML = `<div class="card" style="color:var(--danger)">${esc(e.message)}</div>`;
+            }
+        }
+
+        async function doSetSecret(id) {
+            const key = document.getElementById(`secret-key-${id}`)?.value?.trim();
+            const value = document.getElementById(`secret-val-${id}`)?.value;
+            if (!key || !value) { toast('Key and value required', 'error'); return; }
+            try {
+                await api('POST', `/daemons/${id}/secrets`, { key, value });
+                toast(`Secret "${key}" saved`, 'success');
+                document.getElementById('tab-secrets').dataset.loaded = '0';
+                loadSecrets(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        async function doDeleteSecret(id, key) {
+            if (!confirm(`Delete secret "${key}"?`)) return;
+            try {
+                await api('DELETE', `/daemons/${id}/secrets/${encodeURIComponent(key)}`);
+                toast(`Secret "${key}" deleted`, 'success');
+                document.getElementById('tab-secrets').dataset.loaded = '0';
+                loadSecrets(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        /* ── Files tab ───────────────────────────────────────────────────────────── */
+        let currentFile = 'Agent.md';
+
+        async function loadFiles(id, file) {
+            file = file || currentFile;
+            currentFile = file;
+            const p = document.getElementById('tab-files');
+            p.dataset.loaded = '1';
+            p.innerHTML = `
+    <div class="card">
+      <div class="file-selector">
+        <label style="margin:0;white-space:nowrap">Edit file:</label>
+        <select onchange="loadFiles('${id}', this.value)" style="width:160px">
+          <option value="Agent.md"${file === 'Agent.md' ? ' selected' : ''}>Agent.md</option>
+          <option value="Soul.md"${file === 'Soul.md' ? ' selected' : ''}>Soul.md</option>
+        </select>
+        <button class="primary" onclick="doSaveFile('${id}','${file}')">Save</button>
+      </div>
+      <div id="file-loading" style="color:var(--text2)">Loading…</div>
+      <textarea id="file-content-${id}" style="display:none;min-height:400px" placeholder="(file is empty)"></textarea>
+    </div>
+  `;
+            try {
+                const r = await api('GET', `/daemons/${id}/files/${encodeURIComponent(file)}`);
+                document.getElementById('file-loading').style.display = 'none';
+                const ta = document.getElementById(`file-content-${id}`);
+                ta.style.display = 'block';
+                ta.value = r.content || '';
+            } catch (e) {
+                document.getElementById('file-loading').textContent = '✗ ' + e.message;
+            }
+        }
+
+        async function doSaveFile(id, file) {
+            const ta = document.getElementById(`file-content-${id}`);
+            if (!ta) return;
+            try {
+                await api('PUT', `/daemons/${id}/files/${encodeURIComponent(file)}`, { content: ta.value });
+                toast(`${file} saved`, 'success');
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        /* ── Add daemon modal ─────────────────────────────────────────────────────── */
+        function openAddModal() { document.getElementById('modal-add').classList.remove('hidden'); }
+        function closeAddModal() {
+            document.getElementById('modal-add').classList.add('hidden');
+            ['add-label', 'add-addr', 'add-token'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+        }
+
+        async function submitAddDaemon() {
+            const label = document.getElementById('add-label').value.trim();
+            const addr = document.getElementById('add-addr').value.trim();
+            const token = document.getElementById('add-token').value.trim();
+            if (!label || !addr || !token) { toast('All fields required', 'error'); return; }
+            const btn = document.getElementById('btn-add-submit');
+            btn.disabled = true; btn.textContent = 'Connecting…';
+            try {
+                const r = await api('POST', '/daemons', { label, addr, token });
+                toast(`Added "${label}" (fingerprint: ${r.fingerprint.slice(0, 16)}…)`, 'success');
+                await loadDaemons();
+                closeAddModal();
+                if (r.id) selectDaemon(r.id);
+            } catch (e) {
+                toast(e.message, 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Connect & Add';
+            }
+        }
+
+        /* ── Remove daemon ───────────────────────────────────────────────────────── */
+        function askRemove(id) { pendingRemoveId = id; document.getElementById('modal-remove').classList.remove('hidden'); }
+        function closeRemoveModal() { document.getElementById('modal-remove').classList.add('hidden'); pendingRemoveId = null; }
+        async function confirmRemove() {
+            if (!pendingRemoveId) return;
+            await api('DELETE', `/daemons/${pendingRemoveId}`);
+            toast('Daemon removed', 'success');
+            if (selectedId === pendingRemoveId) {
+                selectedId = null;
+                document.getElementById('content').innerHTML = '<div class="empty"><h2>No daemon selected</h2></div>';
+                document.getElementById('topbar-title').textContent = 'Select a daemon';
+                document.getElementById('topbar-addr').textContent = '';
+                document.getElementById('topbar-fp').textContent = '';
+                document.getElementById('btn-refresh').style.display = 'none';
+            }
+            closeRemoveModal();
+            await loadDaemons();
+        }
+
+        /* ── Toast ────────────────────────────────────────────────────────────────── */
+        function toast(msg, type = 'info') {
+            const c = document.getElementById('toast-container');
+            const el = document.createElement('div');
+            el.className = 'toast ' + (type || '');
+            el.textContent = msg;
+            c.appendChild(el);
+            setTimeout(() => el.remove(), 4000);
+        }
+
+        /* ── Utils ────────────────────────────────────────────────────────────────── */
+        function esc(s) {
+            return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        function fmtUptime(secs) {
+            if (secs < 60) return secs + 's';
+            if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+            const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+            return `${h}h ${m}m`;
+        }
+        function fmtMem(kb) {
+            if (kb >= 1024 * 1024) return (kb / 1024 / 1024).toFixed(1) + ' GB';
+            if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB';
+            return kb + ' KB';
+        }
+
+        /* keyboard: Esc closes modals */
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal-backdrop:not(.hidden)').forEach(m => m.classList.add('hidden'));
+            }
+        });
+    </script>
+</body>
+
+</html>

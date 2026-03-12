@@ -1,0 +1,24 @@
+[package]
+name = "bot-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+remi-agentloop = { path = "../../../remi-agentloop/remi-agentloop", features = [
+    "http-client",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-stream = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+aho-corasick = "1"

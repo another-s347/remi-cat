@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package remi;
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+service DaemonService {
+  // Agent connects to Daemon; bidirectional streaming RPC.
+  // Agent sends AgentMessage stream; Daemon sends DaemonMessage stream.
+  rpc AgentConnect(stream AgentMessage) returns (stream DaemonMessage);
+}
+
+// ── Daemon → Agent ────────────────────────────────────────────────────────────
+
+message DaemonMessage {
+  oneof payload {
+    ImMessageEvent  im_message    = 1;
+    ImReactionEvent im_reaction   = 2;
+    ShutdownSignal  shutdown      = 3;
+    SecretsSync     secrets_sync  = 4;
+  }
+}
+
+message SecretsSync {
+  map<string, string> entries = 1;
+}
+
+message ImMessageEvent {
+  string          message_id      = 1;
+  string          sender_open_id  = 2;
+  string          chat_id         = 3;
+  string          chat_type       = 4;
+  string          text            = 5;
+  repeated string images          = 6;
+  string          parent_id       = 7; // empty string means no parent
+}
+
+message ImReactionEvent {
+  string message_id      = 1;
+  string chat_id         = 2;
+  string sender_open_id  = 3;
+  string emoji_type      = 4;
+}
+
+message ShutdownSignal {}
+
+// ── Agent → Daemon ────────────────────────────────────────────────────────────
+
+// Every AgentMessage carries a `reply_to_message_id` that tells the Daemon
+// which Feishu message (and therefore which StreamingCard) to update.
+message AgentMessage {
+  string reply_to_message_id = 1;
+
+  oneof payload {
+    AgentTextDelta   text_delta  = 2;
+    AgentThinking    thinking    = 3;
+    AgentToolCall    tool_call   = 4;
+    AgentToolResult  tool_result = 5;
+    AgentStats       stats       = 6;
+    AgentDone        done        = 7;
+    AgentError       error       = 8;
+  }
+}
+
+message AgentTextDelta  { string text      = 1; }
+message AgentThinking   { string content   = 1; }
+message AgentToolCall   { string name = 1; string args_json = 2; }
+message AgentToolResult { string name = 1; string result   = 2; }
+message AgentStats      {
+  uint32 prompt_tokens      = 1;
+  uint32 completion_tokens  = 2;
+  uint64 elapsed_ms         = 3;
+}
+message AgentDone  {}
+message AgentError { string message = 1; }

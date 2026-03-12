@@ -1,0 +1,22 @@
+[package]
+name = "remi-cat-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "remi-cat-agent"
+path = "src/main.rs"
+
+[dependencies]
+remi-proto = { path = "../proto" }
+bot-core = { path = "../bot-core" }
+
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+tokio-stream = { version = "0.1" }
+futures = "0.3"
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"

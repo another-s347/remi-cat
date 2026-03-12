@@ -1,0 +1,50 @@
+[package]
+name = "remi-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "remi-daemon"
+path = "src/main.rs"
+
+[dependencies]
+remi-proto = { path = "../proto" }
+im-feishu = { path = "../im-feishu" }
+im-gateway = { path = "../im-gateway" }
+matcher = { path = "../matcher" }
+
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+tokio-stream = { version = "0.1", features = ["net"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Docker API client
+bollard = "0.17"
+
+# HTTP download for self-update
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+
+# Named FIFO / OS primitives for restart handoff (Linux)
+nix = { version = "0.29", features = ["fs"] }
+
+base64 = "0.22"
+
+# ── Management port (Noise-encrypted WebSocket) ───────────────────────────────
+mgmt-api = { path = "../mgmt-api" }
+tokio-tungstenite = "0.23"
+snow = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+bytes = "1"
+sysinfo = "0.30"
