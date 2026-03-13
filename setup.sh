@@ -988,11 +988,7 @@ main() {
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${RESET}"
     echo
 
-    # Prerequisites
-    check_rust
-    check_protoc
-    check_pkg_config
-    check_openssl
+    # Docker check first (determines whether daemon mode is available)
     check_docker
 
     # Mode selection
@@ -1000,6 +996,14 @@ main() {
 
     # Install mode: download release vs build from source
     choose_install_mode
+
+    # Build prerequisites — only needed when compiling from source
+    if [[ "${INSTALL_MODE}" == "source" ]]; then
+        check_rust
+        check_protoc
+        check_pkg_config
+        check_openssl
+    fi
 
     # Port configuration (daemon mode — before build, no binary needed)
     configure_ports
