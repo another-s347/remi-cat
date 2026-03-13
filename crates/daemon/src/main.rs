@@ -6,8 +6,6 @@
 //!   lifecycle + self-update), forwards ordinary messages to the Agent via gRPC.
 //! - Manages a single Agent connection via the `DaemonService` gRPC server.
 //!
-//! # Configuration (environment variables)
-//!
 //! # CLI flags
 //!
 //! | Flag      | Description                                                               |
@@ -16,10 +14,13 @@
 //!
 //! # Configuration (environment variables)
 //!
+//! `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are read from the env var first,
+//! then from the encrypted secret store if the env var is absent.
+//!
 //! | Variable               | Required | Description                                      |
 //! |------------------------|----------|--------------------------------------------------|
-//! | `FEISHU_APP_ID`        | Yes      | Feishu enterprise app ID                         |
-//! | `FEISHU_APP_SECRET`    | Yes      | Feishu enterprise app secret                     |
+//! | `FEISHU_APP_ID`        | Yes*     | Feishu enterprise app ID                         |
+//! | `FEISHU_APP_SECRET`    | Yes*     | Feishu enterprise app secret                     |
 //! | `DAEMON_GRPC_ADDR`     | No       | gRPC listen address (default: `0.0.0.0:50051`)   |
 //! | `DAEMON_MGMT_ADDR`     | No       | Management WS address (default: `0.0.0.0:50052`) |
 //! | `AGENT_CONTAINER`      | No       | Docker container name (default: `remi-cat`)      |
@@ -28,6 +29,8 @@
 //! | `GITHUB_REPO`          | No       | `owner/repo` for auto-constructing update URL    |
 //! | `REMI_CAT_OWNER_ID`    | No       | Pre-configure owner (skip `/pair`)               |
 //! | `RUST_LOG`             | No       | Log filter (default: `remi_daemon=info`)         |
+//!
+//! \* Can also be stored in the encrypted secret store (see `secret_store.rs`).
 
 mod command;
 mod docker;
@@ -71,10 +74,16 @@ async fn main() -> Result<()> {
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────
-    let app_id = std::env::var("FEISHU_APP_ID")
-        .map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
-    let app_secret = std::env::var("FEISHU_APP_SECRET")
-        .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
+    // Load the secret store first so credentials stored there can be used
+    // as a fallback when the corresponding env vars are not set.
+    let secret_store_inner = SecretStore::load(SecretStore::resolve_path())?;
+
+    let app_id = config_or_secret("FEISHU_APP_ID", &secret_store_inner)
+        .ok_or_else(|| anyhow::anyhow!("FEISHU_APP_ID must be set (env var or secret store)"))?;
+    let app_secret = config_or_secret("FEISHU_APP_SECRET", &secret_store_inner)
+        .ok_or_else(|| anyhow::anyhow!("FEISHU_APP_SECRET must be set (env var or secret store)"))?;
+
+    let secret_store = Arc::new(RwLock::new(secret_store_inner));
 
     let grpc_addr: SocketAddr = std::env::var("DAEMON_GRPC_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
@@ -102,9 +111,6 @@ async fn main() -> Result<()> {
     };
     let restart = RestartHandle::new();
     let start_time = Instant::now();
-    let secret_store = Arc::new(RwLock::new(
-        SecretStore::load(SecretStore::resolve_path())?
-    ));
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
@@ -460,6 +466,15 @@ fn spawn_queue_worker(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Read a configuration value from an env var first, then fall back to the
+/// secret store.  Returns `None` if neither source has the key.
+pub fn config_or_secret(env_var: &str, store: &secret_store::SecretStore) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| store.get(env_var).map(str::to_string))
+}
 
 fn is_owner(matcher: &OwnerMatcher, sender_id: &str) -> bool {
     matches!(matcher.check(sender_id), OwnerStatus::Owner)
