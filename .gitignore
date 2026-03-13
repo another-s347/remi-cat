@@ -1,2 +1,10 @@
 /target
 .remi-cat/
+
+# ── Secrets and credentials (never commit these) ────────────────────────────
+.env
+secrets.json
+secrets.key
+mgmt_identity.json
+owner.json
+*.key

@@ -1897,6 +1897,7 @@ dependencies = [
 name = "remi-daemon"
 version = "0.1.3"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "bollard",
@@ -1916,6 +1917,7 @@ dependencies = [
  "sha2",
  "snow",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.23.1",
