@@ -592,20 +592,12 @@ impl Tool for RootedFsLsTool {
 const EXA_API_URL: &str = "https://api.exa.ai/search";
 
 pub struct ExaSearchTool {
-    api_key: String,
     num_results: usize,
 }
 
 impl ExaSearchTool {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            num_results: 5,
-        }
-    }
-    /// Construct from `EXA_API_KEY` env var; returns `None` if not set.
-    pub fn from_env() -> Option<Self> {
-        std::env::var("EXA_API_KEY").ok().map(Self::new)
+    pub fn new() -> Self {
+        Self { num_results: 5 }
     }
 }
 
@@ -615,7 +607,8 @@ impl Tool for ExaSearchTool {
     }
     fn description(&self) -> &str {
         "Search the web via Exa. Returns titles, URLs, and content highlights. \
-         Use for current events, documentation, or any topic needing fresh data."
+         Use for current events, documentation, or any topic needing fresh data. \
+         Requires EXA_API_KEY secret to be set."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -634,9 +627,15 @@ impl Tool for ExaSearchTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let api_key = self.api_key.clone();
         let default_n = self.num_results;
         async move {
+            let api_key = match std::env::var("EXA_API_KEY") {
+                Ok(k) if !k.is_empty() => k,
+                _ => return Err(AgentError::tool(
+                    "web_search",
+                    "EXA_API_KEY is not set — use `/secrets set EXA_API_KEY <key>` to enable web search",
+                )),
+            };
             let query = arguments["query"]
                 .as_str()
                 .ok_or_else(|| AgentError::tool("web_search", "missing 'query'"))?
@@ -691,4 +690,68 @@ impl Tool for ExaSearchTool {
             }))
         }
     }
+}
+
+// ── NowTool ───────────────────────────────────────────────────────────────────
+
+/// Returns the current UTC date and time.
+pub struct NowTool;
+
+impl Tool for NowTool {
+    fn name(&self) -> &str {
+        "now"
+    }
+    fn description(&self) -> &str {
+        "Return the current UTC date and time in ISO 8601 format. \
+         Use this whenever you need to know what time or date it is."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+    fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    {
+        async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            // Format as ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
+            let s = secs % 60;
+            let m = (secs / 60) % 60;
+            let h = (secs / 3600) % 24;
+            let days = secs / 86400; // days since 1970-01-01
+            let (year, month, day) = days_to_ymd(days);
+            let formatted = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z (unix: {})",
+                year, month, day, h, m, s, secs
+            );
+            Ok(ToolResult::Output(async_stream::stream! {
+                yield ToolOutput::text(formatted);
+            }))
+        }
+    }
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Shift epoch to 1 Mar 0000 (proleptic Gregorian) for easier math.
+    days += 719468;
+    let era = days / 146097;
+    let doe = days % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }

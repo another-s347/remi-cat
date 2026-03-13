@@ -42,7 +42,7 @@ use remi_agentloop::tool::registry::DefaultToolRegistry;
 
 use memory::{build_injected_history, LlmCompressor, MemoryGetDetailTool};
 use tools::{
-    BashMode, ExaSearchTool, RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool,
+    BashMode, ExaSearchTool, NowTool, RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool,
     RootedFsRemoveTool, RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, WorkspaceBashTool,
 };
 
@@ -106,6 +106,20 @@ impl CatBot {
     pub fn update_secret_redactor(&self, entries: &std::collections::HashMap<String, String>) {
         let new_redactor = SecretRedactor::from_entries(entries);
         *self.redactor.write().unwrap() = new_redactor;
+    }
+
+    /// Return `(name, description)` pairs for every registered tool.
+    ///
+    /// Useful for the `/tools` slash command — lets users see what the agent
+    /// can do without reading source code.
+    pub fn tool_list(&self) -> Vec<(String, String)> {
+        use remi_agentloop::tool::registry::ToolRegistry;
+        self.inner
+            .local_tools
+            .definitions(&serde_json::Value::Null)
+            .into_iter()
+            .map(|d| (d.function.name, d.function.description))
+            .collect()
     }
 
     /// Stream events for one conversation turn (text input).
@@ -452,10 +466,11 @@ impl CatBotBuilder {
             redactor: Arc::clone(&redactor),
         });
 
-        // ── Web search (optional — requires EXA_API_KEY) ──────────────────
-        if let Some(search) = ExaSearchTool::from_env() {
-            local_tools.register(search);
-        }
+        // ── Web search (reads EXA_API_KEY from env at call time) ──────────
+        local_tools.register(ExaSearchTool::new());
+
+        // ── Current time ──────────────────────────────────────────────────
+        local_tools.register(NowTool);
 
         Ok(CatBot {
             inner: CatAgent {

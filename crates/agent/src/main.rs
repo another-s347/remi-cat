@@ -17,6 +17,8 @@ mod rpc_client;
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -91,6 +93,10 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
     // remove keys that have been deleted from the store.
     let mut last_secret_keys: HashSet<String> = HashSet::new();
 
+    // Per-chat active task handles — used to abort running LLM calls via /cancel.
+    let active: Rc<RefCell<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // Outgoing channel: per-message tasks → single gRPC outbound stream.
     let (out_tx, out_rx) = mpsc::channel::<AgentMessage>(512);
     let outbound = ReceiverStream::new(out_rx);
@@ -114,11 +120,64 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
 
         match payload {
             DaemonPayload::ImMessage(ev) => {
-                let bot = Rc::clone(&bot);
-                let tx  = out_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_message(ev, bot, tx).await;
+                let chat_id   = ev.chat_id.clone();
+                let reply_to  = ev.message_id.clone();
+                let trimmed   = ev.text.trim().to_string();
+
+                // ── /cancel — abort the running task for this chat ────────
+                if trimmed == "/cancel" {
+                    let reply = if let Some(handle) = active.borrow_mut().remove(&chat_id) {
+                        handle.abort();
+                        "✅ 已取消正在运行的任务。".to_string()
+                    } else {
+                        "ℹ️ 当前没有正在运行的任务。".to_string()
+                    };
+                    let tx = out_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = tx.send(AgentMessage {
+                            reply_to_message_id: reply_to.clone(),
+                            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text: reply })),
+                        }).await;
+                        let _ = tx.send(AgentMessage {
+                            reply_to_message_id: reply_to,
+                            payload: Some(AgentPayload::Done(AgentDone {})),
+                        }).await;
+                    });
+                    continue;
+                }
+
+                // ── /tools — list registered tools ────────────────────────
+                if trimmed == "/tools" {
+                    let bot_t = Rc::clone(&bot);
+                    let tx    = out_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        let tools = bot_t.tool_list();
+                        let mut text = "**可用工具列表：**\n\n".to_string();
+                        for (name, desc) in &tools {
+                            text.push_str(&format!("• `{name}` — {desc}\n"));
+                        }
+                        let _ = tx.send(AgentMessage {
+                            reply_to_message_id: reply_to.clone(),
+                            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+                        }).await;
+                        let _ = tx.send(AgentMessage {
+                            reply_to_message_id: reply_to,
+                            payload: Some(AgentPayload::Done(AgentDone {})),
+                        }).await;
+                    });
+                    continue;
+                }
+
+                // ── Regular message — spawn task and track the handle ─────
+                let bot_m      = Rc::clone(&bot);
+                let tx         = out_tx.clone();
+                let active_m   = Rc::clone(&active);
+                let chat_id_m  = chat_id.clone();
+                let handle     = tokio::task::spawn_local(async move {
+                    handle_message(ev, bot_m, tx).await;
+                    active_m.borrow_mut().remove(&chat_id_m);
                 });
+                active.borrow_mut().insert(chat_id, handle);
             }
             DaemonPayload::ImReaction(ev) => {
                 let bot = Rc::clone(&bot);
@@ -209,13 +268,20 @@ async fn handle_message(
         return;
     }
     // Unknown slash command — return error, do NOT invoke LLM.
+    // Note: /cancel and /tools are handled upstream in run_session before
+    // a task is even spawned, so they won't reach here.
     if trimmed.starts_with('/') {
         let cmd_name = trimmed
             .trim_start_matches('/')
             .split_whitespace()
             .next()
             .unwrap_or(trimmed.trim_start_matches('/'));
-        let text = format!("❌ 未知指令: /{cmd_name}");
+        let text = format!(
+            "❌ 未知指令: `/{cmd_name}`\n\n**Agent 支持的指令：**\n\
+             • `/compact` — 压缩短期记忆\n\
+             • `/cancel` — 取消正在运行的任务\n\
+             • `/tools` — 列出可用工具"
+        );
         let _ = tx.send(AgentMessage {
             reply_to_message_id: reply_to.clone(),
             payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
