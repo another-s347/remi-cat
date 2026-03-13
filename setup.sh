@@ -36,6 +36,7 @@ info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
 success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+die()     { echo -e "${RED}[FATAL]${RESET} $*" >&2; exit 1; }
 header()  { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}"; }
 # ask() writes to /dev/tty so prompts are visible even inside $() substitution
 ask()     { printf "${BOLD}${YELLOW}  ➜ ${RESET}%s " "$*" > /dev/tty; }
@@ -375,13 +376,77 @@ download_binaries() {
     local bin_dir="${PWD}/bin"
     mkdir -p "$bin_dir"
 
+    # _fetch <url> <dest>  — download without executing (no chmod)
+    _fetch() {
+        local url="$1" dest="$2"
+        if command -v curl &>/dev/null; then
+            curl -fsSL -o "$dest" "$url" || { error "Download failed: ${url}"; return 1; }
+        else
+            wget -q -O "$dest" "$url" || { error "Download failed: ${url}"; return 1; }
+        fi
+    }
+
+    # _dl <url> <dest>  — download binary, verify sha256, skip if already current
     _dl() {
         local url="$1" dest="$2"
+        local sha_url="${url}.sha256"
+        local tmp_sha
+        tmp_sha=$(mktemp)
+        _fetch "$sha_url" "$tmp_sha" || { rm -f "$tmp_sha"; error "Could not fetch checksum: ${sha_url}"; return 1; }
+        local expected
+        expected=$(awk '{print $1}' "$tmp_sha")
+        rm -f "$tmp_sha"
+
+        if [[ -x "$dest" ]]; then
+            local actual
+            actual=$(sha256sum "$dest" | awk '{print $1}')
+            if [[ "$actual" == "$expected" ]]; then
+                info "  ✓ Already up-to-date (sha256 ok): ${dest}"
+                return 0
+            fi
+            warn "  sha256 mismatch for ${dest} — attempting re-download"
+            # Binary may be running (text file busy); download to a temp file then replace
+            local tmp_dest
+            tmp_dest=$(mktemp "${dest}.XXXXXX")
+            if command -v curl &>/dev/null; then
+                curl -fL --progress-bar -o "$tmp_dest" "$url" 2>/dev/null
+            else
+                wget -q --show-progress -O "$tmp_dest" "$url" 2>/dev/null
+            fi
+            local dl_ok=$?
+            if [[ $dl_ok -ne 0 ]]; then
+                rm -f "$tmp_dest"
+                warn "  Re-download failed (binary may be in use). Using existing ${dest}."
+                return 0
+            fi
+            local new_actual
+            new_actual=$(sha256sum "$tmp_dest" | awk '{print $1}')
+            if [[ "$new_actual" != "$expected" ]]; then
+                rm -f "$tmp_dest"
+                error "SHA256 mismatch after download: expected ${expected}, got ${new_actual}"
+                return 1
+            fi
+            chmod +x "$tmp_dest"
+            mv "$tmp_dest" "$dest" 2>/dev/null || {
+                rm -f "$tmp_dest"
+                warn "  Could not replace ${dest} (binary in use). Using existing version."
+            }
+            return 0
+        fi
+
         info "  ↓ ${url}"
         if command -v curl &>/dev/null; then
-            curl -fL --progress-bar -o "$dest" "$url" || die "Download failed: ${url}"
+            curl -fL --progress-bar -o "$dest" "$url" || { error "Download failed: ${url}"; return 1; }
         else
-            wget -q --show-progress -O "$dest" "$url" || die "Download failed: ${url}"
+            wget -q --show-progress -O "$dest" "$url" || { error "Download failed: ${url}"; return 1; }
+        fi
+
+        local actual
+        actual=$(sha256sum "$dest" | awk '{print $1}')
+        if [[ "$actual" != "$expected" ]]; then
+            rm -f "$dest"
+            error "SHA256 mismatch after download: expected ${expected}, got ${actual}"
+            return 1
         fi
         chmod +x "$dest"
     }
@@ -390,23 +455,53 @@ download_binaries() {
         standalone)
             _dl "${base_url}/remi-cat-linux-x86_64" "${bin_dir}/remi-cat"
             STANDALONE_BIN="${bin_dir}/remi-cat"
-            success "Downloaded: ${STANDALONE_BIN}"
+            success "Ready: ${STANDALONE_BIN}"
             DAEMON_BIN=""
             ADMIN_BIN=""
             ;;
         daemon)
             _dl "${base_url}/remi-daemon-linux-x86_64" "${bin_dir}/remi-daemon"
             DAEMON_BIN="${bin_dir}/remi-daemon"
-            success "Downloaded: ${DAEMON_BIN}"
+            success "Ready: ${DAEMON_BIN}"
 
             if prompt_yn "Also download remi-admin (admin WebUI)?"; then
                 _dl "${base_url}/remi-admin-linux-x86_64" "${bin_dir}/remi-admin"
                 ADMIN_BIN="${bin_dir}/remi-admin"
-                success "Downloaded: ${ADMIN_BIN}"
+                success "Ready: ${ADMIN_BIN}"
             else
                 ADMIN_BIN=""
             fi
             STANDALONE_BIN=""
+
+            # docker-compose.yml and Dockerfile are needed by `docker compose up`
+            # but are not present when running via the curl one-liner.
+            local raw_ref="${RELEASE_TAG:-latest}"
+            [[ "$raw_ref" == "latest" ]] && raw_ref="main"
+            local raw_base="https://raw.githubusercontent.com/${GITHUB_REPO:-another-s347/remi-cat}/${raw_ref}"
+
+            if [[ ! -f "docker-compose.yml" ]]; then
+                info "Downloading docker-compose.yml …"
+                if command -v curl &>/dev/null; then
+                    curl -fsSL "${raw_base}/docker-compose.yml" -o docker-compose.yml \
+                        || die "Failed to download docker-compose.yml"
+                else
+                    wget -q "${raw_base}/docker-compose.yml" -O docker-compose.yml \
+                        || die "Failed to download docker-compose.yml"
+                fi
+                success "Downloaded: docker-compose.yml"
+            fi
+
+            if [[ ! -f "Dockerfile" ]]; then
+                info "Downloading Dockerfile …"
+                if command -v curl &>/dev/null; then
+                    curl -fsSL "${raw_base}/Dockerfile" -o Dockerfile \
+                        || die "Failed to download Dockerfile"
+                else
+                    wget -q "${raw_base}/Dockerfile" -O Dockerfile \
+                        || die "Failed to download Dockerfile"
+                fi
+                success "Downloaded: Dockerfile"
+            fi
             ;;
     esac
 }
