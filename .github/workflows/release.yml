@@ -37,9 +37,9 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release \
-            --bin remi-daemon \
-            --bin remi-cat-agent \
-            --bin remi-admin
+            -p remi-daemon \
+            -p remi-cat-agent \
+            -p remi-admin
 
       - name: Prepare artifacts
         run: |
