@@ -36,6 +36,7 @@ mod mgmt_server;
 mod restart;
 mod rpc_server;
 mod secret_store;
+mod volume_store;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -52,6 +53,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
+use volume_store::VolumeStore;
 
 /// Maximum number of messages that can be queued per chat before new messages
 /// are rejected with a backpressure reply.
@@ -71,8 +73,8 @@ async fn main() -> Result<()> {
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────
-    let app_id = std::env::var("FEISHU_APP_ID")
-        .map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
+    let app_id =
+        std::env::var("FEISHU_APP_ID").map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
     let app_secret = std::env::var("FEISHU_APP_SECRET")
         .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
 
@@ -81,12 +83,11 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid DAEMON_GRPC_ADDR: {e}"))?;
 
-    let agent_container = std::env::var("AGENT_CONTAINER")
-        .unwrap_or_else(|_| "remi-cat".into());
+    let agent_container = std::env::var("AGENT_CONTAINER").unwrap_or_else(|_| "remi-cat".into());
 
     // ── Components ────────────────────────────────────────────────────────
     let data_dir = std::path::PathBuf::from(
-        std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into())
+        std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into()),
     );
 
     let gateway = FeishuGateway::new(&app_id, &app_secret);
@@ -95,16 +96,18 @@ async fn main() -> Result<()> {
         info!("--local flag set — running without Docker");
         None
     } else {
-        let d = docker::DockerManager::new(&agent_container)
-            .map_err(|e| anyhow::anyhow!("failed to connect to Docker daemon: {e:#}\n  (pass --local to run without Docker)"))?;
+        let d = docker::DockerManager::new(&agent_container).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to connect to Docker daemon: {e:#}\n  (pass --local to run without Docker)"
+            )
+        })?;
         info!(container = %agent_container, "connected to Docker daemon");
         Some(d)
     };
     let restart = RestartHandle::new();
     let start_time = Instant::now();
-    let secret_store = Arc::new(RwLock::new(
-        SecretStore::load(SecretStore::resolve_path())?
-    ));
+    let secret_store = Arc::new(RwLock::new(SecretStore::load(SecretStore::resolve_path())?));
+    let volume_store = Arc::new(RwLock::new(VolumeStore::load(VolumeStore::resolve_path())?));
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
@@ -120,11 +123,11 @@ async fn main() -> Result<()> {
 
     // ── Start gRPC server ─────────────────────────────────────────────────
     let rpc_clone = rpc.clone();
-    let grpc_server = Server::builder()
-        .add_service(rpc_clone.into_server());
+    let grpc_server = Server::builder().add_service(rpc_clone.into_server());
 
     // Bind the listener so we can signal readiness before serving.
-    let listener = tokio::net::TcpListener::bind(grpc_addr).await
+    let listener = tokio::net::TcpListener::bind(grpc_addr)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to bind gRPC addr {grpc_addr}: {e}"))?;
 
     info!(addr = %grpc_addr, "gRPC server listening");
@@ -139,6 +142,7 @@ async fn main() -> Result<()> {
         docker: docker.clone(),
         owner: matcher.clone(),
         secret_store: Arc::clone(&secret_store),
+        volume_store: Arc::clone(&volume_store),
         rpc: rpc.clone(),
         data_dir: data_dir.clone(),
         start_time,
@@ -215,7 +219,7 @@ async fn main() -> Result<()> {
                                 "配对失败，请重试。".into()
                             }
                         }
-                        OwnerStatus::Owner   => "您已是我的主人。".into(),
+                        OwnerStatus::Owner => "您已是我的主人。".into(),
                         OwnerStatus::NotOwner => "我已有主人 :)".into(),
                     };
                     send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
@@ -237,7 +241,8 @@ async fn main() -> Result<()> {
                                 &msg.message_id,
                                 &msg.chat_id,
                                 "⚠️ 系统指令只能在单聊中执行。",
-                            ).await;
+                            )
+                            .await;
                             continue;
                         }
                         if !is_owner(&matcher, &msg.sender_open_id) {
@@ -246,16 +251,17 @@ async fn main() -> Result<()> {
                                 &msg.message_id,
                                 &msg.chat_id,
                                 "⚠️ 仅主人可以执行系统指令。",
-                            ).await;
+                            )
+                            .await;
                             continue;
                         }
-                        let docker       = docker.clone();
-                        let restart      = restart.clone();
-                        let gateway      = gateway.clone();
-                        let rpc          = rpc.clone();
+                        let docker = docker.clone();
+                        let restart = restart.clone();
+                        let gateway = gateway.clone();
+                        let rpc = rpc.clone();
                         let secret_store = Arc::clone(&secret_store);
-                        let msg_id       = msg.message_id.clone();
-                        let chat_id      = msg.chat_id.clone();
+                        let msg_id = msg.message_id.clone();
+                        let chat_id = msg.chat_id.clone();
                         tokio::spawn(async move {
                             let reply = command::execute_daemon_command(
                                 &cmd.name,
@@ -286,16 +292,16 @@ async fn main() -> Result<()> {
 
                 // ── Forward to Agent ───────────────────────────────────────
                 let chat_id = msg.chat_id.clone();
-                let msg_id  = msg.message_id.clone();
+                let msg_id = msg.message_id.clone();
                 let queue_tx = {
                     let mut queues = chat_queues.lock().await;
                     // Respawn worker if the channel was closed.
-                    if queues.get(&chat_id).map(|tx| tx.is_closed()).unwrap_or(true) {
-                        let tx = spawn_queue_worker(
-                            chat_id.clone(),
-                            gateway.clone(),
-                            rpc.clone(),
-                        );
+                    if queues
+                        .get(&chat_id)
+                        .map(|tx| tx.is_closed())
+                        .unwrap_or(true)
+                    {
+                        let tx = spawn_queue_worker(chat_id.clone(), gateway.clone(), rpc.clone());
                         queues.insert(chat_id.clone(), tx);
                     }
                     queues[&chat_id].clone()
@@ -344,7 +350,11 @@ async fn main() -> Result<()> {
                 }
             }
 
-            FeishuEvent::CardAction { card_message_id, action_value, user_open_id } => {
+            FeishuEvent::CardAction {
+                card_message_id,
+                action_value,
+                user_open_id,
+            } => {
                 info!(user = %user_open_id, card = %card_message_id, "card action received");
 
                 if !is_owner(&matcher, &user_open_id) {
@@ -352,19 +362,22 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let gateway      = gateway.clone();
-                let rpc          = rpc.clone();
+                let gateway = gateway.clone();
+                let rpc = rpc.clone();
                 let secret_store = Arc::clone(&secret_store);
                 tokio::spawn(async move {
-                    let action = action_value.get("action")
+                    let action = action_value
+                        .get("action")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("").to_string();
+                        .unwrap_or("")
+                        .to_string();
 
                     let result: anyhow::Result<()> = async {
                         match action.as_str() {
                             "delete" => {
-                                let key = action_value["key"].as_str()
-                                    .ok_or_else(|| anyhow::anyhow!("missing key in delete action"))?;
+                                let key = action_value["key"].as_str().ok_or_else(|| {
+                                    anyhow::anyhow!("missing key in delete action")
+                                })?;
                                 secret_store.write().await.delete(key)?;
                                 info!(key, "secret deleted via card");
                                 rpc.sync_secrets_to_agent().await;
@@ -372,12 +385,18 @@ async fn main() -> Result<()> {
                             "set" => {
                                 // form_value is nested under action.form_value
                                 let fv = &action_value["form_value"];
-                                let key = fv["new_key"].as_str()
+                                let key = fv["new_key"]
+                                    .as_str()
                                     .or_else(|| action_value["new_key"].as_str())
-                                    .ok_or_else(|| anyhow::anyhow!("missing new_key in set action"))?;
-                                let val = fv["new_value"].as_str()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("missing new_key in set action")
+                                    })?;
+                                let val = fv["new_value"]
+                                    .as_str()
                                     .or_else(|| action_value["new_value"].as_str())
-                                    .ok_or_else(|| anyhow::anyhow!("missing new_value in set action"))?;
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("missing new_value in set action")
+                                    })?;
                                 secret_store.write().await.set(key, val)?;
                                 info!(key, "secret set via card");
                                 rpc.sync_secrets_to_agent().await;
@@ -388,15 +407,21 @@ async fn main() -> Result<()> {
                             }
                         }
                         // Refresh card with updated key list.
-                        let keys_owned: Vec<String> = secret_store.read().await.keys()
-                            .into_iter().map(str::to_string).collect();
+                        let keys_owned: Vec<String> = secret_store
+                            .read()
+                            .await
+                            .keys()
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect();
                         let keys_ref: Vec<&str> = keys_owned.iter().map(String::as_str).collect();
                         let card = im_feishu::client::build_secret_manager_card(&keys_ref);
                         if let Err(e) = gateway.update_card_raw(&card_message_id, card).await {
                             warn!("update_card_raw after action failed: {e:#}");
                         }
                         Ok(())
-                    }.await;
+                    }
+                    .await;
 
                     if let Err(e) = result {
                         warn!("card action handler error: {e:#}");
@@ -437,9 +462,7 @@ fn spawn_queue_worker(
                 .ok();
 
             let daemon_msg = daemon_msg_im_message(&enriched);
-            if let Some(completion_rx) = rpc
-                .send_to_agent_and_await(daemon_msg, &message_id)
-                .await
+            if let Some(completion_rx) = rpc.send_to_agent_and_await(daemon_msg, &message_id).await
             {
                 if let Some(rid) = reaction_id {
                     rpc.record_reaction(&message_id, rid).await;
@@ -465,12 +488,7 @@ fn is_owner(matcher: &OwnerMatcher, sender_id: &str) -> bool {
     matches!(matcher.check(sender_id), OwnerStatus::Owner)
 }
 
-async fn send_reply(
-    gateway: &FeishuGateway,
-    message_id: &str,
-    chat_id: &str,
-    text: &str,
-) {
+async fn send_reply(gateway: &FeishuGateway, message_id: &str, chat_id: &str, text: &str) {
     if let Err(e) = gateway.reply_text(message_id, text).await {
         warn!("reply_text failed: {e:#}");
         gateway.send_text(chat_id, text).await.ok();

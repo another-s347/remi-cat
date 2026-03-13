@@ -17,12 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use mgmt_api::{methods, AuthParams, MgmtRequest, MgmtResponse};
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::Message,
-    MaybeTlsStream,
-    WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
@@ -48,7 +43,9 @@ impl NoiseClient {
             std::fs::read(&key_path).context("reading identity.key")?
         } else {
             let builder = snow::Builder::new(
-                NOISE_PATTERN.parse().map_err(|e| anyhow!("noise params: {e}"))?,
+                NOISE_PATTERN
+                    .parse()
+                    .map_err(|e| anyhow!("noise params: {e}"))?,
             );
             let keypair = builder
                 .generate_keypair()

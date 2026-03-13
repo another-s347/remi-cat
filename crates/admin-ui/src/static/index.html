@@ -623,6 +623,7 @@
       <button class="tab-btn" onclick="switchTab('container')">Container</button>
       <button class="tab-btn" onclick="switchTab('owner')">Owner</button>
       <button class="tab-btn" onclick="switchTab('secrets')">Secrets</button>
+      <button class="tab-btn" onclick="switchTab('volumes')">Volumes</button>
       <button class="tab-btn" onclick="switchTab('files')">Files</button>
       <div style="flex:1"></div>
       <button class="danger" style="margin:0 0 6px" onclick="askRemove('${id}')">Remove daemon</button>
@@ -631,13 +632,14 @@
     <div id="tab-container" class="tab-panel"></div>
     <div id="tab-owner" class="tab-panel"></div>
     <div id="tab-secrets" class="tab-panel"></div>
+    <div id="tab-volumes" class="tab-panel"></div>
     <div id="tab-files" class="tab-panel"></div>
   `;
         }
 
         function switchTab(name) {
             document.querySelectorAll('.tab-btn').forEach((b, i) => {
-                const names = ['status', 'container', 'owner', 'secrets', 'files'];
+                const names = ['status', 'container', 'owner', 'secrets', 'volumes', 'files'];
                 b.classList.toggle('active', names[i] === name);
             });
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -657,6 +659,7 @@
                 case 'container': return loadContainer(selectedId);
                 case 'owner': return loadOwner(selectedId);
                 case 'secrets': return loadSecrets(selectedId);
+                case 'volumes': return loadVolumes(selectedId);
                 case 'files': return loadFiles(selectedId);
             }
         }
@@ -731,6 +734,7 @@
         <button class="ghost" onclick="doContainerOp('${id}','start')">▶ Start</button>
         <button class="ghost" onclick="doContainerOp('${id}','stop')">■ Stop</button>
         <button class="ghost" onclick="doContainerOp('${id}','pull')">⬇ Pull image</button>
+        <button class="ghost" onclick="doContainerRecreate('${id}')" title="Stop, remove and recreate the container applying configured volume mounts">♻ Recreate</button>
       </div>
       <div id="container-msg-${id}" style="margin-top:12px;font-size:13px;color:var(--text2)"></div>
     </div>
@@ -744,6 +748,20 @@
                 const r = await api('POST', `/daemons/${id}/container`, { op });
                 toast(r.message || 'Done', 'success');
                 if (msgEl) msgEl.textContent = '✓ ' + (r.message || 'Done');
+            } catch (e) {
+                toast(e.message, 'error');
+                if (msgEl) msgEl.textContent = '✗ ' + e.message;
+            }
+        }
+
+        async function doContainerRecreate(id) {
+            if (!confirm('Recreate container?\n\nThis will stop and remove the current container, then create a new one with the configured volume mounts applied. The container will restart automatically.')) return;
+            const msgEl = document.getElementById(`container-msg-${id}`);
+            if (msgEl) msgEl.textContent = 'Recreating container…';
+            try {
+                const r = await api('POST', `/daemons/${id}/container`, { op: 'recreate' });
+                toast(r.message || 'Container recreated', 'success');
+                if (msgEl) msgEl.textContent = '✓ ' + (r.message || 'Container recreated');
             } catch (e) {
                 toast(e.message, 'error');
                 if (msgEl) msgEl.textContent = '✗ ' + e.message;
@@ -843,8 +861,86 @@
             } catch (e) { toast(e.message, 'error'); }
         }
 
-        /* ── Files tab ───────────────────────────────────────────────────────────── */
-        let currentFile = 'Agent.md';
+        /* ── Volumes tab ─────────────────────────────────────────────────────────── */
+        async function loadVolumes(id) {
+            const p = document.getElementById('tab-volumes');
+            p.dataset.loaded = '1';
+            try {
+                const mounts = await api('GET', `/daemons/${id}/volumes`);
+                p.innerHTML = `
+      <div class="card">
+        <div class="card-title">Configured bind mounts</div>
+        <p style="color:var(--text2);font-size:12px;margin-bottom:12px">
+          These mounts are applied when the container is <strong>recreated</strong>.
+          Use the <em>Container → ♻ Recreate</em> button to apply changes.
+        </p>
+        ${mounts.length ? `
+          <table>
+            <thead><tr><th>Host path</th><th>Container path</th><th>Mode</th><th></th></tr></thead>
+            <tbody>
+              ${mounts.map(m => `
+                <tr>
+                  <td class="mono">${esc(m.host_path)}</td>
+                  <td class="mono">${esc(m.container_path)}</td>
+                  <td><span class="tag">${m.read_only ? 'ro' : 'rw'}</span></td>
+                  <td style="text-align:right">
+                    <button class="danger" style="padding:3px 10px;font-size:12px"
+                      onclick="doRemoveVolume('${id}','${esc(m.container_path)}')">Remove</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        ` : '<p style="color:var(--text2);margin-bottom:12px">No bind mounts configured.</p>'}
+      </div>
+      <div class="card">
+        <div class="card-title">Add bind mount</div>
+        <div class="form-row">
+          <label>Host path <span style="color:var(--text2)">(absolute, e.g. /data/mydir)</span></label>
+          <input id="vol-host-${id}" placeholder="/host/path" />
+        </div>
+        <div class="form-row">
+          <label>Container path <span style="color:var(--text2)">(absolute, e.g. /app/mydir)</span></label>
+          <input id="vol-container-${id}" placeholder="/container/path" />
+        </div>
+        <div class="form-row" style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="vol-ro-${id}" style="width:auto" />
+          <label for="vol-ro-${id}" style="margin:0">Read-only</label>
+        </div>
+        <div class="form-actions">
+          <button class="primary" onclick="doAddVolume('${id}')">Add mount</button>
+        </div>
+      </div>
+    `;
+            } catch (e) {
+                p.innerHTML = `<div class="card" style="color:var(--danger)">${esc(e.message)}</div>`;
+            }
+        }
+
+        async function doAddVolume(id) {
+            const hostPath = document.getElementById(`vol-host-${id}`)?.value?.trim();
+            const containerPath = document.getElementById(`vol-container-${id}`)?.value?.trim();
+            const readOnly = document.getElementById(`vol-ro-${id}`)?.checked ?? false;
+            if (!hostPath || !containerPath) { toast('Host path and container path are required', 'error'); return; }
+            try {
+                await api('POST', `/daemons/${id}/volumes`, { host_path: hostPath, container_path: containerPath, read_only: readOnly });
+                toast(`Mount ${hostPath}:${containerPath} added`, 'success');
+                document.getElementById('tab-volumes').dataset.loaded = '0';
+                loadVolumes(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        async function doRemoveVolume(id, containerPath) {
+            if (!confirm(`Remove mount at "${containerPath}"?`)) return;
+            try {
+                await api('POST', `/daemons/${id}/volumes/remove`, { container_path: containerPath });
+                toast(`Mount "${containerPath}" removed`, 'success');
+                document.getElementById('tab-volumes').dataset.loaded = '0';
+                loadVolumes(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        /* ── Files tab ───────────────────────────────────────────────────────────── */        let currentFile = 'Agent.md';
 
         async function loadFiles(id, file) {
             file = file || currentFile;

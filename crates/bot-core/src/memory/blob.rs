@@ -60,9 +60,8 @@ pub async fn extract_blobs(text: &str, blobs_dir: &Path) -> std::io::Result<Stri
 
                 if let Some(b64_rel) = maybe_b64 {
                     let mime = &text[after_data..after_data + b64_rel];
-                    let mime_ok = mime.contains('/')
-                        && mime.len() < 100
-                        && !mime.bytes().any(|b| b <= b' ');
+                    let mime_ok =
+                        mime.contains('/') && mime.len() < 100 && !mime.bytes().any(|b| b <= b' ');
 
                     if mime_ok {
                         let data_start = after_data + b64_rel + B64_MARKER.len();
@@ -128,8 +127,7 @@ pub async fn restore_blobs(text: &str, blobs_dir: &Path) -> String {
 
                     match tokio::fs::read(blobs_dir.join(filename)).await {
                         Ok(bytes) => {
-                            let b64 =
-                                base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                             result.push_str(DATA_PREFIX);
                             result.push_str(mime);
                             result.push_str(B64_MARKER);

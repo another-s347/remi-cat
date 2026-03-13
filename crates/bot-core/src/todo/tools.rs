@@ -48,7 +48,8 @@ fn fmt_todos(todos: &[TodoItem]) -> String {
     if todos.is_empty() {
         return "No todos.".to_string();
     }
-    todos.iter()
+    todos
+        .iter()
         .map(|t| {
             let mark = if t.done { "✓" } else { "○" };
             format!("[{mark}] {} {}", t.id, t.content)
@@ -62,8 +63,12 @@ fn fmt_todos(todos: &[TodoItem]) -> String {
 pub struct TodoAddTool;
 
 impl Tool for TodoAddTool {
-    fn name(&self) -> &str { "todo__add" }
-    fn description(&self) -> &str { "Add a new todo item. Returns the assigned numeric ID." }
+    fn name(&self) -> &str {
+        "todo__add"
+    }
+    fn description(&self) -> &str {
+        "Add a new todo item. Returns the assigned numeric ID."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -79,12 +84,17 @@ impl Tool for TodoAddTool {
         _resume: Option<ResumePayload>,
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let content = arguments["content"].as_str()
+        let content = arguments["content"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("todo__add", "missing 'content'"))?
             .to_string();
         let (id, c) = modify_todos(ctx, |mut todos| {
             let id = next_id(&todos);
-            todos.push(TodoItem { id, content: content.clone(), done: false });
+            todos.push(TodoItem {
+                id,
+                content: content.clone(),
+                done: false,
+            });
             (todos, (id, content))
         });
         Ok(ToolResult::Output(stream! {
@@ -98,8 +108,12 @@ impl Tool for TodoAddTool {
 pub struct TodoListTool;
 
 impl Tool for TodoListTool {
-    fn name(&self) -> &str { "todo__list" }
-    fn description(&self) -> &str { "List all todo items with their completion status." }
+    fn name(&self) -> &str {
+        "todo__list"
+    }
+    fn description(&self) -> &str {
+        "List all todo items with their completion status."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({ "type": "object", "properties": {} })
     }
@@ -111,7 +125,9 @@ impl Tool for TodoListTool {
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let todos = read_todos(ctx);
         let text = fmt_todos(&todos);
-        Ok(ToolResult::Output(stream! { yield ToolOutput::text(text); }))
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(text); },
+        ))
     }
 }
 
@@ -120,8 +136,12 @@ impl Tool for TodoListTool {
 pub struct TodoCompleteTool;
 
 impl Tool for TodoCompleteTool {
-    fn name(&self) -> &str { "todo__complete" }
-    fn description(&self) -> &str { "Mark a todo item as completed by its ID." }
+    fn name(&self) -> &str {
+        "todo__complete"
+    }
+    fn description(&self) -> &str {
+        "Mark a todo item as completed by its ID."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -137,11 +157,15 @@ impl Tool for TodoCompleteTool {
         _resume: Option<ResumePayload>,
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let id = arguments["id"].as_u64()
+        let id = arguments["id"]
+            .as_u64()
             .ok_or_else(|| AgentError::tool("todo__complete", "missing 'id'"))?;
         let msg = modify_todos(ctx, |mut todos| {
             let msg = match todos.iter_mut().find(|t| t.id == id) {
-                Some(t) => { t.done = true; format!("Todo #{id} marked as done.") }
+                Some(t) => {
+                    t.done = true;
+                    format!("Todo #{id} marked as done.")
+                }
                 None => format!("Todo #{id} not found."),
             };
             (todos, msg)
@@ -155,8 +179,12 @@ impl Tool for TodoCompleteTool {
 pub struct TodoUpdateTool;
 
 impl Tool for TodoUpdateTool {
-    fn name(&self) -> &str { "todo__update" }
-    fn description(&self) -> &str { "Update the content text of an existing todo item by its ID." }
+    fn name(&self) -> &str {
+        "todo__update"
+    }
+    fn description(&self) -> &str {
+        "Update the content text of an existing todo item by its ID."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -173,14 +201,19 @@ impl Tool for TodoUpdateTool {
         _resume: Option<ResumePayload>,
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let id = arguments["id"].as_u64()
+        let id = arguments["id"]
+            .as_u64()
             .ok_or_else(|| AgentError::tool("todo__update", "missing 'id'"))?;
-        let content = arguments["content"].as_str()
+        let content = arguments["content"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("todo__update", "missing 'content'"))?
             .to_string();
         let msg = modify_todos(ctx, |mut todos| {
             let msg = match todos.iter_mut().find(|t| t.id == id) {
-                Some(t) => { t.content = content.clone(); format!("Updated todo #{id}: {content}") }
+                Some(t) => {
+                    t.content = content.clone();
+                    format!("Updated todo #{id}: {content}")
+                }
                 None => format!("Todo #{id} not found."),
             };
             (todos, msg)
@@ -194,8 +227,12 @@ impl Tool for TodoUpdateTool {
 pub struct TodoRemoveTool;
 
 impl Tool for TodoRemoveTool {
-    fn name(&self) -> &str { "todo__remove" }
-    fn description(&self) -> &str { "Permanently remove a todo item by its ID." }
+    fn name(&self) -> &str {
+        "todo__remove"
+    }
+    fn description(&self) -> &str {
+        "Permanently remove a todo item by its ID."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -211,7 +248,8 @@ impl Tool for TodoRemoveTool {
         _resume: Option<ResumePayload>,
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let id = arguments["id"].as_u64()
+        let id = arguments["id"]
+            .as_u64()
             .ok_or_else(|| AgentError::tool("todo__remove", "missing 'id'"))?;
         let removed = modify_todos(ctx, |mut todos| {
             let before = todos.len();

@@ -54,7 +54,10 @@ impl StreamingCard {
     /// Create the card now if it hasn't been created yet.
     async fn ensure_card(&mut self, initial_text: &str) -> anyhow::Result<()> {
         if self.message_id.is_none() {
-            let id = self.client.reply_card(&self.parent_msg_id, initial_text).await?;
+            let id = self
+                .client
+                .reply_card(&self.parent_msg_id, initial_text)
+                .await?;
             self.message_id = Some(id);
             self.last_update = Instant::now();
         }

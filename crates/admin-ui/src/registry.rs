@@ -37,8 +37,8 @@ impl Registry {
     pub fn load(config_dir: &PathBuf) -> Result<Self> {
         let path = config_dir.join("daemons.json");
         let daemons = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {path:?}"))?;
+            let raw =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?;
             serde_json::from_str::<Vec<DaemonEntry>>(&raw)
                 .with_context(|| format!("parsing {path:?}"))?
         } else {
@@ -52,8 +52,7 @@ impl Registry {
     fn save(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.daemons)?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes())
-            .with_context(|| format!("writing {tmp:?}"))?;
+        std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("writing {tmp:?}"))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming to {:?}", self.path))?;
         Ok(())

@@ -112,6 +112,12 @@ async fn main() -> Result<()> {
             "/api/daemons/:id/files/:name",
             get(api::read_file).put(api::write_file),
         )
+        // Volume mounts
+        .route(
+            "/api/daemons/:id/volumes",
+            get(api::list_volumes).post(api::add_volume),
+        )
+        .route("/api/daemons/:id/volumes/remove", post(api::remove_volume))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

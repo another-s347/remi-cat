@@ -37,7 +37,7 @@ use futures::{SinkExt, StreamExt};
 use mgmt_api::{
     methods, AgentFileParams, AgentFileResult, AuthParams, AuthResult, ContainerOpParams,
     ContainerOpResult, DaemonStatusResult, MgmtRequest, MgmtResponse, OwnerGetResult,
-    SecretDeleteParams, SecretEntry, SecretSetParams,
+    SecretDeleteParams, SecretEntry, SecretSetParams, VolumeAddParams, VolumeRemoveParams,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,6 +50,7 @@ use tracing::{info, warn};
 use crate::docker::DockerManager;
 use crate::rpc_server::RpcServer;
 use crate::secret_store::SecretStore;
+use crate::volume_store::VolumeStore;
 use matcher::OwnerMatcher;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
@@ -133,6 +134,7 @@ pub struct MgmtContext {
     pub docker: Option<DockerManager>,
     pub owner: OwnerMatcher,
     pub secret_store: Arc<RwLock<SecretStore>>,
+    pub volume_store: Arc<RwLock<VolumeStore>>,
     pub rpc: RpcServer,
     pub data_dir: PathBuf,
     pub start_time: Instant,
@@ -344,6 +346,9 @@ impl MgmtServer {
             methods::SECRET_DELETE => self.handle_secret_delete(id, &req.params).await,
             methods::AGENT_FILE_READ => self.handle_agent_file_read(id, &req.params).await,
             methods::AGENT_FILE_WRITE => self.handle_agent_file_write(id, &req.params).await,
+            methods::VOLUME_LIST => self.handle_volume_list(id).await,
+            methods::VOLUME_ADD => self.handle_volume_add(id, &req.params).await,
+            methods::VOLUME_REMOVE => self.handle_volume_remove(id, &req.params).await,
             _ => MgmtResponse::err(id, 404, format!("unknown method: {}", req.method)),
         }
     }
@@ -417,6 +422,16 @@ impl MgmtServer {
                     .cloned()
                     .unwrap_or_else(|| "pull complete".into())
             }),
+            "recreate" => {
+                let mounts = {
+                    let store = self.ctx.volume_store.read().await;
+                    store.mounts().to_vec()
+                };
+                docker
+                    .recreate_with_mounts(&mounts)
+                    .await
+                    .map(|_| "container recreated with updated mounts".to_string())
+            }
             _ => Err(anyhow!("unknown op: {}", p.op)),
         };
         match result {
@@ -517,6 +532,44 @@ impl MgmtServer {
             }
         }
         match tokio::fs::write(&path, p.content.as_bytes()).await {
+            Ok(()) => MgmtResponse::ok(id, serde_json::json!({"ok": true})),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_volume_list(&self, id: &str) -> MgmtResponse {
+        let store = self.ctx.volume_store.read().await;
+        let mounts = store.mounts().to_vec();
+        match serde_json::to_value(mounts) {
+            Ok(v) => MgmtResponse::ok(id, v),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_volume_add(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: VolumeAddParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        let mount = mgmt_api::VolumeMount {
+            host_path: p.host_path,
+            container_path: p.container_path,
+            read_only: p.read_only,
+        };
+        let mut store = self.ctx.volume_store.write().await;
+        match store.add(mount) {
+            Ok(()) => MgmtResponse::ok(id, serde_json::json!({"ok": true})),
+            Err(e) => MgmtResponse::err(id, 400, e.to_string()),
+        }
+    }
+
+    async fn handle_volume_remove(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: VolumeRemoveParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        let mut store = self.ctx.volume_store.write().await;
+        match store.remove(&p.container_path) {
             Ok(()) => MgmtResponse::ok(id, serde_json::json!({"ok": true})),
             Err(e) => MgmtResponse::err(id, 500, e.to_string()),
         }

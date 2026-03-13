@@ -14,10 +14,18 @@ pub fn register_skill_tools<S: SkillStore>(
     registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry,
     store: Arc<S>,
 ) {
-    registry.register(SkillSaveTool   { store: Arc::clone(&store) });
-    registry.register(SkillGetTool    { store: Arc::clone(&store) });
-    registry.register(SkillListTool   { store: Arc::clone(&store) });
-    registry.register(SkillDeleteTool { store: Arc::clone(&store) });
+    registry.register(SkillSaveTool {
+        store: Arc::clone(&store),
+    });
+    registry.register(SkillGetTool {
+        store: Arc::clone(&store),
+    });
+    registry.register(SkillListTool {
+        store: Arc::clone(&store),
+    });
+    registry.register(SkillDeleteTool {
+        store: Arc::clone(&store),
+    });
 }
 
 /// Produce a `SkillEvent` for mutation tools (save/delete).

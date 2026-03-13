@@ -25,7 +25,9 @@ pub struct FileSkillStore {
 
 impl FileSkillStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
-        Self { base_dir: base_dir.into() }
+        Self {
+            base_dir: base_dir.into(),
+        }
     }
 
     fn skill_path(&self, name: &str) -> PathBuf {
@@ -63,7 +65,11 @@ impl SkillStore for FileSkillStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(AgentError::Io(e.to_string())),
         };
-        while let Some(entry) = rd.next_entry().await.map_err(|e| AgentError::Io(e.to_string()))? {
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?
+        {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("md") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -101,7 +107,10 @@ impl InMemorySkillStore {
 
 impl SkillStore for InMemorySkillStore {
     async fn save(&self, name: &str, content: &str) -> Result<String, AgentError> {
-        self.data.lock().unwrap().insert(name.to_string(), content.to_string());
+        self.data
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), content.to_string());
         Ok(format!("memory:{name}"))
     }
 

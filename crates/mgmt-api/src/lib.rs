@@ -79,7 +79,7 @@ pub mod methods {
     pub const AUTH: &str = "auth";
     /// Daemon status: agent connection, owner, uptime.
     pub const DAEMON_STATUS: &str = "daemon.status";
-    /// Container lifecycle: restart | stop | start | pull.
+    /// Container lifecycle: restart | stop | start | pull | recreate.
     pub const CONTAINER_OP: &str = "container.op";
     /// Owner info.
     pub const OWNER_GET: &str = "owner.get";
@@ -95,6 +95,12 @@ pub mod methods {
     pub const AGENT_FILE_READ: &str = "agent_file.read";
     /// Write an agent data file.
     pub const AGENT_FILE_WRITE: &str = "agent_file.write";
+    /// List configured volume bind mounts.
+    pub const VOLUME_LIST: &str = "volume.list";
+    /// Add a volume bind mount configuration.
+    pub const VOLUME_ADD: &str = "volume.add";
+    /// Remove a volume bind mount configuration.
+    pub const VOLUME_REMOVE: &str = "volume.remove";
 }
 
 // ── Typed params / results ────────────────────────────────────────────────────
@@ -190,4 +196,31 @@ pub struct AgentFileParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentFileResult {
     pub content: String,
+}
+
+/// A single volume bind mount: maps a host directory into the container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMount {
+    /// Absolute path on the **host** machine.
+    pub host_path: String,
+    /// Absolute path inside the container.
+    pub container_path: String,
+    /// When `true` the mount is read-only.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// `volume.add` params.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeAddParams {
+    pub host_path: String,
+    pub container_path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// `volume.remove` params — identify the mount by its container path.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeRemoveParams {
+    pub container_path: String,
 }

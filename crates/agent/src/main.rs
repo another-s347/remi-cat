@@ -15,10 +15,10 @@
 
 mod rpc_client;
 
-use std::collections::HashSet;
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,9 +26,9 @@ use base64::Engine as _;
 use bot_core::{CatBot, CatEvent, Content, ContentPart, StreamOptions};
 use futures::StreamExt;
 use remi_proto::{
-    AgentDone, AgentError as AgentErrorMsg, AgentMessage, AgentStats, AgentTextDelta,
-    AgentThinking, AgentToolCall, AgentToolResult, DaemonPayload, DaemonServiceClient,
-    agent_message::Payload as AgentPayload,
+    agent_message::Payload as AgentPayload, AgentDone, AgentError as AgentErrorMsg, AgentMessage,
+    AgentStats, AgentTextDelta, AgentThinking, AgentToolCall, AgentToolResult, DaemonPayload,
+    DaemonServiceClient,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -48,33 +48,35 @@ async fn main() -> Result<()> {
     info!("remi-cat starting up");
 
     // ── Config ────────────────────────────────────────────────────────────
-    let daemon_addr = std::env::var("DAEMON_ADDR")
-        .unwrap_or_else(|_| "http://localhost:50051".into());
+    let daemon_addr =
+        std::env::var("DAEMON_ADDR").unwrap_or_else(|_| "http://localhost:50051".into());
 
     // ── LocalSet: CatBot is !Send (uses Rc internally) ────────────────────
     let local = tokio::task::LocalSet::new();
-    local.run_until(async move {
-        let bot = Rc::new(CatBot::from_env().expect("CatBot init failed"));
-        info!("CatBot ready");
+    local
+        .run_until(async move {
+            let bot = Rc::new(CatBot::from_env().expect("CatBot init failed"));
+            info!("CatBot ready");
 
-        let mut backoff = Duration::from_secs(1);
-        const MAX_BACKOFF: Duration = Duration::from_secs(60);
+            let mut backoff = Duration::from_secs(1);
+            const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-        loop {
-            info!(addr = %daemon_addr, "connecting to Daemon gRPC");
-            match run_session(&daemon_addr, Rc::clone(&bot)).await {
-                Ok(()) => {
-                    info!("Daemon session ended — reconnecting");
-                    backoff = Duration::from_secs(1);
-                }
-                Err(e) => {
-                    error!("Daemon session error: {e:#} — reconnecting in {backoff:?}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+            loop {
+                info!(addr = %daemon_addr, "connecting to Daemon gRPC");
+                match run_session(&daemon_addr, Rc::clone(&bot)).await {
+                    Ok(()) => {
+                        info!("Daemon session ended — reconnecting");
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        error!("Daemon session error: {e:#} — reconnecting in {backoff:?}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
                 }
             }
-        }
-    }).await;
+        })
+        .await;
 
     Ok(())
 }
@@ -120,9 +122,9 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
 
         match payload {
             DaemonPayload::ImMessage(ev) => {
-                let chat_id   = ev.chat_id.clone();
-                let reply_to  = ev.message_id.clone();
-                let trimmed   = ev.text.trim().to_string();
+                let chat_id = ev.chat_id.clone();
+                let reply_to = ev.message_id.clone();
+                let trimmed = ev.text.trim().to_string();
 
                 // ── /cancel — abort the running task for this chat ────────
                 if trimmed == "/cancel" {
@@ -134,14 +136,20 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                     };
                     let tx = out_tx.clone();
                     tokio::task::spawn_local(async move {
-                        let _ = tx.send(AgentMessage {
-                            reply_to_message_id: reply_to.clone(),
-                            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text: reply })),
-                        }).await;
-                        let _ = tx.send(AgentMessage {
-                            reply_to_message_id: reply_to,
-                            payload: Some(AgentPayload::Done(AgentDone {})),
-                        }).await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to.clone(),
+                                payload: Some(AgentPayload::TextDelta(AgentTextDelta {
+                                    text: reply,
+                                })),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to,
+                                payload: Some(AgentPayload::Done(AgentDone {})),
+                            })
+                            .await;
                     });
                     continue;
                 }
@@ -149,31 +157,35 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                 // ── /tools — list registered tools ────────────────────────
                 if trimmed == "/tools" {
                     let bot_t = Rc::clone(&bot);
-                    let tx    = out_tx.clone();
+                    let tx = out_tx.clone();
                     tokio::task::spawn_local(async move {
                         let tools = bot_t.tool_list();
                         let mut text = "**可用工具列表：**\n\n".to_string();
                         for (name, desc) in &tools {
                             text.push_str(&format!("• `{name}` — {desc}\n"));
                         }
-                        let _ = tx.send(AgentMessage {
-                            reply_to_message_id: reply_to.clone(),
-                            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
-                        }).await;
-                        let _ = tx.send(AgentMessage {
-                            reply_to_message_id: reply_to,
-                            payload: Some(AgentPayload::Done(AgentDone {})),
-                        }).await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to.clone(),
+                                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to,
+                                payload: Some(AgentPayload::Done(AgentDone {})),
+                            })
+                            .await;
                     });
                     continue;
                 }
 
                 // ── Regular message — spawn task and track the handle ─────
-                let bot_m      = Rc::clone(&bot);
-                let tx         = out_tx.clone();
-                let active_m   = Rc::clone(&active);
-                let chat_id_m  = chat_id.clone();
-                let handle     = tokio::task::spawn_local(async move {
+                let bot_m = Rc::clone(&bot);
+                let tx = out_tx.clone();
+                let active_m = Rc::clone(&active);
+                let chat_id_m = chat_id.clone();
+                let handle = tokio::task::spawn_local(async move {
                     handle_message(ev, bot_m, tx).await;
                     active_m.borrow_mut().remove(&chat_id_m);
                 });
@@ -181,7 +193,7 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
             }
             DaemonPayload::ImReaction(ev) => {
                 let bot = Rc::clone(&bot);
-                let tx  = out_tx.clone();
+                let tx = out_tx.clone();
                 tokio::task::spawn_local(async move {
                     handle_reaction(ev, bot, tx).await;
                 });
@@ -257,14 +269,18 @@ async fn handle_message(
             Ok(n) => format!("✅ 已将 {n} 条短期记忆压缩为中期记忆。"),
             Err(e) => format!("❌ 压缩失败: {e:#}"),
         };
-        let _ = tx.send(AgentMessage {
-            reply_to_message_id: reply_to.clone(),
-            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
-        }).await;
-        let _ = tx.send(AgentMessage {
-            reply_to_message_id: reply_to,
-            payload: Some(AgentPayload::Done(AgentDone {})),
-        }).await;
+        let _ = tx
+            .send(AgentMessage {
+                reply_to_message_id: reply_to.clone(),
+                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+            })
+            .await;
+        let _ = tx
+            .send(AgentMessage {
+                reply_to_message_id: reply_to,
+                payload: Some(AgentPayload::Done(AgentDone {})),
+            })
+            .await;
         return;
     }
     // Unknown slash command — return error, do NOT invoke LLM.
@@ -282,14 +298,18 @@ async fn handle_message(
              • `/cancel` — 取消正在运行的任务\n\
              • `/tools` — 列出可用工具"
         );
-        let _ = tx.send(AgentMessage {
-            reply_to_message_id: reply_to.clone(),
-            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
-        }).await;
-        let _ = tx.send(AgentMessage {
-            reply_to_message_id: reply_to,
-            payload: Some(AgentPayload::Done(AgentDone {})),
-        }).await;
+        let _ = tx
+            .send(AgentMessage {
+                reply_to_message_id: reply_to.clone(),
+                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+            })
+            .await;
+        let _ = tx
+            .send(AgentMessage {
+                reply_to_message_id: reply_to,
+                payload: Some(AgentPayload::Done(AgentDone {})),
+            })
+            .await;
         return;
     }
 
@@ -309,8 +329,8 @@ async fn handle_message(
 
     let opts = StreamOptions {
         sender_open_id: Some(ev.sender_open_id.clone()).filter(|s| !s.is_empty()),
-        message_id:     Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
-        chat_type:      Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
+        message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
+        chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
     };
     let stream = bot.stream_with_options(&ev.chat_id, content, opts);
     forward_stream(reply_to, stream, tx).await;
@@ -398,11 +418,15 @@ async fn forward_stream(
             payload: Some(AgentPayload::TextDelta(AgentTextDelta {
                 text: "\n\n⚠️ *[回复超时，已自动中断]*".into(),
             })),
-        }).await.ok();
+        })
+        .await
+        .ok();
     }
 
     tx.send(AgentMessage {
         reply_to_message_id: reply_to,
         payload: Some(AgentPayload::Done(AgentDone {})),
-    }).await.ok();
+    })
+    .await
+    .ok();
 }

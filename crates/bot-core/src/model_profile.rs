@@ -84,12 +84,12 @@ impl ModelProfile {
 
 // ── Base URL constants ────────────────────────────────────────────────────────
 
-const OPENAI_URL:     &str = "https://api.openai.com/v1";
-const DEEPSEEK_URL:   &str = "https://api.deepseek.com/v1";
-const DASHSCOPE_URL:  &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const GEMINI_URL:     &str = "https://generativelanguage.googleapis.com/v1beta/openai";
-const MISTRAL_URL:    &str = "https://api.mistral.ai/v1";
-const MOONSHOT_URL:   &str = "https://api.moonshot.cn/v1";
+const OPENAI_URL: &str = "https://api.openai.com/v1";
+const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1";
+const DASHSCOPE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+const MISTRAL_URL: &str = "https://api.mistral.ai/v1";
+const MOONSHOT_URL: &str = "https://api.moonshot.cn/v1";
 
 // ── Static profile table ──────────────────────────────────────────────────────
 //
@@ -104,74 +104,279 @@ const MOONSHOT_URL:   &str = "https://api.moonshot.cn/v1";
 
 static PROFILES: &[ModelProfile] = &[
     // ── OpenAI o-series ───────────────────────────────────────────────────
-    ModelProfile { name: "o3-mini",    context_tokens: 200_000, max_output_tokens: 100_000, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "o3",         context_tokens: 200_000, max_output_tokens: 100_000, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "o1-mini",    context_tokens: 128_000, max_output_tokens:  65_536, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "o1-preview", context_tokens: 128_000, max_output_tokens:  32_768, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "o1",         context_tokens: 200_000, max_output_tokens: 100_000, base_url: Some(OPENAI_URL) },
-
+    ModelProfile {
+        name: "o3-mini",
+        context_tokens: 200_000,
+        max_output_tokens: 100_000,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "o3",
+        context_tokens: 200_000,
+        max_output_tokens: 100_000,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "o1-mini",
+        context_tokens: 128_000,
+        max_output_tokens: 65_536,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "o1-preview",
+        context_tokens: 128_000,
+        max_output_tokens: 32_768,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "o1",
+        context_tokens: 200_000,
+        max_output_tokens: 100_000,
+        base_url: Some(OPENAI_URL),
+    },
     // ── OpenAI GPT-4o family ──────────────────────────────────────────────
-    ModelProfile { name: "gpt-4o-mini", context_tokens: 128_000, max_output_tokens: 16_384, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "gpt-4o",      context_tokens: 128_000, max_output_tokens: 16_384, base_url: Some(OPENAI_URL) },
-
+    ModelProfile {
+        name: "gpt-4o-mini",
+        context_tokens: 128_000,
+        max_output_tokens: 16_384,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "gpt-4o",
+        context_tokens: 128_000,
+        max_output_tokens: 16_384,
+        base_url: Some(OPENAI_URL),
+    },
     // ── OpenAI GPT-4 family ───────────────────────────────────────────────
-    ModelProfile { name: "gpt-4-turbo", context_tokens: 128_000, max_output_tokens:  4_096, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "gpt-4-32k",   context_tokens:  32_768, max_output_tokens:  4_096, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "gpt-4",       context_tokens:   8_192, max_output_tokens:  4_096, base_url: Some(OPENAI_URL) },
-
+    ModelProfile {
+        name: "gpt-4-turbo",
+        context_tokens: 128_000,
+        max_output_tokens: 4_096,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "gpt-4-32k",
+        context_tokens: 32_768,
+        max_output_tokens: 4_096,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "gpt-4",
+        context_tokens: 8_192,
+        max_output_tokens: 4_096,
+        base_url: Some(OPENAI_URL),
+    },
     // ── OpenAI GPT-3.5 ───────────────────────────────────────────────────
-    ModelProfile { name: "gpt-3.5-turbo-16k", context_tokens: 16_384, max_output_tokens: 4_096, base_url: Some(OPENAI_URL) },
-    ModelProfile { name: "gpt-3.5-turbo",     context_tokens: 16_384, max_output_tokens: 4_096, base_url: Some(OPENAI_URL) },
-
+    ModelProfile {
+        name: "gpt-3.5-turbo-16k",
+        context_tokens: 16_384,
+        max_output_tokens: 4_096,
+        base_url: Some(OPENAI_URL),
+    },
+    ModelProfile {
+        name: "gpt-3.5-turbo",
+        context_tokens: 16_384,
+        max_output_tokens: 4_096,
+        base_url: Some(OPENAI_URL),
+    },
     // ── Anthropic Claude ─────────────────────────────────────────────────
     // Anthropic's API is not natively OpenAI-compatible (different auth
     // headers); base_url is None — users must supply a compatible proxy URL
     // (e.g. AWS Bedrock, Vertex AI, or an openai-proxy sidecar) explicitly.
-    ModelProfile { name: "claude-opus-4",     context_tokens: 200_000, max_output_tokens: 32_000, base_url: None },
-    ModelProfile { name: "claude-sonnet-4",   context_tokens: 200_000, max_output_tokens: 16_000, base_url: None },
-    ModelProfile { name: "claude-3-5-sonnet", context_tokens: 200_000, max_output_tokens:  8_192, base_url: None },
-    ModelProfile { name: "claude-3-5-haiku",  context_tokens: 200_000, max_output_tokens:  8_192, base_url: None },
-    ModelProfile { name: "claude-3-opus",     context_tokens: 200_000, max_output_tokens:  4_096, base_url: None },
-    ModelProfile { name: "claude-3-sonnet",   context_tokens: 200_000, max_output_tokens:  4_096, base_url: None },
-    ModelProfile { name: "claude-3-haiku",    context_tokens: 200_000, max_output_tokens:  4_096, base_url: None },
-
+    ModelProfile {
+        name: "claude-opus-4",
+        context_tokens: 200_000,
+        max_output_tokens: 32_000,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-sonnet-4",
+        context_tokens: 200_000,
+        max_output_tokens: 16_000,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-3-5-sonnet",
+        context_tokens: 200_000,
+        max_output_tokens: 8_192,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-3-5-haiku",
+        context_tokens: 200_000,
+        max_output_tokens: 8_192,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-3-opus",
+        context_tokens: 200_000,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-3-sonnet",
+        context_tokens: 200_000,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "claude-3-haiku",
+        context_tokens: 200_000,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
     // ── DeepSeek ─────────────────────────────────────────────────────────
-    ModelProfile { name: "deepseek-r1",   context_tokens: 128_000, max_output_tokens: 64_000, base_url: Some(DEEPSEEK_URL) },
-    ModelProfile { name: "deepseek-v3",   context_tokens: 128_000, max_output_tokens:  8_192, base_url: Some(DEEPSEEK_URL) },
-    ModelProfile { name: "deepseek-chat", context_tokens:  64_000, max_output_tokens:  8_192, base_url: Some(DEEPSEEK_URL) },
-
+    ModelProfile {
+        name: "deepseek-r1",
+        context_tokens: 128_000,
+        max_output_tokens: 64_000,
+        base_url: Some(DEEPSEEK_URL),
+    },
+    ModelProfile {
+        name: "deepseek-v3",
+        context_tokens: 128_000,
+        max_output_tokens: 8_192,
+        base_url: Some(DEEPSEEK_URL),
+    },
+    ModelProfile {
+        name: "deepseek-chat",
+        context_tokens: 64_000,
+        max_output_tokens: 8_192,
+        base_url: Some(DEEPSEEK_URL),
+    },
     // ── Alibaba Qwen (DashScope) ──────────────────────────────────────────
-    ModelProfile { name: "qwen-long",   context_tokens: 1_000_000, max_output_tokens: 8_192, base_url: Some(DASHSCOPE_URL) },
-    ModelProfile { name: "qwen2.5-72b", context_tokens:   131_072, max_output_tokens: 8_192, base_url: Some(DASHSCOPE_URL) },
-    ModelProfile { name: "qwen-plus",   context_tokens:   131_072, max_output_tokens: 8_192, base_url: Some(DASHSCOPE_URL) },
-    ModelProfile { name: "qwen-turbo",  context_tokens:   131_072, max_output_tokens: 8_192, base_url: Some(DASHSCOPE_URL) },
-    ModelProfile { name: "qwen-max",    context_tokens:    32_768, max_output_tokens: 8_192, base_url: Some(DASHSCOPE_URL) },
-
+    ModelProfile {
+        name: "qwen-long",
+        context_tokens: 1_000_000,
+        max_output_tokens: 8_192,
+        base_url: Some(DASHSCOPE_URL),
+    },
+    ModelProfile {
+        name: "qwen2.5-72b",
+        context_tokens: 131_072,
+        max_output_tokens: 8_192,
+        base_url: Some(DASHSCOPE_URL),
+    },
+    ModelProfile {
+        name: "qwen-plus",
+        context_tokens: 131_072,
+        max_output_tokens: 8_192,
+        base_url: Some(DASHSCOPE_URL),
+    },
+    ModelProfile {
+        name: "qwen-turbo",
+        context_tokens: 131_072,
+        max_output_tokens: 8_192,
+        base_url: Some(DASHSCOPE_URL),
+    },
+    ModelProfile {
+        name: "qwen-max",
+        context_tokens: 32_768,
+        max_output_tokens: 8_192,
+        base_url: Some(DASHSCOPE_URL),
+    },
     // ── Google Gemini ────────────────────────────────────────────────────
-    ModelProfile { name: "gemini-2.0-flash", context_tokens: 1_048_576, max_output_tokens:  8_192, base_url: Some(GEMINI_URL) },
-    ModelProfile { name: "gemini-1.5-pro",   context_tokens: 2_097_152, max_output_tokens:  8_192, base_url: Some(GEMINI_URL) },
-    ModelProfile { name: "gemini-1.5-flash", context_tokens: 1_048_576, max_output_tokens:  8_192, base_url: Some(GEMINI_URL) },
-    ModelProfile { name: "gemini-1.0-pro",   context_tokens:    32_768, max_output_tokens:  2_048, base_url: Some(GEMINI_URL) },
-
+    ModelProfile {
+        name: "gemini-2.0-flash",
+        context_tokens: 1_048_576,
+        max_output_tokens: 8_192,
+        base_url: Some(GEMINI_URL),
+    },
+    ModelProfile {
+        name: "gemini-1.5-pro",
+        context_tokens: 2_097_152,
+        max_output_tokens: 8_192,
+        base_url: Some(GEMINI_URL),
+    },
+    ModelProfile {
+        name: "gemini-1.5-flash",
+        context_tokens: 1_048_576,
+        max_output_tokens: 8_192,
+        base_url: Some(GEMINI_URL),
+    },
+    ModelProfile {
+        name: "gemini-1.0-pro",
+        context_tokens: 32_768,
+        max_output_tokens: 2_048,
+        base_url: Some(GEMINI_URL),
+    },
     // ── Meta Llama ───────────────────────────────────────────────────────
     // Open-weight models; no single canonical provider URL — users must
     // supply the endpoint (Together, Fireworks, Groq, self-hosted, …).
-    ModelProfile { name: "llama-3.3-70b",  context_tokens: 131_072, max_output_tokens: 4_096, base_url: None },
-    ModelProfile { name: "llama-3.1-405b", context_tokens: 131_072, max_output_tokens: 4_096, base_url: None },
-    ModelProfile { name: "llama-3.1-70b",  context_tokens: 131_072, max_output_tokens: 4_096, base_url: None },
-    ModelProfile { name: "llama-3.1-8b",   context_tokens: 131_072, max_output_tokens: 4_096, base_url: None },
-    ModelProfile { name: "llama-3-70b",    context_tokens:   8_192, max_output_tokens: 4_096, base_url: None },
-    ModelProfile { name: "llama-3-8b",     context_tokens:   8_192, max_output_tokens: 4_096, base_url: None },
-
+    ModelProfile {
+        name: "llama-3.3-70b",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "llama-3.1-405b",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "llama-3.1-70b",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "llama-3.1-8b",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "llama-3-70b",
+        context_tokens: 8_192,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
+    ModelProfile {
+        name: "llama-3-8b",
+        context_tokens: 8_192,
+        max_output_tokens: 4_096,
+        base_url: None,
+    },
     // ── Mistral ──────────────────────────────────────────────────────────
-    ModelProfile { name: "mistral-large", context_tokens: 131_072, max_output_tokens: 4_096, base_url: Some(MISTRAL_URL) },
-    ModelProfile { name: "mistral-small", context_tokens: 131_072, max_output_tokens: 4_096, base_url: Some(MISTRAL_URL) },
-    ModelProfile { name: "mixtral-8x22b", context_tokens:  65_536, max_output_tokens: 4_096, base_url: Some(MISTRAL_URL) },
-    ModelProfile { name: "mixtral-8x7b",  context_tokens:  32_768, max_output_tokens: 4_096, base_url: Some(MISTRAL_URL) },
-    ModelProfile { name: "mistral-7b",    context_tokens:  32_768, max_output_tokens: 4_096, base_url: Some(MISTRAL_URL) },
-
+    ModelProfile {
+        name: "mistral-large",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: Some(MISTRAL_URL),
+    },
+    ModelProfile {
+        name: "mistral-small",
+        context_tokens: 131_072,
+        max_output_tokens: 4_096,
+        base_url: Some(MISTRAL_URL),
+    },
+    ModelProfile {
+        name: "mixtral-8x22b",
+        context_tokens: 65_536,
+        max_output_tokens: 4_096,
+        base_url: Some(MISTRAL_URL),
+    },
+    ModelProfile {
+        name: "mixtral-8x7b",
+        context_tokens: 32_768,
+        max_output_tokens: 4_096,
+        base_url: Some(MISTRAL_URL),
+    },
+    ModelProfile {
+        name: "mistral-7b",
+        context_tokens: 32_768,
+        max_output_tokens: 4_096,
+        base_url: Some(MISTRAL_URL),
+    },
     // ── Moonshot Kimi ────────────────────────────────────────────────────
-    ModelProfile { name: "kimi-k2.5", context_tokens: 131_072, max_output_tokens: 16_384, base_url: Some(MOONSHOT_URL) },
+    ModelProfile {
+        name: "kimi-k2.5",
+        context_tokens: 131_072,
+        max_output_tokens: 16_384,
+        base_url: Some(MOONSHOT_URL),
+    },
 ];
 
 #[cfg(test)]
@@ -199,7 +404,10 @@ mod tests {
 
     #[test]
     fn derived_values_in_range() {
-        for p in PROFILES.iter().chain(std::iter::once(&ModelProfile::FALLBACK)) {
+        for p in PROFILES
+            .iter()
+            .chain(std::iter::once(&ModelProfile::FALLBACK))
+        {
             let st = p.default_short_term_tokens();
             let ov = p.default_overflow_bytes();
             assert!(st >= 4_000 && st <= 64_000, "{}: short_term={st}", p.name);
@@ -209,11 +417,26 @@ mod tests {
 
     #[test]
     fn base_url_lookup() {
-        assert_eq!(ModelProfile::for_model("gpt-4o").base_url, Some("https://api.openai.com/v1"));
-        assert_eq!(ModelProfile::for_model("deepseek-chat").base_url, Some("https://api.deepseek.com/v1"));
-        assert_eq!(ModelProfile::for_model("qwen-turbo").base_url, Some("https://dashscope.aliyuncs.com/compatible-mode/v1"));
-        assert_eq!(ModelProfile::for_model("gemini-1.5-flash").base_url, Some("https://generativelanguage.googleapis.com/v1beta/openai"));
-        assert_eq!(ModelProfile::for_model("mistral-large").base_url, Some("https://api.mistral.ai/v1"));
+        assert_eq!(
+            ModelProfile::for_model("gpt-4o").base_url,
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            ModelProfile::for_model("deepseek-chat").base_url,
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(
+            ModelProfile::for_model("qwen-turbo").base_url,
+            Some("https://dashscope.aliyuncs.com/compatible-mode/v1")
+        );
+        assert_eq!(
+            ModelProfile::for_model("gemini-1.5-flash").base_url,
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        );
+        assert_eq!(
+            ModelProfile::for_model("mistral-large").base_url,
+            Some("https://api.mistral.ai/v1")
+        );
         assert_eq!(ModelProfile::for_model("claude-3-opus").base_url, None);
         assert_eq!(ModelProfile::for_model("llama-3.1-70b").base_url, None);
     }

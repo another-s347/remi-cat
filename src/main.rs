@@ -29,8 +29,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────
-    let app_id = std::env::var("FEISHU_APP_ID")
-        .map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
+    let app_id =
+        std::env::var("FEISHU_APP_ID").map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
     let app_secret = std::env::var("FEISHU_APP_SECRET")
         .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
 
@@ -358,4 +358,3 @@ async fn main() -> anyhow::Result<()> {
     Ok::<(), anyhow::Error>(())
     }).await
 }
-

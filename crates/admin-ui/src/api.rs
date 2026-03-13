@@ -14,8 +14,9 @@ use axum::{
 };
 use mgmt_api::{
     methods, AgentFileParams, ContainerOpParams, MgmtRequest, SecretDeleteParams, SecretSetParams,
+    VolumeAddParams, VolumeRemoveParams,
 };
-use serde::{Deserialize};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 
@@ -308,6 +309,67 @@ pub async fn write_file(
         params: serde_json::to_value(AgentFileParams {
             filename,
             content: body.content,
+        })
+        .unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+// ── Volume mounts ─────────────────────────────────────────────────────────────
+
+pub async fn list_volumes(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::VOLUME_LIST.into(),
+        params: serde_json::Value::Null,
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+#[derive(Deserialize)]
+pub struct AddVolumeBody {
+    pub host_path: String,
+    pub container_path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+pub async fn add_volume(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+    Json(body): Json<AddVolumeBody>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::VOLUME_ADD.into(),
+        params: serde_json::to_value(VolumeAddParams {
+            host_path: body.host_path,
+            container_path: body.container_path,
+            read_only: body.read_only,
+        })
+        .unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+#[derive(Deserialize)]
+pub struct RemoveVolumeBody {
+    pub container_path: String,
+}
+
+pub async fn remove_volume(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+    Json(body): Json<RemoveVolumeBody>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::VOLUME_REMOVE.into(),
+        params: serde_json::to_value(VolumeRemoveParams {
+            container_path: body.container_path,
         })
         .unwrap(),
     };

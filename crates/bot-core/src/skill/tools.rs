@@ -30,7 +30,9 @@ pub struct SkillSaveTool<S> {
 }
 
 impl<S: SkillStore + 'static> Tool for SkillSaveTool<S> {
-    fn name(&self) -> &str { "skill__save" }
+    fn name(&self) -> &str {
+        "skill__save"
+    }
     fn description(&self) -> &str {
         "Save a reusable skill as a named markdown document. Use this to record \
         step-by-step procedures, best practices, or any knowledge worth reusing \
@@ -53,11 +55,13 @@ impl<S: SkillStore + 'static> Tool for SkillSaveTool<S> {
         _resume: Option<ResumePayload>,
         _ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let name = arguments["name"].as_str()
+        let name = arguments["name"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("skill__save", "missing 'name'"))?
             .to_string();
         let description = arguments["description"].as_str().unwrap_or("").to_string();
-        let content = arguments["content"].as_str()
+        let content = arguments["content"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("skill__save", "missing 'content'"))?
             .to_string();
 
@@ -83,7 +87,9 @@ pub struct SkillGetTool<S> {
 }
 
 impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
-    fn name(&self) -> &str { "skill__get" }
+    fn name(&self) -> &str {
+        "skill__get"
+    }
     fn description(&self) -> &str {
         "Retrieve the full markdown content of a previously saved skill by name."
     }
@@ -102,7 +108,8 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         _resume: Option<ResumePayload>,
         _ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let name = arguments["name"].as_str()
+        let name = arguments["name"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("skill__get", "missing 'name'"))?
             .to_string();
         let store = self.store.clone();
@@ -110,7 +117,9 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
             Some(content) => content,
             None => format!("Skill '{name}' not found."),
         };
-        Ok(ToolResult::Output(stream! { yield ToolOutput::text(result); }))
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(result); },
+        ))
     }
 }
 
@@ -121,8 +130,12 @@ pub struct SkillListTool<S> {
 }
 
 impl<S: SkillStore + 'static> Tool for SkillListTool<S> {
-    fn name(&self) -> &str { "skill__list" }
-    fn description(&self) -> &str { "List the names of all saved skills." }
+    fn name(&self) -> &str {
+        "skill__list"
+    }
+    fn description(&self) -> &str {
+        "List the names of all saved skills."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({ "type": "object", "properties": {} })
     }
@@ -139,7 +152,9 @@ impl<S: SkillStore + 'static> Tool for SkillListTool<S> {
         } else {
             names.join(", ")
         };
-        Ok(ToolResult::Output(stream! { yield ToolOutput::text(result); }))
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(result); },
+        ))
     }
 }
 
@@ -150,8 +165,12 @@ pub struct SkillDeleteTool<S> {
 }
 
 impl<S: SkillStore + 'static> Tool for SkillDeleteTool<S> {
-    fn name(&self) -> &str { "skill__delete" }
-    fn description(&self) -> &str { "Permanently delete a saved skill by name." }
+    fn name(&self) -> &str {
+        "skill__delete"
+    }
+    fn description(&self) -> &str {
+        "Permanently delete a saved skill by name."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -167,7 +186,8 @@ impl<S: SkillStore + 'static> Tool for SkillDeleteTool<S> {
         _resume: Option<ResumePayload>,
         _ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let name = arguments["name"].as_str()
+        let name = arguments["name"]
+            .as_str()
             .ok_or_else(|| AgentError::tool("skill__delete", "missing 'name'"))?
             .to_string();
         let store = self.store.clone();
@@ -177,6 +197,8 @@ impl<S: SkillStore + 'static> Tool for SkillDeleteTool<S> {
         } else {
             format!("Skill '{name}' not found.")
         };
-        Ok(ToolResult::Output(stream! { yield ToolOutput::text(result); }))
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(result); },
+        ))
     }
 }
