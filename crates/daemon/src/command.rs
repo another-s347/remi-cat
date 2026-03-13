@@ -152,23 +152,39 @@ pub async fn execute_daemon_command(
             // Optional explicit version: /update v1.2.3
             let requested_version: Option<&str> = args.first().map(String::as_str);
 
-            // Without an explicit version, check GitHub for the latest tag and
-            // skip the update if we're already on it.
-            if requested_version.is_none() {
+            // Check whether daemon itself needs updating.
+            // When Docker is present, always restart the agent container even
+            // if the daemon is already on the latest version (they may differ).
+            let daemon_needs_update = if requested_version.is_some() {
+                true // explicit version always forces update
+            } else {
                 let current = env!("CARGO_PKG_VERSION");
-                if let Some(latest) = fetch_latest_github_version().await {
-                    if latest == current {
-                        return Ok(format!("✅ 已是最新版本 **v{current}**，无需更新。"));
-                    }
+                match fetch_latest_github_version().await {
+                    Some(latest) if latest == current => false,
+                    _ => true,
+                }
+            };
+
+            // 1. Restart Agent container (Docker sandbox) if available.
+            let agent_restarted = if let Some(d) = docker {
+                d.restart().await?;
+                true
+            } else {
+                false
+            };
+
+            // 2. Download new Daemon binary (if configured) and restart self.
+            if !daemon_needs_update {
+                let current = env!("CARGO_PKG_VERSION");
+                if agent_restarted {
+                    return Ok(format!(
+                        "✅ Agent 容器已重启（拉取最新镜像）。Daemon 已是最新版本 **v{current}**，无需重启。"
+                    ));
+                } else {
+                    return Ok(format!("✅ 已是最新版本 **v{current}**，无需更新。"));
                 }
             }
 
-            // 1. Restart Agent container (Docker sandbox) if available.
-            if let Some(d) = docker {
-                d.restart().await?;
-            }
-
-            // 2. Download new Daemon binary (if configured) and restart self.
             let download_url = daemon_update_url(requested_version);
             match download_url {
                 None => Ok(
@@ -209,14 +225,15 @@ pub async fn execute_daemon_command(
                 }
                 // /secrets (no subcommand) — render interactive card
                 _ => {
-                    let keys_owned: Vec<String> = secret_store
-                        .read()
-                        .await
+                    let guard = secret_store.read().await;
+                    let keys_info: Vec<(String, bool)> = guard
                         .keys()
                         .into_iter()
-                        .map(str::to_string)
+                        .map(|k| (k.to_string(), guard.is_system(k)))
                         .collect();
-                    let keys_ref: Vec<&str> = keys_owned.iter().map(String::as_str).collect();
+                    drop(guard);
+                    let keys_ref: Vec<(&str, bool)> =
+                        keys_info.iter().map(|(k, s)| (k.as_str(), *s)).collect();
                     let card = build_secret_manager_card(&keys_ref);
                     if let Err(e) = gateway.reply_card_raw(reply_to_id, card).await {
                         return Err(e.context("failed to send secret manager card"));
