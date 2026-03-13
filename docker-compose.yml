@@ -34,6 +34,11 @@ services:
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o}"
 
+      # ── Agent.md path (read-only; outside the agent's writable sandbox) ─
+      # The file is bind-mounted from the host (see volumes below) so only
+      # the host / admin UI can modify it.  The agent cannot write here.
+      AGENT_MD_PATH: "/app/config/Agent.md"
+
       # ── Log level ─────────────────────────────────────────────────────
       RUST_LOG: "${RUST_LOG:-remi_cat_agent=info,bot_core=info}"
 
@@ -44,6 +49,12 @@ services:
     volumes:
       # Persist memory / skill / owner data across container restarts.
       - remi-cat-data:/app/data
+      # Soul.md — writable by the agent (and visible on the host).
+      - ./soul.md:/app/data/Soul.md
+      # Agent.md — read-only inside the container; only host / admin can edit.
+      # Must exist as a file on the host before `docker compose up`.
+      # Run setup.sh or: touch ${REMI_DATA_DIR:-.remi-cat}/Agent.md
+      - ${REMI_DATA_DIR:-.remi-cat}/Agent.md:/app/config/Agent.md:ro
 
 volumes:
   remi-cat-data:

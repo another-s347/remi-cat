@@ -337,8 +337,84 @@ configure_ports() {
     success "Ports — gRPC: ${DAEMON_GRPC_PORT}, mgmt: ${DAEMON_MGMT_PORT}"
 }
 
+# ── install mode selection ─────────────────────────────────────────────────────
+choose_install_mode() {
+    header "Installation mode"
+    echo "  a) Download pre-built release binary  (recommended for production)"
+    echo "  b) Build from source                  (for development / custom builds)"
+    while true; do
+        ask "Choose install mode [a/b] (default: a):"
+        read -r _mode_choice < /dev/tty
+        _mode_choice="${_mode_choice:-a}"
+        case "$_mode_choice" in
+            a|A|release) INSTALL_MODE="release"; break ;;
+            b|B|source)  INSTALL_MODE="source";  break ;;
+            *) warn "Please enter 'a' or 'b'." ;;
+        esac
+    done
+    success "Install mode: ${INSTALL_MODE}"
+}
+
+# ── download pre-built release binaries ───────────────────────────────────────
+download_binaries() {
+    [[ "${INSTALL_MODE:-source}" != "release" ]] && return
+
+    header "Downloading release binaries"
+
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        die "Neither curl nor wget found — cannot download binaries.  Install one and retry."
+    fi
+
+    local base_url
+    if [[ -n "${RELEASE_TAG:-}" && "${RELEASE_TAG}" != "latest" ]]; then
+        base_url="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
+    else
+        base_url="https://github.com/${GITHUB_REPO}/releases/latest/download"
+    fi
+
+    local bin_dir="${PWD}/bin"
+    mkdir -p "$bin_dir"
+
+    _dl() {
+        local url="$1" dest="$2"
+        info "  ↓ ${url}"
+        if command -v curl &>/dev/null; then
+            curl -fL --progress-bar -o "$dest" "$url" || die "Download failed: ${url}"
+        else
+            wget -q --show-progress -O "$dest" "$url" || die "Download failed: ${url}"
+        fi
+        chmod +x "$dest"
+    }
+
+    case "$DEPLOY_MODE" in
+        standalone)
+            _dl "${base_url}/remi-cat-linux-x86_64" "${bin_dir}/remi-cat"
+            STANDALONE_BIN="${bin_dir}/remi-cat"
+            success "Downloaded: ${STANDALONE_BIN}"
+            DAEMON_BIN=""
+            ADMIN_BIN=""
+            ;;
+        daemon)
+            _dl "${base_url}/remi-daemon-linux-x86_64" "${bin_dir}/remi-daemon"
+            DAEMON_BIN="${bin_dir}/remi-daemon"
+            success "Downloaded: ${DAEMON_BIN}"
+
+            if prompt_yn "Also download remi-admin (admin WebUI)?"; then
+                _dl "${base_url}/remi-admin-linux-x86_64" "${bin_dir}/remi-admin"
+                ADMIN_BIN="${bin_dir}/remi-admin"
+                success "Downloaded: ${ADMIN_BIN}"
+            else
+                ADMIN_BIN=""
+            fi
+            STANDALONE_BIN=""
+            ;;
+    esac
+}
+
 # ── build binaries ─────────────────────────────────────────────────────────────
 build_binaries() {
+    [[ "${INSTALL_MODE:-source}" != "source" ]] && return
+
     header "Building Rust binaries"
 
     # Ensure .cargo/env is sourced so cargo is on PATH after fresh rustup install
@@ -371,6 +447,23 @@ build_binaries() {
             fi
             ;;
     esac
+}
+
+# ── release / self-update configuration ──────────────────────────────────────
+configure_updates() {
+    header "Release & self-update configuration"
+    echo
+    info "remi-daemon supports a /update command that downloads and replaces itself."
+    info "These settings are also used to pull the Docker image tag at build time."
+    echo
+
+    GITHUB_REPO=$(prompt_value "GitHub repository (owner/repo)" "another-s347/remi-cat")
+    RELEASE_TAG=$(prompt_value "Release tag to track (used for docker compose build; 'latest' = follow latest)" "latest")
+
+    echo
+    info "By default the daemon constructs the update URL from GITHUB_REPO."
+    info "Set an explicit URL below only if you host binaries elsewhere."
+    DAEMON_UPDATE_URL=$(prompt_optional "Explicit daemon binary download URL (leave blank to use GITHUB_REPO)")
 }
 
 # ── non-secret configuration ───────────────────────────────────────────────────
@@ -570,7 +663,14 @@ EOF
 # ── Data directory ───────────────────────────────────────────────────────────
 REMI_DATA_DIR=${REMI_DATA_DIR}
 EOF
+    # Standalone: record Agent.md path (outside the agent's data_dir sandbox)
+    if [[ "$DEPLOY_MODE" == "standalone" ]]; then
+        cat >> "$env_file" <<EOF
 
+# ── Agent.md path (read-only for the agent; edit directly on the host) ──────────
+AGENT_MD_PATH=./Agent.md
+EOF
+    fi
     # Daemon-specific settings
     if [[ "$DEPLOY_MODE" == "daemon" ]]; then
         cat >> "$env_file" <<EOF
@@ -585,13 +685,30 @@ AGENT_CONTAINER=${AGENT_CONTAINER}
 EOF
     fi
 
+    # ── Self-update / release tracking ────────────────────────────────────
+    cat >> "$env_file" <<EOF
+
+# ── Release & self-update ────────────────────────────────────────────────────
+# GITHUB_REPO is used by both remi-daemon (/update command) and docker compose
+# (GITHUB_REPO build arg in docker-compose.yml).
+GITHUB_REPO=${GITHUB_REPO:-another-s347/remi-cat}
+# RELEASE_TAG controls which image tag docker compose uses for the build arg.
+RELEASE_TAG=${RELEASE_TAG:-latest}
+EOF
+    if [[ -n "${DAEMON_UPDATE_URL:-}" ]]; then
+        echo "# Explicit override URL for remi-daemon binary downloads:" >> "$env_file"
+        echo "DAEMON_UPDATE_URL=${DAEMON_UPDATE_URL}" >> "$env_file"
+    else
+        echo "# DAEMON_UPDATE_URL=  # leave blank to auto-construct from GITHUB_REPO" >> "$env_file"
+    fi
+
     success ".env written (mode 600) → ${env_file}"
 }
 
 # ── generate docker-compose.override.yml (daemon + extra volumes only) ────────
 write_compose_override() {
     [[ "$DEPLOY_MODE" != "daemon" ]] && return
-    [[ ${#VOLUME_MOUNTS[@]:-} -eq 0 ]] && return
+    [[ ${#VOLUME_MOUNTS[@]} -eq 0 ]] && return
 
     header "Writing docker-compose.override.yml"
 
@@ -639,6 +756,117 @@ init_secret_store() {
         warn "Secret store initialization returned an error."
         warn "Your secrets remain in .env.  Re-run manually when ready:"
         warn "  ${DAEMON_BIN} init-env"
+    fi
+}
+
+# ── initialise Agent.md ───────────────────────────────────────────────
+init_agent_md() {
+    header "Agent.md initialisation"
+    echo
+
+    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
+        # Daemon mode: Agent.md lives at <data_dir>/Agent.md on the host and is
+        # bind-mounted into the container as /app/config/Agent.md (read-only).
+        # The agent cannot write to it; only the host / admin UI can.
+        local agent_file="${REMI_DATA_DIR:-".remi-cat"}/Agent.md"
+        mkdir -p "$(dirname "$agent_file")"
+        if [[ -f "$agent_file" ]]; then
+            info "${agent_file} already exists — skipping initialisation."
+        else
+            info "Creating ${agent_file} (bind-mounted read-only into the container)."
+            info "Edit it on the host or via the admin UI. The agent cannot modify it."
+            echo
+            if prompt_yn "Write a default Agent.md now?" "default_n"; then
+                cat > "$agent_file" <<'AGENT'
+# Agent
+
+<!-- Edit this file to define the agent's core instructions, capabilities, and rules. -->
+<!-- Only the host operator or admin UI can change this file. -->
+AGENT
+                success "${agent_file} created"
+            else
+                touch "$agent_file"
+                info "Empty ${agent_file} created (bind mount requires the file to exist)."
+            fi
+        fi
+    else
+        # Standalone mode: Agent.md lives at ./Agent.md (outside data_dir sandbox).
+        # Set AGENT_MD_PATH in .env so the bot reads from here, not data_dir/Agent.md.
+        local agent_file="./Agent.md"
+        if [[ -f "$agent_file" ]]; then
+            info "./Agent.md already exists — skipping initialisation."
+        else
+            info "Creating ./Agent.md outside the agent's data directory sandbox."
+            info "The agent's file tools cannot reach this path."
+            echo
+            if prompt_yn "Write a default Agent.md now?" "default_n"; then
+                cat > "$agent_file" <<'AGENT'
+# Agent
+
+<!-- Edit this file to define the agent's core instructions, capabilities, and rules. -->
+<!-- This file can only be edited directly on the host (not by the agent). -->
+AGENT
+                success "./Agent.md created"
+            else
+                touch "$agent_file"
+                info "Empty ./Agent.md created."
+            fi
+        fi
+    fi
+}
+
+# ── initialise soul.md (daemon mode) ─────────────────────────────────────────
+init_soul_md() {
+    local soul_file="soul.md"
+
+    # Standalone: data_dir/Soul.md is the target; for daemon it's ./soul.md
+    # which is bind-mounted into the container at /app/data/Soul.md.
+    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
+        if [[ -f "$soul_file" ]]; then
+            info "soul.md already exists — skipping initialisation."
+            return
+        fi
+        header "Soul.md initialisation"
+        echo
+        info "soul.md will be bind-mounted into the agent container at /app/data/Soul.md."
+        info "The agent can edit it with its file tools; changes take effect immediately."
+        info "You can also edit it directly on the host at any time."
+        echo
+        if prompt_yn "Write a default soul.md now?" "default_n"; then
+            cat > "$soul_file" <<'SOUL'
+# Soul
+
+<!-- Edit this file to shape the agent's personality, values, and long-term goals. -->
+<!-- Changes take effect on the next message — no restart needed. -->
+SOUL
+            success "soul.md created"
+        else
+            # Create an empty file so the bind mount target exists.
+            touch "$soul_file"
+            info "Empty soul.md created (bind mount requires the file to exist on the host)."
+        fi
+    else
+        # Standalone: soul.md lives at data_dir/Soul.md
+        local standalone_soul="${REMI_DATA_DIR}/Soul.md"
+        if [[ -f "$standalone_soul" ]]; then
+            info "${standalone_soul} already exists — skipping initialisation."
+            return
+        fi
+        header "Soul.md initialisation"
+        echo
+        info "Soul.md will be stored at ${standalone_soul}."
+        info "The agent can edit it with its file tools; changes take effect on the next message."
+        echo
+        if prompt_yn "Write a default Soul.md now?" "default_n"; then
+            mkdir -p "${REMI_DATA_DIR}"
+            cat > "$standalone_soul" <<'SOUL'
+# Soul
+
+<!-- Edit this file to shape the agent's personality, values, and long-term goals. -->
+<!-- Changes take effect on the next message — no restart needed. -->
+SOUL
+            success "${standalone_soul} created"
+        fi
     fi
 }
 
@@ -713,6 +941,9 @@ print_next_steps() {
             success "Secrets have been sealed into the encrypted store."
             info   ".env now contains only non-sensitive runtime config."
             echo
+            info "soul.md (host) is bind-mounted into the container at /app/data/Soul.md."
+            info "Edit it on the host or let the agent edit it — changes are real-time."
+            echo
             echo -e "${BOLD}Run daemon + agent:${RESET}"
             echo "  1. Load runtime config (non-secret):"
             echo "       set -a; source .env; set +a"
@@ -731,7 +962,7 @@ print_next_steps() {
             echo "  Remove a secret     :  ${DAEMON_BIN} secrets delete KEY"
             echo "  Re-import from .env :  ${DAEMON_BIN} init-env"
             echo
-            if [[ ${#VOLUME_MOUNTS[@]:-} -gt 0 ]]; then
+            if [[ ${#VOLUME_MOUNTS[@]} -gt 0 ]]; then
                 echo -e "${BOLD}Extra bind mounts (docker-compose.override.yml):${RESET}"
                 for mount in "${VOLUME_MOUNTS[@]}"; do
                     echo "  ${mount}"
@@ -767,10 +998,19 @@ main() {
     # Mode selection
     choose_deployment_mode
 
+    # Install mode: download release vs build from source
+    choose_install_mode
+
     # Port configuration (daemon mode — before build, no binary needed)
     configure_ports
 
-    # Build
+    # Release / self-update configuration (sets GITHUB_REPO, RELEASE_TAG, DAEMON_UPDATE_URL)
+    configure_updates
+
+    # Download pre-built release binaries (if release mode)
+    download_binaries
+
+    # Build from source (if source mode)
     build_binaries
 
     # Non-secret env vars
@@ -790,6 +1030,10 @@ main() {
 
     # docker-compose.override.yml for extra bind mounts (daemon mode)
     write_compose_override
+
+    # Initialise Agent.md (admin-only) and Soul.md (agent-editable)
+    init_agent_md
+    init_soul_md
 
     # Offer to start services immediately
     offer_start_services

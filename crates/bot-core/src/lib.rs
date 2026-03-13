@@ -307,6 +307,9 @@ pub struct CatBotBuilder {
     system: String,
     skills_dir: PathBuf,
     data_dir: PathBuf,
+    /// If set, Agent.md is read from this path instead of `data_dir/Agent.md`.
+    /// Allows placing Agent.md outside the agent's writable sandbox.
+    agent_md_path: Option<PathBuf>,
     /// None → derive from model profile.
     short_term_tokens: Option<usize>,
     /// None → derive from model profile.
@@ -340,6 +343,7 @@ impl CatBotBuilder {
             Ok("local") => BashMode::Local,
             _ => BashMode::Docker,
         };
+        let agent_md_path = std::env::var("AGENT_MD_PATH").ok().map(PathBuf::from);
         Ok(Self {
             api_key,
             base_url,
@@ -347,6 +351,7 @@ impl CatBotBuilder {
             system: default_system_prompt(),
             skills_dir: PathBuf::from(".remi-cat/skills"),
             data_dir: PathBuf::from(".remi-cat"),
+            agent_md_path,
             short_term_tokens,
             overflow_bytes,
             memory_days,
@@ -424,6 +429,7 @@ impl CatBotBuilder {
 
         let memory = Arc::new(MemoryStore {
             data_dir: self.data_dir,
+            agent_md_path: self.agent_md_path,
             compressor,
             short_term_tokens,
             memory_days: self.memory_days,

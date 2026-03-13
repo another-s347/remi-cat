@@ -45,8 +45,15 @@ pub struct MemoryContext {
 // ── MemoryStore ───────────────────────────────────────────────────────────────
 
 pub struct MemoryStore {
-    /// Root data dir (e.g. `.remi-cat`).  Agent.md / Soul.md are read from here.
+    /// Root data dir (e.g. `.remi-cat`).  Soul.md and all thread data live here.
     pub data_dir: PathBuf,
+    /// If set, `Agent.md` is read from this exact path instead of
+    /// `data_dir/Agent.md`.
+    ///
+    /// Use this to place `Agent.md` **outside** the agent's writable sandbox
+    /// so only an admin / daemon can modify it.  Set via the `AGENT_MD_PATH`
+    /// environment variable.
+    pub agent_md_path: Option<PathBuf>,
     pub compressor: LlmCompressor,
     /// Short-term token budget; overflow triggers compression to mid-term.
     pub short_term_tokens: usize,
@@ -391,7 +398,10 @@ impl MemoryStore {
         // does not block the main turn.
         let _ = self.maybe_promote(thread_id).await;
 
-        let agent_md = read_optional_file(&self.data_dir.join("Agent.md")).await;
+        let agent_md = match &self.agent_md_path {
+            Some(p) => read_optional_file(p).await,
+            None => read_optional_file(&self.data_dir.join("Agent.md")).await,
+        };
         let soul_md = read_optional_file(&self.data_dir.join("Soul.md")).await;
         let long_term = Self::read_index(&self.long_term_dir(thread_id)).await;
         let mid_term = Self::read_index(&self.mid_term_dir(thread_id)).await;
