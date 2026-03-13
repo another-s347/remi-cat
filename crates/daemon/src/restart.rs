@@ -72,8 +72,18 @@ impl RestartHandle {
         .with_context(|| format!("mkfifo({fifo_path})"))?;
 
         // ── Step 3: spawn child ───────────────────────────────────────────
-        let exe = std::fs::read_link("/proc/self/exe")
-            .unwrap_or_else(|_| PathBuf::from(std::env::current_exe().unwrap()));
+        // On Linux, after replacing the running binary, /proc/self/exe resolves
+        // to "<path> (deleted)".  Strip that suffix so we exec the new file.
+        let exe = {
+            let raw = std::fs::read_link("/proc/self/exe")
+                .unwrap_or_else(|_| std::env::current_exe().unwrap());
+            let s = raw.to_string_lossy();
+            if let Some(clean) = s.strip_suffix(" (deleted)") {
+                PathBuf::from(clean)
+            } else {
+                raw
+            }
+        };
 
         let child = std::process::Command::new(&exe)
             .env(READY_FIFO_ENV, &fifo_path)
