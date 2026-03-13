@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use im_feishu::{FeishuGateway, StreamingCard};
 use remi_proto::{
     AgentPayload, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer, ImMessageEvent,
-    ImReactionEvent, SecretsSync,
+    ImReactionEvent, SecretsSync, ShutdownSignal,
 };
 
 use crate::secret_store::SecretStore;
@@ -82,7 +82,7 @@ impl RpcServer {
     /// No-op when no Agent is connected.
     pub async fn sync_secrets_to_agent(&self) {
         let entries: std::collections::HashMap<String, String> =
-            self.secret_store.read().await.all_entries();
+            self.secret_store.read().await.agent_entries();
         let msg = DaemonMessage {
             payload: Some(remi_proto::daemon_message::Payload::SecretsSync(
                 SecretsSync { entries },
@@ -170,8 +170,20 @@ impl DaemonService for RpcServer {
         let (tx, rx) = mpsc::channel::<Result<DaemonMessage, Status>>(256);
         {
             let mut guard = self.agent_sink.lock().await;
-            if guard.is_some() {
-                warn!("replacing existing Agent connection");
+            if let Some(old_tx) = guard.take() {
+                // Tell the existing agent to shut down so it stops reconnecting.
+                // This handles the case where a stale agent process from a
+                // previous daemon run is still alive and competing with the
+                // freshly-spawned one.
+                warn!(peer = %peer, "replacing existing Agent connection — sending Shutdown");
+                let shutdown = DaemonMessage {
+                    payload: Some(remi_proto::daemon_message::Payload::Shutdown(
+                        ShutdownSignal {},
+                    )),
+                };
+                // Best-effort: ignore send errors (old agent may already be gone).
+                let _ = old_tx.send(Ok(shutdown)).await;
+                // Dropping old_tx here closes the old agent's stream.
             }
             *guard = Some(tx);
         }
