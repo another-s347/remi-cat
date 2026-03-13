@@ -3,6 +3,7 @@ members = [
     "crates/im-gateway",
     "crates/im-feishu",
     "crates/matcher",
+    "crates/user-store",
     "crates/bot-core",
     "crates/proto",
     "crates/daemon",

@@ -45,6 +45,7 @@ use mgmt_server::MgmtContext;
 use restart::{signal_ready, RestartHandle};
 use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
 use secret_store::SecretStore;
+use user_store::{PairTokenStore, UserStore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,6 +53,12 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
+
+/// Feishu channel name used when recording channel identities.
+const FEISHU_CHANNEL: &str = "feishu";
+
+/// Command to initiate or complete a cross-channel identity link.
+const PAIR_CHANNEL_COMMAND: &str = "/pair-channel";
 
 /// Maximum number of messages that can be queued per chat before new messages
 /// are rejected with a backpressure reply.
@@ -88,9 +95,19 @@ async fn main() -> Result<()> {
     let data_dir = std::path::PathBuf::from(
         std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into())
     );
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create data dir {data_dir:?}: {e}"))?;
 
     let gateway = FeishuGateway::new(&app_id, &app_secret);
     let matcher = OwnerMatcher::load();
+
+    // ── User identity store ───────────────────────────────────────────────
+    let user_store = Arc::new(
+        UserStore::load(data_dir.join("users.json"))
+            .map_err(|e| anyhow::anyhow!("failed to load user store: {e:#}"))?
+    );
+    let pair_tokens = PairTokenStore::new();
+
     let docker: Option<docker::DockerManager> = if local_mode {
         info!("--local flag set — running without Docker");
         None
@@ -108,12 +125,13 @@ async fn main() -> Result<()> {
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
-    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<FeishuMessage>>>> =
+    // Each item carries the Feishu message together with the resolved user UUID.
+    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
     if let Some(id) = matcher.owner_id() {
-        info!("owner: {id}");
+        info!("owner (uuid): {id}");
     } else {
         info!("no owner set — send '{PAIR_COMMAND}' to claim ownership");
     }
@@ -138,6 +156,7 @@ async fn main() -> Result<()> {
     let mgmt_ctx = MgmtContext {
         docker: docker.clone(),
         owner: matcher.clone(),
+        user_store: Arc::clone(&user_store),
         secret_store: Arc::clone(&secret_store),
         rpc: rpc.clone(),
         data_dir: data_dir.clone(),
@@ -196,20 +215,24 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // ── Resolve channel user ID → internal UUID ────────────────
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &msg.sender_open_id);
+
                 info!(
                     sender = %msg.sender_open_id,
+                    uuid   = %user_uuid,
                     chat   = %msg.chat_id,
                     "received: {text}",
                 );
 
-                // ── Pairing command ────────────────────────────────────────
-                if text.trim() == PAIR_COMMAND {
-                    let reply = match matcher.check(&msg.sender_open_id) {
+                // ── /pair command ──────────────────────────────────────────
+                if text == PAIR_COMMAND {
+                    let reply = match matcher.check(&user_uuid) {
                         OwnerStatus::NeedPairing => {
-                            if matcher.try_pair(&msg.sender_open_id) {
+                            if matcher.try_pair(&user_uuid) {
                                 format!(
-                                    "配对成功！您已成为我的主人。\nYour ID: {}",
-                                    msg.sender_open_id
+                                    "配对成功！您已成为我的主人。\nYour UUID: {}",
+                                    user_uuid
                                 )
                             } else {
                                 "配对失败，请重试。".into()
@@ -219,6 +242,77 @@ async fn main() -> Result<()> {
                         OwnerStatus::NotOwner => "我已有主人 :)".into(),
                     };
                     send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                    continue;
+                }
+
+                // ── /pair-channel command ──────────────────────────────────
+                if text == PAIR_CHANNEL_COMMAND || text.starts_with(&format!("{PAIR_CHANNEL_COMMAND} ")) {
+                    let arg = text.strip_prefix(PAIR_CHANNEL_COMMAND).map(str::trim).unwrap_or("").to_string();
+                    if arg.is_empty() {
+                        // No token provided — generate one.
+                        let token = pair_tokens.create(FEISHU_CHANNEL, &msg.sender_open_id);
+                        let reply = format!(
+                            "🔗 您的频道配对码：**{token}**\n有效期 5 分钟。\n请在另一个频道发送 `/pair-channel {token}` 完成配对。"
+                        );
+                        send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                    } else {
+                        // Token provided — attempt to complete pairing.
+                        match pair_tokens.consume(&arg) {
+                            None => {
+                                send_reply(
+                                    &gateway,
+                                    &msg.message_id,
+                                    &msg.chat_id,
+                                    "⚠️ 配对码无效或已过期，请重新生成。",
+                                ).await;
+                            }
+                            Some(pending) => {
+                                if pending.channel == FEISHU_CHANNEL && pending.user_id == msg.sender_open_id {
+                                    send_reply(
+                                        &gateway,
+                                        &msg.message_id,
+                                        &msg.chat_id,
+                                        "⚠️ 不能将同一账号与自身配对。",
+                                    ).await;
+                                } else {
+                                    // Capture pre-merge UUIDs before the link operation.
+                                    let uuid_pending = user_store.resolve_or_create(&pending.channel, &pending.user_id);
+                                    match user_store.link(
+                                        &pending.channel, &pending.user_id,
+                                        FEISHU_CHANNEL, &msg.sender_open_id,
+                                    ) {
+                                        Ok(merged_uuid) => {
+                                            // If the owner was one of the pre-merge users, update to
+                                            // the merged UUID so ownership is preserved.
+                                            if let Some(owner_uuid) = matcher.owner_id() {
+                                                if (owner_uuid == uuid_pending || owner_uuid == user_uuid)
+                                                    && owner_uuid != merged_uuid
+                                                {
+                                                    matcher.reset();
+                                                    matcher.try_pair(&merged_uuid);
+                                                    info!(old = %owner_uuid, new = %merged_uuid, "owner UUID updated after channel merge");
+                                                }
+                                            }
+                                            let reply = format!(
+                                                "✅ 频道配对成功！两个账号现在共享同一身份。\nUUID: {}",
+                                                merged_uuid
+                                            );
+                                            send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                                        }
+                                        Err(e) => {
+                                            warn!("user link failed: {e:#}");
+                                            send_reply(
+                                                &gateway,
+                                                &msg.message_id,
+                                                &msg.chat_id,
+                                                "❌ 频道配对失败，请稍后重试。",
+                                            ).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -240,7 +334,7 @@ async fn main() -> Result<()> {
                             ).await;
                             continue;
                         }
-                        if !is_owner(&matcher, &msg.sender_open_id) {
+                        if !is_owner(&matcher, &user_uuid) {
                             send_reply(
                                 &gateway,
                                 &msg.message_id,
@@ -278,8 +372,8 @@ async fn main() -> Result<()> {
                     // Non-daemon commands: no owner/chat restriction — forward to Agent.
                 } else {
                     // Regular (non-command) message: owner-only.
-                    if !is_owner(&matcher, &msg.sender_open_id) {
-                        warn!("ignoring message from non-owner {}", msg.sender_open_id);
+                    if !is_owner(&matcher, &user_uuid) {
+                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_open_id, user_uuid);
                         continue;
                     }
                 }
@@ -300,7 +394,7 @@ async fn main() -> Result<()> {
                     }
                     queues[&chat_id].clone()
                 };
-                match queue_tx.try_send(msg) {
+                match queue_tx.try_send((msg, user_uuid)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
@@ -323,32 +417,35 @@ async fn main() -> Result<()> {
             }
 
             FeishuEvent::ReactionReceived(reaction) => {
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_open_id);
                 info!(
                     sender = %reaction.sender_open_id,
+                    uuid   = %user_uuid,
                     emoji  = %reaction.emoji_type,
                     msg    = %reaction.message_id,
                     "reaction received",
                 );
 
-                if !is_owner(&matcher, &reaction.sender_open_id) {
+                if !is_owner(&matcher, &user_uuid) {
                     warn!(
-                        "ignoring reaction from non-owner {}",
-                        reaction.sender_open_id
+                        "ignoring reaction from non-owner {} (uuid: {})",
+                        reaction.sender_open_id, user_uuid
                     );
                     continue;
                 }
 
-                let daemon_msg = daemon_msg_im_reaction(&reaction);
+                let daemon_msg = daemon_msg_im_reaction(&reaction, &user_uuid);
                 if !rpc.send_to_agent(daemon_msg).await {
                     // Reaction with no agent — silently drop.
                 }
             }
 
             FeishuEvent::CardAction { card_message_id, action_value, user_open_id } => {
-                info!(user = %user_open_id, card = %card_message_id, "card action received");
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &user_open_id);
+                info!(user = %user_open_id, uuid = %user_uuid, card = %card_message_id, "card action received");
 
-                if !is_owner(&matcher, &user_open_id) {
-                    warn!("ignoring card action from non-owner {user_open_id}");
+                if !is_owner(&matcher, &user_uuid) {
+                    warn!("ignoring card action from non-owner {} (uuid: {})", user_open_id, user_uuid);
                     continue;
                 }
 
@@ -419,14 +516,17 @@ async fn main() -> Result<()> {
 ///
 /// The worker blocks on one message at a time (enrich → react → agent →
 /// await completion) so messages from the same chat are processed in order.
+///
+/// Each queue item is `(FeishuMessage, user_uuid)` where `user_uuid` is the
+/// internal UUID resolved by the caller before enqueue.
 fn spawn_queue_worker(
     chat_id: String,
     gateway: FeishuGateway,
     rpc: RpcServer,
-) -> mpsc::Sender<FeishuMessage> {
-    let (tx, mut rx) = mpsc::channel::<FeishuMessage>(CHAT_QUEUE_CAPACITY);
+) -> mpsc::Sender<(FeishuMessage, String)> {
+    let (tx, mut rx) = mpsc::channel::<(FeishuMessage, String)>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some((msg, user_uuid)) = rx.recv().await {
             let message_id = msg.message_id.clone();
             let enriched = enrich_message(&gateway, msg).await;
 
@@ -436,7 +536,7 @@ fn spawn_queue_worker(
                 .map_err(|e| warn!("add_reaction failed: {e:#}"))
                 .ok();
 
-            let daemon_msg = daemon_msg_im_message(&enriched);
+            let daemon_msg = daemon_msg_im_message(&enriched, &user_uuid);
             if let Some(completion_rx) = rpc
                 .send_to_agent_and_await(daemon_msg, &message_id)
                 .await

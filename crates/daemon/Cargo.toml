@@ -12,6 +12,7 @@ remi-proto = { path = "../proto" }
 im-feishu = { path = "../im-feishu" }
 im-gateway = { path = "../im-gateway" }
 matcher = { path = "../matcher" }
+user-store = { path = "../user-store" }
 
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"

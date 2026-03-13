@@ -14,6 +14,7 @@ use axum::{
 };
 use mgmt_api::{
     methods, AgentFileParams, ContainerOpParams, MgmtRequest, SecretDeleteParams, SecretSetParams,
+    UserDeleteParams, UserLinkParams, UserUnlinkParams,
 };
 use serde::{Deserialize};
 use serde_json::json;
@@ -310,6 +311,82 @@ pub async fn write_file(
             content: body.content,
         })
         .unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+
+pub async fn list_users(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_LIST.into(),
+        params: serde_json::Value::Null,
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+#[derive(Deserialize)]
+pub struct LinkUsersBody {
+    pub channel_a: String,
+    pub user_id_a: String,
+    pub channel_b: String,
+    pub user_id_b: String,
+}
+
+pub async fn link_users(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+    Json(body): Json<LinkUsersBody>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_LINK.into(),
+        params: serde_json::to_value(UserLinkParams {
+            channel_a: body.channel_a,
+            user_id_a: body.user_id_a,
+            channel_b: body.channel_b,
+            user_id_b: body.user_id_b,
+        })
+        .unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+#[derive(Deserialize)]
+pub struct UnlinkUserBody {
+    pub channel: String,
+    pub user_id: String,
+}
+
+pub async fn unlink_user(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+    Json(body): Json<UnlinkUserBody>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_UNLINK.into(),
+        params: serde_json::to_value(UserUnlinkParams {
+            channel: body.channel,
+            user_id: body.user_id,
+        })
+        .unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+pub async fn delete_user(
+    State(s): State<AppState>,
+    Path((daemon_id, uuid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_DELETE.into(),
+        params: serde_json::to_value(UserDeleteParams { uuid }).unwrap(),
     };
     try_call!(&s, &daemon_id, req)
 }

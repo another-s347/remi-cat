@@ -112,6 +112,11 @@ async fn main() -> Result<()> {
             "/api/daemons/:id/files/:name",
             get(api::read_file).put(api::write_file),
         )
+        // Users
+        .route("/api/daemons/:id/users", get(api::list_users))
+        .route("/api/daemons/:id/users/link", post(api::link_users))
+        .route("/api/daemons/:id/users/unlink", post(api::unlink_user))
+        .route("/api/daemons/:id/users/:uuid", delete(api::delete_user))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
