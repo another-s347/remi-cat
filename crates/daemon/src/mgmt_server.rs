@@ -38,6 +38,8 @@ use mgmt_api::{
     methods, AgentFileParams, AgentFileResult, AuthParams, AuthResult, ContainerOpParams,
     ContainerOpResult, DaemonStatusResult, MgmtRequest, MgmtResponse, OwnerGetResult,
     SecretDeleteParams, SecretEntry, SecretSetParams, VolumeAddParams, VolumeRemoveParams,
+    UserChannel, UserDeleteParams, UserInfo, UserLinkParams, UserLinkResult,
+    UserListResult, UserUnlinkParams,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,6 +54,8 @@ use crate::rpc_server::RpcServer;
 use crate::secret_store::SecretStore;
 use crate::volume_store::VolumeStore;
 use matcher::OwnerMatcher;
+use user_store::UserStore;
+use std::sync::Arc as StdArc;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 const IDENTITY_FILE: &str = "mgmt_identity.json";
@@ -133,6 +137,7 @@ impl MgmtIdentity {
 pub struct MgmtContext {
     pub docker: Option<DockerManager>,
     pub owner: OwnerMatcher,
+    pub user_store: StdArc<UserStore>,
     pub secret_store: Arc<RwLock<SecretStore>>,
     pub volume_store: Arc<RwLock<VolumeStore>>,
     pub rpc: RpcServer,
@@ -349,6 +354,10 @@ impl MgmtServer {
             methods::VOLUME_LIST => self.handle_volume_list(id).await,
             methods::VOLUME_ADD => self.handle_volume_add(id, &req.params).await,
             methods::VOLUME_REMOVE => self.handle_volume_remove(id, &req.params).await,
+            methods::USER_LIST => self.handle_user_list(id).await,
+            methods::USER_LINK => self.handle_user_link(id, &req.params).await,
+            methods::USER_UNLINK => self.handle_user_unlink(id, &req.params).await,
+            methods::USER_DELETE => self.handle_user_delete(id, &req.params).await,
             _ => MgmtResponse::err(id, 404, format!("unknown method: {}", req.method)),
         }
     }
@@ -422,16 +431,6 @@ impl MgmtServer {
                     .cloned()
                     .unwrap_or_else(|| "pull complete".into())
             }),
-            "recreate" => {
-                let mounts = {
-                    let store = self.ctx.volume_store.read().await;
-                    store.mounts().to_vec()
-                };
-                docker
-                    .recreate_with_mounts(&mounts)
-                    .await
-                    .map(|_| "container recreated with updated mounts".to_string())
-            }
             _ => Err(anyhow!("unknown op: {}", p.op)),
         };
         match result {
@@ -533,6 +532,66 @@ impl MgmtServer {
         }
         match tokio::fs::write(&path, p.content.as_bytes()).await {
             Ok(()) => MgmtResponse::ok(id, serde_json::json!({"ok": true})),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    // ── User management handlers ──────────────────────────────────────────────
+
+    async fn handle_user_list(&self, id: &str) -> MgmtResponse {
+        let records = self.ctx.user_store.list();
+        let users: Vec<UserInfo> = records
+            .into_iter()
+            .map(|r| UserInfo {
+                uuid: r.uuid,
+                channels: r
+                    .channels
+                    .into_iter()
+                    .map(|c| UserChannel {
+                        channel: c.channel,
+                        user_id: c.user_id,
+                    })
+                    .collect(),
+            })
+            .collect();
+        match serde_json::to_value(UserListResult { users }) {
+            Ok(v) => MgmtResponse::ok(id, v),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_link(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: UserLinkParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        match self.ctx.user_store.link(&p.channel_a, &p.user_id_a, &p.channel_b, &p.user_id_b) {
+            Ok(uuid) => match serde_json::to_value(UserLinkResult { uuid }) {
+                Ok(v) => MgmtResponse::ok(id, v),
+                Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+            },
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_unlink(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: UserUnlinkParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        match self.ctx.user_store.unlink(&p.channel, &p.user_id) {
+            Ok(removed) => MgmtResponse::ok(id, serde_json::json!({"ok": removed})),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_delete(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: UserDeleteParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        match self.ctx.user_store.delete_by_uuid(&p.uuid) {
+            Ok(deleted) => MgmtResponse::ok(id, serde_json::json!({"ok": deleted})),
             Err(e) => MgmtResponse::err(id, 500, e.to_string()),
         }
     }

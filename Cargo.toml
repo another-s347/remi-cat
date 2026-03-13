@@ -3,6 +3,7 @@ members = [
     "crates/im-gateway",
     "crates/im-feishu",
     "crates/matcher",
+    "crates/user-store",
     "crates/bot-core",
     "crates/proto",
     "crates/daemon",
@@ -10,6 +11,7 @@ members = [
     "crates/mgmt-api",
     "crates/admin-ui",
 ]
+default-members = [".", "crates/daemon", "crates/agent", "crates/admin-ui"]
 resolver = "2"
 
 [package]

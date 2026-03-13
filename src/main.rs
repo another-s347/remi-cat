@@ -58,20 +58,20 @@ async fn main() -> anyhow::Result<()> {
             FeishuEvent::MessageReceived(msg) => {
                 let text = msg.text.trim().to_string();
                 info!(
-                    sender = %msg.sender_open_id,
+                    sender = %msg.sender_user_id,
                     chat   = %msg.chat_id,
                     "received: {text}",
                 );
 
                 // ── Pairing command ────────────────────────────────────
                 if text == PAIR_COMMAND {
-                    let status = matcher.check(&msg.sender_open_id);
+                    let status = matcher.check(&msg.sender_user_id);
                     let reply = match status {
                         OwnerStatus::NeedPairing => {
-                            if matcher.try_pair(&msg.sender_open_id) {
+                            if matcher.try_pair(&msg.sender_user_id) {
                                 format!(
                                     "配对成功！您已成为我的主人。\nYour ID: {}",
-                                    msg.sender_open_id
+                                    msg.sender_user_id
                                 )
                             } else {
                                 "配对失败，请重试。".into()
@@ -88,9 +88,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // ── Non-owner ─────────────────────────────────────────
-                match matcher.check(&msg.sender_open_id) {
+                match matcher.check(&msg.sender_user_id) {
                     OwnerStatus::NeedPairing | OwnerStatus::NotOwner => {
-                        warn!("ignoring message from non-owner {}", msg.sender_open_id);
+                        warn!("ignoring message from non-owner {}", msg.sender_user_id);
                         continue;
                     }
                     OwnerStatus::Owner => {}
@@ -229,18 +229,18 @@ async fn main() -> anyhow::Result<()> {
 
             FeishuEvent::ReactionReceived(reaction) => {
                 info!(
-                    sender = %reaction.sender_open_id,
+                    sender = %reaction.sender_user_id,
                     emoji  = %reaction.emoji_type,
                     msg    = %reaction.message_id,
                     "reaction received",
                 );
 
                 // ── Non-owner ─────────────────────────────────────────
-                match matcher.check(&reaction.sender_open_id) {
+                match matcher.check(&reaction.sender_user_id) {
                     OwnerStatus::NeedPairing | OwnerStatus::NotOwner => {
                         warn!(
                             "ignoring reaction from non-owner {}",
-                            reaction.sender_open_id
+                            reaction.sender_user_id
                         );
                         continue;
                     }

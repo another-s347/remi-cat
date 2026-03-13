@@ -51,9 +51,9 @@ use tools::{
 /// Per-turn options for [`CatBot::stream_with_options`].
 #[derive(Debug, Default, Clone)]
 pub struct StreamOptions {
-    /// Feishu `open_id` of the sender (stored in metadata; injected as a
+    /// UUID of the sender (stored in metadata; injected as a
     /// system annotation in group chats so the LLM can distinguish speakers).
-    pub sender_open_id: Option<String>,
+    pub sender_user_id: Option<String>,
     /// Feishu `message_id` of the incoming message (stored in metadata).
     pub message_id: Option<String>,
     /// Feishu `chat_type` — `"group"` or `"p2p"` (stored in metadata;
@@ -144,7 +144,7 @@ impl CatBot {
 
     /// Stream events with per-turn metadata (sender identity, chat type, etc.).
     ///
-    /// `sender_open_id` and `message_id` are stored as metadata on the user
+    /// `sender_user_id` and `message_id` are stored as metadata on the user
     /// message so they persist in conversation history without polluting the
     /// message body or adding standalone messages.
     pub fn stream_with_options<'a>(
@@ -173,9 +173,9 @@ impl CatBot {
             }
 
             let mut msg_meta = serde_json::Map::new();
-            if let Some(ref sid) = opts.sender_open_id {
-                msg_meta.insert("sender_open_id".into(), serde_json::Value::String(sid.clone()));
-                meta["sender_open_id"] = serde_json::Value::String(sid.clone());
+            if let Some(ref sid) = opts.sender_user_id {
+                msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
+                meta["sender_user_id"] = serde_json::Value::String(sid.clone());
             }
             if let Some(ref mid) = opts.message_id {
                 msg_meta.insert("message_id".into(), serde_json::Value::String(mid.clone()));

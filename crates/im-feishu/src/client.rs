@@ -11,7 +11,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Feishu error code for expired / invalid access token.
+const TOKEN_EXPIRED: i64 = 99991663;
 
 const FEISHU_BASE: &str = "https://open.feishu.cn/open-apis";
 /// Base URL for the WebSocket endpoint (NOT under /open-apis/).
@@ -220,6 +223,16 @@ impl FeishuClient {
 
     /// Send a plain-text message to a chat. Returns the new `message_id`.
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {
+        let res = self.send_text_once(chat_id, text).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("send_text: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.send_text_once(chat_id, text).await;
+        }
+        res
+    }
+
+    async fn send_text_once(&self, chat_id: &str, text: &str) -> Result<String> {
         let content = serde_json::json!({ "text": text }).to_string();
         let token = self.token().await;
 
@@ -248,6 +261,16 @@ impl FeishuClient {
 
     /// Reply to an existing message with plain text. Returns the new `message_id`.
     pub async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
+        let res = self.reply_text_once(message_id, text).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("reply_text: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.reply_text_once(message_id, text).await;
+        }
+        res
+    }
+
+    async fn reply_text_once(&self, message_id: &str, text: &str) -> Result<String> {
         let content = serde_json::json!({ "text": text }).to_string();
         let token = self.token().await;
 
@@ -275,6 +298,16 @@ impl FeishuClient {
 
     /// Send an interactive card to a chat. Returns the new `message_id`.
     pub async fn send_card(&self, chat_id: &str, text: &str) -> Result<String> {
+        let res = self.send_card_once(chat_id, text).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("send_card: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.send_card_once(chat_id, text).await;
+        }
+        res
+    }
+
+    async fn send_card_once(&self, chat_id: &str, text: &str) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
 
@@ -304,6 +337,16 @@ impl FeishuClient {
     /// Reply to an existing message with an interactive card.
     /// Returns the new card `message_id` (used for subsequent [`update_card`] calls).
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
+        let res = self.reply_card_once(message_id, text).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("reply_card: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.reply_card_once(message_id, text).await;
+        }
+        res
+    }
+
+    async fn reply_card_once(&self, message_id: &str, text: &str) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
 
@@ -332,6 +375,16 @@ impl FeishuClient {
     /// Used for streaming: patch the card's content as new text arrives.
     /// Feishu rate-limits card updates; callers should debounce (see [`StreamingCard`]).
     pub async fn update_card(&self, message_id: &str, text: &str) -> Result<()> {
+        let res = self.update_card_once(message_id, text).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("update_card: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.update_card_once(message_id, text).await;
+        }
+        res
+    }
+
+    async fn update_card_once(&self, message_id: &str, text: &str) -> Result<()> {
         let content = card_content(text);
         let token = self.token().await;
 
@@ -354,6 +407,16 @@ impl FeishuClient {
 
     /// Update an existing interactive card with a fully-built card JSON value.
     pub async fn update_card_raw(&self, message_id: &str, card: serde_json::Value) -> Result<()> {
+        let res = self.update_card_raw_once(message_id, card.clone()).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("update_card_raw: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.update_card_raw_once(message_id, card).await;
+        }
+        res
+    }
+
+    async fn update_card_raw_once(&self, message_id: &str, card: serde_json::Value) -> Result<()> {
         let content = card.to_string();
         let token = self.token().await;
 
@@ -381,6 +444,16 @@ impl FeishuClient {
         message_id: &str,
         card: serde_json::Value,
     ) -> Result<String> {
+        let res = self.reply_card_raw_once(message_id, card.clone()).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("reply_card_raw: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.reply_card_raw_once(message_id, card).await;
+        }
+        res
+    }
+
+    async fn reply_card_raw_once(&self, message_id: &str, card: serde_json::Value) -> Result<String> {
         let content = card.to_string();
         let token = self.token().await;
 
@@ -408,6 +481,16 @@ impl FeishuClient {
 
     /// Add an emoji reaction to a message. Returns the `reaction_id`.
     pub async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<String> {
+        let res = self.add_reaction_once(message_id, emoji_type).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("add_reaction: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.add_reaction_once(message_id, emoji_type).await;
+        }
+        res
+    }
+
+    async fn add_reaction_once(&self, message_id: &str, emoji_type: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct ReactionData {
             reaction_id: String,
@@ -441,6 +524,16 @@ impl FeishuClient {
 
     /// Remove a reaction from a message.
     pub async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> Result<()> {
+        let res = self.delete_reaction_once(message_id, reaction_id).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("delete_reaction: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.delete_reaction_once(message_id, reaction_id).await;
+        }
+        res
+    }
+
+    async fn delete_reaction_once(&self, message_id: &str, reaction_id: &str) -> Result<()> {
         let token = self.token().await;
         let resp: ApiResponse = self
             .http
@@ -466,6 +559,20 @@ impl FeishuClient {
         message_id: &str,
         image_key: &str,
     ) -> Result<(String, Vec<u8>)> {
+        let res = self.download_image_once(message_id, image_key).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("download_image: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.download_image_once(message_id, image_key).await;
+        }
+        res
+    }
+
+    async fn download_image_once(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> Result<(String, Vec<u8>)> {
         let token = self.token().await;
         let resp = self
             .http
@@ -477,6 +584,10 @@ impl FeishuClient {
             .await
             .context("download_image")?;
 
+        // 401 HTTP status → treat as token expired
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(anyhow!("download_image error {TOKEN_EXPIRED}: token expired"));
+        }
         if !resp.status().is_success() {
             return Err(anyhow!("download_image HTTP {}", resp.status()));
         }
@@ -494,6 +605,16 @@ impl FeishuClient {
 
     /// Fetch the raw `(msg_type, content_str)` of a message by ID.
     pub async fn get_message_raw(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        let res = self.get_message_raw_once(message_id).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("get_message_raw: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.get_message_raw_once(message_id).await;
+        }
+        res
+    }
+
+    async fn get_message_raw_once(&self, message_id: &str) -> Result<Option<(String, String)>> {
         #[derive(Deserialize)]
         struct GetResp {
             code: i64,
@@ -535,6 +656,35 @@ impl FeishuClient {
         };
         Ok(Some((item.msg_type, item.body.content)))
     }
+
+    /// Delete (withdraw) a message sent by the bot.
+    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        let res = self.delete_message_once(message_id).await;
+        if res.as_ref().err().map(is_token_expired_err).unwrap_or(false) {
+            warn!("delete_message: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.delete_message_once(message_id).await;
+        }
+        res
+    }
+
+    async fn delete_message_once(&self, message_id: &str) -> Result<()> {
+        let token = self.token().await;
+        let resp: ApiResponse = self
+            .http
+            .delete(format!("{FEISHU_BASE}/im/v1/messages/{message_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("delete_message")?
+            .json()
+            .await
+            .context("parse delete_message response")?;
+
+        ensure_ok(resp.code, &resp.msg, "delete_message")?;
+        debug!("Deleted message {message_id}");
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -569,6 +719,12 @@ fn ensure_ok(code: i64, msg: &str, api: &str) -> Result<()> {
     }
 }
 
+/// Returns `true` if the error string contains a Feishu token-expired code.
+fn is_token_expired_err(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains(&TOKEN_EXPIRED.to_string())
+}
+
 fn message_id_from(data: Option<MessageData>) -> String {
     data.map(|d| d.message_id).unwrap_or_default()
 }
@@ -586,7 +742,12 @@ fn message_id_from(data: Option<MessageData>) -> String {
 /// Set form:      `{ "action": "set" }` — the form `input_confirm` callback
 ///                carries the field values in `action.form_value`:
 ///                `{ "new_key": "<KEY>", "new_value": "<VALUE>" }`.
-pub fn build_secret_manager_card(keys: &[&str]) -> serde_json::Value {
+/// Build the secret manager interactive card.
+///
+/// `keys` is a slice of `(key_name, is_system)` pairs.  System secrets are
+/// displayed with a lock indicator and their values are **not** forwarded to
+/// the Agent; a small note makes this visible to the admin.
+pub fn build_secret_manager_card(keys: &[(&str, bool)]) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
     if keys.is_empty() {
@@ -599,7 +760,17 @@ pub fn build_secret_manager_card(keys: &[&str]) -> serde_json::Value {
             "tag": "markdown",
             "content": "**已配置的 Secrets：**"
         }));
-        for key in keys {
+        for (key, is_system) in keys {
+            let label = if *is_system {
+                format!("`{key}` 🔒")
+            } else {
+                format!("`{key}`")
+            };
+            let (toggle_text, toggle_action) = if *is_system {
+                ("🔓 取消系统", "unmark_system")
+            } else {
+                ("🔒 设为系统", "mark_system")
+            };
             elements.push(serde_json::json!({
                 "tag": "column_set",
                 "flex_mode": "stretch",
@@ -607,10 +778,21 @@ pub fn build_secret_manager_card(keys: &[&str]) -> serde_json::Value {
                     {
                         "tag": "column",
                         "width": "weighted",
-                        "weight": 4,
+                        "weight": 3,
                         "elements": [{
                             "tag": "markdown",
-                            "content": format!("`{key}`")
+                            "content": label
+                        }]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 2,
+                        "elements": [{
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": toggle_text },
+                            "type": "default",
+                            "behaviors": [{ "type": "callback", "value": { "action": toggle_action, "key": key } }]
                         }]
                     },
                     {
@@ -619,9 +801,9 @@ pub fn build_secret_manager_card(keys: &[&str]) -> serde_json::Value {
                         "weight": 1,
                         "elements": [{
                             "tag": "button",
-                            "text": { "tag": "plain_text", "content": "🗑️ 删除" },
+                            "text": { "tag": "plain_text", "content": "🗑️" },
                             "type": "danger",
-                            "value": { "action": "delete", "key": key }
+                            "behaviors": [{ "type": "callback", "value": { "action": "delete", "key": key } }]
                         }]
                     }
                 ]

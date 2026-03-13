@@ -6,20 +6,29 @@
 //!   lifecycle + self-update), forwards ordinary messages to the Agent via gRPC.
 //! - Manages a single Agent connection via the `DaemonService` gRPC server.
 //!
+//! # CLI flags / subcommands
+//!
+//! | Subcommand / Flag                      | Description                                                  |
+//! |----------------------------------------|--------------------------------------------------------------|
+//! | *(none)*                               | Start the daemon normally.                                   |
+//! | `--local`                              | Local mode: skip Docker entirely.                            |
+//! | `secrets set <KEY> <VALUE>`            | Write a secret to the encrypted store and exit.              |
+//! | `secrets delete <KEY>`                 | Remove a secret from the encrypted store and exit.           |
+//! | `secrets list`                         | Print all stored secret keys (not values) and exit.          |
+//! | `init-env`                             | Import known keys from `.env` / env vars into the secret    |
+//! |                                        | store, strip those lines from `.env`, then exit.             |
+//! | `init-env --dev`                       | Same, but **keep** `.env` intact (useful during development).|
+//! |                                        |                                                              |
+//!
 //! # Configuration (environment variables)
 //!
-//! # CLI flags
-//!
-//! | Flag      | Description                                                               |
-//! |-----------|---------------------------------------------------------------------------|
-//! | `--local` | Local mode: skip Docker entirely (useful for local debugging).            |
-//!
-//! # Configuration (environment variables)
+//! `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are read from the env var first,
+//! then from the encrypted secret store if the env var is absent.
 //!
 //! | Variable               | Required | Description                                      |
 //! |------------------------|----------|--------------------------------------------------|
-//! | `FEISHU_APP_ID`        | Yes      | Feishu enterprise app ID                         |
-//! | `FEISHU_APP_SECRET`    | Yes      | Feishu enterprise app secret                     |
+//! | `FEISHU_APP_ID`        | Yes*     | Feishu enterprise app ID                         |
+//! | `FEISHU_APP_SECRET`    | Yes*     | Feishu enterprise app secret                     |
 //! | `DAEMON_GRPC_ADDR`     | No       | gRPC listen address (default: `0.0.0.0:50051`)   |
 //! | `DAEMON_MGMT_ADDR`     | No       | Management WS address (default: `0.0.0.0:50052`) |
 //! | `AGENT_CONTAINER`      | No       | Docker container name (default: `remi-cat`)      |
@@ -28,6 +37,8 @@
 //! | `GITHUB_REPO`          | No       | `owner/repo` for auto-constructing update URL    |
 //! | `REMI_CAT_OWNER_ID`    | No       | Pre-configure owner (skip `/pair`)               |
 //! | `RUST_LOG`             | No       | Log filter (default: `remi_daemon=info`)         |
+//!
+//! \* Can also be stored in the encrypted secret store (see `secret_store.rs`).
 
 mod command;
 mod docker;
@@ -38,7 +49,7 @@ mod rpc_server;
 mod secret_store;
 mod volume_store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
 use matcher::{OwnerMatcher, OwnerStatus, PAIR_COMMAND};
@@ -46,6 +57,7 @@ use mgmt_server::MgmtContext;
 use restart::{signal_ready, RestartHandle};
 use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
 use secret_store::SecretStore;
+use user_store::{PairTokenStore, UserStore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,12 +67,65 @@ use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
 use volume_store::VolumeStore;
 
+/// Feishu channel name used when recording channel identities.
+const FEISHU_CHANNEL: &str = "feishu";
+
+/// Command to initiate or complete a cross-channel identity link.
+const PAIR_CHANNEL_COMMAND: &str = "/pair-channel";
+
 /// Maximum number of messages that can be queued per chat before new messages
 /// are rejected with a backpressure reply.
 const CHAT_QUEUE_CAPACITY: usize = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file if present (silently ignored when absent)
+    let _ = dotenvy::dotenv();
+
+    // ── CLI dispatch ──────────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        // secrets set KEY VALUE
+        [cmd, sub, key, value] if cmd == "secrets" && sub == "set" => {
+            let mut store = SecretStore::load(SecretStore::resolve_path())?;
+            store.set(key, value)?;
+            println!(
+                "✅ secret `{key}` saved to {}",
+                SecretStore::resolve_path().display()
+            );
+            return Ok(());
+        }
+        // secrets delete KEY
+        [cmd, sub, key] if cmd == "secrets" && sub == "delete" => {
+            let mut store = SecretStore::load(SecretStore::resolve_path())?;
+            store.delete(key)?;
+            println!("🗑️  secret `{key}` removed");
+            return Ok(());
+        }
+        // secrets list
+        [cmd, sub] if cmd == "secrets" && sub == "list" => {
+            let store = SecretStore::load(SecretStore::resolve_path())?;
+            let keys = store.keys();
+            if keys.is_empty() {
+                println!("(secret store is empty)");
+            } else {
+                println!("stored secret keys ({}):", keys.len());
+                for k in keys {
+                    println!("  {k}");
+                }
+            }
+            return Ok(());
+        }
+        // init-env [--dev] — import .env / env vars into the store
+        [cmd] if cmd == "init-env" => {
+            return cmd_init_env(false);
+        }
+        [cmd, flag] if cmd == "init-env" && flag == "--dev" => {
+            return cmd_init_env(true);
+        }
+        _ => {}
+    }
+
     // ── CLI flags ─────────────────────────────────────────────────────────
     let local_mode = std::env::args().any(|a| a == "--local");
 
@@ -73,10 +138,18 @@ async fn main() -> Result<()> {
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────
-    let app_id =
-        std::env::var("FEISHU_APP_ID").map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
-    let app_secret = std::env::var("FEISHU_APP_SECRET")
-        .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
+    // Load the secret store first so credentials stored there can be used
+    // as a fallback when the corresponding env vars are not set.
+    let secret_store_inner = SecretStore::load(SecretStore::resolve_path())?;
+
+    let app_id = config_or_secret("FEISHU_APP_ID", &secret_store_inner)
+        .ok_or_else(|| anyhow::anyhow!("FEISHU_APP_ID must be set (env var or secret store)"))?;
+    let app_secret =
+        config_or_secret("FEISHU_APP_SECRET", &secret_store_inner).ok_or_else(|| {
+            anyhow::anyhow!("FEISHU_APP_SECRET must be set (env var or secret store)")
+        })?;
+
+    let secret_store = Arc::new(RwLock::new(secret_store_inner));
 
     let grpc_addr: SocketAddr = std::env::var("DAEMON_GRPC_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
@@ -89,9 +162,19 @@ async fn main() -> Result<()> {
     let data_dir = std::path::PathBuf::from(
         std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into()),
     );
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create data dir {data_dir:?}: {e}"))?;
 
     let gateway = FeishuGateway::new(&app_id, &app_secret);
     let matcher = OwnerMatcher::load();
+
+    // ── User identity store ───────────────────────────────────────────────
+    let user_store = Arc::new(
+        UserStore::load(data_dir.join("users.json"))
+            .map_err(|e| anyhow::anyhow!("failed to load user store: {e:#}"))?
+    );
+    let pair_tokens = PairTokenStore::new();
+
     let docker: Option<docker::DockerManager> = if local_mode {
         info!("--local flag set — running without Docker");
         None
@@ -106,17 +189,17 @@ async fn main() -> Result<()> {
     };
     let restart = RestartHandle::new();
     let start_time = Instant::now();
-    let secret_store = Arc::new(RwLock::new(SecretStore::load(SecretStore::resolve_path())?));
     let volume_store = Arc::new(RwLock::new(VolumeStore::load(VolumeStore::resolve_path())?));
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
-    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<FeishuMessage>>>> =
+    // Each item carries the Feishu message together with the resolved user UUID.
+    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
     if let Some(id) = matcher.owner_id() {
-        info!("owner: {id}");
+        info!("owner (uuid): {id}");
     } else {
         info!("no owner set — send '{PAIR_COMMAND}' to claim ownership");
     }
@@ -141,6 +224,7 @@ async fn main() -> Result<()> {
     let mgmt_ctx = MgmtContext {
         docker: docker.clone(),
         owner: matcher.clone(),
+        user_store: Arc::clone(&user_store),
         secret_store: Arc::clone(&secret_store),
         volume_store: Arc::clone(&volume_store),
         rpc: rpc.clone(),
@@ -193,27 +277,31 @@ async fn main() -> Result<()> {
                 // ── Group chat: only handle @-mentions ────────────────────
                 if msg.chat_type == "group" && !msg.at_bot {
                     debug!(
-                        sender = %msg.sender_open_id,
+                        sender = %msg.sender_user_id,
                         chat   = %msg.chat_id,
                         "group message without @bot — skipping",
                     );
                     continue;
                 }
 
+                // ── Resolve channel user ID → internal UUID ────────────────
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &msg.sender_user_id);
+
                 info!(
-                    sender = %msg.sender_open_id,
+                    sender = %msg.sender_user_id,
+                    uuid   = %user_uuid,
                     chat   = %msg.chat_id,
                     "received: {text}",
                 );
 
-                // ── Pairing command ────────────────────────────────────────
-                if text.trim() == PAIR_COMMAND {
-                    let reply = match matcher.check(&msg.sender_open_id) {
+                // ── /pair command ──────────────────────────────────────────
+                if text == PAIR_COMMAND {
+                    let reply = match matcher.check(&user_uuid) {
                         OwnerStatus::NeedPairing => {
-                            if matcher.try_pair(&msg.sender_open_id) {
+                            if matcher.try_pair(&user_uuid) {
                                 format!(
-                                    "配对成功！您已成为我的主人。\nYour ID: {}",
-                                    msg.sender_open_id
+                                    "配对成功！您已成为我的主人。\nYour UUID: {}",
+                                    user_uuid
                                 )
                             } else {
                                 "配对失败，请重试。".into()
@@ -226,10 +314,81 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // ── /pair-channel command ──────────────────────────────────
+                if text == PAIR_CHANNEL_COMMAND || text.starts_with(&format!("{PAIR_CHANNEL_COMMAND} ")) {
+                    let arg = text.strip_prefix(PAIR_CHANNEL_COMMAND).map(str::trim).unwrap_or("").to_string();
+                    if arg.is_empty() {
+                        // No token provided — generate one.
+                        let token = pair_tokens.create(FEISHU_CHANNEL, &msg.sender_user_id);
+                        let reply = format!(
+                            "🔗 您的频道配对码：**{token}**\n有效期 5 分钟。\n请在另一个频道发送 `/pair-channel {token}` 完成配对。"
+                        );
+                        send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                    } else {
+                        // Token provided — attempt to complete pairing.
+                        match pair_tokens.consume(&arg) {
+                            None => {
+                                send_reply(
+                                    &gateway,
+                                    &msg.message_id,
+                                    &msg.chat_id,
+                                    "⚠️ 配对码无效或已过期，请重新生成。",
+                                ).await;
+                            }
+                            Some(pending) => {
+                                if pending.channel == FEISHU_CHANNEL && pending.user_id == msg.sender_user_id {
+                                    send_reply(
+                                        &gateway,
+                                        &msg.message_id,
+                                        &msg.chat_id,
+                                        "⚠️ 不能将同一账号与自身配对。",
+                                    ).await;
+                                } else {
+                                    // Capture pre-merge UUIDs before the link operation.
+                                    let uuid_pending = user_store.resolve_or_create(&pending.channel, &pending.user_id);
+                                    match user_store.link(
+                                        &pending.channel, &pending.user_id,
+                                        FEISHU_CHANNEL, &msg.sender_user_id,
+                                    ) {
+                                        Ok(merged_uuid) => {
+                                            // If the owner was one of the pre-merge users, update to
+                                            // the merged UUID so ownership is preserved.
+                                            if let Some(owner_uuid) = matcher.owner_id() {
+                                                if (owner_uuid == uuid_pending || owner_uuid == user_uuid)
+                                                    && owner_uuid != merged_uuid
+                                                {
+                                                    matcher.reset();
+                                                    matcher.try_pair(&merged_uuid);
+                                                    info!(old = %owner_uuid, new = %merged_uuid, "owner UUID updated after channel merge");
+                                                }
+                                            }
+                                            let reply = format!(
+                                                "✅ 频道配对成功！两个账号现在共享同一身份。\nUUID: {}",
+                                                merged_uuid
+                                            );
+                                            send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                                        }
+                                        Err(e) => {
+                                            warn!("user link failed: {e:#}");
+                                            send_reply(
+                                                &gateway,
+                                                &msg.message_id,
+                                                &msg.chat_id,
+                                                "❌ 频道配对失败，请稍后重试。",
+                                            ).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // ── Command detection ──────────────────────────────────────
                 if let Some(cmd) = im_gateway::ImCommand::parse(
                     &msg.message_id,
-                    &msg.sender_open_id,
+                    &msg.sender_user_id,
                     &msg.chat_id,
                     &text,
                 ) {
@@ -245,7 +404,7 @@ async fn main() -> Result<()> {
                             .await;
                             continue;
                         }
-                        if !is_owner(&matcher, &msg.sender_open_id) {
+                        if !is_owner(&matcher, &user_uuid) {
                             send_reply(
                                 &gateway,
                                 &msg.message_id,
@@ -284,8 +443,8 @@ async fn main() -> Result<()> {
                     // Non-daemon commands: no owner/chat restriction — forward to Agent.
                 } else {
                     // Regular (non-command) message: owner-only.
-                    if !is_owner(&matcher, &msg.sender_open_id) {
-                        warn!("ignoring message from non-owner {}", msg.sender_open_id);
+                    if !is_owner(&matcher, &user_uuid) {
+                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_user_id, user_uuid);
                         continue;
                     }
                 }
@@ -306,7 +465,7 @@ async fn main() -> Result<()> {
                     }
                     queues[&chat_id].clone()
                 };
-                match queue_tx.try_send(msg) {
+                match queue_tx.try_send((msg, user_uuid)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
@@ -329,22 +488,24 @@ async fn main() -> Result<()> {
             }
 
             FeishuEvent::ReactionReceived(reaction) => {
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_user_id);
                 info!(
-                    sender = %reaction.sender_open_id,
+                    sender = %reaction.sender_user_id,
+                    uuid   = %user_uuid,
                     emoji  = %reaction.emoji_type,
                     msg    = %reaction.message_id,
                     "reaction received",
                 );
 
-                if !is_owner(&matcher, &reaction.sender_open_id) {
+                if !is_owner(&matcher, &user_uuid) {
                     warn!(
-                        "ignoring reaction from non-owner {}",
-                        reaction.sender_open_id
+                        "ignoring reaction from non-owner {} (uuid: {})",
+                        reaction.sender_user_id, user_uuid
                     );
                     continue;
                 }
 
-                let daemon_msg = daemon_msg_im_reaction(&reaction);
+                let daemon_msg = daemon_msg_im_reaction(&reaction, &user_uuid);
                 if !rpc.send_to_agent(daemon_msg).await {
                     // Reaction with no agent — silently drop.
                 }
@@ -355,10 +516,11 @@ async fn main() -> Result<()> {
                 action_value,
                 user_open_id,
             } => {
-                info!(user = %user_open_id, card = %card_message_id, "card action received");
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &user_open_id);
+                info!(user = %user_open_id, uuid = %user_uuid, card = %card_message_id, "card action received");
 
-                if !is_owner(&matcher, &user_open_id) {
-                    warn!("ignoring card action from non-owner {user_open_id}");
+                if !is_owner(&matcher, &user_uuid) {
+                    warn!("ignoring card action from non-owner {} (uuid: {})", user_open_id, user_uuid);
                     continue;
                 }
 
@@ -401,23 +563,30 @@ async fn main() -> Result<()> {
                                 info!(key, "secret set via card");
                                 rpc.sync_secrets_to_agent().await;
                             }
+                            "mark_system" => {
+                                let key = action_value["key"].as_str().ok_or_else(|| {
+                                    anyhow::anyhow!("missing key in mark_system action")
+                                })?;
+                                secret_store.write().await.mark_system(key)?;
+                                info!(key, "secret marked as system via card");
+                                rpc.sync_secrets_to_agent().await;
+                            }
+                            "unmark_system" => {
+                                let key = action_value["key"].as_str().ok_or_else(|| {
+                                    anyhow::anyhow!("missing key in unmark_system action")
+                                })?;
+                                secret_store.write().await.unmark_system(key)?;
+                                info!(key, "secret unmarked as system via card");
+                                rpc.sync_secrets_to_agent().await;
+                            }
                             other => {
                                 warn!("unknown card action: {other}");
                                 return Ok(());
                             }
                         }
-                        // Refresh card with updated key list.
-                        let keys_owned: Vec<String> = secret_store
-                            .read()
-                            .await
-                            .keys()
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect();
-                        let keys_ref: Vec<&str> = keys_owned.iter().map(String::as_str).collect();
-                        let card = im_feishu::client::build_secret_manager_card(&keys_ref);
-                        if let Err(e) = gateway.update_card_raw(&card_message_id, card).await {
-                            warn!("update_card_raw after action failed: {e:#}");
+                        // Close the card after a successful action.
+                        if let Err(e) = gateway.delete_message(&card_message_id).await {
+                            warn!("delete card message after action failed: {e:#}");
                         }
                         Ok(())
                     }
@@ -444,14 +613,17 @@ async fn main() -> Result<()> {
 ///
 /// The worker blocks on one message at a time (enrich → react → agent →
 /// await completion) so messages from the same chat are processed in order.
+///
+/// Each queue item is `(FeishuMessage, user_uuid)` where `user_uuid` is the
+/// internal UUID resolved by the caller before enqueue.
 fn spawn_queue_worker(
     chat_id: String,
     gateway: FeishuGateway,
     rpc: RpcServer,
-) -> mpsc::Sender<FeishuMessage> {
-    let (tx, mut rx) = mpsc::channel::<FeishuMessage>(CHAT_QUEUE_CAPACITY);
+) -> mpsc::Sender<(FeishuMessage, String)> {
+    let (tx, mut rx) = mpsc::channel::<(FeishuMessage, String)>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some((msg, user_uuid)) = rx.recv().await {
             let message_id = msg.message_id.clone();
             let enriched = enrich_message(&gateway, msg).await;
 
@@ -461,8 +633,10 @@ fn spawn_queue_worker(
                 .map_err(|e| warn!("add_reaction failed: {e:#}"))
                 .ok();
 
-            let daemon_msg = daemon_msg_im_message(&enriched);
-            if let Some(completion_rx) = rpc.send_to_agent_and_await(daemon_msg, &message_id).await
+            let daemon_msg = daemon_msg_im_message(&enriched, &user_uuid);
+            if let Some(completion_rx) = rpc
+                .send_to_agent_and_await(daemon_msg, &message_id)
+                .await
             {
                 if let Some(rid) = reaction_id {
                     rpc.record_reaction(&message_id, rid).await;
@@ -483,6 +657,15 @@ fn spawn_queue_worker(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Read a configuration value from an env var first, then fall back to the
+/// secret store.  Returns `None` if neither source has the key.
+pub fn config_or_secret(env_var: &str, store: &secret_store::SecretStore) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| store.get(env_var).map(str::to_string))
+}
 
 fn is_owner(matcher: &OwnerMatcher, sender_id: &str) -> bool {
     matches!(matcher.check(sender_id), OwnerStatus::Owner)
@@ -524,4 +707,118 @@ async fn enrich_message(gateway: &FeishuGateway, mut msg: FeishuMessage) -> Feis
     msg.images = data_urls;
 
     msg
+}
+
+// ── init-env subcommand ───────────────────────────────────────────────────────
+
+/// Keys that are moved from `.env` / environment into the secret store by
+/// `remi-daemon init-env` **and** stored as system secrets (not forwarded to
+/// the Agent).
+const SYSTEM_KEYS: &[&str] = &["FEISHU_APP_ID", "FEISHU_APP_SECRET", "OPENAI_API_KEY"];
+
+/// Keys that are moved from `.env` / environment into the secret store by
+/// `remi-daemon init-env`.
+const INIT_ENV_KEYS: &[&str] = &[
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "EXA_API_KEY",
+];
+
+/// Import known credential keys from the environment (already populated by
+/// `dotenvy::dotenv()` above) into the encrypted secret store.
+///
+/// When `dev` is `false` the imported lines are stripped from `.env` so they
+/// are no longer stored in plaintext.  When `dev` is `true` `.env` is left
+/// unchanged (convenient during local development).
+///
+/// Keys that are empty / absent are skipped silently.
+/// Keys that already exist in the store are overwritten.
+fn cmd_init_env(dev: bool) -> Result<()> {
+    let store_path = SecretStore::resolve_path();
+    let mut store = SecretStore::load(store_path.clone())?;
+    let mut imported: Vec<&str> = Vec::new();
+
+    for &key in INIT_ENV_KEYS {
+        let val = std::env::var(key).unwrap_or_default();
+        if val.is_empty() {
+            continue;
+        }
+        if SYSTEM_KEYS.contains(&key) {
+            store.set_system(key, &val)?;
+        } else {
+            store.set(key, &val)?;
+        }
+        imported.push(key);
+    }
+
+    if imported.is_empty() {
+        println!("ℹ️  No credential keys found in environment / .env — nothing imported.");
+        println!("    Expected keys: {}", INIT_ENV_KEYS.join(", "));
+        return Ok(());
+    }
+
+    println!(
+        "✅ Imported {} key(s) into {}",
+        imported.len(),
+        store_path.display()
+    );
+    for k in &imported {
+        println!("   • {k}");
+    }
+
+    if dev {
+        println!("ℹ️  --dev mode: .env left unchanged.");
+    } else {
+        // Strip the imported keys from .env so they are no longer stored as plaintext.
+        let dot_env_path = std::path::Path::new(".env");
+        if dot_env_path.exists() {
+            strip_keys_from_dotenv(dot_env_path, &imported)?;
+            println!("🧹 Removed imported keys from .env");
+        }
+    }
+
+    println!("\nYou can now start the daemon without any credentials in .env:");
+    println!("  cargo run -p remi-daemon -- --local");
+    Ok(())
+}
+
+/// Remove lines that set any of `keys` from a `.env` file in-place.
+/// Lines are matched as `KEY=...` (with optional leading whitespace).
+/// Comment lines and unrelated lines are preserved unchanged.
+fn strip_keys_from_dotenv(path: &std::path::Path, keys: &[&str]) -> Result<()> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    let filtered: String = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            // Keep comment lines and blank lines as-is.
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return true;
+            }
+            // Drop lines that assign one of the imported keys.
+            if let Some(eq) = trimmed.find('=') {
+                let lhs = trimmed[..eq].trim();
+                if keys.contains(&lhs) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Preserve a trailing newline if the original had one.
+    let output = if content.ends_with('\n') {
+        format!("{filtered}\n")
+    } else {
+        filtered
+    };
+
+    std::fs::write(path, output).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }

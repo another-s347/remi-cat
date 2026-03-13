@@ -13,7 +13,7 @@
 //! | 0      | control | `ping`               | reply with pong                 |
 //! | 0      | control | `pong`               | ignore                          |
 //! | 1      | data    | `event`              | parse payload, ACK, forward     |
-//! | 1      | data    | `card`               | ACK, ignore                     |
+//! | 1      | data    | `card`               | parse card action, ACK, forward |
 //!
 //! The ACK for a data frame is the same `PbFrame` echoed back with
 //! `payload = {"code":200}`.
@@ -50,6 +50,7 @@ const METHOD_DATA: i32 = 1;
 const TYPE_PING: &str = "ping";
 const TYPE_PONG: &str = "pong";
 const TYPE_EVENT: &str = "event";
+const TYPE_CARD: &str = "card";
 
 // ── Public event types ────────────────────────────────────────────────────────
 
@@ -77,7 +78,7 @@ pub enum FeishuEvent {
 #[derive(Debug, Clone)]
 pub struct FeishuMessage {
     pub message_id: String,
-    pub sender_open_id: String,
+    pub sender_user_id: String,
     pub chat_id: String,
     /// `"p2p"` for direct messages, `"group"` for group chats.
     pub chat_type: String,
@@ -97,7 +98,7 @@ pub struct FeishuMessage {
 pub struct FeishuReaction {
     pub message_id: String,
     pub chat_id: String,
-    pub sender_open_id: String,
+    pub sender_user_id: String,
     pub emoji_type: String,
 }
 
@@ -304,17 +305,33 @@ impl FeishuGateway {
                     let _ = sink.send(Message::Binary(ack_bytes.into())).await;
 
                     let msg_type = frame.get_header("type").unwrap_or("");
-
-                    if msg_type != TYPE_EVENT {
-                        continue; // unknown — ACKed, nothing else to do
-                    }
+                    debug!(msg_type, seq = frame.seq_id, "METHOD_DATA frame received");
 
                     let payload = match &frame.payload {
                         Some(p) if !p.is_empty() => p,
-                        _ => continue,
+                        _ => {
+                            debug!("METHOD_DATA frame has empty payload — skipping");
+                            continue;
+                        }
                     };
 
-                    if let Some(event) = Self::extract_event(payload, bot_open_id.as_deref()) {
+                    let event = if msg_type == TYPE_EVENT {
+                        debug!(bytes = payload.len(), "dispatching as event");
+                        Self::extract_event(payload, bot_open_id.as_deref())
+                    } else if msg_type == TYPE_CARD {
+                        debug!(bytes = payload.len(), "dispatching as card action");
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            if let Ok(s) = std::str::from_utf8(payload) {
+                                tracing::trace!(raw = s, "card action payload");
+                            }
+                        }
+                        Self::extract_card_action(payload)
+                    } else {
+                        debug!(msg_type, "unknown METHOD_DATA type — skipping");
+                        continue;
+                    };
+
+                    if let Some(event) = event {
                         if tx.send(event).await.is_err() {
                             return Ok(()); // receiver dropped
                         }
@@ -373,7 +390,7 @@ impl FeishuGateway {
 
                 Some(FeishuEvent::MessageReceived(FeishuMessage {
                     message_id: msg.message_id.clone(),
-                    sender_open_id: sender_id,
+                    sender_user_id: sender_id,
                     chat_id: msg.chat_id.clone(),
                     chat_type: msg.chat_type.clone(),
                     text,
@@ -394,7 +411,7 @@ impl FeishuGateway {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .unwrap_or_default();
-                let sender_open_id = event_body
+                let sender_user_id = event_body
                     .get("user_id")?
                     .get("open_id")?
                     .as_str()?
@@ -408,18 +425,53 @@ impl FeishuGateway {
                 Some(FeishuEvent::ReactionReceived(FeishuReaction {
                     message_id,
                     chat_id,
-                    sender_open_id,
+                    sender_user_id,
                     emoji_type,
                 }))
             }
 
             "card.action.trigger" => {
-                let open_id = event_body.get("open_id")?.as_str()?.to_string();
-                let open_message_id = event_body.get("open_message_id")?.as_str()?.to_string();
-                let action = event_body.get("action")?;
-                let mut action_value = action.get("value")?.clone();
+                debug!(event_body = ?event_body, "card.action.trigger received");
+                // open_id is nested under event.operator.open_id.
+                let open_id = event_body
+                    .get("operator")
+                    .and_then(|op| op.get("open_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // open_message_id is nested under event.context.open_message_id.
+                let context = match event_body.get("context") {
+                    Some(c) => c,
+                    None => {
+                        warn!(event_body = ?event_body, "card.action.trigger missing context");
+                        return None;
+                    }
+                };
+                let open_message_id = match context.get("open_message_id").and_then(|v| v.as_str())
+                {
+                    Some(id) => id.to_string(),
+                    None => {
+                        warn!(context = ?context, "card.action.trigger missing context.open_message_id");
+                        return None;
+                    }
+                };
+                let action = match event_body.get("action") {
+                    Some(a) => a,
+                    None => {
+                        warn!(event_body = ?event_body, "card.action.trigger missing action");
+                        return None;
+                    }
+                };
+                debug!(action = ?action, "card action object");
+                // For schema 2.0 with behaviors, the value may come from
+                // action.value directly or may be absent — fall back to empty object.
+                let mut action_value = action
+                    .get("value")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 // Merge form_value fields so callers can read input values directly.
                 if let Some(form_value) = action.get("form_value") {
+                    debug!(form_value = ?form_value, "merging form_value");
                     if let (Some(av), Some(fv)) =
                         (action_value.as_object_mut(), form_value.as_object())
                     {
@@ -428,6 +480,7 @@ impl FeishuGateway {
                         }
                     }
                 }
+                debug!(action_value = ?action_value, open_message_id, "card.action.trigger parsed OK");
                 Some(FeishuEvent::CardAction {
                     card_message_id: open_message_id,
                     action_value,
@@ -447,8 +500,8 @@ impl FeishuGateway {
     /// Feishu sends a JSON body like:
     /// ```json
     /// {
-    ///   "open_id": "ou_...",
-    ///   "open_message_id": "om_...",
+    ///   "operator": { "open_id": "ou_..." },
+    ///   "context": { "open_message_id": "om_...", "open_chat_id": "oc_..." },
     ///   "action": { "value": { ... }, "tag": "button" }
     /// }
     /// ```
@@ -456,12 +509,42 @@ impl FeishuGateway {
         let v: serde_json::Value = serde_json::from_slice(payload)
             .map_err(|e| warn!("card action JSON parse error: {e}"))
             .ok()?;
-        let user_open_id = v.get("open_id")?.as_str()?.to_string();
-        let card_message_id = v.get("open_message_id")?.as_str()?.to_string();
-        let action = v.get("action")?;
+        debug!(raw = ?v, "extract_card_action: parsed JSON");
+        // open_id lives under operator.open_id.
+        let user_open_id = v
+            .get("operator")
+            .and_then(|op| op.get("open_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // open_message_id lives under context.open_message_id.
+        let card_message_id = match v
+            .get("context")
+            .and_then(|c| c.get("open_message_id"))
+            .and_then(|v| v.as_str())
+        {
+            Some(id) => id.to_string(),
+            None => {
+                warn!(
+                    "card action missing context.open_message_id; top-level keys: {:?}",
+                    v.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                );
+                return None;
+            }
+        };
+        let action = match v.get("action") {
+            Some(a) => a,
+            None => {
+                warn!("card action missing 'action' field");
+                return None;
+            }
+        };
         // Merge form_value fields into the button value so callers can read
         // input fields directly from action_value["new_key"] etc.
-        let mut action_value = action.get("value")?.clone();
+        let mut action_value = action
+            .get("value")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         if let Some(form_value) = action.get("form_value") {
             if let (Some(av), Some(fv)) = (action_value.as_object_mut(), form_value.as_object()) {
                 for (k, val) in fv {
@@ -533,6 +616,11 @@ impl FeishuGateway {
         image_key: &str,
     ) -> Result<(String, Vec<u8>)> {
         self.client.download_image(message_id, image_key).await
+    }
+
+    /// Delete (withdraw) a message sent by the bot.
+    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        self.client.delete_message(message_id).await
     }
 
     /// Fetch plain-text content of a message by ID. Returns `None` for unsupported types.

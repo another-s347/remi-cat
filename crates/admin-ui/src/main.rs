@@ -118,6 +118,11 @@ async fn main() -> Result<()> {
             get(api::list_volumes).post(api::add_volume),
         )
         .route("/api/daemons/:id/volumes/remove", post(api::remove_volume))
+        // Users
+        .route("/api/daemons/:id/users", get(api::list_users))
+        .route("/api/daemons/:id/users/link", post(api::link_users))
+        .route("/api/daemons/:id/users/unlink", post(api::unlink_user))
+        .route("/api/daemons/:id/users/:uuid", delete(api::delete_user))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

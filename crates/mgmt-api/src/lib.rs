@@ -101,6 +101,14 @@ pub mod methods {
     pub const VOLUME_ADD: &str = "volume.add";
     /// Remove a volume bind mount configuration.
     pub const VOLUME_REMOVE: &str = "volume.remove";
+    /// List all users (UUID + channel identities).
+    pub const USER_LIST: &str = "user.list";
+    /// Link two channel identities to the same user UUID.
+    pub const USER_LINK: &str = "user.link";
+    /// Unlink a channel identity from its user.
+    pub const USER_UNLINK: &str = "user.unlink";
+    /// Delete a user by UUID (removes all their channel mappings).
+    pub const USER_DELETE: &str = "user.delete";
 }
 
 // ── Typed params / results ────────────────────────────────────────────────────
@@ -224,3 +232,53 @@ pub struct VolumeAddParams {
 pub struct VolumeRemoveParams {
     pub container_path: String,
 }
+// ── User management types ─────────────────────────────────────────────────────
+
+/// A single channel identity (channel name + channel-specific user ID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserChannel {
+    pub channel: String,
+    pub user_id: String,
+}
+
+/// A user record returned by `user.list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub uuid: String,
+    pub channels: Vec<UserChannel>,
+}
+
+/// `user.list` result.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserListResult {
+    pub users: Vec<UserInfo>,
+}
+
+/// `user.link` params — link two channel identities to one UUID.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserLinkParams {
+    pub channel_a: String,
+    pub user_id_a: String,
+    pub channel_b: String,
+    pub user_id_b: String,
+}
+
+/// `user.link` result.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserLinkResult {
+    pub uuid: String,
+}
+
+/// `user.unlink` params — remove a channel identity from its user.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserUnlinkParams {
+    pub channel: String,
+    pub user_id: String,
+}
+
+/// `user.delete` params — delete a user by UUID.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserDeleteParams {
+    pub uuid: String,
+}
+

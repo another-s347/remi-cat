@@ -55,17 +55,33 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            let bot = Rc::new(CatBot::from_env().expect("CatBot init failed"));
-            info!("CatBot ready");
+            // CatBot is initialized lazily: first we try from the current env
+            // (works when OPENAI_API_KEY is already set), and if that fails we wait
+            // for the first SecretsSync from the Daemon which injects the keys from
+            // the encrypted secret store.
+            let mut bot: Option<Rc<CatBot>> = match CatBot::from_env() {
+                Ok(b) => {
+                    info!("CatBot ready (initialized from env)");
+                    Some(Rc::new(b))
+                }
+                Err(e) => {
+                    info!("CatBot not yet ready ({e}); will initialize after SecretsSync");
+                    None
+                }
+            };
 
             let mut backoff = Duration::from_secs(1);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
             loop {
                 info!(addr = %daemon_addr, "connecting to Daemon gRPC");
-                match run_session(&daemon_addr, Rc::clone(&bot)).await {
+                match run_session(&daemon_addr, &mut bot).await {
                     Ok(()) => {
-                        info!("Daemon session ended — reconnecting");
+                        info!("Daemon session ended — reconnecting in 2 s");
+                        // Always sleep before reconnecting to avoid a tight loop
+                        // when the daemon closes the stream immediately (e.g. on
+                        // restart or while another agent instance is being replaced).
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                         backoff = Duration::from_secs(1);
                     }
                     Err(e) => {
@@ -83,7 +99,7 @@ async fn main() -> Result<()> {
 
 // ── Session ───────────────────────────────────────────────────────────────────
 
-async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
+async fn run_session(addr: &str, bot: &mut Option<Rc<CatBot>>) -> Result<()> {
     let channel = Channel::from_shared(addr.to_string())?
         .connect_timeout(Duration::from_secs(10))
         .connect()
@@ -126,6 +142,29 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                 let reply_to = ev.message_id.clone();
                 let trimmed = ev.text.trim().to_string();
 
+                // If CatBot is not yet initialized (waiting for SecretsSync),
+                // reply with a transient error instead of panicking.
+                let Some(bot_rc) = bot.as_ref().map(Rc::clone) else {
+                    let tx = out_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to.clone(),
+                                payload: Some(AgentPayload::TextDelta(AgentTextDelta {
+                                    text: "⚠️ Agent 正在初始化（等待凭证同步），请稍后重试。"
+                                        .into(),
+                                })),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to,
+                                payload: Some(AgentPayload::Done(AgentDone {})),
+                            })
+                            .await;
+                    });
+                    continue;
+                };
                 // ── /cancel — abort the running task for this chat ────────
                 if trimmed == "/cancel" {
                     let reply = if let Some(handle) = active.borrow_mut().remove(&chat_id) {
@@ -156,7 +195,7 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
 
                 // ── /tools — list registered tools ────────────────────────
                 if trimmed == "/tools" {
-                    let bot_t = Rc::clone(&bot);
+                    let bot_t = Rc::clone(&bot_rc);
                     let tx = out_tx.clone();
                     tokio::task::spawn_local(async move {
                         let tools = bot_t.tool_list();
@@ -181,7 +220,7 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                 }
 
                 // ── Regular message — spawn task and track the handle ─────
-                let bot_m = Rc::clone(&bot);
+                let bot_m = Rc::clone(&bot_rc);
                 let tx = out_tx.clone();
                 let active_m = Rc::clone(&active);
                 let chat_id_m = chat_id.clone();
@@ -192,11 +231,12 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                 active.borrow_mut().insert(chat_id, handle);
             }
             DaemonPayload::ImReaction(ev) => {
-                let bot = Rc::clone(&bot);
-                let tx = out_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_reaction(ev, bot, tx).await;
-                });
+                if let Some(bot_rc) = bot.as_ref().map(Rc::clone) {
+                    let tx = out_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        handle_reaction(ev, bot_rc, tx).await;
+                    });
+                }
             }
             DaemonPayload::Shutdown(_) => {
                 info!("received Shutdown signal from Daemon — exiting");
@@ -207,8 +247,25 @@ async fn run_session(addr: &str, bot: Rc<CatBot>) -> Result<()> {
                 // Apply secrets as environment variables, removing any that
                 // were present in the previous sync but are gone now.
                 apply_secrets_sync(sync.entries.clone(), &mut last_secret_keys);
-                // Rebuild the redactor so bash/fs tools scrub the new values.
-                bot.update_secret_redactor(&sync.entries);
+                match bot.as_ref() {
+                    None => {
+                        // First sync — try to initialize CatBot now that API credentials
+                        // have been injected into the environment from the secret store.
+                        match CatBot::from_env() {
+                            Ok(b) => {
+                                info!("CatBot ready (initialized from SecretsSync)");
+                                *bot = Some(Rc::new(b));
+                            }
+                            Err(e) => {
+                                warn!("CatBot init failed after SecretsSync: {e:#}");
+                            }
+                        }
+                    }
+                    Some(b) => {
+                        // Rebuild the redactor so bash/fs tools scrub the new values.
+                        b.update_secret_redactor(&sync.entries);
+                    }
+                }
             }
         }
     }
@@ -328,7 +385,7 @@ async fn handle_message(
     };
 
     let opts = StreamOptions {
-        sender_open_id: Some(ev.sender_open_id.clone()).filter(|s| !s.is_empty()),
+        sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
         chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
     };

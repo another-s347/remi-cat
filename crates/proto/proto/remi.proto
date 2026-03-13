@@ -27,7 +27,7 @@ message SecretsSync {
 
 message ImMessageEvent {
   string          message_id      = 1;
-  string          sender_open_id  = 2;
+  string          sender_user_id  = 2;
   string          chat_id         = 3;
   string          chat_type       = 4;
   string          text            = 5;
@@ -38,7 +38,7 @@ message ImMessageEvent {
 message ImReactionEvent {
   string message_id      = 1;
   string chat_id         = 2;
-  string sender_open_id  = 3;
+  string sender_user_id  = 3;
   string emoji_type      = 4;
 }
 
