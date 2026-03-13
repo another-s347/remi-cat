@@ -1880,6 +1880,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "user-store",
 ]
 
 [[package]]

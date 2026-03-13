@@ -9,14 +9,18 @@
 //! | `OPENAI_API_KEY`     | Yes      | OpenAI-compatible API key            |
 //! | `OPENAI_BASE_URL`    | No       | Custom base URL (e.g. local LLM)     |
 //! | `OPENAI_MODEL`       | No       | Model name (default: gpt-4o)         |
+//! | `REMI_DATA_DIR`      | No       | Data directory (default: `.remi-cat`)|
 
 use base64::Engine as _;
 use bot_core::{CatBot, CatEvent, Content, ContentPart};
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuGateway};
 use matcher::{OwnerMatcher, OwnerStatus, PAIR_COMMAND};
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 use tracing::{error, info, warn};
+use user_store::UserStore;
+
+const FEISHU_CHANNEL: &str = "feishu";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,13 +39,24 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
 
     // ── Components ────────────────────────────────────────────────────────
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into()),
+    );
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create data dir {data_dir:?}: {e}"))?;
+
+    let user_store = Arc::new(
+        UserStore::load(data_dir.join("users.json"))
+            .map_err(|e| anyhow::anyhow!("failed to load user store: {e:#}"))?,
+    );
+
     let gateway = FeishuGateway::new(app_id, app_secret);
     let matcher = OwnerMatcher::load();
     let bot = Rc::new(CatBot::from_env()?);
 
     info!("remi-cat starting up");
     if let Some(id) = matcher.owner_id() {
-        info!("owner: {id}");
+        info!("owner (uuid): {id}");
     } else {
         info!("no owner set — send '{}' to claim ownership", PAIR_COMMAND);
     }
@@ -57,21 +72,25 @@ async fn main() -> anyhow::Result<()> {
         match event {
             FeishuEvent::MessageReceived(msg) => {
                 let text = msg.text.trim().to_string();
+                // Resolve Feishu open_id → internal UUID (creates entry if new).
+                let sender_uuid =
+                    user_store.resolve_or_create(FEISHU_CHANNEL, &msg.sender_user_id);
                 info!(
                     sender = %msg.sender_user_id,
+                    uuid   = %sender_uuid,
                     chat   = %msg.chat_id,
                     "received: {text}",
                 );
 
                 // ── Pairing command ────────────────────────────────────
                 if text == PAIR_COMMAND {
-                    let status = matcher.check(&msg.sender_user_id);
+                    let status = matcher.check(&sender_uuid);
                     let reply = match status {
                         OwnerStatus::NeedPairing => {
-                            if matcher.try_pair(&msg.sender_user_id) {
+                            if matcher.try_pair(&sender_uuid) {
                                 format!(
-                                    "配对成功！您已成为我的主人。\nYour ID: {}",
-                                    msg.sender_user_id
+                                    "配对成功！您已成为我的主人。\nYour UUID: {}",
+                                    sender_uuid
                                 )
                             } else {
                                 "配对失败，请重试。".into()
@@ -88,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // ── Non-owner ─────────────────────────────────────────
-                match matcher.check(&msg.sender_user_id) {
+                match matcher.check(&sender_uuid) {
                     OwnerStatus::NeedPairing | OwnerStatus::NotOwner => {
-                        warn!("ignoring message from non-owner {}", msg.sender_user_id);
+                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_user_id, sender_uuid);
                         continue;
                     }
                     OwnerStatus::Owner => {}

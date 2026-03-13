@@ -23,6 +23,7 @@ edition = "2021"
 im-feishu = { path = "crates/im-feishu" }
 matcher = { path = "crates/matcher" }
 bot-core = { path = "crates/bot-core" }
+user-store = { path = "crates/user-store" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
