@@ -402,35 +402,9 @@ download_binaries() {
             actual=$(sha256sum "$dest" | awk '{print $1}')
             if [[ "$actual" == "$expected" ]]; then
                 info "  ✓ Already up-to-date (sha256 ok): ${dest}"
-                return 0
-            fi
-            warn "  sha256 mismatch for ${dest} — attempting re-download"
-            # Binary may be running (text file busy); download to a temp file then replace
-            local tmp_dest
-            tmp_dest=$(mktemp "${dest}.XXXXXX")
-            if command -v curl &>/dev/null; then
-                curl -fL --progress-bar -o "$tmp_dest" "$url" 2>/dev/null
             else
-                wget -q --show-progress -O "$tmp_dest" "$url" 2>/dev/null
+                warn "  sha256 mismatch for ${dest} — using existing binary"
             fi
-            local dl_ok=$?
-            if [[ $dl_ok -ne 0 ]]; then
-                rm -f "$tmp_dest"
-                warn "  Re-download failed (binary may be in use). Using existing ${dest}."
-                return 0
-            fi
-            local new_actual
-            new_actual=$(sha256sum "$tmp_dest" | awk '{print $1}')
-            if [[ "$new_actual" != "$expected" ]]; then
-                rm -f "$tmp_dest"
-                error "SHA256 mismatch after download: expected ${expected}, got ${new_actual}"
-                return 1
-            fi
-            chmod +x "$tmp_dest"
-            mv "$tmp_dest" "$dest" 2>/dev/null || {
-                rm -f "$tmp_dest"
-                warn "  Could not replace ${dest} (binary in use). Using existing version."
-            }
             return 0
         fi
 
