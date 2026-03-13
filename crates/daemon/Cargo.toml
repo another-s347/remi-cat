@@ -23,8 +23,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Docker API client
-bollard = "0.17"
+# Docker API client — connects via Unix socket only, no TLS needed
+bollard = { version = "0.17", default-features = false }
 
 # HTTP download for self-update
 reqwest = { version = "0.12", default-features = false, features = [

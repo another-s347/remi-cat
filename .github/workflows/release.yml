@@ -32,18 +32,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev protobuf-compiler
+            pkg-config protobuf-compiler musl-tools
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Build release binaries
         run: |
-          cargo build --release \
+          cargo build --release --target x86_64-unknown-linux-musl \
             -p remi-daemon \
             -p remi-cat-agent \
             -p remi-admin
 
       - name: Prepare artifacts
         run: |
-          cd target/release
+          cd target/x86_64-unknown-linux-musl/release
           for bin in remi-daemon remi-cat-agent remi-admin; do
             cp "${bin}" "${bin}-linux-x86_64"
             sha256sum "${bin}-linux-x86_64" > "${bin}-linux-x86_64.sha256"
@@ -56,9 +59,9 @@ jobs:
           name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
-            target/release/remi-daemon-linux-x86_64
-            target/release/remi-daemon-linux-x86_64.sha256
-            target/release/remi-cat-agent-linux-x86_64
-            target/release/remi-cat-agent-linux-x86_64.sha256
-            target/release/remi-admin-linux-x86_64
-            target/release/remi-admin-linux-x86_64.sha256
+            target/x86_64-unknown-linux-musl/release/remi-daemon-linux-x86_64
+            target/x86_64-unknown-linux-musl/release/remi-daemon-linux-x86_64.sha256
+            target/x86_64-unknown-linux-musl/release/remi-cat-agent-linux-x86_64
+            target/x86_64-unknown-linux-musl/release/remi-cat-agent-linux-x86_64.sha256
+            target/x86_64-unknown-linux-musl/release/remi-admin-linux-x86_64
+            target/x86_64-unknown-linux-musl/release/remi-admin-linux-x86_64.sha256
