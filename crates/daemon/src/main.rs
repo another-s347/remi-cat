@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
                 // ── Group chat: only handle @-mentions ────────────────────
                 if msg.chat_type == "group" && !msg.at_bot {
                     debug!(
-                        sender = %msg.sender_open_id,
+                        sender = %msg.sender_user_id,
                         chat   = %msg.chat_id,
                         "group message without @bot — skipping",
                     );
@@ -281,10 +281,10 @@ async fn main() -> Result<()> {
                 }
 
                 // ── Resolve channel user ID → internal UUID ────────────────
-                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &msg.sender_open_id);
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &msg.sender_user_id);
 
                 info!(
-                    sender = %msg.sender_open_id,
+                    sender = %msg.sender_user_id,
                     uuid   = %user_uuid,
                     chat   = %msg.chat_id,
                     "received: {text}",
@@ -315,7 +315,7 @@ async fn main() -> Result<()> {
                     let arg = text.strip_prefix(PAIR_CHANNEL_COMMAND).map(str::trim).unwrap_or("").to_string();
                     if arg.is_empty() {
                         // No token provided — generate one.
-                        let token = pair_tokens.create(FEISHU_CHANNEL, &msg.sender_open_id);
+                        let token = pair_tokens.create(FEISHU_CHANNEL, &msg.sender_user_id);
                         let reply = format!(
                             "🔗 您的频道配对码：**{token}**\n有效期 5 分钟。\n请在另一个频道发送 `/pair-channel {token}` 完成配对。"
                         );
@@ -332,7 +332,7 @@ async fn main() -> Result<()> {
                                 ).await;
                             }
                             Some(pending) => {
-                                if pending.channel == FEISHU_CHANNEL && pending.user_id == msg.sender_open_id {
+                                if pending.channel == FEISHU_CHANNEL && pending.user_id == msg.sender_user_id {
                                     send_reply(
                                         &gateway,
                                         &msg.message_id,
@@ -344,7 +344,7 @@ async fn main() -> Result<()> {
                                     let uuid_pending = user_store.resolve_or_create(&pending.channel, &pending.user_id);
                                     match user_store.link(
                                         &pending.channel, &pending.user_id,
-                                        FEISHU_CHANNEL, &msg.sender_open_id,
+                                        FEISHU_CHANNEL, &msg.sender_user_id,
                                     ) {
                                         Ok(merged_uuid) => {
                                             // If the owner was one of the pre-merge users, update to
@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
                 // ── Command detection ──────────────────────────────────────
                 if let Some(cmd) = im_gateway::ImCommand::parse(
                     &msg.message_id,
-                    &msg.sender_open_id,
+                    &msg.sender_user_id,
                     &msg.chat_id,
                     &text,
                 ) {
@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
                 } else {
                     // Regular (non-command) message: owner-only.
                     if !is_owner(&matcher, &user_uuid) {
-                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_open_id, user_uuid);
+                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_user_id, user_uuid);
                         continue;
                     }
                 }
@@ -484,9 +484,9 @@ async fn main() -> Result<()> {
             }
 
             FeishuEvent::ReactionReceived(reaction) => {
-                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_open_id);
+                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_user_id);
                 info!(
-                    sender = %reaction.sender_open_id,
+                    sender = %reaction.sender_user_id,
                     uuid   = %user_uuid,
                     emoji  = %reaction.emoji_type,
                     msg    = %reaction.message_id,
@@ -496,7 +496,7 @@ async fn main() -> Result<()> {
                 if !is_owner(&matcher, &user_uuid) {
                     warn!(
                         "ignoring reaction from non-owner {} (uuid: {})",
-                        reaction.sender_open_id, user_uuid
+                        reaction.sender_user_id, user_uuid
                     );
                     continue;
                 }

@@ -331,7 +331,7 @@ pub fn daemon_msg_im_message(ev: &im_feishu::FeishuMessage, user_uuid: &str) -> 
     DaemonMessage {
         payload: Some(DaemonPayload::ImMessage(ImMessageEvent {
             message_id: ev.message_id.clone(),
-            sender_open_id: user_uuid.to_string(),
+            sender_user_id: user_uuid.to_string(),
             chat_id: ev.chat_id.clone(),
             chat_type: ev.chat_type.clone(),
             text: ev.text.clone(),
@@ -346,7 +346,7 @@ pub fn daemon_msg_im_reaction(ev: &im_feishu::FeishuReaction, user_uuid: &str) -
         payload: Some(DaemonPayload::ImReaction(ImReactionEvent {
             message_id: ev.message_id.clone(),
             chat_id: ev.chat_id.clone(),
-            sender_open_id: user_uuid.to_string(),
+            sender_user_id: user_uuid.to_string(),
             emoji_type: ev.emoji_type.clone(),
         })),
     }

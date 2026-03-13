@@ -78,7 +78,7 @@ pub enum FeishuEvent {
 #[derive(Debug, Clone)]
 pub struct FeishuMessage {
     pub message_id: String,
-    pub sender_open_id: String,
+    pub sender_user_id: String,
     pub chat_id: String,
     /// `"p2p"` for direct messages, `"group"` for group chats.
     pub chat_type: String,
@@ -98,7 +98,7 @@ pub struct FeishuMessage {
 pub struct FeishuReaction {
     pub message_id: String,
     pub chat_id: String,
-    pub sender_open_id: String,
+    pub sender_user_id: String,
     pub emoji_type: String,
 }
 
@@ -390,7 +390,7 @@ impl FeishuGateway {
 
                 Some(FeishuEvent::MessageReceived(FeishuMessage {
                     message_id: msg.message_id.clone(),
-                    sender_open_id: sender_id,
+                    sender_user_id: sender_id,
                     chat_id: msg.chat_id.clone(),
                     chat_type: msg.chat_type.clone(),
                     text,
@@ -411,7 +411,7 @@ impl FeishuGateway {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .unwrap_or_default();
-                let sender_open_id = event_body
+                let sender_user_id = event_body
                     .get("user_id")?
                     .get("open_id")?
                     .as_str()?
@@ -425,7 +425,7 @@ impl FeishuGateway {
                 Some(FeishuEvent::ReactionReceived(FeishuReaction {
                     message_id,
                     chat_id,
-                    sender_open_id,
+                    sender_user_id,
                     emoji_type,
                 }))
             }
