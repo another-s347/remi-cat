@@ -12,10 +12,11 @@
 //!
 //! # Environment variables
 //!
-//! | Variable            | Default                      | Description        |
-//! |---------------------|------------------------------|--------------------|
-//! | `REMI_ADMIN_PORT`   | `8770`                       | Local HTTP port    |
-//! | `REMI_ADMIN_CONFIG` | `~/.config/remi-admin`       | Config directory   |
+//! | Variable            | Default                      | Description           |
+//! |---------------------|------------------------------|-----------------------|
+//! | `REMI_ADMIN_HOST`   | `127.0.0.1`                  | Local HTTP bind host  |
+//! | `REMI_ADMIN_PORT`   | `8770`                       | Local HTTP port       |
+//! | `REMI_ADMIN_CONFIG` | `~/.config/remi-admin`       | Config directory      |
 
 mod api;
 mod noise_client;
@@ -63,14 +64,22 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("creating config dir {config_dir:?}"))?;
 
+    // ── Host ──────────────────────────────────────────────────────────────
+    let host = std::env::var("REMI_ADMIN_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+
     // ── Port ──────────────────────────────────────────────────────────────
     let port: u16 = std::env::var("REMI_ADMIN_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8770);
 
-    // CLI override: --port N
+    // CLI overrides: --host HOST --port N
     let args: Vec<String> = std::env::args().collect();
+    let host = args
+        .windows(2)
+        .find(|w| w[0] == "--host")
+        .map(|w| w[1].clone())
+        .unwrap_or(host);
     let port = args
         .windows(2)
         .find(|w| w[0] == "--port")
@@ -131,8 +140,8 @@ async fn main() -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{port}");
-    let url = format!("http://localhost:{port}");
+    let addr = format!("{host}:{port}");
+    let url = format!("http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

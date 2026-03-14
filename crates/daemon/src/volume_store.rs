@@ -13,6 +13,19 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use mgmt_api::VolumeMount;
+
+/// The default agent workspace path inside the container.
+/// Must match the WORKDIR + data_dir the agent binary uses.
+const DEFAULT_AGENT_WORKSPACE: &str = "/app/data/.remi-cat";
+
+/// Return the canonical agent workspace prefix for container paths.
+/// Reads `AGENT_WORKSPACE_PATH` env var, falling back to the default.
+fn agent_workspace_prefix() -> String {
+    std::env::var("AGENT_WORKSPACE_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AGENT_WORKSPACE.to_string())
+}
 use tracing::{debug, info};
 
 // ── VolumeStore ───────────────────────────────────────────────────────────────
@@ -70,6 +83,19 @@ impl VolumeStore {
         }
         if !mount.container_path.starts_with('/') {
             anyhow::bail!("container_path must be an absolute path");
+        }
+        let workspace = agent_workspace_prefix();
+        let prefix_with_slash = if workspace.ends_with('/') {
+            workspace.clone()
+        } else {
+            format!("{workspace}/")
+        };
+        if !mount.container_path.starts_with(&prefix_with_slash) {
+            anyhow::bail!(
+                "container_path must be inside the agent workspace ({}); \
+                 e.g. {prefix_with_slash}workspace/my-docs",
+                workspace
+            );
         }
         // Replace existing entry with the same container_path, or append.
         if let Some(existing) = self

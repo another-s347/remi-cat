@@ -678,7 +678,7 @@ configure_volumes() {
 
         local container_path=""
         while true; do
-            container_path=$(prompt_optional "Container path (absolute, e.g. /app/docs)")
+            container_path=$(prompt_optional "Container path (must be inside agent workspace, e.g. /app/data/.remi-cat/workspace/my-docs)")
             if [[ -z "$container_path" ]]; then
                 warn "Container path cannot be empty."; continue
             fi

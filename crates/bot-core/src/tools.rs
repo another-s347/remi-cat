@@ -154,11 +154,11 @@ impl Tool for WorkspaceBashTool {
                  between calls. Write results to files if you need them later."
             }
             BashMode::Docker => {
-                "Execute a bash command inside the Docker container. \
-                 Working directory is the container root (/). \
+                "Execute a bash command in the agent workspace. \
+                 Working directory is the agent workspace root (contains soul.md, memory/, etc.). \
                  ⚠️ Each invocation is a fresh one-time session — no state \
                  (variables, directory changes, background processes) persists \
-                 between calls. The container filesystem is ephemeral and resets on restart."
+                 between calls. Write results to files if you need them later."
             }
         }
     }
@@ -193,15 +193,8 @@ impl Tool for WorkspaceBashTool {
                 tracing::debug!(cmd = %command, timeout_ms, ?mode, "bash: running");
                 let mut cmd = tokio::process::Command::new("bash");
                 cmd.arg("-c").arg(&command);
-                match mode {
-                    BashMode::Local => {
-                        let _ = std::fs::create_dir_all(&root);
-                        cmd.current_dir(&root);
-                    }
-                    BashMode::Docker => {
-                        cmd.current_dir("/");
-                    }
-                }
+                let _ = std::fs::create_dir_all(&root);
+                cmd.current_dir(&root);
                 let run = cmd.output();
                 match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
                     Err(_) => {
