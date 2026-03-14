@@ -61,7 +61,7 @@ echo
 if [[ $SKIP_BUILD -eq 0 ]]; then
     info "Building release binaries..."
     cd "${SCRIPT_DIR}"
-    cargo build --release -p remi-cat -p remi-cat-agent -p remi-daemon -p remi-admin \
+    cargo build --release -p remi-cat-agent -p remi-daemon -p remi-admin \
         2>&1 | grep -E "^error|Compiling remi|Finished"
     success "Build complete"
 else
@@ -73,7 +73,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "${STAGE}"' EXIT
 
 cd "${SCRIPT_DIR}"
-for bin in remi-cat remi-cat-agent remi-daemon remi-admin; do
+for bin in remi-cat-agent remi-daemon remi-admin; do
     src="target/release/${bin}"
     dst="${STAGE}/${bin}-linux-x86_64"
     [[ -f "$src" ]] || { error "Binary not found: ${src}"; exit 1; }

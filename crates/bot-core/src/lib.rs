@@ -42,10 +42,12 @@ use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{AgentBuilder, LoopInput, OpenAIClient, ReqwestTransport};
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 
+use crate::im_tools::register_fetch_tool;
 use memory::{build_injected_history, LlmCompressor, MemoryGetDetailTool};
 use tools::{
     BashMode, ExaSearchTool, NowTool, RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool,
-    RootedFsRemoveTool, RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, WorkspaceBashTool,
+    RootedFsRemoveTool, RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, SleepTool,
+    WorkspaceBashTool,
 };
 
 const REMI_KIMI_THINKING_ENV: &str = "REMI_KIMI_THINKING";
@@ -63,7 +65,7 @@ impl KimiThinkingMode {
             Ok(raw) => Self::parse(&raw).ok_or_else(|| {
                 anyhow::anyhow!("{REMI_KIMI_THINKING_ENV} must be one of: auto, enabled, disabled")
             }),
-            Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Disabled),
             Err(err) => Err(anyhow::anyhow!(
                 "failed to read {REMI_KIMI_THINKING_ENV}: {err}"
             )),
@@ -145,6 +147,11 @@ pub struct StreamOptions {
     pub im_attachments: Vec<ImAttachment>,
     /// Feishu document links referenced by the current message.
     pub im_documents: Vec<ImDocument>,
+    /// Optional cooperative-cancel signal.  When the wrapped [`Notify`] is
+    /// signalled (via `notify_one()`), `stream_with_options` will persist any
+    /// already-generated content and yield a final [`CatEvent::Done`] before
+    /// returning — so memory is not lost on preemption.
+    pub cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 // -- Type aliases -------------------------------------------------------------
@@ -169,7 +176,7 @@ impl CatBot {
     /// | `OPENAI_API_KEY`          | API key (required)                                    |
     /// | `OPENAI_BASE_URL`         | Custom base URL (optional)                            |
     /// | `OPENAI_MODEL`            | Model name (default: `gpt-4o`)                        |
-    /// | `REMI_KIMI_THINKING`      | Moonshot `kimi-k2.5` thinking mode: `auto`, `enabled`, or `disabled` |
+    /// | `REMI_KIMI_THINKING`      | Moonshot `kimi-k2.5` thinking mode override: `auto`, `enabled`, or `disabled` (default when unset: `disabled`) |
     /// | `REMI_SHORT_TERM_TOKENS`  | Override short-term token budget (default: from model profile) |
     /// | `REMI_OVERFLOW_BYTES`     | Override tool-output overflow threshold in bytes (default: from model profile) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
@@ -368,6 +375,8 @@ impl CatBot {
                 "stream_with_options: username propagation"
             );
 
+            let initial_user_state = ctx.user_state.clone();
+
             let mut input = LoopInput::start_content(content)
                 .history(history)
                 .metadata(meta)
@@ -379,28 +388,38 @@ impl CatBot {
                 input = input.message_metadata(mm);
             }
 
+            yield CatEvent::StateUpdate(initial_user_state);
+
             // 4. Drive inner agent, intercept History event to persist.
             let mut raw_history: Option<Vec<Message>> = None;
             let mut raw_user_state: Option<serde_json::Value> = None;
+            let cancel = opts.cancel.clone();
             let inner_stream = self.inner.stream_with_input(input);
             let mut inner_stream = std::pin::pin!(inner_stream);
 
-            while let Some(ev) = inner_stream.next().await {
-                match ev {
-                    CatEvent::History(msgs, us) => {
-                        raw_history = Some(msgs);
-                        raw_user_state = Some(us);
+            loop {
+                // When a cancel notify is present, race the inner stream against
+                // the cancel signal so in-progress content is persisted even when
+                // the task is preempted (e.g. by a newer incoming message).
+                enum SelectOut {
+                    Event(Option<CatEvent>),
+                    Cancelled,
+                }
+                let outcome = if let Some(ref notify) = cancel {
+                    tokio::select! {
+                        ev = inner_stream.next() => SelectOut::Event(ev),
+                        _ = notify.notified() => SelectOut::Cancelled,
                     }
-                    // Persist user_state immediately after each tool round.
-                    CatEvent::StateUpdate(us) => {
-                        if let Err(e) = self.memory.save_user_state(&thread_id_owned, &us).await {
-                            tracing::warn!("memory save_user_state (intermediate) failed: {e:#}");
-                        }
-                    }
-                    // Save memory BEFORE yielding Done/Error — the caller drops
-                    // the stream immediately on these events, so any code after
-                    // this loop would never execute.
-                    CatEvent::Done => {
+                } else {
+                    SelectOut::Event(inner_stream.next().await)
+                };
+
+                match outcome {
+                    SelectOut::Cancelled => {
+                        tracing::info!(
+                            thread_id = %thread_id_owned,
+                            "stream_with_options: cooperative cancel — persisting partial content"
+                        );
                         persist_turn(
                             &self.memory, &thread_id_owned,
                             raw_history.take(), raw_user_state.take(), skip_count,
@@ -408,16 +427,43 @@ impl CatBot {
                         yield CatEvent::Done;
                         return;
                     }
-                    CatEvent::Error(e) => {
-                        // Best-effort save on error (partial history is better than nothing).
-                        persist_turn(
-                            &self.memory, &thread_id_owned,
-                            raw_history.take(), raw_user_state.take(), skip_count,
-                        ).await;
-                        yield CatEvent::Error(e);
-                        return;
-                    }
-                    other => yield other,
+                    SelectOut::Event(None) => break,
+                    SelectOut::Event(Some(ev)) => match ev {
+                        CatEvent::History(msgs, us) => {
+                            raw_history = Some(msgs);
+                            raw_user_state = Some(us);
+                        }
+                        // Persist user_state immediately after each tool round.
+                        CatEvent::StateUpdate(us) => {
+                            yield persist_intermediate_user_state(
+                                &self.memory,
+                                &thread_id_owned,
+                                us,
+                            )
+                            .await;
+                        }
+                        // Save memory BEFORE yielding Done/Error — the caller drops
+                        // the stream immediately on these events, so any code after
+                        // this loop would never execute.
+                        CatEvent::Done => {
+                            persist_turn(
+                                &self.memory, &thread_id_owned,
+                                raw_history.take(), raw_user_state.take(), skip_count,
+                            ).await;
+                            yield CatEvent::Done;
+                            return;
+                        }
+                        CatEvent::Error(e) => {
+                            // Best-effort save on error (partial history is better than nothing).
+                            persist_turn(
+                                &self.memory, &thread_id_owned,
+                                raw_history.take(), raw_user_state.take(), skip_count,
+                            ).await;
+                            yield CatEvent::Error(e);
+                            return;
+                        }
+                        other => yield other,
+                    },
                 }
             }
 
@@ -470,6 +516,17 @@ async fn persist_turn(
             tracing::warn!("memory save_user_state failed: {e:#}");
         }
     }
+}
+
+async fn persist_intermediate_user_state(
+    memory: &MemoryStore,
+    thread_id: &str,
+    user_state: serde_json::Value,
+) -> CatEvent {
+    if let Err(e) = memory.save_user_state(thread_id, &user_state).await {
+        tracing::warn!("memory save_user_state (intermediate) failed: {e:#}");
+    }
+    CatEvent::StateUpdate(user_state)
 }
 
 fn truncate_user_name(name: Option<&str>, max_chars: usize) -> Option<String> {
@@ -835,11 +892,14 @@ impl CatBotBuilder {
             redactor: Arc::clone(&redactor),
         });
 
+        register_fetch_tool(&mut local_tools, data_dir.clone(), self.im_bridge.clone());
+
         // ── Web search (reads EXA_API_KEY from env at call time) ──────────
         local_tools.register(ExaSearchTool::new());
 
         // ── Current time ──────────────────────────────────────────────────
         local_tools.register(NowTool);
+        local_tools.register(SleepTool);
 
         Ok(CatBot {
             inner: CatAgent {
@@ -858,10 +918,49 @@ impl CatBotBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
+        memory::{build_injected_history, MemoryContext, MemoryIndex},
         insert_single_chat_sender_system_prompt, kimi_thinking_extra_options,
         prepend_group_sender_username, single_chat_sender_system_prompt, Content, ContentPart,
-        KimiThinkingMode, Message,
+        KimiThinkingMode, Message, REMI_KIMI_THINKING_ENV,
     };
+    use crate::todo::tools::TodoItem;
+    use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn kimi_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn kimi_k25_enabled_sets_thinking_extra_option() {
@@ -885,6 +984,20 @@ mod tests {
     fn non_toggleable_kimi_models_ignore_override() {
         let options = kimi_thinking_extra_options("kimi-k2-thinking", KimiThinkingMode::Disabled);
         assert!(options.is_empty());
+    }
+
+    #[test]
+    fn kimi_thinking_defaults_to_disabled_when_env_missing() {
+        let _lock = kimi_env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::capture(REMI_KIMI_THINKING_ENV);
+        unsafe {
+            std::env::remove_var(REMI_KIMI_THINKING_ENV);
+        }
+
+        assert_eq!(
+            KimiThinkingMode::from_env().expect("default Kimi thinking mode should resolve"),
+            KimiThinkingMode::Disabled
+        );
     }
 
     #[test]
@@ -971,13 +1084,103 @@ mod tests {
             Some("当前是单聊场景。当前正在与你对话的用户内部ID是 uuid-1。")
         );
     }
+
+    #[test]
+    fn single_chat_sender_prompt_precedes_thread_todo_batch_prompt() {
+        let user_state = json!({
+            "__todos": [TodoItem {
+                id: 1,
+                content: "Draft changelog".to_string(),
+                description: None,
+                done: false,
+                batch_id: Some(1),
+                batch_title: Some("Release launch".to_string()),
+                batch_index: Some(0),
+            }]
+        });
+        let ctx = MemoryContext {
+            agent_md: Some("agent".to_string()),
+            soul_md: Some("soul".to_string()),
+            long_term: MemoryIndex::default(),
+            mid_term: MemoryIndex::default(),
+            short_term: vec![],
+            user_state,
+        };
+
+        let mut history = build_injected_history(&ctx);
+        insert_single_chat_sender_system_prompt(
+            &mut history,
+            2,
+            single_chat_sender_system_prompt(Some("p2p"), Some("Alice"), Some("uuid-1")),
+        );
+
+        let contents: Vec<String> = history
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect();
+        assert_eq!(contents[0], "agent");
+        assert_eq!(contents[1], "soul");
+        assert_eq!(
+            contents[2],
+            "当前是单聊场景。当前正在与你对话的用户是 Alice（内部ID: uuid-1）。"
+        );
+        assert_eq!(
+            contents[3],
+            "[CURRENT TODO BATCH]\nThis thread still has unfinished work under \"Release launch\".\nKeep progress synchronized with todo__complete/update/remove.\nWhen this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.\n- #1 Draft changelog"
+        );
+    }
+
+    #[tokio::test]
+    async fn intermediate_state_updates_are_persisted_and_forwarded() {
+        let data_dir = std::env::temp_dir().join(format!("remi-cat-state-update-{}", Uuid::new_v4()));
+        let memory = super::MemoryStore {
+            data_dir: data_dir.clone(),
+            agent_md_path: None,
+            compressor: super::memory::LlmCompressor::new(
+                "test-key".to_string(),
+                None,
+                "gpt-4o-mini".to_string(),
+                serde_json::Map::new(),
+            ),
+            short_term_tokens: 1024,
+            memory_days: 7,
+        };
+        let user_state = json!({
+            "__todos": [TodoItem {
+                id: 6,
+                content: "Summarize future trends".to_string(),
+                description: None,
+                done: true,
+                batch_id: Some(1),
+                batch_title: Some("Knowledge synthesis".to_string()),
+                batch_index: Some(0),
+            }]
+        });
+
+        let event = super::persist_intermediate_user_state(&memory, "thread-1", user_state.clone()).await;
+
+        match event {
+            super::CatEvent::StateUpdate(forwarded) => assert_eq!(forwarded, user_state),
+            _ => panic!("expected StateUpdate event"),
+        }
+
+        let persisted = tokio::fs::read_to_string(data_dir.join("memory/thread-1/user_state.json"))
+            .await
+            .expect("intermediate user_state should be saved to disk");
+        let persisted: serde_json::Value = serde_json::from_str(&persisted)
+            .expect("persisted user_state should deserialize");
+        assert_eq!(persisted, user_state);
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
 }
 
 fn default_system_prompt() -> String {
     "You are a helpful AI assistant. \
      You have access to skill memory tools (skill__save/get/list/delete) \
      to store and recall reusable procedures, todo tools \
-     (todo__add/list/complete/update/remove) to track multi-step work, \
+     (todo__add/list/complete/update/remove) to track multi-step work per thread; \
+     todo__add creates a titled batch of child todos and returns their IDs, \
      and memory__get_detail to read full compressed memory blocks. \
      Use them when appropriate."
         .to_string()

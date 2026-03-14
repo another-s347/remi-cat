@@ -4,6 +4,7 @@ package remi;
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
+// Bidirectional Agent <-> Daemon control and event stream.
 service DaemonService {
   // Agent connects to Daemon; bidirectional streaming RPC.
   // Agent sends AgentMessage stream; Daemon sends DaemonMessage stream.
@@ -19,7 +20,15 @@ message DaemonMessage {
     ShutdownSignal   shutdown           = 3;
     SecretsSync      secrets_sync       = 4;
     ImBridgeResponse im_bridge_response = 5;
+    ChatCancelSignal chat_cancel        = 6;
   }
+}
+
+// Sent by the Daemon to the Agent to cooperatively cancel the in-flight task
+// for a given chat.  The Agent should stop the current LLM stream, persist any
+// already-generated content, and send Done for the cancelled message_id.
+message ChatCancelSignal {
+  string chat_id = 1;
 }
 
 message SecretsSync {
@@ -80,6 +89,7 @@ message AgentMessage {
     AgentDone       done              = 7;
     AgentError      error             = 8;
     ImBridgeRequest im_bridge_request = 9;
+    AgentTodoState  todo_state        = 10;
   }
 }
 
@@ -96,6 +106,8 @@ message AgentStats      {
   uint32 completion_tokens = 2;
   uint64 elapsed_ms        = 3;
 }
+
+message AgentTodoState { string markdown = 1; }
 
 message AgentDone  {}
 

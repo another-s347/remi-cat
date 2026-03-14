@@ -14,6 +14,7 @@
 //! [System: Agent.md]      (if file exists)
 //! [System: Soul.md]       (if file exists)
 //! [System: current DM user]   (single-chat only; injected per turn)
+//! [System: latest unfinished TODO batch] (if any batch in this thread)
 //! [System: LONG-TERM index]  (if any entries)
 //! [System: MID-TERM index]   (if any entries)
 //! ... short-term messages ...
@@ -42,10 +43,12 @@ pub use tool::MemoryGetDetailTool;
 
 use remi_agentloop::prelude::Message;
 
+use crate::todo::latest_unfinished_batch_system_prompt;
+
 /// Build the full injected message list from a loaded `MemoryContext`.
 ///
 /// Returns messages in the canonical order:
-/// `agent_md → soul_md → long_term index → mid_term index → short_term messages`
+/// `agent_md → soul_md → latest todo batch → long_term index → mid_term index → short_term messages`
 ///
 /// The length of the returned `Vec` is used by `CatBot::stream()` to strip
 /// these injected messages before saving the new turn to disk.
@@ -57,6 +60,9 @@ pub fn build_injected_history(ctx: &MemoryContext) -> Vec<Message> {
     }
     if let Some(text) = &ctx.soul_md {
         msgs.push(Message::system(text.clone()));
+    }
+    if let Some(text) = latest_unfinished_batch_system_prompt(&ctx.user_state) {
+        msgs.push(Message::system(text));
     }
     if !ctx.long_term.entries.is_empty() {
         msgs.push(build_tier_msg("LONG-TERM", &ctx.long_term.entries));

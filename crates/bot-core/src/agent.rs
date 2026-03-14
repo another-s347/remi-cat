@@ -57,7 +57,11 @@ where
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
         let overflow_bytes = self.overflow_bytes;
-        let dynamic_tools = build_dynamic_tools(input_metadata(&input), data_dir.clone(), self.im_bridge.clone());
+        let dynamic_tools = build_dynamic_tools(
+            input_metadata(&input),
+            data_dir.clone(),
+            self.im_bridge.clone(),
+        );
         let mut extra_defs = self.local_tools.definitions(&serde_json::Value::Null);
         extra_defs.extend(dynamic_tools.definitions(&serde_json::Value::Null));
 
@@ -377,7 +381,7 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
     if let Some(ev) = skill::make_skill_event(tc) {
         evs.push(CatEvent::Skill(ev));
     }
-    if let Some(ev) = todo::make_todo_event(tc, result_str) {
+    for ev in todo::make_todo_events(tc, result_str) {
         evs.push(CatEvent::Todo(ev));
     }
     evs

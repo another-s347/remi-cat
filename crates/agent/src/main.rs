@@ -24,13 +24,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bot_core::{
-    CatBot, CatEvent, Content, ContentPart, ImAttachment, ImDocument, ImFileBridge, StreamOptions,
+    todo::current_todo_card_markdown, CatBot, CatEvent, Content, ContentPart, ImAttachment,
+    ImDocument, ImFileBridge, StreamOptions,
 };
 use futures::StreamExt;
 use remi_proto::{
     agent_message::Payload as AgentPayload, AgentDone, AgentError as AgentErrorMsg, AgentMessage,
-    AgentStats, AgentTextDelta, AgentThinking, AgentToolCall, AgentToolResult, DaemonPayload,
-    DaemonServiceClient,
+    AgentStats, AgentTextDelta, AgentThinking, AgentTodoState, AgentToolCall, AgentToolResult,
+    DaemonPayload, DaemonServiceClient,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -119,8 +120,11 @@ async fn run_session(addr: &str) -> Result<()> {
     // remove keys that have been deleted from the store.
     let mut last_secret_keys: HashSet<String> = HashSet::new();
 
-    // Per-chat active task handles — used to abort running LLM calls via /cancel.
-    let active: Rc<RefCell<HashMap<String, tokio::task::JoinHandle<()>>>> =
+// Per-chat active task handles — used to cancel running LLM calls.
+                // Each entry is (join_handle, cancel_notify) so cancellation is
+                // cooperative: signalling the Notify lets stream_with_options
+                // persist partial content and emit Done before the task exits.
+                let active: Rc<RefCell<HashMap<String, (tokio::task::JoinHandle<()>, Arc<tokio::sync::Notify>)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
     // Outgoing channel: per-message tasks → single gRPC outbound stream.
@@ -196,21 +200,22 @@ async fn run_session(addr: &str) -> Result<()> {
                     });
                     continue;
                 };
-                // ── /cancel — abort the running task for this chat ────────
+                // ── /cancel — cooperatively cancel the running task for this chat ──
                 if trimmed == "/cancel" {
-                    let reply = if let Some(handle) = active.borrow_mut().remove(&chat_id) {
-                        handle.abort();
-                        "✅ 已取消正在运行的任务。".to_string()
-                    } else {
-                        "ℹ️ 当前没有正在运行的任务。".to_string()
-                    };
+                    // Signal the active task (if any) to stop gracefully.  The
+                    // daemon's queue worker has already preempted and fired the
+                    // old completion channel, so the old task's eventual Done is
+                    // a no-op; we still signal here for belt-and-suspenders.
+                    if let Some((_, cancel)) = active.borrow_mut().remove(&chat_id) {
+                        cancel.notify_one();
+                    }
                     let tx = out_tx.clone();
                     tokio::task::spawn_local(async move {
                         let _ = tx
                             .send(AgentMessage {
                                 reply_to_message_id: reply_to.clone(),
                                 payload: Some(AgentPayload::TextDelta(AgentTextDelta {
-                                    text: reply,
+                                    text: "✅ 已取消正在运行的任务（如有），已记录的内容将被保存。".into(),
                                 })),
                             })
                             .await;
@@ -251,15 +256,26 @@ async fn run_session(addr: &str) -> Result<()> {
                 }
 
                 // ── Regular message — spawn task and track the handle ─────
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                // If there is already an in-flight task for this chat (shouldn't
+                // normally happen because the daemon preempts via ChatCancelSignal
+                // before sending a new message, but handle it defensively).
+                if let Some((old_handle, old_cancel)) = active.borrow_mut().remove(&chat_id) {
+                    old_cancel.notify_one();
+                    // Allow the old task to drain without blocking; it will send
+                    // Done for its own message_id which is now a daemon no-op.
+                    drop(old_handle);
+                }
                 let bot_m = Rc::clone(&bot_rc);
                 let tx = out_tx.clone();
                 let active_m = Rc::clone(&active);
                 let chat_id_m = chat_id.clone();
+                let cancel_m = Arc::clone(&cancel);
                 let handle = tokio::task::spawn_local(async move {
-                    handle_message(ev, bot_m, tx).await;
+                    handle_message(ev, bot_m, tx, cancel_m).await;
                     active_m.borrow_mut().remove(&chat_id_m);
                 });
-                active.borrow_mut().insert(chat_id, handle);
+                active.borrow_mut().insert(chat_id, (handle, cancel));
             }
             DaemonPayload::ImReaction(ev) => {
                 if let Some(bot_rc) = bot.as_ref().map(Rc::clone) {
@@ -267,6 +283,14 @@ async fn run_session(addr: &str) -> Result<()> {
                     tokio::task::spawn_local(async move {
                         handle_reaction(ev, bot_rc, tx).await;
                     });
+                }
+            }
+            DaemonPayload::ChatCancel(ev) => {
+                // The daemon queue worker preempted an in-flight task for this
+                // chat.  Signal it to stop gracefully (memory will be saved).
+                if let Some((_, cancel)) = active.borrow_mut().remove(&ev.chat_id) {
+                    cancel.notify_one();
+                    info!(chat_id = %ev.chat_id, "received ChatCancelSignal — cooperative cancel signalled");
                 }
             }
             DaemonPayload::Shutdown(_) => {
@@ -346,6 +370,7 @@ async fn handle_message(
     ev: remi_proto::ImMessageEvent,
     bot: Rc<CatBot>,
     tx: mpsc::Sender<AgentMessage>,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     let reply_to = ev.message_id.clone();
 
@@ -437,6 +462,7 @@ async fn handle_message(
                 token: document.token.clone(),
             })
             .collect(),
+        cancel: Some(cancel),
     };
     info!(
         message_id = %ev.message_id,
@@ -547,6 +573,10 @@ async fn forward_stream(
                             prompt_tokens,
                             completion_tokens,
                             elapsed_ms,
+                        })),
+                    CatEvent::StateUpdate(us) =>
+                        Some(AgentPayload::TodoState(AgentTodoState {
+                            markdown: current_todo_card_markdown(&us).unwrap_or_default(),
                         })),
                     CatEvent::Error(e) => {
                         tx.send(AgentMessage {

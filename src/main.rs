@@ -14,7 +14,8 @@
 use base64::Engine as _;
 use bot_core::{
     im_tools::{
-        DownloadedImFile, ImDownloadRequest, ImFileBridge, ImUploadRequest, UploadedImFile,
+        decode_agent_file_key, encode_agent_file_key, DownloadedImFile, ImDownloadRequest,
+        ImFileBridge, ImUploadRequest, UploadedImFile,
     },
     CatBotBuilder, CatEvent, Content, ContentPart, ImAttachment, ImDocument, StreamOptions,
 };
@@ -45,10 +46,20 @@ impl ImFileBridge for LocalImFileBridge {
             }
             let (mime_type, file_name, content, source_label) =
                 if let Some(key) = req.attachment_key.filter(|k| !k.is_empty()) {
-                    let label = format!("attachment:{key}");
+                    let decoded = decode_agent_file_key(&key);
+                    let owner_message_id = decoded
+                        .as_ref()
+                        .map(|value| value.message_id.as_str())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(req.message_id.as_str());
+                    let real_key = decoded
+                        .as_ref()
+                        .map(|value| value.file_key.as_str())
+                        .unwrap_or(key.as_str());
+                    let label = format!("attachment:{real_key}");
                     let (mt, fn_, c) = self
                         .gateway
-                        .download_file(&req.message_id, &key, &req.file_type)
+                        .download_file(owner_message_id, real_key, &req.file_type)
                         .await?;
                     (mt, fn_, c, label)
                 } else if let Some(url) = req.document_url.filter(|u| !u.is_empty()) {
@@ -230,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
                 let bot = std::rc::Rc::clone(&bot);
                 let gateway = gateway.clone();
                 let im_attachments: Vec<ImAttachment> = msg.files.iter().map(|f| ImAttachment {
-                    key: f.file_key.clone(),
+                    key: encode_agent_file_key(&msg.message_id, &f.file_key),
                     name: f.file_name.clone(),
                     mime_type: f.mime_type.clone(),
                     size_bytes: f.size_bytes,

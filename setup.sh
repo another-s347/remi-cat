@@ -5,7 +5,7 @@
 #   1. Checks / installs prerequisites (Rust, protobuf-compiler, pkg-config,
 #      Docker, Docker Compose)
 #   2. Asks which deployment mode you want
-#        a) Standalone  — single binary, no Docker required
+#        a) Local  — remi-daemon --local (daemon + agent on host, no Docker)
 #        b) Daemon+Agent — recommended production setup with Docker
 #   3. Configures network ports (daemon mode)
 #   4. Builds the required Rust binaries
@@ -296,7 +296,7 @@ check_docker() {
         warn "Docker is not installed."
         echo "  Please install Docker Desktop (macOS/Windows) or Docker Engine (Linux):"
         echo "  https://docs.docker.com/engine/install/"
-        if ! prompt_yn "Continue without Docker? (only Standalone mode will be available)"; then
+        if ! prompt_yn "Continue without Docker? (only Local mode will be available)"; then
             exit 1
         fi
         DOCKER_AVAILABLE=false
@@ -314,7 +314,7 @@ check_docker() {
         warn "Docker Compose not found."
         echo "  Please install the Docker Compose plugin:"
         echo "  https://docs.docker.com/compose/install/"
-        if ! prompt_yn "Continue without Docker Compose? (only Standalone mode will be available)"; then
+        if ! prompt_yn "Continue without Docker Compose? (only Local mode will be available)"; then
             exit 1
         fi
         DOCKER_AVAILABLE=false
@@ -331,13 +331,13 @@ choose_deployment_mode() {
         return
     fi
     header "Deployment mode"
-    echo "  a) Standalone  — single binary (remi-cat), no Docker required"
+    echo "  a) Local       — remi-daemon --local (daemon + agent on host, no Docker)"
     echo "                   Good for local testing."
     echo "  b) Daemon+Agent — remi-daemon on the host + remi-cat-agent in Docker"
     echo "                   Recommended for production."
     if [[ "${DOCKER_AVAILABLE:-true}" == "false" ]]; then
-        warn "Docker is not available — only Standalone mode is possible."
-        DEPLOY_MODE="standalone"
+        warn "Docker is not available — only Local mode is possible."
+        DEPLOY_MODE="local"
         return
     fi
     while true; do
@@ -345,8 +345,8 @@ choose_deployment_mode() {
         read -r mode_choice < /dev/tty
         mode_choice="${mode_choice:-b}"
         case "$mode_choice" in
-            a|A|standalone) DEPLOY_MODE="standalone"; break ;;
-            b|B|daemon)     DEPLOY_MODE="daemon";     break ;;
+            a|A|local)  DEPLOY_MODE="local";  break ;;
+            b|B|daemon) DEPLOY_MODE="daemon"; break ;;
             *) warn "Please enter 'a' or 'b'." ;;
         esac
     done
@@ -514,10 +514,10 @@ download_binaries() {
     }
 
     case "$DEPLOY_MODE" in
-        standalone)
-            _dl "remi-cat-linux-x86_64" "${bin_dir}/remi-cat"
-            STANDALONE_BIN="${bin_dir}/remi-cat"
-            DAEMON_BIN=""
+        local)
+            _dl "remi-daemon-linux-x86_64" "${bin_dir}/remi-daemon"
+            _dl "remi-cat-agent-linux-x86_64" "${bin_dir}/remi-cat-agent"
+            DAEMON_BIN="${bin_dir}/remi-daemon"
             ADMIN_BIN=""
             ;;
         daemon)
@@ -530,7 +530,6 @@ download_binaries() {
             else
                 ADMIN_BIN=""
             fi
-            STANDALONE_BIN=""
 
             # docker-compose.yml and Dockerfile are needed by `docker compose up`
             # but not present when running via the curl one-liner.
@@ -557,12 +556,11 @@ build_binaries() {
     fi
 
     case "$DEPLOY_MODE" in
-        standalone)
-            info "Building remi-cat (standalone binary) …"
-            cargo build --release
-            DAEMON_BIN=""
-            STANDALONE_BIN="$(pwd)/target/release/remi-cat"
-            success "Built: ${STANDALONE_BIN}"
+        local)
+            info "Building remi-daemon and remi-cat-agent …"
+            cargo build --release -p remi-daemon -p remi-cat-agent
+            DAEMON_BIN="$(pwd)/target/release/remi-daemon"
+            success "Built: ${DAEMON_BIN} + target/release/remi-cat-agent"
             ;;
         daemon)
             info "Building remi-daemon …"
@@ -623,11 +621,7 @@ configure() {
     OPENAI_BASE_URL=$(prompt_secret_optional "OpenAI-compatible API base URL (e.g. https://api.openai.com/v1)")
 
     # Log level
-    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
-        DEFAULT_LOG="remi_cat_agent=info,bot_core=info,remi_daemon=info"
-    else
-        DEFAULT_LOG="remi_cat=info,bot_core=info"
-    fi
+    DEFAULT_LOG="remi_cat_agent=info,bot_core=info,remi_daemon=info"
     RUST_LOG=$(prompt_value "Log level (RUST_LOG)" "$DEFAULT_LOG")
 
     # Owner pre-configuration
@@ -638,7 +632,8 @@ configure() {
         AGENT_CONTAINER=$(prompt_value "Docker container name for the agent" "remi-cat")
         REMI_DATA_DIR=$(prompt_value "Daemon data directory (host path)" ".remi-cat")
     else
-        REMI_DATA_DIR=$(prompt_value "Bot data directory" ".remi-cat")
+        # local mode: no Docker container needed
+        REMI_DATA_DIR=$(prompt_value "Data directory" ".remi-cat")
         AGENT_CONTAINER=""
     fi
 }
@@ -708,12 +703,12 @@ configure_volumes() {
 
 # ── secret credential input ────────────────────────────────────────────────────
 input_secrets() {
-    # Skip if secrets are already sealed into the encrypted store (daemon mode)
-    if [[ "$DEPLOY_MODE" == "daemon" && "${STEP_SECRET_STORE:-}" == "1" ]]; then
+    # Skip if secrets are already sealed into the encrypted store
+    if [[ ( "$DEPLOY_MODE" == "daemon" || "$DEPLOY_MODE" == "local" ) && "${STEP_SECRET_STORE:-}" == "1" ]]; then
         info "Secrets already sealed in encrypted store — skipping credentials input"
         return
     fi
-    # Skip if .env already exists with credentials (standalone or interrupted after write_env)
+    # Skip if .env already exists with credentials (interrupted after write_env)
     if [[ -f ".env" ]] && grep -q '^FEISHU_APP_ID=.' ".env" 2>/dev/null; then
         info ".env already contains credentials — skipping credentials input"
         return
@@ -722,15 +717,10 @@ input_secrets() {
     header "Secret credentials (input hidden)"
 
     echo
-    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
-        info "Secrets will be written to .env, then imported into the daemon's"
-        info "AES-256-GCM encrypted secret store via 'remi-daemon init-env',"
-        info "after which they are stripped from .env so they are never stored"
-        info "in plaintext on disk."
-    else
-        warn "Standalone mode: secrets will remain in .env (plaintext)."
-        warn "Keep .env protected (chmod 600) and never commit it to git."
-    fi
+    info "Secrets will be written to .env, then imported into the daemon's"
+    info "AES-256-GCM encrypted secret store via 'remi-daemon init-env',"
+    info "after which they are stripped from .env so they are never stored"
+    info "in plaintext on disk."
     echo
 
     FEISHU_APP_ID=$(prompt_secret     "Feishu App ID      (e.g. cli_xxxxxxxxxxxxxxxx)")
@@ -763,19 +753,11 @@ write_env() {
 EOF
 
     # ── Secrets section ───────────────────────────────────────────────────
-    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
-        cat >> "$env_file" <<EOF
+    cat >> "$env_file" <<EOF
 # ── Feishu / LLM credentials (imported into secret store by init-env) ────────
 # These lines are temporary — 'remi-daemon init-env' will strip them after
 # importing them into the AES-256-GCM encrypted secret store.
 EOF
-    else
-        cat >> "$env_file" <<EOF
-# ── Feishu / LLM credentials ─────────────────────────────────────────────────
-# WARNING: standalone mode — secrets remain in this file (plaintext).
-# Run: chmod 600 .env   and never commit this file to version control.
-EOF
-    fi
 
     cat >> "$env_file" <<EOF
 FEISHU_APP_ID=${FEISHU_APP_ID}
@@ -833,15 +815,7 @@ EOF
 # ── Data directory ───────────────────────────────────────────────────────────
 REMI_DATA_DIR=${REMI_DATA_DIR}
 EOF
-    # Standalone: record Agent.md path (outside the agent's data_dir sandbox)
-    if [[ "$DEPLOY_MODE" == "standalone" ]]; then
-        cat >> "$env_file" <<EOF
-
-# ── Agent.md path (read-only for the agent; edit directly on the host) ──────────
-AGENT_MD_PATH=./Agent.md
-EOF
-    fi
-    # Daemon-specific settings
+    # Mode-specific network settings
     if [[ "$DEPLOY_MODE" == "daemon" ]]; then
         cat >> "$env_file" <<EOF
 
@@ -852,6 +826,13 @@ DAEMON_MGMT_ADDR=${DAEMON_MGMT_ADDR}
 
 # ── Docker agent container name ──────────────────────────────────────────────
 AGENT_CONTAINER=${AGENT_CONTAINER}
+EOF
+    elif [[ "$DEPLOY_MODE" == "local" ]]; then
+        cat >> "$env_file" <<EOF
+
+# ── Daemon network (local mode — daemon spawns agent directly) ───────────────
+DAEMON_GRPC_ADDR=127.0.0.1:50051
+DAEMON_MGMT_ADDR=0.0.0.0:50052
 EOF
     fi
 
@@ -901,9 +882,9 @@ write_compose_override() {
     done
 }
 
-# ── import secrets into the encrypted secret store (daemon mode only) ─────────
+# ── import secrets into the encrypted secret store ───────────────────────────
 init_secret_store() {
-    [[ "$DEPLOY_MODE" != "daemon" ]] && return
+    [[ "$DEPLOY_MODE" != "daemon" && "$DEPLOY_MODE" != "local" ]] && return
     # Skip if already completed (secrets.key exists = store was initialized)
     local key_file="${REMI_DATA_DIR:-.remi-cat}/secrets.key"
     if [[ "${STEP_SECRET_STORE:-}" == "1" ]] || [[ -f "$key_file" ]]; then
@@ -943,10 +924,10 @@ init_agent_md() {
     header "Agent.md initialisation"
     echo
 
-    if [[ "$DEPLOY_MODE" == "daemon" ]]; then
-        # Daemon mode: Agent.md lives at <data_dir>/Agent.md on the host and is
-        # bind-mounted into the container as /app/config/Agent.md (read-only).
-        # The agent cannot write to it; only the host / admin UI can.
+    if [[ "$DEPLOY_MODE" == "daemon" || "$DEPLOY_MODE" == "local" ]]; then
+        # Daemon/local mode: Agent.md lives at <data_dir>/Agent.md on the host.
+        # In daemon mode it is bind-mounted read-only into the container.
+        # In local mode the agent reads it directly from the data directory.
         local agent_file="${REMI_DATA_DIR:-".remi-cat"}/Agent.md"
         mkdir -p "$(dirname "$agent_file")"
         if [[ -f "$agent_file" ]]; then
@@ -1047,108 +1028,6 @@ AGENT
                 info "Empty ${agent_file} created (bind mount requires the file to exist)."
             fi
         fi
-    else
-        # Standalone mode: Agent.md lives at ./Agent.md (outside data_dir sandbox).
-        # Set AGENT_MD_PATH in .env so the bot reads from here, not data_dir/Agent.md.
-        local agent_file="./Agent.md"
-        if [[ -f "$agent_file" ]]; then
-            info "./Agent.md already exists — skipping initialisation."
-        else
-            info "Creating ./Agent.md outside the agent's data directory sandbox."
-            info "The agent's file tools cannot reach this path."
-            echo
-            if prompt_yn "Write a default Agent.md now?" "default_n"; then
-                local _raw_ref="${RELEASE_TAG:-main}"
-                [[ "$_raw_ref" == "latest" ]] && _raw_ref="main"
-                local _raw_url="https://raw.githubusercontent.com/${GITHUB_REPO:-another-s347/remi-cat}/${_raw_ref}/Agent.md"
-                local _agent_fallback=0
-                if command -v curl &>/dev/null; then
-                    curl -fsSL --retry 3 --retry-delay 2 -o "$agent_file" "$_raw_url" 2>/dev/null || _agent_fallback=1
-                elif command -v wget &>/dev/null; then
-                    wget -q -t 3 -O "$agent_file" "$_raw_url" 2>/dev/null || _agent_fallback=1
-                else
-                    _agent_fallback=1
-                fi
-                if [[ "$_agent_fallback" == "1" ]]; then
-                    warn "Could not download Agent.md from GitHub — writing built-in default."
-                    cat > "$agent_file" <<'AGENT'
-# Agent
-
-## 1. 基本身份
-
-你是 Remi，一个运行在 remi-cat 框架上的 AI 助手。你通过即时通讯平台（如飞书）与用户交流，能够执行工具调用、管理任务、访问记忆，并在多轮对话中保持上下文连贯。
-
-默认情况下，你面向**多用户对话**，而不是只和 owner 对话。普通用户可以直接与你交流。
-
-但**系统命令**仍然只有 owner 可以执行；被加入黑名单的用户不会获得对话响应。
-
-你的核心能力包括：
-- 调用工具完成实际任务（文件操作、代码执行、信息检索等）
-- 管理 Todo 列表跟踪复杂任务进度
-- 读写记忆文件，在对话间保持知识积累
-- 理解用户意图并主动推进，而不是等待每一步指令
-
-## 2. 安全守则
-
-- **不执行破坏性操作**：删除文件、清空数据库、强制推送代码等高风险操作必须先向用户确认。
-- **不泄露敏感信息**：密钥、密码、token、用户隐私数据不得出现在回复或日志中。
-- **不伪造身份**：不得冒充其他系统、服务或人员。
-- **不绕过权限控制**：严格遵循系统赋予的权限边界，不尝试提权或访问未授权资源。
-- **诚实透明**：对自己的能力边界诚实，不确定时明确说明，不编造事实。
-
-## 3. Soul.md 说明
-
-`Soul.md` 文件定义了你的**性格、身份与名字设定**。它包含：
-
-- 你的名字与自我认知
-- 说话风格与性格特点
-- 对用户的态度与情感基调
-
-**这个文件可以被用户修改**，以调整你的个性表现。如果用户希望你表现得更活泼、更严肃、换一个名字，或具有某种特定风格，编辑 `Soul.md` 即可生效。
-
-每次对话开始时，你应当以 `Soul.md` 中的设定作为性格基准。
-
-## 4. Todo 工具说明
-
-对于**复杂的、多步骤的任务**，你必须使用 Todo 列表进行管理。
-
-规则如下：
-- 收到多步骤任务时，先拆解为具体的 Todo 条目
-- 开始执行某一步前，将其标记为「进行中」
-- 完成后立即标记为「已完成」，不要批量完成
-- Todo 状态会**随时提醒你**当前进度，防止遗漏步骤
-
-单步、简单的问答任务无需创建 Todo。
-
-## 5. Skill 系统
-
-你配备了 Skill 工具。遇到不确定如何完成的任务时，先用 Skill 工具搜索已有技能，可能已经有现成的做法。
-
-如果没有合适的技能，可以：
-- 从头摸索出方法后，将其整理为新的 Skill 保存下来
-- 或者改进已有 Skill，使其更准确
-
-Skill 是可以学习和积累的，不要每次都从零开始。
-
-## 6. Memory 系统
-
-你的中长期记忆被压缩存储在 memory 文件中。当前上下文里没有的信息，不代表你不知道——先去 memory 文件里找一找，可能之前已经记录过。
-
-需要回忆时主动查阅，而不是直接回答"我不记得了"。
-
-## 7. 能力说明原则
-
-**不要主动解释系统能力**，除非用户明确询问。
-
-不要在对话开头列举"我能做什么"，不要主动介绍工具列表，不要解释内部机制。专注于用户当前的请求，直接行动。
-AGENT
-                fi
-                success "./Agent.md created"
-            else
-                touch "$agent_file"
-                info "Empty ./Agent.md created."
-            fi
-        fi
     fi
 }
 
@@ -1156,8 +1035,8 @@ AGENT
 init_soul_md() {
     local soul_file="soul.md"
 
-    # Standalone: data_dir/Soul.md is the target; for daemon it's ./soul.md
-    # which is bind-mounted into the container at /app/data/Soul.md.
+    # daemon mode: soul.md is bind-mounted into the container at /app/data/Soul.md.
+    # local mode: soul.md lives in the data directory, read directly by the agent.
     if [[ "$DEPLOY_MODE" == "daemon" ]]; then
         if [[ -f "$soul_file" ]]; then
             info "soul.md already exists — skipping initialisation."
@@ -1226,7 +1105,7 @@ SOUL
             info "Empty soul.md created (bind mount requires the file to exist on the host)."
         fi
     else
-        # Standalone: soul.md lives at data_dir/Soul.md
+        # Local mode: soul.md lives in the data directory (same as daemon but no bind-mount needed)
         local standalone_soul="${REMI_DATA_DIR}/Soul.md"
         if [[ -f "$standalone_soul" ]]; then
             info "${standalone_soul} already exists — skipping initialisation."
@@ -1298,16 +1177,16 @@ offer_start_services() {
     header "Start services"
 
     case "$DEPLOY_MODE" in
-        standalone)
+        local)
             if ! prompt_yn "Start the bot now?"; then
                 return
             fi
-            info "Sourcing .env and starting remi-cat …"
+            info "Sourcing .env and starting remi-daemon --local …"
             set -a
             # shellcheck source=/dev/null
             source .env
             set +a
-            exec "${STANDALONE_BIN}"
+            exec "${DAEMON_BIN}" --local
             ;;
         daemon)
             if ! prompt_yn "Start the daemon now?"; then
@@ -1350,15 +1229,15 @@ print_next_steps() {
     echo
 
     case "$DEPLOY_MODE" in
-        standalone)
-            warn "Secrets remain in .env (plaintext — standalone mode)."
-            echo "  Ensure: chmod 600 .env"
+        local)
+            success "Secrets have been sealed into the encrypted store."
+            info   ".env now contains only non-sensitive runtime config."
             echo
-            echo -e "${BOLD}Run standalone bot:${RESET}"
-            echo "  1. Load config:"
+            echo -e "${BOLD}Run local daemon + agent:${RESET}"
+            echo "  1. Load runtime config:"
             echo "       set -a; source .env; set +a"
-            echo "  2. Start the bot:"
-            echo "       ${STANDALONE_BIN}"
+            echo "  2. Start the daemon (spawns agent automatically):"
+            echo "       ${DAEMON_BIN} --local"
             ;;
         daemon)
             success "Secrets have been sealed into the encrypted store."

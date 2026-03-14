@@ -238,7 +238,10 @@ impl FeishuClient {
             .map(is_token_expired_err)
             .unwrap_or(false)
         {
-            warn!(user_id, "get_user_name: token expired, refreshing and retrying");
+            warn!(
+                user_id,
+                "get_user_name: token expired, refreshing and retrying"
+            );
             self.refresh_token().await?;
             return self.get_user_name_once(user_id).await;
         }
@@ -440,7 +443,12 @@ impl FeishuClient {
     // ── File messages ─────────────────────────────────────────────────────────
 
     /// Send a file message to a chat. Returns the new `message_id`.
-    pub async fn send_file(&self, chat_id: &str, file_key: &str, file_type: &str) -> Result<String> {
+    pub async fn send_file(
+        &self,
+        chat_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
         let res = self.send_file_once(chat_id, file_key, file_type).await;
         if res
             .as_ref()
@@ -455,8 +463,17 @@ impl FeishuClient {
         res
     }
 
-    async fn send_file_once(&self, chat_id: &str, file_key: &str, file_type: &str) -> Result<String> {
-        let msg_type = if file_type == "folder" { "folder" } else { "file" };
+    async fn send_file_once(
+        &self,
+        chat_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
+        let msg_type = if file_type == "folder" {
+            "folder"
+        } else {
+            "file"
+        };
         let content = serde_json::json!({ "file_key": file_key }).to_string();
         let token = self.token().await;
 
@@ -484,7 +501,12 @@ impl FeishuClient {
     }
 
     /// Reply to an existing message with a file. Returns the new `message_id`.
-    pub async fn reply_file(&self, message_id: &str, file_key: &str, file_type: &str) -> Result<String> {
+    pub async fn reply_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
         let res = self.reply_file_once(message_id, file_key, file_type).await;
         if res
             .as_ref()
@@ -499,8 +521,17 @@ impl FeishuClient {
         res
     }
 
-    async fn reply_file_once(&self, message_id: &str, file_key: &str, file_type: &str) -> Result<String> {
-        let msg_type = if file_type == "folder" { "folder" } else { "file" };
+    async fn reply_file_once(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
+        let msg_type = if file_type == "folder" {
+            "folder"
+        } else {
+            "file"
+        };
         let content = serde_json::json!({ "file_key": file_key }).to_string();
         let token = self.token().await;
 
@@ -532,7 +563,9 @@ impl FeishuClient {
         content: &[u8],
         file_type: &str,
     ) -> Result<String> {
-        let res = self.upload_file_once(file_name, mime_type, content, file_type).await;
+        let res = self
+            .upload_file_once(file_name, mime_type, content, file_type)
+            .await;
         if res
             .as_ref()
             .err()
@@ -541,7 +574,9 @@ impl FeishuClient {
         {
             warn!("upload_file: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.upload_file_once(file_name, mime_type, content, file_type).await;
+            return self
+                .upload_file_once(file_name, mime_type, content, file_type)
+                .await;
         }
         res
     }
@@ -571,7 +606,11 @@ impl FeishuClient {
                 .mime_str(mime_type)
                 .context("upload_file invalid mime_type")?;
         }
-        let feishu_file_type = if file_type == "folder" { "folder" } else { feishu_file_type_for(mime_type, file_name) };
+        let feishu_file_type = if file_type == "folder" {
+            "folder"
+        } else {
+            feishu_file_type_for(mime_type, file_name)
+        };
         let form = multipart::Form::new()
             .text("file_type", feishu_file_type)
             .text("file_name", file_name.to_string())
@@ -960,7 +999,9 @@ impl FeishuClient {
         file_key: &str,
         file_type: &str,
     ) -> Result<(String, String, Vec<u8>)> {
-        let res = self.download_file_once(message_id, file_key, file_type).await;
+        let res = self
+            .download_file_once(message_id, file_key, file_type)
+            .await;
         if res
             .as_ref()
             .err()
@@ -969,7 +1010,9 @@ impl FeishuClient {
         {
             warn!("download_file: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.download_file_once(message_id, file_key, file_type).await;
+            return self
+                .download_file_once(message_id, file_key, file_type)
+                .await;
         }
         res
     }
@@ -997,7 +1040,21 @@ impl FeishuClient {
             ));
         }
         if !resp.status().is_success() {
-            return Err(anyhow!("download_file HTTP {} (url: {})", resp.status(), url));
+            let status = resp.status();
+            let response_body = match resp.bytes().await {
+                Ok(bytes) => log_text_preview(&String::from_utf8_lossy(&bytes), 1024),
+                Err(err) => format!("<failed to read response body: {err}>"),
+            };
+            warn!(
+                message_id,
+                file_key,
+                file_type,
+                url = %url,
+                status = %status,
+                response_body = %response_body,
+                "download_file failed"
+            );
+            return Err(anyhow!("download_file HTTP {} (url: {})", status, url));
         }
 
         let headers = resp.headers().clone();
@@ -1045,7 +1102,10 @@ impl FeishuClient {
             if parsed.doc_type == "file" {
                 return self.download_drive_file_once(&parsed.token).await;
             }
-            if let Some(result) = self.export_document_once(&parsed.doc_type, &parsed.token).await? {
+            if let Some(result) = self
+                .export_document_once(&parsed.doc_type, &parsed.token)
+                .await?
+            {
                 return Ok(result);
             }
             // doc_type not supported by export API — fall back to raw text
@@ -1086,9 +1146,15 @@ impl FeishuClient {
 
         // Step 1 – Create export task.
         #[derive(Deserialize)]
-        struct ExportTaskData { ticket: String }
+        struct ExportTaskData {
+            ticket: String,
+        }
         #[derive(Deserialize)]
-        struct ExportTaskResp { code: i64, msg: String, data: Option<ExportTaskData> }
+        struct ExportTaskResp {
+            code: i64,
+            msg: String,
+            data: Option<ExportTaskData>,
+        }
 
         let resp: ExportTaskResp = self
             .http
@@ -1107,10 +1173,16 @@ impl FeishuClient {
             .context("parse export_document create task response")?;
 
         if resp.code == TOKEN_EXPIRED {
-            return Err(anyhow!("export_document error {TOKEN_EXPIRED}: token expired"));
+            return Err(anyhow!(
+                "export_document error {TOKEN_EXPIRED}: token expired"
+            ));
         }
         if resp.code != 0 {
-            return Err(anyhow!("export_document create task error {}: {}", resp.code, resp.msg));
+            return Err(anyhow!(
+                "export_document create task error {}: {}",
+                resp.code,
+                resp.msg
+            ));
         }
         let ticket = resp
             .data
@@ -1119,11 +1191,21 @@ impl FeishuClient {
 
         // Step 2 – Poll until the export job finishes.
         #[derive(Deserialize)]
-        struct ExportResult { job_status: i64, file_token: String, file_name: String }
+        struct ExportResult {
+            job_status: i64,
+            file_token: String,
+            file_name: String,
+        }
         #[derive(Deserialize)]
-        struct ExportResultData { result: ExportResult }
+        struct ExportResultData {
+            result: ExportResult,
+        }
         #[derive(Deserialize)]
-        struct ExportPollResp { code: i64, msg: String, data: Option<ExportResultData> }
+        struct ExportPollResp {
+            code: i64,
+            msg: String,
+            data: Option<ExportResultData>,
+        }
 
         let mut file_token = String::new();
         let mut file_name_hint = String::new();
@@ -1141,10 +1223,16 @@ impl FeishuClient {
                 .await
                 .context("parse export_document poll response")?;
             if poll.code == TOKEN_EXPIRED {
-                return Err(anyhow!("export_document error {TOKEN_EXPIRED}: token expired"));
+                return Err(anyhow!(
+                    "export_document error {TOKEN_EXPIRED}: token expired"
+                ));
             }
             if poll.code != 0 {
-                return Err(anyhow!("export_document poll error {}: {}", poll.code, poll.msg));
+                return Err(anyhow!(
+                    "export_document poll error {}: {}",
+                    poll.code,
+                    poll.msg
+                ));
             }
             let result = poll
                 .data
@@ -1167,14 +1255,18 @@ impl FeishuClient {
         // Step 3 – Download the exported file.
         let dl = self
             .http
-            .get(format!("{FEISHU_BASE}/drive/v1/export_tasks/file/{file_token}/download"))
+            .get(format!(
+                "{FEISHU_BASE}/drive/v1/export_tasks/file/{file_token}/download"
+            ))
             .bearer_auth(&bearer)
             .send()
             .await
             .context("export_document download")?;
 
         if dl.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!("export_document error {TOKEN_EXPIRED}: token expired"));
+            return Err(anyhow!(
+                "export_document error {TOKEN_EXPIRED}: token expired"
+            ));
         }
         if !dl.status().is_success() {
             return Err(anyhow!("export_document download HTTP {}", dl.status()));
@@ -1200,11 +1292,23 @@ impl FeishuClient {
                     format!("{file_name_hint}.{file_extension}")
                 }
             } else {
-                format!("{}_{}.{}", doc_type, sanitize_file_name(token_value), file_extension)
+                format!(
+                    "{}_{}.{}",
+                    doc_type,
+                    sanitize_file_name(token_value),
+                    file_extension
+                )
             }
         };
-        let bytes = dl.bytes().await.context("read export download bytes")?.to_vec();
-        debug!(doc_type, token_value, resolved_name, "Exported cloud document");
+        let bytes = dl
+            .bytes()
+            .await
+            .context("read export download bytes")?
+            .to_vec();
+        debug!(
+            doc_type,
+            token_value, resolved_name, "Exported cloud document"
+        );
         Ok(Some((content_type, resolved_name, bytes)))
     }
 
@@ -1279,7 +1383,11 @@ impl FeishuClient {
     pub fn file_resource_url(&self, message_id: &str, file_key: &str, file_type: &str) -> String {
         // The Feishu IM resource download API only accepts type=image or type=file.
         // Folder attachments are also downloaded with type=file.
-        let t = if file_type == "image" { "image" } else { "file" };
+        let t = if file_type == "image" {
+            "image"
+        } else {
+            "file"
+        };
         format!("{FEISHU_BASE}/im/v1/messages/{message_id}/resources/{file_key}?type={t}")
     }
 
@@ -1496,10 +1604,6 @@ pub fn card_content(text: &str) -> String {
                 "tag": "markdown",
                 "content": text
             }]
-        },
-        "header": {
-            "title": { "tag": "plain_text", "content": "remi-cat" },
-            "template": "blue"
         }
     })
     .to_string()
@@ -1551,12 +1655,7 @@ fn should_retry_contact_user_lookup(err: &anyhow::Error) -> bool {
 }
 
 fn pick_contact_user_display_name(user: ContactUser) -> Option<String> {
-    pick_name_fields(
-        user.name,
-        user.display_name,
-        user.nickname,
-        user.en_name,
-    )
+    pick_name_fields(user.name, user.display_name, user.nickname, user.en_name)
 }
 
 fn pick_name_fields(
@@ -1638,6 +1737,34 @@ fn sanitize_file_name(name: &str) -> String {
     }
 }
 
+fn log_text_preview(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut truncated = false;
+    for ch in trimmed.chars() {
+        if count >= max_chars {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+        count += 1;
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
 fn extension_for_content_type(content_type: &str) -> &'static str {
     match content_type {
         "text/plain" => "txt",
@@ -1691,8 +1818,17 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        preferred_contact_user_id_types, should_retry_contact_user_lookup, ContactUserIdType,
+        log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
+        ContactUserIdType,
     };
+
+    #[test]
+    fn log_text_preview_flattens_and_truncates_multiline_text() {
+        assert_eq!(
+            log_text_preview("  first\nsecond\tthird  ", 10),
+            "first\\nseco…"
+        );
+    }
 
     #[test]
     fn open_id_prefers_open_id_lookup() {

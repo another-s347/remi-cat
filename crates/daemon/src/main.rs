@@ -52,12 +52,11 @@ mod volume_store;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
-use matcher::{BanResult, OwnerMatcher, OwnerStatus, PAIR_COMMAND, UnbanResult};
+use matcher::{BanResult, OwnerMatcher, OwnerStatus, UnbanResult, PAIR_COMMAND};
 use mgmt_server::MgmtContext;
 use restart::{signal_ready, RestartHandle};
 use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
 use secret_store::SecretStore;
-use user_store::{PairTokenStore, UserStore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,10 +64,13 @@ use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
+use user_store::{PairTokenStore, UserStore};
 use volume_store::VolumeStore;
 
 /// Feishu channel name used when recording channel identities.
 const FEISHU_CHANNEL: &str = "feishu";
+const AGENT_FILE_KEY_SEPARATOR: char = '\\';
+const LEGACY_AGENT_FILE_KEY_SEPARATOR: char = '\t';
 
 /// Command to initiate or complete a cross-channel identity link.
 const PAIR_CHANNEL_COMMAND: &str = "/pair-channel";
@@ -76,6 +78,37 @@ const PAIR_CHANNEL_COMMAND: &str = "/pair-channel";
 /// Maximum number of messages that can be queued per chat before new messages
 /// are rejected with a backpressure reply.
 const CHAT_QUEUE_CAPACITY: usize = 5;
+
+fn decode_agent_file_key(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    for separator in [AGENT_FILE_KEY_SEPARATOR, LEGACY_AGENT_FILE_KEY_SEPARATOR] {
+        if let Some((message_id, file_key)) = value.split_once(separator) {
+            let message_id = message_id.trim();
+            let file_key = file_key.trim().trim_start_matches(|c| {
+                c == AGENT_FILE_KEY_SEPARATOR || c == LEGACY_AGENT_FILE_KEY_SEPARATOR
+            });
+            if !message_id.is_empty() && !file_key.is_empty() {
+                return Some((message_id, file_key));
+            }
+        }
+    }
+    None
+}
+
+fn encode_agent_file_key(message_id: &str, file_key: &str) -> String {
+    let message_id = message_id.trim();
+    let file_key = file_key.trim();
+    if let Some((owner_message_id, real_file_key)) = decode_agent_file_key(file_key) {
+        return format!(
+            "{}{}{}",
+            owner_message_id, AGENT_FILE_KEY_SEPARATOR, real_file_key
+        );
+    }
+    if message_id.is_empty() || file_key.is_empty() {
+        return file_key.to_string();
+    }
+    format!("{message_id}{AGENT_FILE_KEY_SEPARATOR}{file_key}")
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -184,7 +217,7 @@ async fn main() -> Result<()> {
     // ── User identity store ───────────────────────────────────────────────
     let user_store = Arc::new(
         UserStore::load(data_dir.join("users.json"))
-            .map_err(|e| anyhow::anyhow!("failed to load user store: {e:#}"))?
+            .map_err(|e| anyhow::anyhow!("failed to load user store: {e:#}"))?,
     );
     let pair_tokens = PairTokenStore::new();
 
@@ -208,11 +241,9 @@ async fn main() -> Result<()> {
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
     // Each item carries the Feishu message together with the resolved user UUID
     // and cached sender username, if we have one.
-    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<(
-        FeishuMessage,
-        String,
-        Option<String>,
-    )>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let chat_queues: Arc<
+        Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String, Option<String>)>>>,
+    > = Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
     if let Some(id) = matcher.owner_id() {
@@ -321,16 +352,15 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let sender_username =
-                    ensure_im_username(
-                        &user_store,
-                        &gateway,
-                        &user_uuid,
-                        &msg.sender_user_id,
-                        Some(&msg.message_id),
-                        Some(&msg.chat_id),
-                    )
-                    .await;
+                let sender_username = ensure_im_username(
+                    &user_store,
+                    &gateway,
+                    &user_uuid,
+                    &msg.sender_user_id,
+                    Some(&msg.message_id),
+                    Some(&msg.chat_id),
+                )
+                .await;
                 info!(
                     message_id = %msg.message_id,
                     uuid = %user_uuid,
@@ -346,10 +376,7 @@ async fn main() -> Result<()> {
                         OwnerStatus::Banned => "⚠️ 你已被拉黑，无法配对。".into(),
                         OwnerStatus::NeedPairing => {
                             if matcher.try_pair(&user_uuid) {
-                                format!(
-                                    "配对成功！您已成为我的主人。\nYour UUID: {}",
-                                    user_uuid
-                                )
+                                format!("配对成功！您已成为我的主人。\nYour UUID: {}", user_uuid)
                             } else {
                                 "配对失败，请重试。".into()
                             }
@@ -362,8 +389,14 @@ async fn main() -> Result<()> {
                 }
 
                 // ── /pair-channel command ──────────────────────────────────
-                if text == PAIR_CHANNEL_COMMAND || text.starts_with(&format!("{PAIR_CHANNEL_COMMAND} ")) {
-                    let arg = text.strip_prefix(PAIR_CHANNEL_COMMAND).map(str::trim).unwrap_or("").to_string();
+                if text == PAIR_CHANNEL_COMMAND
+                    || text.starts_with(&format!("{PAIR_CHANNEL_COMMAND} "))
+                {
+                    let arg = text
+                        .strip_prefix(PAIR_CHANNEL_COMMAND)
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
                     if arg.is_empty() {
                         // No token provided — generate one.
                         let token = pair_tokens.create(FEISHU_CHANNEL, &msg.sender_user_id);
@@ -380,28 +413,36 @@ async fn main() -> Result<()> {
                                     &msg.message_id,
                                     &msg.chat_id,
                                     "⚠️ 配对码无效或已过期，请重新生成。",
-                                ).await;
+                                )
+                                .await;
                             }
                             Some(pending) => {
-                                if pending.channel == FEISHU_CHANNEL && pending.user_id == msg.sender_user_id {
+                                if pending.channel == FEISHU_CHANNEL
+                                    && pending.user_id == msg.sender_user_id
+                                {
                                     send_reply(
                                         &gateway,
                                         &msg.message_id,
                                         &msg.chat_id,
                                         "⚠️ 不能将同一账号与自身配对。",
-                                    ).await;
+                                    )
+                                    .await;
                                 } else {
                                     // Capture pre-merge UUIDs before the link operation.
-                                    let uuid_pending = user_store.resolve_or_create(&pending.channel, &pending.user_id);
+                                    let uuid_pending = user_store
+                                        .resolve_or_create(&pending.channel, &pending.user_id);
                                     match user_store.link(
-                                        &pending.channel, &pending.user_id,
-                                        FEISHU_CHANNEL, &msg.sender_user_id,
+                                        &pending.channel,
+                                        &pending.user_id,
+                                        FEISHU_CHANNEL,
+                                        &msg.sender_user_id,
                                     ) {
                                         Ok(merged_uuid) => {
                                             // If the owner was one of the pre-merge users, update to
                                             // the merged UUID so ownership is preserved.
                                             if let Some(owner_uuid) = matcher.owner_id() {
-                                                if (owner_uuid == uuid_pending || owner_uuid == user_uuid)
+                                                if (owner_uuid == uuid_pending
+                                                    || owner_uuid == user_uuid)
                                                     && owner_uuid != merged_uuid
                                                 {
                                                     matcher.reset();
@@ -419,7 +460,13 @@ async fn main() -> Result<()> {
                                                 "✅ 频道配对成功！两个账号现在共享同一身份。\nUUID: {}",
                                                 merged_uuid
                                             );
-                                            send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                                            send_reply(
+                                                &gateway,
+                                                &msg.message_id,
+                                                &msg.chat_id,
+                                                &reply,
+                                            )
+                                            .await;
                                         }
                                         Err(e) => {
                                             warn!("user link failed: {e:#}");
@@ -428,7 +475,8 @@ async fn main() -> Result<()> {
                                                 &msg.message_id,
                                                 &msg.chat_id,
                                                 "❌ 频道配对失败，请稍后重试。",
-                                            ).await;
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -572,7 +620,8 @@ async fn main() -> Result<()> {
             }
 
             FeishuEvent::ReactionReceived(reaction) => {
-                let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_user_id);
+                let user_uuid =
+                    user_store.resolve_or_create(FEISHU_CHANNEL, &reaction.sender_user_id);
                 info!(
                     sender = %reaction.sender_user_id,
                     uuid   = %user_uuid,
@@ -614,7 +663,10 @@ async fn main() -> Result<()> {
                 info!(user = %user_open_id, uuid = %user_uuid, card = %card_message_id, "card action received");
 
                 if matcher.is_banned(&user_uuid) {
-                    warn!("ignoring card action from blacklisted user {} (uuid: {})", user_open_id, user_uuid);
+                    warn!(
+                        "ignoring card action from blacklisted user {} (uuid: {})",
+                        user_open_id, user_uuid
+                    );
                     continue;
                 }
 
@@ -629,7 +681,10 @@ async fn main() -> Result<()> {
                 .await;
 
                 if !is_owner(&matcher, &user_uuid) {
-                    warn!("ignoring card action from non-owner {} (uuid: {})", user_open_id, user_uuid);
+                    warn!(
+                        "ignoring card action from non-owner {} (uuid: {})",
+                        user_open_id, user_uuid
+                    );
                     continue;
                 }
 
@@ -730,9 +785,56 @@ fn spawn_queue_worker(
     gateway: FeishuGateway,
     rpc: RpcServer,
 ) -> mpsc::Sender<(FeishuMessage, String, Option<String>)> {
-    let (tx, mut rx) = mpsc::channel::<(FeishuMessage, String, Option<String>)>(CHAT_QUEUE_CAPACITY);
+    let (tx, mut rx) =
+        mpsc::channel::<(FeishuMessage, String, Option<String>)>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
-        while let Some((msg, user_uuid, sender_username)) = rx.recv().await {
+        // Holds the completion receiver for the currently in-flight message,
+        // if any.  We drop it (without awaiting) when a newer message preempts.
+        let mut completion_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
+
+        loop {
+            // ── Obtain the next item to process ──────────────────────────
+            //
+            // If a task is in-flight we race between its completion and a new
+            // incoming queue item.  A new arrival preempts the in-flight task:
+            // we send a cancel signal to the Agent, drop the old completion
+            // receiver (the Agent's eventual Done for that message becomes a
+            // no-op on the daemon side), and process the newest item instead.
+            let item: (FeishuMessage, String, Option<String>) = if completion_rx.is_some() {
+                let mut comp = completion_rx.take().unwrap();
+                tokio::select! {
+                    _ = &mut comp => {
+                        // In-flight task finished normally — wait for next item.
+                        match rx.recv().await {
+                            Some(item) => item,
+                            None => return,
+                        }
+                    }
+                    item = rx.recv() => {
+                        let Some(item) = item else { return };
+                        // New message arrived while a task is in-flight — preempt.
+                        info!(chat = %chat_id, "new message preempts in-flight task — cancelling");
+                        rpc.cancel_chat(&chat_id).await;
+                        // comp is dropped here; agent's eventual Done is a no-op.
+                        // Drain any additional queued items: latest-message wins.
+                        let mut latest = item;
+                        loop {
+                            match rx.try_recv() {
+                                Ok(newer) => latest = newer,
+                                Err(_) => break,
+                            }
+                        }
+                        latest
+                    }
+                }
+            } else {
+                match rx.recv().await {
+                    Some(item) => item,
+                    None => return,
+                }
+            };
+
+            let (msg, user_uuid, sender_username) = item;
             let message_id = msg.message_id.clone();
             let enriched = enrich_message(&gateway, msg).await;
 
@@ -766,21 +868,22 @@ fn spawn_queue_worker(
 
             let daemon_msg =
                 daemon_msg_im_message(&enriched, &user_uuid, sender_username.as_deref());
-            if let Some(completion_rx) = rpc
-                .send_to_agent_and_await(daemon_msg, &message_id)
-                .await
-            {
-                if let Some(rid) = reaction_id {
-                    rpc.record_reaction(&message_id, rid).await;
+            match rpc.send_to_agent_and_await(daemon_msg, &message_id).await {
+                Some(comp_rx) => {
+                    if let Some(rid) = reaction_id {
+                        rpc.record_reaction(&message_id, rid).await;
+                    }
+                    // Store the completion receiver; the top of the loop will
+                    // race it against future queue arrivals.
+                    completion_rx = Some(comp_rx);
                 }
-                // Block until the Agent signals Done/Error for this message.
-                completion_rx.await.ok();
-            } else {
-                // Agent not connected.
-                if let Some(rid) = reaction_id {
-                    gateway.delete_reaction(&message_id, &rid).await.ok();
+                None => {
+                    // Agent not connected.
+                    if let Some(rid) = reaction_id {
+                        gateway.delete_reaction(&message_id, &rid).await.ok();
+                    }
+                    rpc.reply_agent_unavailable(&message_id).await;
                 }
-                rpc.reply_agent_unavailable(&message_id).await;
             }
         }
         info!(chat = %chat_id, "chat queue worker exiting");
@@ -897,7 +1000,11 @@ fn resolve_blacklist_target(
         return resolve_blacklist_channel_id(command_name, feishu_id.trim(), user_store);
     }
 
-    if let Some(mention) = msg.mentions.iter().find(|mention| mention.key == raw_target) {
+    if let Some(mention) = msg
+        .mentions
+        .iter()
+        .find(|mention| mention.key == raw_target)
+    {
         let feishu_id = mention
             .open_id
             .as_deref()
@@ -1000,15 +1107,14 @@ async fn enrich_message(gateway: &FeishuGateway, mut msg: FeishuMessage) -> Feis
                     }
                 }
                 // Prepend parent files so they appear before the reply's own files.
-                // Encode the file key as "{parent_id}\t{original_key}" so the
-                // download handler knows to use the parent message ID when
-                // fetching the resource — transparent to the agent.
+                // Normalize the file key into the agent-visible self-contained
+                // format so downstream fetch only needs one field.
                 if !parent.files.is_empty() {
                     let mut all_files: Vec<im_feishu::FeishuFile> = parent
                         .files
                         .into_iter()
                         .map(|mut f| {
-                            f.file_key = format!("{parent_id}\t{}", f.file_key);
+                            f.file_key = encode_agent_file_key(&parent_id, &f.file_key);
                             f
                         })
                         .collect();
@@ -1082,7 +1188,10 @@ async fn enrich_message(gateway: &FeishuGateway, mut msg: FeishuMessage) -> Feis
     // Quoted images first, then own images.
     parent_data_urls.extend(own_data_urls);
     msg.images = parent_data_urls;
-    if had_own_images && msg.images.iter().all(|u| !u.starts_with("data:")) && msg.text.trim().is_empty() {
+    if had_own_images
+        && msg.images.iter().all(|u| !u.starts_with("data:"))
+        && msg.text.trim().is_empty()
+    {
         msg.text = "[用户发送了图片]".to_string();
     }
     if had_own_images {
@@ -1129,15 +1238,27 @@ async fn maybe_notify_feishu_permission_issue(
 
     match gateway.reply_card(message_id, &card_text).await {
         Ok(_) => {
-            warn!(message_id, operation, "replied with Feishu permission hint card");
+            warn!(
+                message_id,
+                operation, "replied with Feishu permission hint card"
+            );
         }
         Err(reply_err) => {
-            warn!(message_id, operation, "reply_card for Feishu permission hint failed: {reply_err:#}");
+            warn!(
+                message_id,
+                operation, "reply_card for Feishu permission hint failed: {reply_err:#}"
+            );
             if let Err(text_err) = gateway.reply_text(message_id, &text_fallback).await {
-                warn!(message_id, operation, "reply_text for Feishu permission hint failed: {text_err:#}");
+                warn!(
+                    message_id,
+                    operation, "reply_text for Feishu permission hint failed: {text_err:#}"
+                );
                 if let Some(chat_id) = chat_id {
                     if let Err(send_err) = gateway.send_text(chat_id, &text_fallback).await {
-                        warn!(chat_id, operation, "send_text for Feishu permission hint failed: {send_err:#}");
+                        warn!(
+                            chat_id,
+                            operation, "send_text for Feishu permission hint failed: {send_err:#}"
+                        );
                     }
                 }
             }

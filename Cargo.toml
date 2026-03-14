@@ -11,24 +11,5 @@ members = [
     "crates/mgmt-api",
     "crates/admin-ui",
 ]
-default-members = [".", "crates/daemon", "crates/agent", "crates/admin-ui"]
+default-members = ["crates/daemon", "crates/agent", "crates/admin-ui"]
 resolver = "2"
-
-[package]
-name = "remi-cat"
-version = "0.1.6"
-edition = "2021"
-
-[dependencies]
-im-feishu = { path = "crates/im-feishu" }
-matcher = { path = "crates/matcher" }
-bot-core = { path = "crates/bot-core" }
-user-store = { path = "crates/user-store" }
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde_json = "1"
-anyhow = "1"
-futures = "0.3"
-base64 = "0.22"
-sentry = { version = "0.47", features = ["tracing"] }

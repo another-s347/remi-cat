@@ -27,12 +27,15 @@ use tracing::{debug, info, warn};
 
 use im_feishu::{FeishuGateway, StreamingCard};
 use remi_proto::{
-    AgentPayload, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer,
+    AgentPayload, AgentStats, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer,
     ImAttachmentRef, ImBridgeRequest, ImBridgeResponse, ImDocumentRef, ImDownloadedFile,
     ImMessageEvent, ImReactionEvent, ImUploadedFile, SecretsSync, ShutdownSignal,
 };
 
 use crate::secret_store::SecretStore;
+
+const AGENT_FILE_KEY_SEPARATOR: char = '\\';
+const LEGACY_AGENT_FILE_KEY_SEPARATOR: char = '\t';
 
 /// Shared map: Feishu message_id → reaction_id, for cleaning up "thinking" emoji.
 pub type ReactionMap = Arc<Mutex<HashMap<String, String>>>;
@@ -40,6 +43,37 @@ pub type ReactionMap = Arc<Mutex<HashMap<String, String>>>;
 /// Shared map: Feishu message_id → oneshot sender, for signalling queue workers
 /// when the Agent finishes processing a message.
 pub type CompletionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
+
+fn decode_agent_file_key(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    for separator in [AGENT_FILE_KEY_SEPARATOR, LEGACY_AGENT_FILE_KEY_SEPARATOR] {
+        if let Some((message_id, file_key)) = value.split_once(separator) {
+            let message_id = message_id.trim();
+            let file_key = file_key.trim().trim_start_matches(|c| {
+                c == AGENT_FILE_KEY_SEPARATOR || c == LEGACY_AGENT_FILE_KEY_SEPARATOR
+            });
+            if !message_id.is_empty() && !file_key.is_empty() {
+                return Some((message_id, file_key));
+            }
+        }
+    }
+    None
+}
+
+fn encode_agent_file_key(message_id: &str, file_key: &str) -> String {
+    let message_id = message_id.trim();
+    let file_key = file_key.trim();
+    if let Some((owner_message_id, real_file_key)) = decode_agent_file_key(file_key) {
+        return format!(
+            "{}{}{}",
+            owner_message_id, AGENT_FILE_KEY_SEPARATOR, real_file_key
+        );
+    }
+    if message_id.is_empty() || file_key.is_empty() {
+        return file_key.to_string();
+    }
+    format!("{message_id}{AGENT_FILE_KEY_SEPARATOR}{file_key}")
+}
 
 // ── AgentSink ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +178,19 @@ impl RpcServer {
         self.agent_sink.lock().await.is_some()
     }
 
+    /// Ask the Agent to cooperatively cancel the in-flight task for `chat_id`.
+    ///
+    /// The Daemon must separately ensure the corresponding completion channel
+    /// is unblocked (e.g. by dropping the `oneshot::Receiver`).
+    pub async fn cancel_chat(&self, chat_id: &str) {
+        self.send_to_agent(DaemonMessage {
+            payload: Some(DaemonPayload::ChatCancel(remi_proto::ChatCancelSignal {
+                chat_id: chat_id.to_string(),
+            })),
+        })
+        .await;
+    }
+
     /// Reply to a Feishu message indicating the Agent is not connected.
     pub async fn reply_agent_unavailable(&self, message_id: &str) {
         let _ = self
@@ -204,6 +251,7 @@ impl DaemonService for RpcServer {
             let mut inbound = request.into_inner();
             // Map: Feishu message_id → StreamingCard for that reply thread.
             let mut cards: HashMap<String, StreamingCard> = HashMap::new();
+            let mut todo_cards: HashMap<String, String> = HashMap::new();
 
             while let Some(result) = inbound.next().await {
                 let agent_msg = match result {
@@ -267,32 +315,30 @@ impl DaemonService for RpcServer {
                     }
 
                     Some(AgentPayload::Stats(s)) => {
-                        let secs = s.elapsed_ms / 1000;
-                        let ms = s.elapsed_ms % 1000;
-                        let stats = format!(
-                            "\n\n---\n📊 *tokens: {}↑ {}↓ | 耗时: {}.{:03}s*",
-                            s.prompt_tokens, s.completion_tokens, secs, ms
-                        );
                         let card = cards
                             .entry(reply_to.clone())
                             .or_insert_with(|| gateway.begin_streaming_reply(&reply_to));
-                        card.push(&stats).await.ok();
+                        card.push(&stats_block(&s)).await.ok();
+                    }
+
+                    Some(AgentPayload::TodoState(todo_state)) => {
+                        if let Some(markdown) = normalize_todo_card_markdown(&todo_state.markdown) {
+                            todo_cards.insert(reply_to.clone(), markdown);
+                        } else {
+                            todo_cards.remove(&reply_to);
+                        }
                     }
 
                     Some(AgentPayload::Done(_)) => {
-                        if let Some(mut card) = cards.remove(&reply_to) {
-                            card.finish().await.ok();
-                        }
-                        // Remove "thinking" reaction.
-                        if let Some(rid) = reactions.lock().await.remove(&reply_to) {
-                            if let Err(e) = gateway.delete_reaction(&reply_to, &rid).await {
-                                warn!("delete_reaction failed: {e:#}");
-                            }
-                        }
-                        // Signal completion to queue worker.
-                        if let Some(tx) = completions.lock().await.remove(&reply_to) {
-                            let _ = tx.send(());
-                        }
+                        finalize_reply(
+                            &gateway,
+                            &reply_to,
+                            &mut cards,
+                            &mut todo_cards,
+                            &reactions,
+                            &completions,
+                        )
+                        .await;
                     }
 
                     Some(AgentPayload::Error(e)) => {
@@ -301,18 +347,15 @@ impl DaemonService for RpcServer {
                             .entry(reply_to.clone())
                             .or_insert_with(|| gateway.begin_streaming_reply(&reply_to));
                         card.push(&msg).await.ok();
-                        if let Some(mut card) = cards.remove(&reply_to) {
-                            card.finish().await.ok();
-                        }
-                        if let Some(rid) = reactions.lock().await.remove(&reply_to) {
-                            if let Err(e) = gateway.delete_reaction(&reply_to, &rid).await {
-                                warn!("delete_reaction failed: {e:#}");
-                            }
-                        }
-                        // Signal completion to queue worker.
-                        if let Some(tx) = completions.lock().await.remove(&reply_to) {
-                            let _ = tx.send(());
-                        }
+                        finalize_reply(
+                            &gateway,
+                            &reply_to,
+                            &mut cards,
+                            &mut todo_cards,
+                            &reactions,
+                            &completions,
+                        )
+                        .await;
                     }
 
                     None => {}
@@ -328,6 +371,7 @@ impl DaemonService for RpcServer {
                 card.push("\n\n⚠️ *[Agent 连接断开]*").await.ok();
                 card.finish().await.ok();
             }
+            todo_cards.clear();
             // Fire all pending completion signals so queue workers don't block.
             for (_, tx) in completions.lock().await.drain() {
                 let _ = tx.send(());
@@ -364,16 +408,13 @@ async fn handle_im_bridge_request(
             }
 
             let result = if !download.attachment_key.is_empty() {
-                // A key encoded as "{owner_msg_id}\t{real_key}" means the file
-                // belongs to a quoted (parent) message — use that message's ID
-                // for the resource request. Otherwise fall back to the current
-                // message ID. This is transparent to the agent.
-                let (owner_msg_id, real_key) =
-                    if let Some((owner, key)) = download.attachment_key.split_once('\t') {
-                        (owner.to_string(), key.to_string())
-                    } else {
+                // Self-contained keys encode the owner message ID so the
+                // agent never needs to pass message_id explicitly.
+                let (owner_msg_id, real_key) = decode_agent_file_key(&download.attachment_key)
+                    .map(|(owner, key)| (owner.to_string(), key.to_string()))
+                    .unwrap_or_else(|| {
                         (download.message_id.clone(), download.attachment_key.clone())
-                    };
+                    });
                 debug!(
                     message_id = %owner_msg_id,
                     file_key   = %real_key,
@@ -519,7 +560,7 @@ pub fn daemon_msg_im_message(
                         "daemon_msg_im_message: attachment"
                     );
                     ImAttachmentRef {
-                        key: file.file_key.clone(),
+                        key: encode_agent_file_key(&ev.message_id, &file.file_key),
                         name: file.file_name.clone(),
                         mime_type: file.mime_type.clone(),
                         size_bytes: file.size_bytes,
@@ -581,4 +622,88 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         }
     }
     out
+}
+
+fn normalize_todo_card_markdown(markdown: &str) -> Option<String> {
+    let trimmed = markdown.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn finalize_reply(
+    gateway: &FeishuGateway,
+    reply_to: &str,
+    cards: &mut HashMap<String, StreamingCard>,
+    todo_cards: &mut HashMap<String, String>,
+    reactions: &ReactionMap,
+    completions: &CompletionMap,
+) {
+    let todo_card = todo_cards.remove(reply_to);
+
+    if let Some(mut card) = cards.remove(reply_to) {
+        card.finish().await.ok();
+    }
+
+    if let Some(markdown) = todo_card {
+        if let Err(err) = gateway.reply_card(reply_to, &markdown).await {
+            warn!(reply_to, "reply_card for todo state failed: {err:#}");
+        }
+    }
+
+    if let Some(rid) = reactions.lock().await.remove(reply_to) {
+        if let Err(err) = gateway.delete_reaction(reply_to, &rid).await {
+            warn!("delete_reaction failed: {err:#}");
+        }
+    }
+
+    if let Some(tx) = completions.lock().await.remove(reply_to) {
+        let _ = tx.send(());
+    }
+}
+
+fn stats_block(stats: &AgentStats) -> String {
+    let secs = stats.elapsed_ms / 1000;
+    let ms = stats.elapsed_ms % 1000;
+    format!(
+        "\n\n---\n📊 *tokens: {}↑ {}↓ | 耗时: {}.{:03}s*",
+        stats.prompt_tokens, stats.completion_tokens, secs, ms
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_agent_file_key, normalize_todo_card_markdown, stats_block};
+    use remi_proto::AgentStats;
+
+    #[test]
+    fn decode_agent_file_key_tolerates_double_backslashes() {
+        let (message_id, file_key) =
+            decode_agent_file_key("msg_123\\\\file_abc").expect("double escaped key should decode");
+
+        assert_eq!(message_id, "msg_123");
+        assert_eq!(file_key, "file_abc");
+    }
+
+    #[test]
+    fn todo_card_markdown_is_kept_as_a_separate_reply_body() {
+        let todo =
+            normalize_todo_card_markdown("\n📝 **当前 Todo**\n```\n[○] 1 Draft changelog\n```\n")
+                .expect("todo markdown should be kept");
+
+        assert_eq!(todo, "📝 **当前 Todo**\n```\n[○] 1 Draft changelog\n```");
+    }
+
+    #[test]
+    fn stats_block_does_not_include_todo_content() {
+        let stats = stats_block(&AgentStats {
+            prompt_tokens: 120,
+            completion_tokens: 45,
+            elapsed_ms: 3456,
+        });
+
+        assert_eq!(stats, "\n\n---\n📊 *tokens: 120↑ 45↓ | 耗时: 3.456s*");
+    }
 }

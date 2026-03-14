@@ -21,5 +21,7 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    "stream",
 ] }
 aho-corasick = "1"
+html2md = "0.2.15"

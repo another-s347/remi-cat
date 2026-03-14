@@ -733,6 +733,60 @@ impl Tool for NowTool {
     }
 }
 
+/// Pause the tool loop briefly so the agent can wait before polling another tool.
+pub struct SleepTool;
+
+impl Tool for SleepTool {
+    fn name(&self) -> &str {
+        "sleep"
+    }
+
+    fn description(&self) -> &str {
+        "Sleep for a short duration in seconds. Use this before polling a background task again. Maximum 10 seconds."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "seconds": {
+                    "type": "number",
+                    "description": "Sleep duration in seconds. Must be between 0 and 10."
+                }
+            },
+            "required": ["seconds"]
+        })
+    }
+
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    {
+        async move {
+            let seconds = arguments["seconds"]
+                .as_f64()
+                .ok_or_else(|| AgentError::tool("sleep", "missing or invalid 'seconds'"))?;
+            if !seconds.is_finite() || !(0.0..=10.0).contains(&seconds) {
+                return Err(AgentError::tool(
+                    "sleep",
+                    "seconds must be a finite number between 0 and 10",
+                ));
+            }
+
+            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+            Ok(ToolResult::Output(async_stream::stream! {
+                yield ToolOutput::text(serde_json::json!({
+                    "slept_seconds": seconds,
+                    "status": "completed"
+                }).to_string());
+            }))
+        }
+    }
+}
+
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     // Shift epoch to 1 Mar 0000 (proleptic Gregorian) for easier math.
