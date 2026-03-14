@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod events;
+pub mod im_tools;
 pub mod memory;
 pub mod model_profile;
 pub mod skill;
@@ -25,6 +26,7 @@ pub mod tools;
 
 pub use agent::CatAgent;
 pub use events::{CatEvent, SkillEvent, TodoEvent};
+pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use memory::MemoryStore;
 pub use model_profile::ModelProfile;
 pub use remi_agentloop::prelude::{Content, ContentPart, Message};
@@ -46,6 +48,84 @@ use tools::{
     RootedFsRemoveTool, RootedFsReplaceTool, RootedFsWriteTool, SecretRedactor, WorkspaceBashTool,
 };
 
+const REMI_KIMI_THINKING_ENV: &str = "REMI_KIMI_THINKING";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiThinkingMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl KimiThinkingMode {
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var(REMI_KIMI_THINKING_ENV) {
+            Ok(raw) => Self::parse(&raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{REMI_KIMI_THINKING_ENV} must be one of: auto, enabled, disabled"
+                )
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
+            Err(err) => Err(anyhow::anyhow!(
+                "failed to read {REMI_KIMI_THINKING_ENV}: {err}"
+            )),
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Self::Auto),
+            "enabled" | "enable" | "on" | "true" | "1" => Some(Self::Enabled),
+            "disabled" | "disable" | "off" | "false" | "0" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    fn request_type(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Enabled => Some("enabled"),
+            Self::Disabled => Some("disabled"),
+        }
+    }
+}
+
+fn kimi_thinking_extra_options(
+    model: &str,
+    mode: KimiThinkingMode,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut options = serde_json::Map::new();
+    let lower = model.trim().to_ascii_lowercase();
+
+    let Some(thinking_type) = mode.request_type() else {
+        return options;
+    };
+
+    if lower.contains("kimi-k2.5") {
+        options.insert(
+            "thinking".into(),
+            serde_json::json!({ "type": thinking_type }),
+        );
+        return options;
+    }
+
+    if lower.contains("kimi-k2-thinking") {
+        tracing::warn!(
+            model = %model,
+            env = REMI_KIMI_THINKING_ENV,
+            "ignoring Kimi thinking override because kimi-k2-thinking always reasons"
+        );
+    } else if lower.contains("kimi") {
+        tracing::warn!(
+            model = %model,
+            env = REMI_KIMI_THINKING_ENV,
+            "ignoring Kimi thinking override because only kimi-k2.5 supports toggling thinking"
+        );
+    }
+
+    options
+}
+
 // -- StreamOptions ----------------------------------------------------------
 
 /// Per-turn options for [`CatBot::stream_with_options`].
@@ -54,11 +134,19 @@ pub struct StreamOptions {
     /// UUID of the sender (stored in metadata; injected as a
     /// system annotation in group chats so the LLM can distinguish speakers).
     pub sender_user_id: Option<String>,
+    /// IM username used for `Message.name` on the current user turn.
+    pub sender_username: Option<String>,
     /// Feishu `message_id` of the incoming message (stored in metadata).
     pub message_id: Option<String>,
     /// Feishu `chat_type` — `"group"` or `"p2p"` (stored in metadata;
     /// triggers speaker annotation when `"group"`).
     pub chat_type: Option<String>,
+    /// Current IM platform identifier (for example `feishu`).
+    pub platform: Option<String>,
+    /// Downloadable IM attachments referenced by the current message.
+    pub im_attachments: Vec<ImAttachment>,
+    /// Feishu document links referenced by the current message.
+    pub im_documents: Vec<ImDocument>,
 }
 
 // -- Type aliases -------------------------------------------------------------
@@ -83,6 +171,7 @@ impl CatBot {
     /// | `OPENAI_API_KEY`          | API key (required)                                    |
     /// | `OPENAI_BASE_URL`         | Custom base URL (optional)                            |
     /// | `OPENAI_MODEL`            | Model name (default: `gpt-4o`)                        |
+    /// | `REMI_KIMI_THINKING`      | Moonshot `kimi-k2.5` thinking mode: `auto`, `enabled`, or `disabled` |
     /// | `REMI_SHORT_TERM_TOKENS`  | Override short-term token budget (default: from model profile) |
     /// | `REMI_OVERFLOW_BYTES`     | Override tool-output overflow threshold in bytes (default: from model profile) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
@@ -171,36 +260,108 @@ impl CatBot {
             if let Some(ref ct) = opts.chat_type {
                 meta["chat_type"] = serde_json::Value::String(ct.clone());
             }
+            if let Some(ref platform) = opts.platform {
+                meta["platform"] = serde_json::Value::String(platform.clone());
+            }
 
             let mut msg_meta = serde_json::Map::new();
             if let Some(ref sid) = opts.sender_user_id {
                 msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
                 meta["sender_user_id"] = serde_json::Value::String(sid.clone());
             }
+            if let Some(ref username) = opts.sender_username {
+                let username = username.trim();
+                if !username.is_empty() {
+                    let username = username.to_string();
+                    msg_meta.insert("sender_username".into(), serde_json::Value::String(username.clone()));
+                    meta["sender_username"] = serde_json::Value::String(username);
+                }
+            }
             if let Some(ref mid) = opts.message_id {
                 msg_meta.insert("message_id".into(), serde_json::Value::String(mid.clone()));
+                meta["message_id"] = serde_json::Value::String(mid.clone());
             }
             if let Some(ref ct) = opts.chat_type {
                 msg_meta.insert("chat_type".into(), serde_json::Value::String(ct.clone()));
+            }
+            if let Some(ref platform) = opts.platform {
+                msg_meta.insert("platform".into(), serde_json::Value::String(platform.clone()));
+            }
+            if !opts.im_attachments.is_empty() {
+                let json_str = serde_json::to_string(&opts.im_attachments).unwrap_or_default();
+                let str_val = serde_json::Value::String(json_str);
+                msg_meta.insert("im_attachments".into(), str_val.clone());
+                meta["im_attachments"] = str_val;
+            }
+            if !opts.im_documents.is_empty() {
+                let json_str = serde_json::to_string(&opts.im_documents).unwrap_or_default();
+                let str_val = serde_json::Value::String(json_str);
+                msg_meta.insert("im_documents".into(), str_val.clone());
+                meta["im_documents"] = str_val;
             }
             let message_metadata = if msg_meta.is_empty() {
                 None
             } else {
                 Some(serde_json::Value::Object(msg_meta))
             };
+            let requested_user_name = opts
+                .sender_username
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let injected_user_name = requested_user_name
+                .as_deref()
+                .and_then(|value| truncate_user_name(Some(value), 10));
+            let content = prepend_group_sender_username(
+                content,
+                opts.chat_type.as_deref(),
+                requested_user_name.as_deref(),
+            );
+
+            let should_log_media_input = content.is_multimodal()
+                || !opts.im_attachments.is_empty()
+                || !opts.im_documents.is_empty();
+            if should_log_media_input {
+                tracing::info!(
+                    thread_id = %thread_id_owned,
+                    sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
+                    message_id = opts.message_id.as_deref().unwrap_or(""),
+                    chat_type = opts.chat_type.as_deref().unwrap_or(""),
+                    content_summary = %summarize_content_for_log(&content),
+                    attachment_count = opts.im_attachments.len(),
+                    document_count = opts.im_documents.len(),
+                    "stream_with_options: media input"
+                );
+            }
 
             tracing::debug!(
                 thread_id = %thread_id_owned,
                 skip_count,
                 has_message_metadata = message_metadata.is_some(),
+                requested_user_name = requested_user_name.as_deref().unwrap_or(""),
+                injected_user_name = injected_user_name.as_deref().unwrap_or(""),
                 ?message_metadata,
                 "stream_with_options: building LoopInput"
+            );
+            tracing::info!(
+                thread_id = %thread_id_owned,
+                sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
+                message_id = opts.message_id.as_deref().unwrap_or(""),
+                sender_username = requested_user_name.as_deref().unwrap_or(""),
+                injected_user_name = injected_user_name.as_deref().unwrap_or(""),
+                has_sender_username = requested_user_name.is_some(),
+                has_message_metadata = message_metadata.is_some(),
+                "stream_with_options: username propagation"
             );
 
             let mut input = LoopInput::start_content(content)
                 .history(history)
                 .metadata(meta)
                 .user_state(ctx.user_state);
+            if let Some(user_name) = injected_user_name {
+                input = input.user_name(user_name);
+            }
             if let Some(mm) = message_metadata {
                 input = input.message_metadata(mm);
             }
@@ -298,6 +459,110 @@ async fn persist_turn(
     }
 }
 
+fn truncate_user_name(name: Option<&str>, max_chars: usize) -> Option<String> {
+    let trimmed = name?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(max_chars).collect())
+}
+
+fn prepend_group_sender_username(
+    content: Content,
+    chat_type: Option<&str>,
+    sender_username: Option<&str>,
+) -> Content {
+    let Some(prefix) = group_sender_prefix(chat_type, sender_username) else {
+        return content;
+    };
+
+    match content {
+        Content::Text(text) => Content::Text(format!("{prefix}{text}")),
+        Content::Parts(mut parts) => {
+            if let Some(ContentPart::Text { text }) = parts.first_mut() {
+                let original = std::mem::take(text);
+                *text = format!("{prefix}{original}");
+            } else {
+                parts.insert(0, ContentPart::text(prefix));
+            }
+            Content::Parts(parts)
+        }
+    }
+}
+
+fn group_sender_prefix(chat_type: Option<&str>, sender_username: Option<&str>) -> Option<String> {
+    if !is_group_chat(chat_type) {
+        return None;
+    }
+
+    let username = sender_username?.trim();
+    if username.is_empty() {
+        return None;
+    }
+
+    Some(format!("{username}:\n"))
+}
+
+fn is_group_chat(chat_type: Option<&str>) -> bool {
+    chat_type
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("group"))
+}
+
+fn summarize_content_for_log(content: &Content) -> String {
+    match content {
+        Content::Text(text) => format!("text(len={})", text.chars().count()),
+        Content::Parts(parts) => {
+            let mut text_len = 0usize;
+            let mut image_urls: Vec<String> = Vec::new();
+            let mut image_base64: Vec<String> = Vec::new();
+            let mut audio_parts = 0usize;
+            let mut file_parts = 0usize;
+
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => {
+                        text_len += text.chars().count();
+                    }
+                    ContentPart::ImageUrl { image_url } => {
+                        image_urls.push(format!(
+                            "{}(len={})",
+                            preview_url_header(&image_url.url),
+                            image_url.url.len()
+                        ));
+                    }
+                    ContentPart::ImageBase64 { media_type, data } => {
+                        image_base64.push(format!("{}(data_len={})", media_type, data.len()));
+                    }
+                    ContentPart::Audio { .. } => {
+                        audio_parts += 1;
+                    }
+                    ContentPart::File { .. } => {
+                        file_parts += 1;
+                    }
+                }
+            }
+
+            format!(
+                "parts(total={}, text_len={}, image_urls={:?}, image_base64={:?}, audio_parts={}, file_parts={})",
+                parts.len(),
+                text_len,
+                image_urls,
+                image_base64,
+                audio_parts,
+                file_parts,
+            )
+        }
+    }
+}
+
+fn preview_url_header(url: &str) -> &str {
+    match url.find(',') {
+        Some(idx) => &url[..idx],
+        None => url,
+    }
+}
+
 // -- CatBotBuilder ------------------------------------------------------------
 
 pub struct CatBotBuilder {
@@ -316,6 +581,8 @@ pub struct CatBotBuilder {
     overflow_bytes: Option<usize>,
     memory_days: u64,
     bash_mode: BashMode,
+    im_bridge: Option<Arc<dyn ImFileBridge>>,
+    extra_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CatBotBuilder {
@@ -328,7 +595,8 @@ impl CatBotBuilder {
             .unwrap_or_else(|_| "gpt-4o".into());
         let base_url = std::env::var("OPENAI_BASE_URL")
             .or_else(|_| std::env::var("REMI_BASE_URL"))
-            .ok();
+            .ok()
+            .filter(|s| !s.is_empty());
         let short_term_tokens = std::env::var("REMI_SHORT_TERM_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -339,6 +607,8 @@ impl CatBotBuilder {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(7_u64);
+        let kimi_thinking_mode = KimiThinkingMode::from_env()?;
+        let extra_options = kimi_thinking_extra_options(&model, kimi_thinking_mode);
         let bash_mode = match std::env::var("REMI_BASH_MODE").as_deref() {
             Ok("local") => BashMode::Local,
             _ => BashMode::Docker,
@@ -356,6 +626,8 @@ impl CatBotBuilder {
             overflow_bytes,
             memory_days,
             bash_mode,
+            im_bridge: None,
+            extra_options,
         })
     }
 
@@ -388,6 +660,11 @@ impl CatBotBuilder {
         self
     }
 
+    pub fn im_bridge(mut self, bridge: Arc<dyn ImFileBridge>) -> Self {
+        self.im_bridge = Some(bridge);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<CatBot> {
         // Resolve model profile first so we can derive all configuration.
         let profile = ModelProfile::for_model(&self.model);
@@ -413,19 +690,36 @@ impl CatBotBuilder {
             "model profile resolved"
         );
 
+        if !self.extra_options.is_empty() {
+            tracing::info!(
+                model = %self.model,
+                extra_options = ?self.extra_options,
+                "model extra options enabled"
+            );
+        }
+
         let mut oai = OpenAIClient::new(self.api_key.clone()).with_model(self.model.clone());
         if let Some(url) = resolved_base_url.clone() {
             oai = oai.with_base_url(url);
         }
 
-        let inner_loop: InnerAgent = AgentBuilder::new()
+        let extra_options = self.extra_options.clone();
+        let mut inner_builder = AgentBuilder::new()
             .model(oai)
             .system(self.system)
-            .max_turns(usize::MAX)
-            .build_loop();
+            .max_turns(usize::MAX);
+        if !extra_options.is_empty() {
+            inner_builder = inner_builder.extra_options(extra_options.clone());
+        }
+        let inner_loop: InnerAgent = inner_builder.build_loop();
 
         // Compressor uses the same API credentials but no tools, max 1 turn.
-        let compressor = LlmCompressor::new(self.api_key, resolved_base_url, self.model);
+        let compressor = LlmCompressor::new(
+            self.api_key,
+            resolved_base_url,
+            self.model,
+            extra_options,
+        );
 
         let memory = Arc::new(MemoryStore {
             data_dir: self.data_dir,
@@ -484,10 +778,88 @@ impl CatBotBuilder {
                 local_tools,
                 data_dir: memory.data_dir.clone(),
                 overflow_bytes,
+                im_bridge: self.im_bridge,
             },
             memory,
             redactor,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        kimi_thinking_extra_options, prepend_group_sender_username, Content, ContentPart,
+        KimiThinkingMode,
+    };
+
+    #[test]
+    fn kimi_k25_enabled_sets_thinking_extra_option() {
+        let options = kimi_thinking_extra_options("kimi-k2.5", KimiThinkingMode::Enabled);
+        assert_eq!(
+            options.get("thinking"),
+            Some(&serde_json::json!({ "type": "enabled" }))
+        );
+    }
+
+    #[test]
+    fn kimi_k25_disabled_sets_thinking_extra_option() {
+        let options = kimi_thinking_extra_options("kimi-k2.5", KimiThinkingMode::Disabled);
+        assert_eq!(
+            options.get("thinking"),
+            Some(&serde_json::json!({ "type": "disabled" }))
+        );
+    }
+
+    #[test]
+    fn non_toggleable_kimi_models_ignore_override() {
+        let options = kimi_thinking_extra_options("kimi-k2-thinking", KimiThinkingMode::Disabled);
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn group_text_content_is_prefixed_with_sender_username() {
+        let content = prepend_group_sender_username(
+            Content::text("hello"),
+            Some("group"),
+            Some("vv"),
+        );
+
+        match content {
+            Content::Text(text) => assert_eq!(text, "vv:\nhello"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p2p_content_is_not_prefixed() {
+        let content = prepend_group_sender_username(
+            Content::text("hello"),
+            Some("p2p"),
+            Some("vv"),
+        );
+
+        match content {
+            Content::Text(text) => assert_eq!(text, "hello"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_multimodal_content_gets_prefix_text_part() {
+        let content = prepend_group_sender_username(
+            Content::parts(vec![ContentPart::image_url("data:image/png;base64,abc")]),
+            Some("group"),
+            Some("vv"),
+        );
+
+        match content {
+            Content::Parts(parts) => {
+                assert!(matches!(parts.first(), Some(ContentPart::Text { text }) if text == "vv:\n"));
+                assert!(matches!(parts.get(1), Some(ContentPart::ImageUrl { .. })));
+            }
+            other => panic!("expected parts content, got {other:?}"),
+        }
     }
 }
 

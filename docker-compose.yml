@@ -29,8 +29,11 @@ services:
       # or set host.docker.internal via extra_hosts below.
       DAEMON_ADDR: "${DAEMON_ADDR:-http://host.docker.internal:50051}"
 
-      # ── OpenAI-compatible LLM (required) ──────────────────────────────
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      # ── OpenAI-compatible LLM (injected by daemon via SecretsSync) ───────
+      # Leave blank — the daemon pushes secrets into the agent over gRPC after
+      # startup.  Setting these here is optional and only needed when running
+      # the agent container standalone (without remi-daemon).
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o}"
 

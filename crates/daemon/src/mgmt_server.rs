@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::{collections::HashSet, sync::Arc as StdArc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -37,9 +38,9 @@ use futures::{SinkExt, StreamExt};
 use mgmt_api::{
     methods, AgentFileParams, AgentFileResult, AuthParams, AuthResult, ContainerOpParams,
     ContainerOpResult, DaemonStatusResult, MgmtRequest, MgmtResponse, OwnerGetResult,
-    SecretDeleteParams, SecretEntry, SecretSetParams, VolumeAddParams, VolumeRemoveParams,
-    UserChannel, UserDeleteParams, UserInfo, UserLinkParams, UserLinkResult,
-    UserListResult, UserUnlinkParams,
+    SecretDeleteParams, SecretEntry, SecretSetParams, UserBanListResult, UserBanParams,
+    UserChannel, UserDeleteParams, UserInfo, UserLinkParams, UserLinkResult, UserListResult,
+    UserUnlinkParams, VolumeAddParams, VolumeRemoveParams,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,7 +56,6 @@ use crate::secret_store::SecretStore;
 use crate::volume_store::VolumeStore;
 use matcher::OwnerMatcher;
 use user_store::UserStore;
-use std::sync::Arc as StdArc;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 const IDENTITY_FILE: &str = "mgmt_identity.json";
@@ -358,6 +358,9 @@ impl MgmtServer {
             methods::USER_LINK => self.handle_user_link(id, &req.params).await,
             methods::USER_UNLINK => self.handle_user_unlink(id, &req.params).await,
             methods::USER_DELETE => self.handle_user_delete(id, &req.params).await,
+            methods::USER_BAN => self.handle_user_ban(id, &req.params).await,
+            methods::USER_UNBAN => self.handle_user_unban(id, &req.params).await,
+            methods::USER_BAN_LIST => self.handle_user_ban_list(id).await,
             _ => MgmtResponse::err(id, 404, format!("unknown method: {}", req.method)),
         }
     }
@@ -540,10 +543,13 @@ impl MgmtServer {
 
     async fn handle_user_list(&self, id: &str) -> MgmtResponse {
         let records = self.ctx.user_store.list();
+        let banned: HashSet<String> = self.ctx.owner.list_banned().into_iter().collect();
         let users: Vec<UserInfo> = records
             .into_iter()
             .map(|r| UserInfo {
+                banned: banned.contains(&r.uuid),
                 uuid: r.uuid,
+                username: r.username,
                 channels: r
                     .channels
                     .into_iter()
@@ -565,11 +571,19 @@ impl MgmtServer {
             Ok(p) => p,
             Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
         };
+        let old_a = self.ctx.user_store.resolve(&p.channel_a, &p.user_id_a);
+        let old_b = self.ctx.user_store.resolve(&p.channel_b, &p.user_id_b);
         match self.ctx.user_store.link(&p.channel_a, &p.user_id_a, &p.channel_b, &p.user_id_b) {
-            Ok(uuid) => match serde_json::to_value(UserLinkResult { uuid }) {
-                Ok(v) => MgmtResponse::ok(id, v),
-                Err(e) => MgmtResponse::err(id, 500, e.to_string()),
-            },
+            Ok(uuid) => {
+                let old_ids: Vec<String> = old_a.into_iter().chain(old_b).collect();
+                if let Err(e) = self.ctx.owner.migrate_blacklist(&old_ids, &uuid) {
+                    return MgmtResponse::err(id, 500, e.to_string());
+                }
+                match serde_json::to_value(UserLinkResult { uuid }) {
+                    Ok(v) => MgmtResponse::ok(id, v),
+                    Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+                }
+            }
             Err(e) => MgmtResponse::err(id, 500, e.to_string()),
         }
     }
@@ -592,6 +606,42 @@ impl MgmtServer {
         };
         match self.ctx.user_store.delete_by_uuid(&p.uuid) {
             Ok(deleted) => MgmtResponse::ok(id, serde_json::json!({"ok": deleted})),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_ban(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: UserBanParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        match self.ctx.owner.ban(&p.uuid) {
+            Ok(matcher::BanResult::Added | matcher::BanResult::AlreadyBanned) => {
+                MgmtResponse::ok(id, serde_json::json!({"ok": true}))
+            }
+            Ok(matcher::BanResult::ProtectedOwner) => {
+                MgmtResponse::err(id, 400, "cannot ban owner or protected user")
+            }
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_unban(&self, id: &str, params: &serde_json::Value) -> MgmtResponse {
+        let p: UserBanParams = match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => return MgmtResponse::err(id, 400, e.to_string()),
+        };
+        match self.ctx.owner.unban(&p.uuid) {
+            Ok(_) => MgmtResponse::ok(id, serde_json::json!({"ok": true})),
+            Err(e) => MgmtResponse::err(id, 500, e.to_string()),
+        }
+    }
+
+    async fn handle_user_ban_list(&self, id: &str) -> MgmtResponse {
+        match serde_json::to_value(UserBanListResult {
+            users: self.ctx.owner.list_banned(),
+        }) {
+            Ok(v) => MgmtResponse::ok(id, v),
             Err(e) => MgmtResponse::err(id, 500, e.to_string()),
         }
     }

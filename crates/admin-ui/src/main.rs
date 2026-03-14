@@ -27,7 +27,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::{
     response::Html,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Router,
 };
 use tokio::sync::RwLock;
@@ -120,9 +120,14 @@ async fn main() -> Result<()> {
         .route("/api/daemons/:id/volumes/remove", post(api::remove_volume))
         // Users
         .route("/api/daemons/:id/users", get(api::list_users))
+        .route("/api/daemons/:id/users/banned", get(api::list_banned_users))
         .route("/api/daemons/:id/users/link", post(api::link_users))
         .route("/api/daemons/:id/users/unlink", post(api::unlink_user))
         .route("/api/daemons/:id/users/:uuid", delete(api::delete_user))
+        .route(
+            "/api/daemons/:id/users/:uuid/ban",
+            post(api::ban_user).delete(api::unban_user),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -14,7 +14,7 @@ use axum::{
 };
 use mgmt_api::{
     methods, AgentFileParams, ContainerOpParams, MgmtRequest, SecretDeleteParams, SecretSetParams,
-    VolumeAddParams, VolumeRemoveParams,
+    UserBanParams, VolumeAddParams, VolumeRemoveParams,
     UserDeleteParams, UserLinkParams, UserUnlinkParams,
 };
 use serde::Deserialize;
@@ -449,6 +449,42 @@ pub async fn delete_user(
         id: "1".into(),
         method: methods::USER_DELETE.into(),
         params: serde_json::to_value(UserDeleteParams { uuid }).unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+pub async fn list_banned_users(
+    State(s): State<AppState>,
+    Path(daemon_id): Path<String>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_BAN_LIST.into(),
+        params: serde_json::Value::Null,
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+pub async fn ban_user(
+    State(s): State<AppState>,
+    Path((daemon_id, uuid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_BAN.into(),
+        params: serde_json::to_value(UserBanParams { uuid }).unwrap(),
+    };
+    try_call!(&s, &daemon_id, req)
+}
+
+pub async fn unban_user(
+    State(s): State<AppState>,
+    Path((daemon_id, uuid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let req = MgmtRequest {
+        id: "1".into(),
+        method: methods::USER_UNBAN.into(),
+        params: serde_json::to_value(UserBanParams { uuid }).unwrap(),
     };
     try_call!(&s, &daemon_id, req)
 }

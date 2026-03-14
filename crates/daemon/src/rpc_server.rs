@@ -27,8 +27,9 @@ use tracing::{debug, info, warn};
 
 use im_feishu::{FeishuGateway, StreamingCard};
 use remi_proto::{
-    AgentPayload, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer, ImMessageEvent,
-    ImReactionEvent, SecretsSync, ShutdownSignal,
+    AgentPayload, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer,
+    ImAttachmentRef, ImBridgeRequest, ImBridgeResponse, ImDocumentRef, ImDownloadedFile,
+    ImMessageEvent, ImReactionEvent, ImUploadedFile, SecretsSync, ShutdownSignal,
 };
 
 use crate::secret_store::SecretStore;
@@ -102,6 +103,8 @@ impl RpcServer {
     /// Build the tonic server wrapper for this service.
     pub fn into_server(self) -> DaemonServiceServer<Self> {
         DaemonServiceServer::new(self)
+            .max_decoding_message_size(remi_proto::GRPC_MESSAGE_LIMIT_BYTES)
+            .max_encoding_message_size(remi_proto::GRPC_MESSAGE_LIMIT_BYTES)
     }
 
     /// Send a `DaemonMessage` to the connected Agent, if any.
@@ -192,6 +195,7 @@ impl DaemonService for RpcServer {
 
         // ── Inbound task (Agent → Daemon) ─────────────────────────────────
         let gateway = self.gateway.clone();
+        let server = self.clone();
         let sink = self.agent_sink.clone();
         let reactions = self.reactions.clone();
         let completions = self.completions.clone();
@@ -214,6 +218,15 @@ impl DaemonService for RpcServer {
                 debug!(reply_to = %reply_to, "received AgentMessage");
 
                 match agent_msg.payload {
+                    Some(AgentPayload::ImBridgeRequest(req)) => {
+                        let response = handle_im_bridge_request(&gateway, req).await;
+                        server
+                            .send_to_agent(DaemonMessage {
+                                payload: Some(DaemonPayload::ImBridgeResponse(response)),
+                            })
+                            .await;
+                    }
+
                     Some(AgentPayload::TextDelta(d)) => {
                         let card = cards
                             .entry(reply_to.clone())
@@ -327,7 +340,163 @@ impl DaemonService for RpcServer {
 
 // ── Helper: build DaemonMessage wrappers ─────────────────────────────────────
 
-pub fn daemon_msg_im_message(ev: &im_feishu::FeishuMessage, user_uuid: &str) -> DaemonMessage {
+async fn handle_im_bridge_request(
+    gateway: &FeishuGateway,
+    request: ImBridgeRequest,
+) -> ImBridgeResponse {
+    let request_id = request.request_id;
+    let Some(payload) = request.payload else {
+        return ImBridgeResponse {
+            request_id,
+            error: "missing bridge payload".into(),
+            payload: None,
+        };
+    };
+
+    match payload {
+        remi_proto::im_bridge_request::Payload::Download(download) => {
+            if download.platform != "feishu" {
+                return ImBridgeResponse {
+                    request_id,
+                    error: format!("unsupported platform: {}", download.platform),
+                    payload: None,
+                };
+            }
+
+            let result = if !download.attachment_key.is_empty() {
+                // A key encoded as "{owner_msg_id}\t{real_key}" means the file
+                // belongs to a quoted (parent) message — use that message's ID
+                // for the resource request. Otherwise fall back to the current
+                // message ID. This is transparent to the agent.
+                let (owner_msg_id, real_key) =
+                    if let Some((owner, key)) = download.attachment_key.split_once('\t') {
+                        (owner.to_string(), key.to_string())
+                    } else {
+                        (download.message_id.clone(), download.attachment_key.clone())
+                    };
+                debug!(
+                    message_id = %owner_msg_id,
+                    file_key   = %real_key,
+                    file_type  = %download.file_type,
+                    "handle_im_bridge_request: download attachment"
+                );
+                gateway
+                    .download_file(&owner_msg_id, &real_key, &download.file_type)
+                    .await
+                    .map(|(mime_type, file_name, content)| ImDownloadedFile {
+                        file_name,
+                        mime_type,
+                        content,
+                        source_label: format!("attachment:{}", real_key),
+                    })
+            } else if !download.document_url.is_empty() {
+                gateway.download_document(&download.document_url).await.map(
+                    |(mime_type, file_name, content)| ImDownloadedFile {
+                        file_name,
+                        mime_type,
+                        content,
+                        source_label: download.document_url.clone(),
+                    },
+                )
+            } else {
+                Err(anyhow::anyhow!(
+                    "download request must specify attachment_key or document_url"
+                ))
+            };
+
+            match result {
+                Ok(downloaded) => ImBridgeResponse {
+                    request_id,
+                    error: String::new(),
+                    payload: Some(remi_proto::im_bridge_response::Payload::Downloaded(
+                        downloaded,
+                    )),
+                },
+                Err(e) => ImBridgeResponse {
+                    request_id,
+                    error: e.to_string(),
+                    payload: None,
+                },
+            }
+        }
+        remi_proto::im_bridge_request::Payload::Upload(upload) => {
+            if upload.platform != "feishu" {
+                return ImBridgeResponse {
+                    request_id,
+                    error: format!("unsupported platform: {}", upload.platform),
+                    payload: None,
+                };
+            }
+
+            let result = async {
+                let file_key = gateway
+                    .upload_file(
+                        &upload.file_name,
+                        &upload.mime_type,
+                        &upload.content,
+                        &upload.file_type,
+                    )
+                    .await?;
+                let sent_message_id = if !upload.message_id.is_empty() {
+                    match gateway
+                        .reply_file(&upload.message_id, &file_key, &upload.file_type)
+                        .await
+                    {
+                        Ok(message_id) => message_id,
+                        Err(err) => {
+                            warn!(error = %err, "reply_file failed, falling back to send_file");
+                            gateway
+                                .send_file(&upload.chat_id, &file_key, &upload.file_type)
+                                .await?
+                        }
+                    }
+                } else {
+                    gateway
+                        .send_file(&upload.chat_id, &file_key, &upload.file_type)
+                        .await?
+                };
+
+                Ok::<ImUploadedFile, anyhow::Error>(ImUploadedFile {
+                    file_name: upload.file_name.clone(),
+                    file_key: file_key.clone(),
+                    message_id: sent_message_id.clone(),
+                    resource_url: gateway.file_resource_url(
+                        &sent_message_id,
+                        &file_key,
+                        &upload.file_type,
+                    ),
+                })
+            }
+            .await;
+
+            match result {
+                Ok(uploaded) => ImBridgeResponse {
+                    request_id,
+                    error: String::new(),
+                    payload: Some(remi_proto::im_bridge_response::Payload::Uploaded(uploaded)),
+                },
+                Err(e) => ImBridgeResponse {
+                    request_id,
+                    error: e.to_string(),
+                    payload: None,
+                },
+            }
+        }
+    }
+}
+
+pub fn daemon_msg_im_message(
+    ev: &im_feishu::FeishuMessage,
+    user_uuid: &str,
+    sender_username: Option<&str>,
+) -> DaemonMessage {
+    info!(
+        message_id = %ev.message_id,
+        sender_user_id = %user_uuid,
+        sender_username = sender_username.unwrap_or(""),
+        has_sender_username = sender_username.map(str::trim).map(|value| !value.is_empty()).unwrap_or(false),
+        "daemon_msg_im_message: building ImMessageEvent"
+    );
     DaemonMessage {
         payload: Some(DaemonPayload::ImMessage(ImMessageEvent {
             message_id: ev.message_id.clone(),
@@ -337,6 +506,38 @@ pub fn daemon_msg_im_message(ev: &im_feishu::FeishuMessage, user_uuid: &str) -> 
             text: ev.text.clone(),
             images: ev.images.clone(),
             parent_id: ev.parent_id.clone().unwrap_or_default(),
+            platform: "feishu".into(),
+            attachments: ev
+                .files
+                .iter()
+                .map(|file| {
+                    debug!(
+                        file_key  = %file.file_key,
+                        file_name = %file.file_name,
+                        file_type = %file.file_type,
+                        mime_type = %file.mime_type,
+                        "daemon_msg_im_message: attachment"
+                    );
+                    ImAttachmentRef {
+                        key: file.file_key.clone(),
+                        name: file.file_name.clone(),
+                        mime_type: file.mime_type.clone(),
+                        size_bytes: file.size_bytes,
+                        file_type: file.file_type.clone(),
+                    }
+                })
+                .collect(),
+            documents: ev
+                .documents
+                .iter()
+                .map(|doc| ImDocumentRef {
+                    url: doc.url.clone(),
+                    title: doc.title.clone(),
+                    doc_type: doc.doc_type.clone(),
+                    token: doc.token.clone(),
+                })
+                .collect(),
+            sender_username: sender_username.unwrap_or_default().to_string(),
         })),
     }
 }

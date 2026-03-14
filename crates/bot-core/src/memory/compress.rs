@@ -25,16 +25,24 @@ pub struct LlmCompressor {
 }
 
 impl LlmCompressor {
-    pub fn new(api_key: String, base_url: Option<String>, model: String) -> Self {
+    pub fn new(
+        api_key: String,
+        base_url: Option<String>,
+        model: String,
+        extra_options: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
         let mut oai = OpenAIClient::new(api_key).with_model(model);
         if let Some(url) = base_url {
             oai = oai.with_base_url(url);
         }
-        let inner = AgentBuilder::new()
+        let mut builder = AgentBuilder::new()
             .model(oai)
             .system(COMPRESSION_SYSTEM)
-            .max_turns(1)
-            .build_loop();
+            .max_turns(1);
+        if !extra_options.is_empty() {
+            builder = builder.extra_options(extra_options);
+        }
+        let inner = builder.build_loop();
         Self { inner }
     }
 

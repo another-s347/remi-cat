@@ -21,6 +21,8 @@ use reqwest;
 
 /// All commands that the Daemon handles without forwarding to the Agent.
 const DAEMON_COMMANDS: &[&str] = &[
+    "ban",
+    "unban",
     "help",
     "diagnose",
     "repair",
@@ -254,6 +256,8 @@ fn help_text() -> String {
     r#"**remi-cat 指令列表**
 
 **系统指令（由 Daemon 处理，不经过 AI）：**
+`/ban <uuid|feishu:open_id|@用户>` — 拉黑用户
+`/unban <uuid|feishu:open_id|@用户>` — 解除拉黑
 `/help` — 显示此帮助
 `/diagnose` — 诊断记忆文件健康状态
 `/repair` — 修复损坏的短期记忆

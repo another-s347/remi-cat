@@ -8,3 +8,4 @@ secrets.key
 mgmt_identity.json
 owner.json
 *.key
+.setup-state

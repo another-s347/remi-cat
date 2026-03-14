@@ -19,9 +19,10 @@ use remi_agentloop::prelude::{
     ToolContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
-use remi_agentloop::types::{AgentEvent, ThreadId};
+use remi_agentloop::types::AgentEvent;
 
-use crate::events::{CatEvent, SkillEvent, TodoEvent};
+use crate::events::CatEvent;
+use crate::im_tools::{register_im_tools, ImFileBridge};
 use crate::skill;
 use crate::todo;
 
@@ -38,6 +39,8 @@ pub struct CatAgent<I> {
     /// Tool-output byte threshold above which output is spilled to a temp file.
     /// Configured from the model profile; can be overridden per-builder.
     pub overflow_bytes: usize,
+    /// Optional daemon-mediated IM bridge used for per-platform upload/download tools.
+    pub im_bridge: Option<Arc<dyn ImFileBridge>>,
 }
 
 impl<I> CatAgent<I>
@@ -52,9 +55,11 @@ where
     ///
     /// Called by `CatBot::stream()` in lib.rs after injecting memory context.
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
-        let extra_defs = self.local_tools.definitions(&serde_json::Value::Null);
         let data_dir = self.data_dir.clone();
         let overflow_bytes = self.overflow_bytes;
+        let dynamic_tools = build_dynamic_tools(input_metadata(&input), data_dir.clone(), self.im_bridge.clone());
+        let mut extra_defs = self.local_tools.definitions(&serde_json::Value::Null);
+        extra_defs.extend(dynamic_tools.definitions(&serde_json::Value::Null));
 
         stream! {
             let run_start = Instant::now();
@@ -91,14 +96,21 @@ where
 
                         // ── Tool execution ───────────────────────────────────
                         AgentEvent::NeedToolExecution { mut state, tool_calls, completed_results } => {
-                            let (local, external): (Vec<_>, Vec<_>) = tool_calls
+                            let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
                                 .iter()
                                 .cloned()
                                 .partition(|tc| self.local_tools.contains(&tc.name));
+                            let (dynamic, external): (Vec<_>, Vec<_>) = remaining
+                                .into_iter()
+                                .partition(|tc| dynamic_tools.contains(&tc.name));
 
                             if !local.is_empty() {
                                 let names: Vec<&str> = local.iter().map(|t| t.name.as_str()).collect();
                                 debug!(tools = ?names, "agent: dispatching local tools");
+                            }
+                            if !dynamic.is_empty() {
+                                let names: Vec<&str> = dynamic.iter().map(|t| t.name.as_str()).collect();
+                                debug!(tools = ?names, "agent: dispatching dynamic tools");
                             }
 
                             let tool_ctx = build_tool_ctx(&state);
@@ -148,6 +160,38 @@ where
 
                                 // Notify lib.rs to persist user_state eagerly
                                 yield CatEvent::StateUpdate(state.user_state.clone());
+                            }
+
+                            if !dynamic.is_empty() {
+                                for tc in &dynamic {
+                                    yield CatEvent::ToolCall {
+                                        name: tc.name.clone(),
+                                        args: tc.arguments.clone(),
+                                    };
+                                }
+
+                                let resume_map = HashMap::new();
+                                let results = dynamic_tools
+                                    .execute_parallel(&dynamic, &resume_map, &tool_ctx)
+                                    .await;
+
+                                for (call_id, result) in results {
+                                    let tc = dynamic.iter().find(|t| t.id == call_id).unwrap();
+                                    debug!(tool = %tc.name, "agent: collecting dynamic tool result");
+                                    let result_str = collect_result_with_overflow(result, &data_dir, overflow_bytes).await;
+                                    debug!(tool = %tc.name, len = result_str.len(), "agent: dynamic tool done");
+
+                                    yield CatEvent::ToolCallResult {
+                                        name: tc.name.clone(),
+                                        result: result_str.clone(),
+                                    };
+
+                                    all_outcomes.push(ToolCallOutcome::Result {
+                                        tool_call_id: call_id,
+                                        tool_name: tc.name.clone(),
+                                        content: Content::text(result_str),
+                                    });
+                                }
                             }
 
                             if !external.is_empty() {
@@ -218,6 +262,7 @@ fn inject_extra_tools(
             model,
             temperature,
             max_tokens,
+            user_name,
             metadata,
             message_metadata,
             user_state,
@@ -230,6 +275,7 @@ fn inject_extra_tools(
                 model,
                 temperature,
                 max_tokens,
+                user_name,
                 metadata,
                 message_metadata,
                 user_state,
@@ -247,6 +293,33 @@ fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
         metadata: state.config.metadata.clone(),
         user_state: Arc::new(RwLock::new(state.user_state.clone())),
     }
+}
+
+fn input_metadata(input: &LoopInput) -> Option<serde_json::Value> {
+    match input {
+        LoopInput::Start { metadata, .. } => metadata.clone(),
+        LoopInput::Resume { state, .. } => state.config.metadata.clone(),
+        LoopInput::Cancel { state } => state.config.metadata.clone(),
+    }
+}
+
+fn build_dynamic_tools(
+    metadata: Option<serde_json::Value>,
+    data_dir: PathBuf,
+    im_bridge: Option<Arc<dyn ImFileBridge>>,
+) -> DefaultToolRegistry {
+    let mut registry = DefaultToolRegistry::new();
+    let Some(bridge) = im_bridge else {
+        return registry;
+    };
+    let platform = metadata
+        .as_ref()
+        .and_then(|value| value.get("platform"))
+        .and_then(|value| value.as_str());
+    if platform == Some("feishu") {
+        register_im_tools(&mut registry, data_dir, bridge);
+    }
+    registry
 }
 
 /// Maximum byte length of a tool result returned inline.

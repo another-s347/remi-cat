@@ -87,10 +87,41 @@ pub struct FeishuMessage {
     pub text: String,
     /// Image keys for any images attached to the message.
     pub images: Vec<String>,
+    /// File attachments carried by this message.
+    pub files: Vec<FeishuFile>,
+    /// Feishu document links discovered in this message.
+    pub documents: Vec<FeishuDocument>,
     /// Parent message ID when this message quotes/replies to another.
     pub parent_id: Option<String>,
     /// `true` when this message @-mentions the bot (always `true` for p2p).
     pub at_bot: bool,
+    /// Non-bot @mentions preserved from the original event payload.
+    pub mentions: Vec<FeishuMention>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeishuFile {
+    pub file_key: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    /// Feishu IM message type: `"file"`, `"folder"`, etc.
+    pub file_type: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeishuDocument {
+    pub url: String,
+    pub title: String,
+    pub doc_type: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeishuMention {
+    pub key: String,
+    pub open_id: Option<String>,
+    pub user_id: Option<String>,
 }
 
 /// An emoji reaction added to a message by a user.
@@ -147,6 +178,17 @@ struct RawMention {
 #[derive(Debug, Deserialize)]
 struct ImageContent {
     image_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileContent {
+    file_key: String,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default)]
+    file_size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,32 +403,132 @@ impl FeishuGateway {
                 let msg = &ev.message;
 
                 let content_str = msg.content.as_deref().unwrap_or("");
-                let (raw_text, images) = match msg.message_type.as_str() {
+                debug!(
+                    message_id = %msg.message_id,
+                    chat_id = %msg.chat_id,
+                    chat_type = %msg.chat_type,
+                    message_type = %msg.message_type,
+                    content_len = content_str.len(),
+                    content_preview = %preview_message_content(content_str),
+                    mention_count = msg.mentions.len(),
+                    "extract_event: raw Feishu message"
+                );
+                let (raw_text, images, files, content_documents) = match msg.message_type.as_str() {
                     "text" => {
-                        let tc: TextContent = serde_json::from_str(content_str).ok()?;
-                        (tc.text.trim().to_string(), vec![])
+                        let tc: TextContent = match serde_json::from_str(content_str) {
+                            Ok(tc) => tc,
+                            Err(e) => {
+                                warn!(
+                                    message_id = %msg.message_id,
+                                    content_preview = %preview_message_content(content_str),
+                                    "extract_event: failed to parse text content: {e}"
+                                );
+                                return None;
+                            }
+                        };
+                        (tc.text.trim().to_string(), vec![], vec![], vec![])
                     }
                     "image" => {
-                        let ic: ImageContent = serde_json::from_str(content_str).ok()?;
-                        (String::new(), vec![ic.image_key])
+                        let ic: ImageContent = match serde_json::from_str(content_str) {
+                            Ok(ic) => ic,
+                            Err(e) => {
+                                warn!(
+                                    message_id = %msg.message_id,
+                                    content_preview = %preview_message_content(content_str),
+                                    "extract_event: failed to parse image content: {e}"
+                                );
+                                return None;
+                            }
+                        };
+                        (String::new(), vec![ic.image_key], vec![], vec![])
+                    }
+                    "file" | "folder" => {
+                        let fc: FileContent = match serde_json::from_str(content_str) {
+                            Ok(fc) => fc,
+                            Err(e) => {
+                                warn!(
+                                    message_id = %msg.message_id,
+                                    content_preview = %preview_message_content(content_str),
+                                    "extract_event: failed to parse file content: {e}"
+                                );
+                                return None;
+                            }
+                        };
+                        let ftype = msg.message_type.clone();
+                        (
+                            String::new(),
+                            vec![],
+                            vec![FeishuFile {
+                                file_key: fc.file_key,
+                                file_name: fc.file_name,
+                                mime_type: fc.mime_type,
+                                size_bytes: fc.file_size,
+                                file_type: ftype,
+                            }],
+                            vec![],
+                        )
                     }
                     "post" => extract_from_post(content_str),
-                    _ => return None,
+                    other => {
+                        debug!(
+                            message_id = %msg.message_id,
+                            message_type = other,
+                            content_preview = %preview_message_content(content_str),
+                            "extract_event: unsupported Feishu message type"
+                        );
+                        return None;
+                    }
                 };
 
                 // Determine if the bot was @mentioned, and strip the mention
                 // placeholder from the text so the LLM sees clean input.
                 let (text, at_bot) = strip_bot_mention(&raw_text, &msg.mentions, bot_open_id);
+                let documents = merge_documents(content_documents, extract_doc_links_from_text(&text));
+
+                debug!(
+                    message_id = %msg.message_id,
+                    message_type = %msg.message_type,
+                    raw_text_len = raw_text.chars().count(),
+                    text_len = text.chars().count(),
+                    image_key_count = images.len(),
+                    file_count = files.len(),
+                    document_count = documents.len(),
+                    at_bot,
+                    "extract_event: normalized Feishu message"
+                );
 
                 // P2P messages always address the bot.
                 let at_bot = at_bot || msg.chat_type != "group";
 
+
+fn preview_message_content(content: &str) -> &str {
+    const MAX_PREVIEW: usize = 160;
+    if content.len() <= MAX_PREVIEW {
+        return content;
+    }
+
+    let mut end = MAX_PREVIEW;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
                 let sender_id = ev
                     .sender
                     .sender_id
                     .open_id
                     .or(ev.sender.sender_id.user_id)
                     .unwrap_or_default();
+                let mentions = msg
+                    .mentions
+                    .iter()
+                    .filter(|mention| mention.id.open_id.as_deref() != bot_open_id)
+                    .map(|mention| FeishuMention {
+                        key: mention.key.clone(),
+                        open_id: mention.id.open_id.clone(),
+                        user_id: mention.id.user_id.clone(),
+                    })
+                    .collect();
 
                 Some(FeishuEvent::MessageReceived(FeishuMessage {
                     message_id: msg.message_id.clone(),
@@ -395,8 +537,11 @@ impl FeishuGateway {
                     chat_type: msg.chat_type.clone(),
                     text,
                     images,
+                    files,
+                    documents,
                     parent_id: msg.parent_id.clone(),
                     at_bot,
+                    mentions,
                 }))
             }
 
@@ -561,6 +706,10 @@ impl FeishuGateway {
 
     // ── Outbound helpers ──────────────────────────────────────────────────────
 
+    pub async fn get_user_name(&self, user_id: &str) -> Result<Option<String>> {
+        self.client.get_user_name(user_id).await
+    }
+
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {
         self.client.send_text(chat_id, text).await
     }
@@ -618,6 +767,55 @@ impl FeishuGateway {
         self.client.download_image(message_id, image_key).await
     }
 
+    /// Download a file resource from an IM message.
+    pub async fn download_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<(String, String, Vec<u8>)> {
+        self.client.download_file(message_id, file_key, file_type).await
+    }
+
+    /// Download a Feishu document referenced by URL.
+    pub async fn download_document(
+        &self,
+        document_url: &str,
+    ) -> Result<(String, String, Vec<u8>)> {
+        self.client.download_document(document_url).await
+    }
+    pub async fn download_drive_file(
+        &self,
+        file_token: &str,
+    ) -> anyhow::Result<(String, String, Vec<u8>)> {
+        self.client.download_drive_file(file_token).await
+    }
+    /// Upload a file to Feishu IM and return its file key.
+    pub async fn upload_file(
+        &self,
+        file_name: &str,
+        mime_type: &str,
+        content: &[u8],
+        file_type: &str,
+    ) -> Result<String> {
+        self.client.upload_file(file_name, mime_type, content, file_type).await
+    }
+
+    /// Reply to an existing message with a file attachment.
+    pub async fn reply_file(&self, message_id: &str, file_key: &str, file_type: &str) -> Result<String> {
+        self.client.reply_file(message_id, file_key, file_type).await
+    }
+
+    /// Send a file attachment into a chat.
+    pub async fn send_file(&self, chat_id: &str, file_key: &str, file_type: &str) -> Result<String> {
+        self.client.send_file(chat_id, file_key, file_type).await
+    }
+
+    /// Return an authenticated Feishu resource URL for a sent file message.
+    pub fn file_resource_url(&self, message_id: &str, file_key: &str, file_type: &str) -> String {
+        self.client.file_resource_url(message_id, file_key, file_type)
+    }
+
     /// Delete (withdraw) a message sent by the bot.
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
         self.client.delete_message(message_id).await
@@ -635,16 +833,95 @@ impl FeishuGateway {
                 tc.text.trim().to_string()
             }
             "post" => {
-                let (text, _) = extract_from_post(&content_str);
+                let (text, _, _, _) = extract_from_post(&content_str);
                 text
             }
+            "interactive" => extract_text_from_card(&content_str),
             _ => return Ok(None),
         };
         Ok(if text.is_empty() { None } else { Some(text) })
     }
+
+    /// Fetch the full content of a quoted/parent message.
+    ///
+    /// Returns `None` when the message cannot be found or has an unsupported type.
+    /// Images are returned as raw keys; callers must download them using this
+    /// `message_id` as the resource owner (not the replying message's ID).
+    pub async fn fetch_parent_content(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<ParentContent>> {
+        let Some((msg_type, content_str)) = self.client.get_message_raw(message_id).await? else {
+            return Ok(None);
+        };
+        let content = match msg_type.as_str() {
+            "text" => {
+                let tc: TextContent = serde_json::from_str(&content_str)
+                    .map_err(|e| anyhow::anyhow!("parse text content: {e}"))?;
+                ParentContent {
+                    text: Some(tc.text.trim().to_string()).filter(|s| !s.is_empty()),
+                    images: vec![],
+                    files: vec![],
+                }
+            }
+            "post" => {
+                let (text, images, files, _) = extract_from_post(&content_str);
+                ParentContent {
+                    text: Some(text).filter(|s| !s.is_empty()),
+                    images,
+                    files,
+                }
+            }
+            "interactive" => {
+                let text = extract_text_from_card(&content_str);
+                ParentContent {
+                    text: Some(text).filter(|s| !s.is_empty()),
+                    images: vec![],
+                    files: vec![],
+                }
+            }
+            "image" => {
+                let ic: ImageContent = serde_json::from_str(&content_str)
+                    .map_err(|e| anyhow::anyhow!("parse image content: {e}"))?;
+                ParentContent {
+                    text: None,
+                    images: vec![ic.image_key],
+                    files: vec![],
+                }
+            }
+            "file" | "folder" | "audio" | "media" => {
+                let fc: FileContent = serde_json::from_str(&content_str)
+                    .map_err(|e| anyhow::anyhow!("parse file content: {e}"))?;
+                ParentContent {
+                    text: None,
+                    images: vec![],
+                    files: vec![FeishuFile {
+                        file_key: fc.file_key,
+                        file_name: fc.file_name,
+                        mime_type: fc.mime_type,
+                        size_bytes: fc.file_size,
+                        file_type: msg_type.to_string(),
+                    }],
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(content))
+    }
 }
 
 // ── Content helpers ───────────────────────────────────────────────────────────
+
+/// Content extracted from a quoted / parent message.
+#[derive(Debug, Clone, Default)]
+pub struct ParentContent {
+    /// Plain-text body, if any.
+    pub text: Option<String>,
+    /// Raw image keys (must be downloaded using the parent message's ID).
+    pub images: Vec<String>,
+    /// File attachments.
+    pub files: Vec<FeishuFile>,
+}
 
 /// Check whether the bot was @-mentioned and strip its placeholder from `text`.
 ///
@@ -678,22 +955,31 @@ fn strip_bot_mention(
 }
 
 /// Extract text content and image keys from a Feishu `post` message body.
-fn extract_from_post(content_str: &str) -> (String, Vec<String>) {
+fn extract_from_post(content_str: &str) -> (String, Vec<String>, Vec<FeishuFile>, Vec<FeishuDocument>) {
     let v: serde_json::Value = match serde_json::from_str(content_str) {
         Ok(v) => v,
-        Err(_) => return (String::new(), vec![]),
+        Err(_) => return (String::new(), vec![], vec![], vec![]),
     };
 
-    // Try zh_cn first, fall back to the first available language key.
-    let lang = v
-        .get("zh_cn")
-        .or_else(|| v.as_object().and_then(|m| m.values().next()));
+    // Feishu `post` content can be either a direct `{title, content}` object
+    // or a multilingual wrapper like `{zh_cn: {title, content}}`.
+    let lang = if v.get("content").and_then(|c| c.as_array()).is_some() {
+        Some(&v)
+    } else {
+        v.get("zh_cn").or_else(|| {
+            v.as_object().and_then(|map| {
+                map.values()
+                    .find(|value| value.get("content").and_then(|c| c.as_array()).is_some())
+            })
+        })
+    };
     let Some(lang_val) = lang else {
-        return (String::new(), vec![]);
+        return (String::new(), vec![], vec![], vec![]);
     };
 
     let mut texts: Vec<&str> = Vec::new();
     let mut images: Vec<String> = Vec::new();
+    let mut documents: Vec<FeishuDocument> = Vec::new();
 
     if let Some(rows) = lang_val.get("content").and_then(|c| c.as_array()) {
         for row in rows {
@@ -712,10 +998,261 @@ fn extract_from_post(content_str: &str) -> (String, Vec<String>) {
                         }
                         _ => {}
                     }
+                    collect_doc_links_from_value(item, &mut documents);
                 }
             }
         }
     }
 
-    (texts.join("").trim().to_string(), images)
+    (texts.join("").trim().to_string(), images, vec![], unique_documents(documents))
+}
+
+/// Extract plain text from a Feishu interactive card content JSON string.
+///
+/// The card schema used by this bot is:
+/// `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"..."}]},...}`
+///
+/// We join the `content` fields of all `markdown` elements, which covers both
+/// bot-generated cards and generic Feishu 2.0 cards.
+fn extract_text_from_card(content_str: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(content_str) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(elements) = v
+        .get("body")
+        .and_then(|b| b.get("elements"))
+        .and_then(|e| e.as_array())
+    {
+        for el in elements {
+            if el.get("tag").and_then(|t| t.as_str()) == Some("markdown") {
+                if let Some(text) = el.get("content").and_then(|c| c.as_str()) {
+                    parts.push(text);
+                }
+            }
+        }
+    }
+    parts.join("\n").trim().to_string()
+}
+
+fn extract_doc_links_from_text(text: &str) -> Vec<FeishuDocument> {
+    unique_documents(
+        text.split_whitespace()
+            .filter_map(|part| {
+                let candidate = part.trim_matches(|c: char| {
+                    c.is_ascii_whitespace()
+                        || matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';')
+                });
+                parse_feishu_document_url(candidate)
+            })
+            .collect(),
+    )
+}
+
+fn merge_documents(mut left: Vec<FeishuDocument>, right: Vec<FeishuDocument>) -> Vec<FeishuDocument> {
+    left.extend(right);
+    unique_documents(left)
+}
+
+fn unique_documents(docs: Vec<FeishuDocument>) -> Vec<FeishuDocument> {
+    let mut out: Vec<FeishuDocument> = Vec::new();
+    for doc in docs {
+        if out.iter().any(|existing| existing.url == doc.url) {
+            continue;
+        }
+        out.push(doc);
+    }
+    out
+}
+
+fn collect_doc_links_from_value(value: &serde_json::Value, docs: &mut Vec<FeishuDocument>) {
+    match value {
+        serde_json::Value::String(s) => {
+            docs.extend(extract_doc_links_from_text(s));
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_doc_links_from_value(item, docs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let title = map
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            for key in ["href", "link", "url"] {
+                if let Some(url) = map.get(key).and_then(|v| v.as_str()) {
+                    if let Some(mut doc) = parse_feishu_document_url(url) {
+                        if doc.title.is_empty() {
+                            doc.title = title.to_string();
+                        }
+                        docs.push(doc);
+                    }
+                }
+            }
+
+            for nested in map.values() {
+                collect_doc_links_from_value(nested, docs);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn parse_feishu_document_url(raw: &str) -> Option<FeishuDocument> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !host.contains("feishu.cn") && !host.contains("larksuite.com") {
+        return None;
+    }
+
+    let segments: Vec<&str> = url.path_segments()?.filter(|seg| !seg.is_empty()).collect();
+    for (idx, segment) in segments.iter().enumerate() {
+        match *segment {
+            "drive" => {
+                // /drive/file/{token}
+                if segments.get(idx + 1).copied() == Some("file") {
+                    if let Some(raw_token) = segments.get(idx + 2) {
+                        let token = raw_token.split('?').next().unwrap_or("").to_string();
+                        if !token.is_empty() {
+                            return Some(FeishuDocument {
+                                url: raw.to_string(),
+                                title: String::new(),
+                                doc_type: "file".to_string(),
+                                token,
+                            });
+                        }
+                    }
+                }
+            }
+            "docx" | "docs" | "doc" | "wiki" | "sheet" | "sheets" | "base" | "bitable" => {
+                let token = match segments.get(idx + 1) {
+                    Some(t) => t.split('?').next().unwrap_or("").to_string(),
+                    None => return None,
+                };
+                if token.is_empty() {
+                    return None;
+                }
+                return Some(FeishuDocument {
+                    url: raw.to_string(),
+                    title: String::new(),
+                    doc_type: segment.to_string(),
+                    token,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_doc_links_from_text, extract_from_post, parse_feishu_document_url};
+
+    #[test]
+    fn extracts_images_from_direct_post_shape() {
+        let payload = r#"{
+            "title": "",
+            "content": [
+                [
+                    {"tag": "at", "user_id": "@_user_1", "user_name": "RemiCat-Dev", "style": []},
+                    {"tag": "text", "text": " ", "style": []}
+                ],
+                [
+                    {"tag": "img", "image_key": "img_v3_123"}
+                ]
+            ]
+        }"#;
+
+        let (text, images, files, documents) = extract_from_post(payload);
+        assert_eq!(text, "");
+        assert_eq!(images, vec!["img_v3_123"]);
+        assert!(files.is_empty());
+        assert!(documents.is_empty());
+    }
+
+    #[test]
+    fn extracts_images_from_multilingual_post_shape() {
+        let payload = r#"{
+            "zh_cn": {
+                "title": "",
+                "content": [
+                    [
+                        {"tag": "text", "text": "看图", "style": []},
+                        {"tag": "img", "image_key": "img_v3_456"}
+                    ]
+                ]
+            }
+        }"#;
+
+        let (text, images, files, documents) = extract_from_post(payload);
+        assert_eq!(text, "看图");
+        assert_eq!(images, vec!["img_v3_456"]);
+        assert!(files.is_empty());
+        assert!(documents.is_empty());
+    }
+
+    #[test]
+    fn parses_feishu_docx_url() {
+        let doc = parse_feishu_document_url("https://example.feishu.cn/docx/AbCdEf123?from=im")
+            .expect("docx url should parse");
+        assert_eq!(doc.doc_type, "docx");
+        assert_eq!(doc.token, "AbCdEf123");
+    }
+
+    #[test]
+    fn extracts_doc_links_from_text() {
+        let docs = extract_doc_links_from_text(
+            "请看 https://foo.feishu.cn/docx/AAA111 和 https://foo.feishu.cn/wiki/BBB222)",
+        );
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].token, "AAA111");
+        assert_eq!(docs[1].doc_type, "wiki");
+    }
+
+    #[test]
+    fn parses_feishu_drive_file_url() {
+        let doc = parse_feishu_document_url("https://example.feishu.cn/drive/file/XyZ789abc")
+            .expect("drive file url should parse");
+        assert_eq!(doc.doc_type, "file");
+        assert_eq!(doc.token, "XyZ789abc");
+    }
+
+    #[test]
+    fn parses_feishu_drive_file_url_with_query() {
+        let doc = parse_feishu_document_url(
+            "https://example.feishu.cn/drive/file/XyZ789abc?from=im",
+        )
+        .expect("drive file url with query should parse");
+        assert_eq!(doc.doc_type, "file");
+        assert_eq!(doc.token, "XyZ789abc");
+    }
+
+    #[test]
+    fn file_resource_url_uses_file_type_for_regular_files() {
+        use crate::FeishuClient;
+        let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
+        let url = client.file_resource_url("msg_id", "file_key_abc", "file");
+        assert!(url.ends_with("?type=file"), "expected ?type=file, got {url}");
+    }
+
+    #[test]
+    fn file_resource_url_uses_file_type_for_folders() {
+        use crate::FeishuClient;
+        let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
+        let url = client.file_resource_url("msg_id", "file_key_abc", "folder");
+        // Feishu IM resource API only accepts image/file — folder must also use type=file
+        assert!(url.ends_with("?type=file"), "expected ?type=file for folder, got {url}");
+    }
+
+    #[test]
+    fn file_resource_url_uses_image_type_for_images() {
+        use crate::FeishuClient;
+        let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
+        let url = client.file_resource_url("msg_id", "img_key_abc", "image");
+        assert!(url.ends_with("?type=image"), "expected ?type=image, got {url}");
+    }
 }

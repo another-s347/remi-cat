@@ -52,7 +52,7 @@ mod volume_store;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
-use matcher::{OwnerMatcher, OwnerStatus, PAIR_COMMAND};
+use matcher::{BanResult, OwnerMatcher, OwnerStatus, PAIR_COMMAND, UnbanResult};
 use mgmt_server::MgmtContext;
 use restart::{signal_ready, RestartHandle};
 use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
@@ -193,9 +193,13 @@ async fn main() -> Result<()> {
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
-    // Each item carries the Feishu message together with the resolved user UUID.
-    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String)>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Each item carries the Feishu message together with the resolved user UUID
+    // and cached sender username, if we have one.
+    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<(
+        FeishuMessage,
+        String,
+        Option<String>,
+    )>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
     if let Some(id) = matcher.owner_id() {
@@ -294,9 +298,39 @@ async fn main() -> Result<()> {
                     "received: {text}",
                 );
 
+                if matcher.is_banned(&user_uuid) {
+                    warn!(
+                        sender = %msg.sender_user_id,
+                        uuid = %user_uuid,
+                        chat = %msg.chat_id,
+                        "ignoring message from blacklisted user",
+                    );
+                    continue;
+                }
+
+                let sender_username =
+                    ensure_im_username(
+                        &user_store,
+                        &gateway,
+                        &user_uuid,
+                        &msg.sender_user_id,
+                        Some(&msg.message_id),
+                        Some(&msg.chat_id),
+                    )
+                    .await;
+                info!(
+                    message_id = %msg.message_id,
+                    uuid = %user_uuid,
+                    sender = %msg.sender_user_id,
+                    username = sender_username.as_deref().unwrap_or(""),
+                    has_username = sender_username.is_some(),
+                    "message username resolved before enqueue"
+                );
+
                 // ── /pair command ──────────────────────────────────────────
                 if text == PAIR_COMMAND {
                     let reply = match matcher.check(&user_uuid) {
+                        OwnerStatus::Banned => "⚠️ 你已被拉黑，无法配对。".into(),
                         OwnerStatus::NeedPairing => {
                             if matcher.try_pair(&user_uuid) {
                                 format!(
@@ -362,6 +396,12 @@ async fn main() -> Result<()> {
                                                     info!(old = %owner_uuid, new = %merged_uuid, "owner UUID updated after channel merge");
                                                 }
                                             }
+                                            if let Err(e) = matcher.migrate_blacklist(
+                                                &[uuid_pending.clone(), user_uuid.clone()],
+                                                &merged_uuid,
+                                            ) {
+                                                warn!("failed to migrate blacklist after channel merge: {e}");
+                                            }
                                             let reply = format!(
                                                 "✅ 频道配对成功！两个账号现在共享同一身份。\nUUID: {}",
                                                 merged_uuid
@@ -414,6 +454,43 @@ async fn main() -> Result<()> {
                             .await;
                             continue;
                         }
+                        if is_blacklist_command(&cmd.name) {
+                            let reply = match resolve_blacklist_target(
+                                &cmd.name,
+                                &cmd.args,
+                                &msg,
+                                &user_store,
+                                &matcher,
+                            ) {
+                                Ok(target_uuid) => match cmd.name.as_str() {
+                                    "ban" => match matcher.ban(&target_uuid) {
+                                        Ok(BanResult::Added) => {
+                                            format!("✅ 已拉黑用户：{}", target_uuid)
+                                        }
+                                        Ok(BanResult::AlreadyBanned) => {
+                                            format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
+                                        }
+                                        Ok(BanResult::ProtectedOwner) => {
+                                            "⚠️ 不能拉黑主人或系统放行用户。".into()
+                                        }
+                                        Err(e) => format!("❌ 拉黑失败: {e}"),
+                                    },
+                                    "unban" => match matcher.unban(&target_uuid) {
+                                        Ok(UnbanResult::Removed) => {
+                                            format!("✅ 已解除拉黑：{}", target_uuid)
+                                        }
+                                        Ok(UnbanResult::NotBanned) => {
+                                            format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
+                                        }
+                                        Err(e) => format!("❌ 解除拉黑失败: {e}"),
+                                    },
+                                    _ => unreachable!("checked by is_blacklist_command"),
+                                },
+                                Err(err) => err,
+                            };
+                            send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                            continue;
+                        }
                         let docker = docker.clone();
                         let restart = restart.clone();
                         let gateway = gateway.clone();
@@ -441,12 +518,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     // Non-daemon commands: no owner/chat restriction — forward to Agent.
-                } else {
-                    // Regular (non-command) message: owner-only.
-                    if !is_owner(&matcher, &user_uuid) {
-                        warn!("ignoring message from non-owner {} (uuid: {})", msg.sender_user_id, user_uuid);
-                        continue;
-                    }
                 }
 
                 // ── Forward to Agent ───────────────────────────────────────
@@ -465,7 +536,7 @@ async fn main() -> Result<()> {
                     }
                     queues[&chat_id].clone()
                 };
-                match queue_tx.try_send((msg, user_uuid)) {
+                match queue_tx.try_send((msg, user_uuid, sender_username)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
@@ -497,13 +568,23 @@ async fn main() -> Result<()> {
                     "reaction received",
                 );
 
-                if !is_owner(&matcher, &user_uuid) {
+                if matcher.is_banned(&user_uuid) {
                     warn!(
-                        "ignoring reaction from non-owner {} (uuid: {})",
+                        "ignoring reaction from blacklisted user {} (uuid: {})",
                         reaction.sender_user_id, user_uuid
                     );
                     continue;
                 }
+
+                let _ = ensure_im_username(
+                    &user_store,
+                    &gateway,
+                    &user_uuid,
+                    &reaction.sender_user_id,
+                    None,
+                    None,
+                )
+                .await;
 
                 let daemon_msg = daemon_msg_im_reaction(&reaction, &user_uuid);
                 if !rpc.send_to_agent(daemon_msg).await {
@@ -518,6 +599,21 @@ async fn main() -> Result<()> {
             } => {
                 let user_uuid = user_store.resolve_or_create(FEISHU_CHANNEL, &user_open_id);
                 info!(user = %user_open_id, uuid = %user_uuid, card = %card_message_id, "card action received");
+
+                if matcher.is_banned(&user_uuid) {
+                    warn!("ignoring card action from blacklisted user {} (uuid: {})", user_open_id, user_uuid);
+                    continue;
+                }
+
+                let _ = ensure_im_username(
+                    &user_store,
+                    &gateway,
+                    &user_uuid,
+                    &user_open_id,
+                    None,
+                    None,
+                )
+                .await;
 
                 if !is_owner(&matcher, &user_uuid) {
                     warn!("ignoring card action from non-owner {} (uuid: {})", user_open_id, user_uuid);
@@ -614,18 +710,40 @@ async fn main() -> Result<()> {
 /// The worker blocks on one message at a time (enrich → react → agent →
 /// await completion) so messages from the same chat are processed in order.
 ///
-/// Each queue item is `(FeishuMessage, user_uuid)` where `user_uuid` is the
-/// internal UUID resolved by the caller before enqueue.
+/// Each queue item is `(FeishuMessage, user_uuid, sender_username)` where
+/// `user_uuid` is the internal UUID resolved by the caller before enqueue.
 fn spawn_queue_worker(
     chat_id: String,
     gateway: FeishuGateway,
     rpc: RpcServer,
-) -> mpsc::Sender<(FeishuMessage, String)> {
-    let (tx, mut rx) = mpsc::channel::<(FeishuMessage, String)>(CHAT_QUEUE_CAPACITY);
+) -> mpsc::Sender<(FeishuMessage, String, Option<String>)> {
+    let (tx, mut rx) = mpsc::channel::<(FeishuMessage, String, Option<String>)>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
-        while let Some((msg, user_uuid)) = rx.recv().await {
+        while let Some((msg, user_uuid, sender_username)) = rx.recv().await {
             let message_id = msg.message_id.clone();
             let enriched = enrich_message(&gateway, msg).await;
+
+            // Feishu folder-type attachments cannot be downloaded via the API.
+            // Reply with a canned message and skip the agent entirely.
+            if enriched.files.iter().any(|f| f.file_type == "folder") {
+                info!(message_id = %message_id, "folder attachment — sending unsupported notice");
+                send_reply(
+                    &gateway,
+                    &enriched.message_id,
+                    &enriched.chat_id,
+                    "📁 暂不支持读取飞书「文件夹」类型的附件，请将文件夹压缩成 zip 后重新上传。",
+                )
+                .await;
+                continue;
+            }
+
+            info!(
+                message_id = %message_id,
+                uuid = %user_uuid,
+                sender_username = sender_username.as_deref().unwrap_or(""),
+                has_sender_username = sender_username.is_some(),
+                "queue worker forwarding message to agent"
+            );
 
             let reaction_id = gateway
                 .add_reaction(&enriched.message_id, "THINKING")
@@ -633,7 +751,8 @@ fn spawn_queue_worker(
                 .map_err(|e| warn!("add_reaction failed: {e:#}"))
                 .ok();
 
-            let daemon_msg = daemon_msg_im_message(&enriched, &user_uuid);
+            let daemon_msg =
+                daemon_msg_im_message(&enriched, &user_uuid, sender_username.as_deref());
             if let Some(completion_rx) = rpc
                 .send_to_agent_and_await(daemon_msg, &message_id)
                 .await
@@ -667,8 +786,135 @@ pub fn config_or_secret(env_var: &str, store: &secret_store::SecretStore) -> Opt
         .or_else(|| store.get(env_var).map(str::to_string))
 }
 
+async fn ensure_im_username(
+    user_store: &UserStore,
+    gateway: &FeishuGateway,
+    user_uuid: &str,
+    channel_user_id: &str,
+    message_id: Option<&str>,
+    chat_id: Option<&str>,
+) -> Option<String> {
+    if let Some(username) = user_store.username(user_uuid) {
+        debug!(uuid = %user_uuid, sender = %channel_user_id, username = %username, "ensure_im_username: using cached username");
+        return Some(username);
+    }
+
+    match gateway.get_user_name(channel_user_id).await {
+        Ok(Some(username)) => {
+            let username = username.trim().to_string();
+            if username.is_empty() {
+                warn!(uuid = %user_uuid, sender = %channel_user_id, "ensure_im_username: Feishu returned empty username");
+                return None;
+            }
+            info!(uuid = %user_uuid, sender = %channel_user_id, username = %username, "ensure_im_username: fetched username from Feishu");
+            let persisted = match user_store.set_username_if_missing(user_uuid, &username) {
+                Ok(persisted) => persisted,
+                Err(e) => {
+                    warn!(uuid = %user_uuid, sender = %channel_user_id, username = %username, "failed to persist username: {e:#}");
+                    false
+                }
+            };
+            let final_username = user_store.username(user_uuid).or_else(|| Some(username));
+            if let Some(final_username) = final_username.as_deref() {
+                info!(
+                    uuid = %user_uuid,
+                    sender = %channel_user_id,
+                    username = %final_username,
+                    persisted,
+                    "ensure_im_username: username ready for forwarding"
+                );
+            }
+            final_username
+        }
+        Ok(None) => {
+            warn!(uuid = %user_uuid, sender = %channel_user_id, "ensure_im_username: Feishu returned no username");
+            None
+        }
+        Err(e) => {
+            if let Some(message_id) = message_id {
+                let _ = maybe_notify_feishu_permission_issue(
+                    gateway,
+                    message_id,
+                    chat_id,
+                    "获取用户姓名",
+                    &e,
+                )
+                .await;
+            }
+            warn!(uuid = %user_uuid, sender = %channel_user_id, "ensure_im_username: failed to fetch Feishu username: {e:#}");
+            None
+        }
+    }
+}
+
 fn is_owner(matcher: &OwnerMatcher, sender_id: &str) -> bool {
-    matches!(matcher.check(sender_id), OwnerStatus::Owner)
+    matcher.is_owner(sender_id)
+}
+
+fn is_blacklist_command(name: &str) -> bool {
+    matches!(name, "ban" | "unban")
+}
+
+fn resolve_blacklist_target(
+    command_name: &str,
+    args: &[String],
+    msg: &FeishuMessage,
+    user_store: &UserStore,
+    matcher: &OwnerMatcher,
+) -> std::result::Result<String, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "⚠️ 用法：/{} <uuid|feishu:open_id|@用户>",
+            command_name
+        ));
+    }
+
+    let raw_target = args[0].trim();
+    if raw_target.is_empty() {
+        return Err(format!(
+            "⚠️ 用法：/{} <uuid|feishu:open_id|@用户>",
+            command_name
+        ));
+    }
+
+    if let Some(feishu_id) = raw_target.strip_prefix("feishu:") {
+        if feishu_id.trim().is_empty() {
+            return Err("⚠️ feishu:open_id 不能为空。".into());
+        }
+        return resolve_blacklist_channel_id(command_name, feishu_id.trim(), user_store);
+    }
+
+    if let Some(mention) = msg.mentions.iter().find(|mention| mention.key == raw_target) {
+        let feishu_id = mention
+            .open_id
+            .as_deref()
+            .or(mention.user_id.as_deref())
+            .ok_or_else(|| "⚠️ 这个 @用户 没有可用的飞书 ID。".to_string())?;
+        return resolve_blacklist_channel_id(command_name, feishu_id, user_store);
+    }
+
+    if user_store.contains_uuid(raw_target) || matcher.is_banned(raw_target) {
+        return Ok(raw_target.to_string());
+    }
+
+    Err(format!(
+        "⚠️ 无法解析目标 `{}`。请使用 UUID、`feishu:open_id`，或直接 @ 用户。",
+        raw_target
+    ))
+}
+
+fn resolve_blacklist_channel_id(
+    command_name: &str,
+    channel_user_id: &str,
+    user_store: &UserStore,
+) -> std::result::Result<String, String> {
+    match command_name {
+        "ban" => Ok(user_store.resolve_or_create(FEISHU_CHANNEL, channel_user_id)),
+        "unban" => user_store
+            .resolve(FEISHU_CHANNEL, channel_user_id)
+            .ok_or_else(|| "⚠️ 找不到这个用户的 UUID，请改用 `/users` 里显示的 UUID。".into()),
+        other => Err(format!("⚠️ 不支持的黑名单命令：{}", other)),
+    }
 }
 
 async fn send_reply(gateway: &FeishuGateway, message_id: &str, chat_id: &str, text: &str) {
@@ -682,31 +928,232 @@ async fn send_reply(gateway: &FeishuGateway, message_id: &str, chat_id: &str, te
 /// Image keys are replaced with base64 data URLs so the Agent doesn't need
 /// Feishu credentials.
 async fn enrich_message(gateway: &FeishuGateway, mut msg: FeishuMessage) -> FeishuMessage {
-    // ── Parent message text ─────────────────────────────────────────────
-    if let Some(parent_id) = &msg.parent_id {
-        match gateway.fetch_message_text(parent_id).await {
-            Ok(Some(parent_text)) => {
-                msg.text = format!("[引用]\n{parent_text}\n\n[回复]\n{}", msg.text);
+    let mut permission_card_sent = false;
+    // ── Parent (quoted) message content ────────────────────────────────
+    let mut parent_data_urls: Vec<String> = Vec::new();
+    if let Some(parent_id) = msg.parent_id.clone() {
+        match gateway.fetch_parent_content(&parent_id).await {
+            Ok(Some(parent)) => {
+                // Prepend quoted content summary so the agent always knows
+                // what was quoted, even for image/file-only messages.
+                let quoted_summary = match parent.text.as_deref() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ if !parent.images.is_empty() => "[图片]".to_string(),
+                    _ if !parent.files.is_empty() => {
+                        let names: Vec<&str> = parent
+                            .files
+                            .iter()
+                            .map(|f| f.file_name.as_str())
+                            .filter(|n| !n.is_empty())
+                            .collect();
+                        if names.is_empty() {
+                            "[文件]".to_string()
+                        } else {
+                            format!("[文件] {}", names.join(", "))
+                        }
+                    }
+                    _ => String::new(),
+                };
+                if !quoted_summary.is_empty() {
+                    msg.text = format!("[引用]\n{quoted_summary}\n\n[回复]\n{}", msg.text);
+                }
+                // Download parent images using the *parent* message ID.
+                for image_key in &parent.images {
+                    match gateway.download_image(&parent_id, image_key).await {
+                        Ok((content_type, bytes)) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            parent_data_urls.push(format!("data:{content_type};base64,{b64}"));
+                            info!(
+                                parent_id = %parent_id,
+                                image_key = %image_key,
+                                "enrich_message: downloaded quoted image"
+                            );
+                        }
+                        Err(e) => {
+                            if !permission_card_sent
+                                && maybe_notify_feishu_permission_issue(
+                                    gateway,
+                                    &msg.message_id,
+                                    Some(&msg.chat_id),
+                                    "读取引用图片",
+                                    &e,
+                                )
+                                .await
+                            {
+                                permission_card_sent = true;
+                            }
+                            warn!("download quoted image {image_key}: {e:#}");
+                        }
+                    }
+                }
+                // Prepend parent files so they appear before the reply's own files.
+                // Encode the file key as "{parent_id}\t{original_key}" so the
+                // download handler knows to use the parent message ID when
+                // fetching the resource — transparent to the agent.
+                if !parent.files.is_empty() {
+                    let mut all_files: Vec<im_feishu::FeishuFile> = parent
+                        .files
+                        .into_iter()
+                        .map(|mut f| {
+                            f.file_key = format!("{parent_id}\t{}", f.file_key);
+                            f
+                        })
+                        .collect();
+                    all_files.extend(std::mem::take(&mut msg.files));
+                    msg.files = all_files;
+                }
             }
             Ok(None) => {}
-            Err(e) => warn!("fetch parent message failed: {e:#}"),
+            Err(e) => {
+                if !permission_card_sent
+                    && maybe_notify_feishu_permission_issue(
+                        gateway,
+                        &msg.message_id,
+                        Some(&msg.chat_id),
+                        "读取引用消息",
+                        &e,
+                    )
+                    .await
+                {
+                    permission_card_sent = true;
+                }
+                warn!("fetch parent message failed: {e:#}");
+            }
         }
     }
 
-    // ── Images → base64 data URLs ───────────────────────────────────────
-    let mut data_urls: Vec<String> = Vec::new();
+    // ── Own-message images → base64 data URLs ──────────────────────────
+    let had_own_images = !msg.images.is_empty();
+    if had_own_images {
+        info!(
+            message_id = %msg.message_id,
+            image_key_count = msg.images.len(),
+            text_len = msg.text.chars().count(),
+            "enrich_message: starting image download"
+        );
+    }
+    let mut own_data_urls: Vec<String> = Vec::new();
     for image_key in &msg.images {
         match gateway.download_image(&msg.message_id, image_key).await {
             Ok((content_type, bytes)) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                data_urls.push(format!("data:{content_type};base64,{b64}"));
+                let data_url = format!("data:{content_type};base64,{b64}");
+                info!(
+                    message_id = %msg.message_id,
+                    image_key = %image_key,
+                    content_type = %content_type,
+                    raw_bytes = bytes.len(),
+                    data_url_len = data_url.len(),
+                    data_url_prefix = %preview_data_url(&data_url),
+                    "enrich_message: image converted to data url"
+                );
+                own_data_urls.push(data_url);
             }
-            Err(e) => warn!("download_image {image_key} failed: {e:#}"),
+            Err(e) => {
+                if !permission_card_sent
+                    && maybe_notify_feishu_permission_issue(
+                        gateway,
+                        &msg.message_id,
+                        Some(&msg.chat_id),
+                        "读取图片",
+                        &e,
+                    )
+                    .await
+                {
+                    permission_card_sent = true;
+                }
+                warn!("download_image {image_key} failed: {e:#}");
+            }
         }
     }
-    msg.images = data_urls;
+    // Quoted images first, then own images.
+    parent_data_urls.extend(own_data_urls);
+    msg.images = parent_data_urls;
+    if had_own_images && msg.images.iter().all(|u| !u.starts_with("data:")) && msg.text.trim().is_empty() {
+        msg.text = "[用户发送了图片]".to_string();
+    }
+    if had_own_images {
+        info!(
+            message_id = %msg.message_id,
+            downloaded_image_count = msg.images.len(),
+            fallback_text = %msg.text,
+            "enrich_message: image enrichment complete"
+        );
+    }
 
     msg
+}
+
+fn preview_data_url(data_url: &str) -> &str {
+    match data_url.find(',') {
+        Some(idx) => &data_url[..idx],
+        None => data_url,
+    }
+}
+
+async fn maybe_notify_feishu_permission_issue(
+    gateway: &FeishuGateway,
+    message_id: &str,
+    chat_id: Option<&str>,
+    operation: &str,
+    err: &anyhow::Error,
+) -> bool {
+    if !is_feishu_permission_error(err) {
+        return false;
+    }
+
+    let summary = summarize_feishu_error(err);
+    let card_text = format!(
+        "⚠️ **飞书权限不足**\n\nDaemon 在执行 **{}** 时被飞书拒绝。\n请到飞书开放平台为当前应用开通对应的 scope 后重试。\n\n错误摘要：`{}`",
+        operation,
+        summary.replace('`', "'")
+    );
+    let text_fallback = format!(
+        "⚠️ 飞书权限不足：执行{}时被拒绝。请到飞书开放平台为当前应用开通对应 scope 后重试。错误摘要：{}",
+        operation,
+        summary
+    );
+
+    match gateway.reply_card(message_id, &card_text).await {
+        Ok(_) => {
+            warn!(message_id, operation, "replied with Feishu permission hint card");
+        }
+        Err(reply_err) => {
+            warn!(message_id, operation, "reply_card for Feishu permission hint failed: {reply_err:#}");
+            if let Err(text_err) = gateway.reply_text(message_id, &text_fallback).await {
+                warn!(message_id, operation, "reply_text for Feishu permission hint failed: {text_err:#}");
+                if let Some(chat_id) = chat_id {
+                    if let Err(send_err) = gateway.send_text(chat_id, &text_fallback).await {
+                        warn!(chat_id, operation, "send_text for Feishu permission hint failed: {send_err:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn is_feishu_permission_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("99991672")
+        || text.contains("access denied")
+        || text.contains("required scope")
+        || text.contains("required scopes")
+        || text.contains("permission denied")
+}
+
+fn summarize_feishu_error(err: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 220;
+    let text = err.to_string().replace('\n', " ");
+    let mut summary = String::new();
+    for ch in text.chars().take(MAX_CHARS) {
+        summary.push(ch);
+    }
+    if text.chars().count() > MAX_CHARS {
+        summary.push('…');
+    }
+    summary
 }
 
 // ── init-env subcommand ───────────────────────────────────────────────────────

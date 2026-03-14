@@ -14,10 +14,11 @@ service DaemonService {
 
 message DaemonMessage {
   oneof payload {
-    ImMessageEvent  im_message    = 1;
-    ImReactionEvent im_reaction   = 2;
-    ShutdownSignal  shutdown      = 3;
-    SecretsSync     secrets_sync  = 4;
+    ImMessageEvent   im_message         = 1;
+    ImReactionEvent  im_reaction        = 2;
+    ShutdownSignal   shutdown           = 3;
+    SecretsSync      secrets_sync       = 4;
+    ImBridgeResponse im_bridge_response = 5;
   }
 }
 
@@ -26,20 +27,39 @@ message SecretsSync {
 }
 
 message ImMessageEvent {
-  string          message_id      = 1;
-  string          sender_user_id  = 2;
-  string          chat_id         = 3;
-  string          chat_type       = 4;
-  string          text            = 5;
-  repeated string images          = 6;
-  string          parent_id       = 7; // empty string means no parent
+  string                   message_id      = 1;
+  string                   sender_user_id  = 2;
+  string                   chat_id         = 3;
+  string                   chat_type       = 4;
+  string                   text            = 5;
+  repeated string          images          = 6;
+  string                   parent_id       = 7; // empty string means no parent
+  string                   platform        = 8;
+  repeated ImAttachmentRef attachments     = 9;
+  repeated ImDocumentRef   documents       = 10;
+  string                   sender_username = 11;
+}
+
+message ImAttachmentRef {
+  string key        = 1;
+  string name       = 2;
+  string mime_type  = 3;
+  uint64 size_bytes = 4;
+  string file_type  = 5;
+}
+
+message ImDocumentRef {
+  string url      = 1;
+  string title    = 2;
+  string doc_type = 3;
+  string token    = 4;
 }
 
 message ImReactionEvent {
-  string message_id      = 1;
-  string chat_id         = 2;
-  string sender_user_id  = 3;
-  string emoji_type      = 4;
+  string message_id     = 1;
+  string chat_id        = 2;
+  string sender_user_id = 3;
+  string emoji_type     = 4;
 }
 
 message ShutdownSignal {}
@@ -52,24 +72,83 @@ message AgentMessage {
   string reply_to_message_id = 1;
 
   oneof payload {
-    AgentTextDelta   text_delta  = 2;
-    AgentThinking    thinking    = 3;
-    AgentToolCall    tool_call   = 4;
-    AgentToolResult  tool_result = 5;
-    AgentStats       stats       = 6;
-    AgentDone        done        = 7;
-    AgentError       error       = 8;
+    AgentTextDelta  text_delta        = 2;
+    AgentThinking   thinking          = 3;
+    AgentToolCall   tool_call         = 4;
+    AgentToolResult tool_result       = 5;
+    AgentStats      stats             = 6;
+    AgentDone       done              = 7;
+    AgentError      error             = 8;
+    ImBridgeRequest im_bridge_request = 9;
   }
 }
 
 message AgentTextDelta  { string text      = 1; }
+
 message AgentThinking   { string content   = 1; }
+
 message AgentToolCall   { string name = 1; string args_json = 2; }
+
 message AgentToolResult { string name = 1; string result   = 2; }
+
 message AgentStats      {
-  uint32 prompt_tokens      = 1;
-  uint32 completion_tokens  = 2;
-  uint64 elapsed_ms         = 3;
+  uint32 prompt_tokens     = 1;
+  uint32 completion_tokens = 2;
+  uint64 elapsed_ms        = 3;
 }
+
 message AgentDone  {}
+
 message AgentError { string message = 1; }
+
+message ImBridgeRequest {
+  string request_id = 1;
+
+  oneof payload {
+    ImDownloadRequest download = 2;
+    ImUploadRequest   upload   = 3;
+  }
+}
+
+message ImDownloadRequest {
+  string platform       = 1;
+  string message_id     = 2;
+  string chat_id        = 3;
+  string attachment_key = 4;
+  string document_url   = 5;
+  string file_type      = 6;
+}
+
+message ImUploadRequest {
+  string platform   = 1;
+  string message_id = 2;
+  string chat_id    = 3;
+  string file_name  = 4;
+  string mime_type  = 5;
+  bytes  content    = 6;
+  string file_type  = 7;
+}
+
+message ImBridgeResponse {
+  string request_id = 1;
+  string error      = 2;
+
+  oneof payload {
+    ImDownloadedFile downloaded = 3;
+    ImUploadedFile   uploaded   = 4;
+  }
+}
+
+message ImDownloadedFile {
+  string file_name    = 1;
+  string mime_type    = 2;
+  bytes  content      = 3;
+  string source_label = 4;
+}
+
+message ImUploadedFile {
+  string file_name    = 1;
+  string file_key     = 2;
+  string message_id   = 3;
+  string resource_url = 4;
+}

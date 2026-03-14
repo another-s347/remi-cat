@@ -19,11 +19,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use base64::Engine as _;
-use bot_core::{CatBot, CatEvent, Content, ContentPart, StreamOptions};
+use bot_core::{
+    CatBot, CatEvent, Content, ContentPart, ImAttachment, ImDocument, ImFileBridge, StreamOptions,
+};
 use futures::StreamExt;
 use remi_proto::{
     agent_message::Payload as AgentPayload, AgentDone, AgentError as AgentErrorMsg, AgentMessage,
@@ -55,27 +57,12 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            // CatBot is initialized lazily: first we try from the current env
-            // (works when OPENAI_API_KEY is already set), and if that fails we wait
-            // for the first SecretsSync from the Daemon which injects the keys from
-            // the encrypted secret store.
-            let mut bot: Option<Rc<CatBot>> = match CatBot::from_env() {
-                Ok(b) => {
-                    info!("CatBot ready (initialized from env)");
-                    Some(Rc::new(b))
-                }
-                Err(e) => {
-                    info!("CatBot not yet ready ({e}); will initialize after SecretsSync");
-                    None
-                }
-            };
-
             let mut backoff = Duration::from_secs(1);
             const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
             loop {
                 info!(addr = %daemon_addr, "connecting to Daemon gRPC");
-                match run_session(&daemon_addr, &mut bot).await {
+                match run_session(&daemon_addr).await {
                     Ok(()) => {
                         info!("Daemon session ended — reconnecting in 2 s");
                         // Always sleep before reconnecting to avoid a tight loop
@@ -99,13 +86,21 @@ async fn main() -> Result<()> {
 
 // ── Session ───────────────────────────────────────────────────────────────────
 
-async fn run_session(addr: &str, bot: &mut Option<Rc<CatBot>>) -> Result<()> {
+fn build_bot(bridge: Arc<dyn ImFileBridge>) -> Result<CatBot> {
+    bot_core::CatBotBuilder::from_env()?
+        .im_bridge(bridge)
+        .build()
+}
+
+async fn run_session(addr: &str) -> Result<()> {
     let channel = Channel::from_shared(addr.to_string())?
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await?;
 
-    let mut client = DaemonServiceClient::new(channel);
+    let mut client = DaemonServiceClient::new(channel)
+        .max_decoding_message_size(remi_proto::GRPC_MESSAGE_LIMIT_BYTES)
+        .max_encoding_message_size(remi_proto::GRPC_MESSAGE_LIMIT_BYTES);
 
     // Track which secret keys were set in the last SecretsSync so we can
     // remove keys that have been deleted from the store.
@@ -117,6 +112,18 @@ async fn run_session(addr: &str, bot: &mut Option<Rc<CatBot>>) -> Result<()> {
 
     // Outgoing channel: per-message tasks → single gRPC outbound stream.
     let (out_tx, out_rx) = mpsc::channel::<AgentMessage>(512);
+    let bridge_client = Arc::new(rpc_client::GrpcImFileBridge::new(out_tx.clone()));
+    let bridge: Arc<dyn ImFileBridge> = bridge_client.clone();
+    let mut bot: Option<Rc<CatBot>> = match build_bot(Arc::clone(&bridge)) {
+        Ok(b) => {
+            info!("CatBot ready (initialized from env)");
+            Some(Rc::new(b))
+        }
+        Err(e) => {
+            info!("CatBot not yet ready ({e}); will initialize after SecretsSync");
+            None
+        }
+    };
     let outbound = ReceiverStream::new(out_rx);
 
     let response = client.agent_connect(outbound).await?;
@@ -137,7 +144,18 @@ async fn run_session(addr: &str, bot: &mut Option<Rc<CatBot>>) -> Result<()> {
         };
 
         match payload {
+            DaemonPayload::ImBridgeResponse(response) => {
+                bridge_client.handle_response(response).await;
+            }
             DaemonPayload::ImMessage(ev) => {
+                info!(
+                    message_id = %ev.message_id,
+                    chat_id = %ev.chat_id,
+                    sender_user_id = %ev.sender_user_id,
+                    sender_username = %ev.sender_username,
+                    has_sender_username = !ev.sender_username.trim().is_empty(),
+                    "agent received IM message event"
+                );
                 let chat_id = ev.chat_id.clone();
                 let reply_to = ev.message_id.clone();
                 let trimmed = ev.text.trim().to_string();
@@ -251,10 +269,10 @@ async fn run_session(addr: &str, bot: &mut Option<Rc<CatBot>>) -> Result<()> {
                     None => {
                         // First sync — try to initialize CatBot now that API credentials
                         // have been injected into the environment from the secret store.
-                        match CatBot::from_env() {
+                        match build_bot(Arc::clone(&bridge)) {
                             Ok(b) => {
                                 info!("CatBot ready (initialized from SecretsSync)");
-                                *bot = Some(Rc::new(b));
+                                bot = Some(Rc::new(b));
                             }
                             Err(e) => {
                                 warn!("CatBot init failed after SecretsSync: {e:#}");
@@ -371,24 +389,50 @@ async fn handle_message(
     }
 
     // Build text (incorporating quoted/parent context from daemon-enriched text).
-    let content = if ev.images.is_empty() {
-        Content::text(ev.text.clone())
-    } else {
-        let mut parts: Vec<ContentPart> = Vec::new();
-        if !ev.text.is_empty() {
-            parts.push(ContentPart::text(ev.text.clone()));
-        }
-        for data_url in &ev.images {
-            parts.push(ContentPart::image_url(data_url.clone()));
-        }
-        Content::parts(parts)
-    };
+    let content = build_message_content(
+        &ev.text,
+        &ev.images,
+        !ev.images.is_empty(),
+        ev.attachments.len(),
+        ev.documents.len(),
+    );
 
     let opts = StreamOptions {
         sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
+        sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
         chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
+        platform: Some(ev.platform.clone()).filter(|s| !s.is_empty()),
+        im_attachments: ev
+            .attachments
+            .iter()
+            .map(|attachment| ImAttachment {
+                key: attachment.key.clone(),
+                name: attachment.name.clone(),
+                mime_type: attachment.mime_type.clone(),
+                size_bytes: attachment.size_bytes,
+                file_type: attachment.file_type.clone(),
+            })
+            .collect(),
+        im_documents: ev
+            .documents
+            .iter()
+            .map(|document| ImDocument {
+                url: document.url.clone(),
+                title: document.title.clone(),
+                doc_type: document.doc_type.clone(),
+                token: document.token.clone(),
+            })
+            .collect(),
     };
+    info!(
+        message_id = %ev.message_id,
+        chat_id = %ev.chat_id,
+        sender_user_id = %ev.sender_user_id,
+        sender_username = %ev.sender_username,
+        has_sender_username = !ev.sender_username.trim().is_empty(),
+        "handle_message: built StreamOptions"
+    );
     let stream = bot.stream_with_options(&ev.chat_id, content, opts);
     forward_stream(reply_to, stream, tx).await;
 }
@@ -402,6 +446,57 @@ async fn handle_reaction(
     let text = format!("[用户对该消息使用了「{}」表情]", ev.emoji_type);
     let stream = bot.stream(&ev.chat_id, text);
     forward_stream(reply_to, stream, tx).await;
+}
+
+fn build_message_content(
+    text: &str,
+    image_urls: &[String],
+    had_images: bool,
+    attachment_count: usize,
+    document_count: usize,
+) -> Content {
+    let trimmed = text.trim();
+    let valid_images: Vec<String> = image_urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if !valid_images.is_empty() {
+        let mut parts: Vec<ContentPart> = Vec::new();
+        if !trimmed.is_empty() {
+            parts.push(ContentPart::text(trimmed.to_string()));
+        }
+        for data_url in valid_images {
+            parts.push(ContentPart::image_url(data_url));
+        }
+        return Content::parts(parts);
+    }
+
+    if !trimmed.is_empty() {
+        return Content::text(trimmed.to_string());
+    }
+
+    Content::text(fallback_message_text(
+        had_images,
+        attachment_count,
+        document_count,
+    ))
+}
+
+fn fallback_message_text(
+    had_images: bool,
+    attachment_count: usize,
+    document_count: usize,
+) -> String {
+    match (had_images, attachment_count > 0, document_count > 0) {
+        (true, _, _) => "[用户发送了图片]".to_string(),
+        (false, true, true) => "[用户发送了附件和文档链接]".to_string(),
+        (false, true, false) => "[用户发送了附件]".to_string(),
+        (false, false, true) => "[用户发送了文档链接]".to_string(),
+        (false, false, false) => "[用户发送了一条空白消息]".to_string(),
+    }
 }
 
 // ── CatEvent → AgentMessage forwarding ───────────────────────────────────────

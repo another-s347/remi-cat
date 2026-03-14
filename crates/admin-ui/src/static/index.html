@@ -622,6 +622,7 @@
       <button class="tab-btn active" onclick="switchTab('status')">Status</button>
       <button class="tab-btn" onclick="switchTab('container')">Container</button>
       <button class="tab-btn" onclick="switchTab('owner')">Owner</button>
+            <button class="tab-btn" onclick="switchTab('users')">Users</button>
       <button class="tab-btn" onclick="switchTab('secrets')">Secrets</button>
       <button class="tab-btn" onclick="switchTab('volumes')">Volumes</button>
       <button class="tab-btn" onclick="switchTab('files')">Files</button>
@@ -631,6 +632,7 @@
     <div id="tab-status" class="tab-panel active"><div class="empty"><p>Loading…</p></div></div>
     <div id="tab-container" class="tab-panel"></div>
     <div id="tab-owner" class="tab-panel"></div>
+        <div id="tab-users" class="tab-panel"></div>
     <div id="tab-secrets" class="tab-panel"></div>
     <div id="tab-volumes" class="tab-panel"></div>
     <div id="tab-files" class="tab-panel"></div>
@@ -639,7 +641,7 @@
 
         function switchTab(name) {
             document.querySelectorAll('.tab-btn').forEach((b, i) => {
-                const names = ['status', 'container', 'owner', 'secrets', 'volumes', 'files'];
+                const names = ['status', 'container', 'owner', 'users', 'secrets', 'volumes', 'files'];
                 b.classList.toggle('active', names[i] === name);
             });
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -658,6 +660,7 @@
                 case 'status': return loadStatus(selectedId);
                 case 'container': return loadContainer(selectedId);
                 case 'owner': return loadOwner(selectedId);
+                case 'users': return loadUsers(selectedId);
                 case 'secrets': return loadSecrets(selectedId);
                 case 'volumes': return loadVolumes(selectedId);
                 case 'files': return loadFiles(selectedId);
@@ -798,6 +801,66 @@
                 await api('DELETE', `/daemons/${id}/owner`);
                 toast('Owner reset', 'success');
                 loadOwner(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        /* ── Users tab ─────────────────────────────────────────────────────────── */
+        async function loadUsers(id) {
+            const p = document.getElementById('tab-users');
+            p.dataset.loaded = '1';
+            try {
+                const result = await api('GET', `/daemons/${id}/users`);
+                const users = result.users || [];
+                p.innerHTML = `
+            <div class="card">
+                <div class="card-title">Known users</div>
+                <p style="color:var(--text2);font-size:12px;margin-bottom:12px">
+                    普通对话默认对所有用户开放；系统指令仍只允许 owner。被拉黑的用户会被静默忽略。
+                </p>
+                ${users.length ? `
+                    <table>
+                        <thead><tr><th>Name</th><th>UUID</th><th>Channels</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                            ${users.map(user => `
+                                <tr>
+                                    <td>${user.username ? esc(user.username) : '<span style="color:var(--text2)">-</span>'}</td>
+                                    <td class="mono">${esc(user.uuid)}</td>
+                                    <td>${(user.channels || []).map(ch => `<div><span class="tag">${esc(ch.channel)}</span> <span class="mono">${esc(ch.user_id)}</span></div>`).join('')}</td>
+                                    <td>${user.banned ? '<span class="tag" style="color:var(--danger);border:1px solid var(--danger)">banned</span>' : '<span class="tag">active</span>'}</td>
+                                    <td style="text-align:right">
+                                        ${user.banned
+                        ? `<button class="ghost" style="padding:3px 10px;font-size:12px" onclick="doUnbanUser('${id}','${user.uuid}')">Unban</button>`
+                        : `<button class="danger" style="padding:3px 10px;font-size:12px" onclick="doBanUser('${id}','${user.uuid}')">Ban</button>`}
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                ` : '<p style="color:var(--text2)">No users recorded yet.</p>'}
+            </div>
+        `;
+            } catch (e) {
+                p.innerHTML = `<div class="card" style="color:var(--danger)">${esc(e.message)}</div>`;
+            }
+        }
+
+        async function doBanUser(id, uuid) {
+            if (!confirm(`Ban user ${uuid}?`)) return;
+            try {
+                await api('POST', `/daemons/${id}/users/${encodeURIComponent(uuid)}/ban`);
+                toast(`User ${uuid} banned`, 'success');
+                document.getElementById('tab-users').dataset.loaded = '0';
+                loadUsers(id);
+            } catch (e) { toast(e.message, 'error'); }
+        }
+
+        async function doUnbanUser(id, uuid) {
+            if (!confirm(`Unban user ${uuid}?`)) return;
+            try {
+                await api('DELETE', `/daemons/${id}/users/${encodeURIComponent(uuid)}/ban`);
+                toast(`User ${uuid} unbanned`, 'success');
+                document.getElementById('tab-users').dataset.loaded = '0';
+                loadUsers(id);
             } catch (e) { toast(e.message, 'error'); }
         }
 

@@ -12,7 +12,6 @@
 //! bot logic    ──►  ImGateway::reply_text() / send_text()            ──►  IM platform
 //! ```
 
-use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -120,7 +119,6 @@ pub struct ImMessage {
 /// Implementors connect to the platform, translate incoming events into
 /// [`ImEvent`] values forwarded through the provided channel, and expose
 /// async methods for sending/replying to messages.
-#[async_trait]
 pub trait ImGateway: Send + Sync {
     /// Start receiving events from the platform.
     ///

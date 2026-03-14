@@ -109,6 +109,12 @@ pub mod methods {
     pub const USER_UNLINK: &str = "user.unlink";
     /// Delete a user by UUID (removes all their channel mappings).
     pub const USER_DELETE: &str = "user.delete";
+    /// Add a UUID to the blacklist.
+    pub const USER_BAN: &str = "user.ban";
+    /// Remove a UUID from the blacklist.
+    pub const USER_UNBAN: &str = "user.unban";
+    /// List blacklisted UUIDs.
+    pub const USER_BAN_LIST: &str = "user.ban_list";
 }
 
 // ── Typed params / results ────────────────────────────────────────────────────
@@ -245,7 +251,11 @@ pub struct UserChannel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub channels: Vec<UserChannel>,
+    #[serde(default)]
+    pub banned: bool,
 }
 
 /// `user.list` result.
@@ -280,5 +290,17 @@ pub struct UserUnlinkParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserDeleteParams {
     pub uuid: String,
+}
+
+/// `user.ban` / `user.unban` params.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserBanParams {
+    pub uuid: String,
+}
+
+/// `user.ban_list` result.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserBanListResult {
+    pub users: Vec<String>,
 }
 

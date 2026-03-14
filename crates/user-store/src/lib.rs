@@ -59,6 +59,9 @@ pub struct ChannelIdentity {
 pub struct UserRecord {
     /// Internal stable UUID assigned by this system.
     pub uuid: String,
+    /// First known IM username for this user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     /// All channel identities linked to this user.
     pub channels: Vec<ChannelIdentity>,
 }
@@ -120,6 +123,7 @@ impl UserStore {
         let uuid = uuid::Uuid::new_v4().to_string();
         db.users.push(UserRecord {
             uuid: uuid.clone(),
+            username: None,
             channels: vec![ChannelIdentity {
                 channel: channel.to_string(),
                 user_id: user_id.to_string(),
@@ -131,6 +135,12 @@ impl UserStore {
             warn!("failed to persist user store: {e:#}");
         }
         uuid
+    }
+
+    /// Resolve `(channel, user_id)` to our UUID without creating a new user.
+    pub fn resolve(&self, channel: &str, user_id: &str) -> Option<String> {
+        let db = self.inner.read().expect("lock poisoned");
+        find_uuid(&db, channel, user_id)
     }
 
     /// Link two channel identities together under one UUID.
@@ -163,10 +173,14 @@ impl UserStore {
                 let (lo, hi) = if ia < ib { (ia, ib) } else { (ib, ia) };
                 // Clone the channels from the record that will be removed.
                 let hi_channels: Vec<ChannelIdentity> = db.users[hi].channels.clone();
+                let hi_username = db.users[hi].username.clone();
                 for ch in hi_channels {
                     if !db.users[lo].channels.contains(&ch) {
                         db.users[lo].channels.push(ch);
                     }
+                }
+                if db.users[lo].username.is_none() {
+                    db.users[lo].username = hi_username;
                 }
                 let uuid = db.users[lo].uuid.clone();
                 db.users.remove(hi);
@@ -204,6 +218,7 @@ impl UserStore {
                 let uuid = uuid::Uuid::new_v4().to_string();
                 db.users.push(UserRecord {
                     uuid: uuid.clone(),
+                    username: None,
                     channels: vec![
                         ChannelIdentity {
                             channel: channel_a.to_string(),
@@ -261,6 +276,49 @@ impl UserStore {
     /// Return all user records.
     pub fn list(&self) -> Vec<UserRecord> {
         self.inner.read().expect("lock poisoned").users.clone()
+    }
+
+    /// Return the stored username for the given UUID, if available.
+    pub fn username(&self, uuid: &str) -> Option<String> {
+        self.inner
+            .read()
+            .expect("lock poisoned")
+            .users
+            .iter()
+            .find(|user| user.uuid == uuid)
+            .and_then(|user| user.username.clone())
+    }
+
+    /// Persist the first known username for a UUID without overwriting later.
+    pub fn set_username_if_missing(&self, uuid: &str, username: &str) -> Result<bool> {
+        let normalized = username.trim();
+        if normalized.is_empty() {
+            return Ok(false);
+        }
+
+        let mut db = self.inner.write().expect("lock poisoned");
+        let Some(user) = db.users.iter_mut().find(|user| user.uuid == uuid) else {
+            return Ok(false);
+        };
+        if user.username.is_some() {
+            return Ok(false);
+        }
+
+        user.username = Some(normalized.to_string());
+        info!(%uuid, username = normalized, "user username recorded");
+        drop(db);
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Return `true` if the given UUID exists in the store.
+    pub fn contains_uuid(&self, uuid: &str) -> bool {
+        self.inner
+            .read()
+            .expect("lock poisoned")
+            .users
+            .iter()
+            .any(|user| user.uuid == uuid)
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -368,8 +426,7 @@ mod tests {
     use super::*;
 
     fn in_memory_store() -> UserStore {
-        let path = std::env::temp_dir()
-            .join(format!("test_users_{}.json", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("test_users_{}.json", uuid::Uuid::new_v4()));
         UserStore {
             inner: Arc::new(RwLock::new(UserDb::default())),
             path,
@@ -475,6 +532,33 @@ mod tests {
     }
 
     #[test]
+    fn username_is_written_once() {
+        let store = in_memory_store();
+        let uuid = store.resolve_or_create("feishu", "ou_alice");
+
+        assert!(store.set_username_if_missing(&uuid, "Alice").unwrap());
+        assert_eq!(store.username(&uuid).as_deref(), Some("Alice"));
+
+        assert!(!store.set_username_if_missing(&uuid, "Alice New").unwrap());
+        assert_eq!(store.username(&uuid).as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn link_preserves_existing_username() {
+        let store = in_memory_store();
+        let uuid_a = store.resolve_or_create("feishu", "ou_alice");
+        let uuid_b = store.resolve_or_create("slack", "U_alice");
+        store.set_username_if_missing(&uuid_b, "Alice").unwrap();
+
+        let merged_uuid = store
+            .link("feishu", "ou_alice", "slack", "U_alice")
+            .unwrap();
+
+        assert_eq!(merged_uuid, uuid_a);
+        assert_eq!(store.username(&merged_uuid).as_deref(), Some("Alice"));
+    }
+
+    #[test]
     fn pair_token_round_trip() {
         let pts = PairTokenStore::new();
         let token = pts.create("feishu", "ou_alice");
@@ -491,7 +575,9 @@ mod tests {
         let pts = PairTokenStore::new();
         let token = pts.create("feishu", "ou_alice");
         let lower = token.to_lowercase();
-        let pending = pts.consume(&lower).expect("should match regardless of case");
+        let pending = pts
+            .consume(&lower)
+            .expect("should match regardless of case");
         assert_eq!(pending.user_id, "ou_alice");
     }
 }
