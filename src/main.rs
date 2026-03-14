@@ -13,7 +13,9 @@
 
 use base64::Engine as _;
 use bot_core::{
-    im_tools::{DownloadedImFile, ImDownloadRequest, ImFileBridge, ImUploadRequest, UploadedImFile},
+    im_tools::{
+        DownloadedImFile, ImDownloadRequest, ImFileBridge, ImUploadRequest, UploadedImFile,
+    },
     CatBotBuilder, CatEvent, Content, ContentPart, ImAttachment, ImDocument, StreamOptions,
 };
 use futures::StreamExt;
@@ -34,7 +36,9 @@ impl ImFileBridge for LocalImFileBridge {
     fn download<'a>(
         &'a self,
         req: ImDownloadRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<DownloadedImFile>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<DownloadedImFile>> + Send + 'a>,
+    > {
         Box::pin(async move {
             if req.platform != "feishu" {
                 anyhow::bail!("unsupported platform: {}", req.platform);
@@ -42,7 +46,10 @@ impl ImFileBridge for LocalImFileBridge {
             let (mime_type, file_name, content, source_label) =
                 if let Some(key) = req.attachment_key.filter(|k| !k.is_empty()) {
                     let label = format!("attachment:{key}");
-                    let (mt, fn_, c) = self.gateway.download_file(&req.message_id, &key, &req.file_type).await?;
+                    let (mt, fn_, c) = self
+                        .gateway
+                        .download_file(&req.message_id, &key, &req.file_type)
+                        .await?;
                     (mt, fn_, c, label)
                 } else if let Some(url) = req.document_url.filter(|u| !u.is_empty()) {
                     let label = url.clone();
@@ -51,14 +58,21 @@ impl ImFileBridge for LocalImFileBridge {
                 } else {
                     anyhow::bail!("download request must specify attachment_key or document_url");
                 };
-            Ok(DownloadedImFile { file_name, mime_type, content, source_label })
+            Ok(DownloadedImFile {
+                file_name,
+                mime_type,
+                content,
+                source_label,
+            })
         })
     }
 
     fn upload<'a>(
         &'a self,
         req: ImUploadRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<UploadedImFile>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<UploadedImFile>> + Send + 'a>,
+    > {
         Box::pin(async move {
             if req.platform != "feishu" {
                 anyhow::bail!("unsupported platform: {}", req.platform);
@@ -68,21 +82,33 @@ impl ImFileBridge for LocalImFileBridge {
                 .upload_file(&req.file_name, &req.mime_type, &req.content, &req.file_type)
                 .await?;
             let sent_message_id = if !req.message_id.is_empty() {
-                match self.gateway.reply_file(&req.message_id, &file_key, &req.file_type).await {
+                match self
+                    .gateway
+                    .reply_file(&req.message_id, &file_key, &req.file_type)
+                    .await
+                {
                     Ok(id) => id,
                     Err(e) => {
                         warn!(error = %e, "reply_file failed, falling back to send_file");
-                        self.gateway.send_file(&req.chat_id, &file_key, &req.file_type).await?
+                        self.gateway
+                            .send_file(&req.chat_id, &file_key, &req.file_type)
+                            .await?
                     }
                 }
             } else {
-                self.gateway.send_file(&req.chat_id, &file_key, &req.file_type).await?
+                self.gateway
+                    .send_file(&req.chat_id, &file_key, &req.file_type)
+                    .await?
             };
             Ok(UploadedImFile {
                 file_name: req.file_name,
                 file_key: file_key.clone(),
                 message_id: sent_message_id.clone(),
-                resource_url: self.gateway.file_resource_url(&sent_message_id, &file_key, &req.file_type),
+                resource_url: self.gateway.file_resource_url(
+                    &sent_message_id,
+                    &file_key,
+                    &req.file_type,
+                ),
             })
         })
     }
@@ -92,12 +118,25 @@ const FEISHU_CHANNEL: &str = "feishu";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // ── Logging ───────────────────────────────────────────────────────────
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "remi_cat=info,im_feishu=info".into()),
+    // ── Sentry ────────────────────────────────────────────────────
+    let _sentry_guard = sentry::init((
+        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+
+    // ── Logging ───────────────────────────────────────────────────
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "remi_cat=info,im_feishu=info".into()),
+            ),
         )
+        .with(sentry::integrations::tracing::layer())
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────
@@ -120,7 +159,9 @@ async fn main() -> anyhow::Result<()> {
 
     let gateway = FeishuGateway::new(app_id, app_secret);
     let matcher = OwnerMatcher::load();
-    let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge { gateway: gateway.clone() });
+    let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge {
+        gateway: gateway.clone(),
+    });
     let bot = Rc::new(CatBotBuilder::from_env()?.im_bridge(bridge).build()?);
 
     info!("remi-cat starting up");

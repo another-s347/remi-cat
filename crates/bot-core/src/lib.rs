@@ -61,9 +61,7 @@ impl KimiThinkingMode {
     fn from_env() -> anyhow::Result<Self> {
         match std::env::var(REMI_KIMI_THINKING_ENV) {
             Ok(raw) => Self::parse(&raw).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{REMI_KIMI_THINKING_ENV} must be one of: auto, enabled, disabled"
-                )
+                anyhow::anyhow!("{REMI_KIMI_THINKING_ENV} must be one of: auto, enabled, disabled")
             }),
             Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
             Err(err) => Err(anyhow::anyhow!(
@@ -175,6 +173,8 @@ impl CatBot {
     /// | `REMI_SHORT_TERM_TOKENS`  | Override short-term token budget (default: from model profile) |
     /// | `REMI_OVERFLOW_BYTES`     | Override tool-output overflow threshold in bytes (default: from model profile) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
+    /// | `LANGSMITH_API_KEY`       | Enable LangSmith tracing (optional)                   |
+    /// | `LANGSMITH_PROJECT`       | LangSmith project name (default: `remi-cat`)          |
     pub fn from_env() -> anyhow::Result<Self> {
         CatBotBuilder::from_env()?.build()
     }
@@ -250,8 +250,28 @@ impl CatBot {
                 Err(e) => { yield CatEvent::Error(e); return; }
             };
 
+            let requested_user_name = opts
+                .sender_username
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let injected_user_name = requested_user_name
+                .as_deref()
+                .and_then(|value| truncate_user_name(Some(value), 10));
+            let single_chat_sender_prompt = single_chat_sender_system_prompt(
+                opts.chat_type.as_deref(),
+                requested_user_name.as_deref(),
+                opts.sender_user_id.as_deref(),
+            );
+
             // 2. Build injected history prefix; record its length to strip later.
-            let history = build_injected_history(&ctx);
+            let mut history = build_injected_history(&ctx);
+            insert_single_chat_sender_system_prompt(
+                &mut history,
+                usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some()),
+                single_chat_sender_prompt,
+            );
             let skip_count = history.len();
 
             // 3. Build request-level metadata (thread_id for tools);
@@ -304,15 +324,6 @@ impl CatBot {
             } else {
                 Some(serde_json::Value::Object(msg_meta))
             };
-            let requested_user_name = opts
-                .sender_username
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let injected_user_name = requested_user_name
-                .as_deref()
-                .and_then(|value| truncate_user_name(Some(value), 10));
             let content = prepend_group_sender_username(
                 content,
                 opts.chat_type.as_deref(),
@@ -339,6 +350,7 @@ impl CatBot {
                 thread_id = %thread_id_owned,
                 skip_count,
                 has_message_metadata = message_metadata.is_some(),
+                has_single_chat_sender_prompt = is_direct_chat(opts.chat_type.as_deref()) && (requested_user_name.is_some() || opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
                 requested_user_name = requested_user_name.as_deref().unwrap_or(""),
                 injected_user_name = injected_user_name.as_deref().unwrap_or(""),
                 ?message_metadata,
@@ -350,6 +362,7 @@ impl CatBot {
                 message_id = opts.message_id.as_deref().unwrap_or(""),
                 sender_username = requested_user_name.as_deref().unwrap_or(""),
                 injected_user_name = injected_user_name.as_deref().unwrap_or(""),
+                has_single_chat_sender_prompt = is_direct_chat(opts.chat_type.as_deref()) && (requested_user_name.is_some() || opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
                 has_sender_username = requested_user_name.is_some(),
                 has_message_metadata = message_metadata.is_some(),
                 "stream_with_options: username propagation"
@@ -467,6 +480,47 @@ fn truncate_user_name(name: Option<&str>, max_chars: usize) -> Option<String> {
     Some(trimmed.chars().take(max_chars).collect())
 }
 
+fn insert_single_chat_sender_system_prompt(
+    history: &mut Vec<Message>,
+    insertion_index: usize,
+    prompt: Option<String>,
+) {
+    let Some(prompt) = prompt else {
+        return;
+    };
+    history.insert(insertion_index.min(history.len()), Message::system(prompt));
+}
+
+fn single_chat_sender_system_prompt(
+    chat_type: Option<&str>,
+    sender_username: Option<&str>,
+    sender_user_id: Option<&str>,
+) -> Option<String> {
+    if !is_direct_chat(chat_type) {
+        return None;
+    }
+
+    let username = sender_username
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sender_user_id = sender_user_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (username, sender_user_id) {
+        (Some(username), Some(sender_user_id)) => Some(format!(
+            "当前是单聊场景。当前正在与你对话的用户是 {username}（内部ID: {sender_user_id}）。"
+        )),
+        (Some(username), None) => Some(format!(
+            "当前是单聊场景。当前正在与你对话的用户是 {username}。"
+        )),
+        (None, Some(sender_user_id)) => Some(format!(
+            "当前是单聊场景。当前正在与你对话的用户内部ID是 {sender_user_id}。"
+        )),
+        (None, None) => None,
+    }
+}
+
 fn prepend_group_sender_username(
     content: Content,
     chat_type: Option<&str>,
@@ -507,6 +561,12 @@ fn is_group_chat(chat_type: Option<&str>) -> bool {
     chat_type
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("group"))
+}
+
+fn is_direct_chat(chat_type: Option<&str>) -> bool {
+    chat_type
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("p2p"))
 }
 
 fn summarize_content_for_log(content: &Content) -> String {
@@ -711,15 +771,24 @@ impl CatBotBuilder {
         if !extra_options.is_empty() {
             inner_builder = inner_builder.extra_options(extra_options.clone());
         }
+
+        // ── LangSmith tracing (optional) ──────────────────────────────────
+        if let Ok(api_key) = std::env::var("LANGSMITH_API_KEY") {
+            if !api_key.is_empty() {
+                let project =
+                    std::env::var("LANGSMITH_PROJECT").unwrap_or_else(|_| "remi-cat".into());
+                tracing::info!(project = %project, "LangSmith tracing enabled");
+                inner_builder = inner_builder.tracer(
+                    remi_agentloop::prelude::LangSmithTracer::new(api_key).with_project(project),
+                );
+            }
+        }
+
         let inner_loop: InnerAgent = inner_builder.build_loop();
 
         // Compressor uses the same API credentials but no tools, max 1 turn.
-        let compressor = LlmCompressor::new(
-            self.api_key,
-            resolved_base_url,
-            self.model,
-            extra_options,
-        );
+        let compressor =
+            LlmCompressor::new(self.api_key, resolved_base_url, self.model, extra_options);
 
         let memory = Arc::new(MemoryStore {
             data_dir: self.data_dir,
@@ -789,8 +858,9 @@ impl CatBotBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        kimi_thinking_extra_options, prepend_group_sender_username, Content, ContentPart,
-        KimiThinkingMode,
+        insert_single_chat_sender_system_prompt, kimi_thinking_extra_options,
+        prepend_group_sender_username, single_chat_sender_system_prompt, Content, ContentPart,
+        KimiThinkingMode, Message,
     };
 
     #[test]
@@ -819,11 +889,8 @@ mod tests {
 
     #[test]
     fn group_text_content_is_prefixed_with_sender_username() {
-        let content = prepend_group_sender_username(
-            Content::text("hello"),
-            Some("group"),
-            Some("vv"),
-        );
+        let content =
+            prepend_group_sender_username(Content::text("hello"), Some("group"), Some("vv"));
 
         match content {
             Content::Text(text) => assert_eq!(text, "vv:\nhello"),
@@ -833,11 +900,8 @@ mod tests {
 
     #[test]
     fn p2p_content_is_not_prefixed() {
-        let content = prepend_group_sender_username(
-            Content::text("hello"),
-            Some("p2p"),
-            Some("vv"),
-        );
+        let content =
+            prepend_group_sender_username(Content::text("hello"), Some("p2p"), Some("vv"));
 
         match content {
             Content::Text(text) => assert_eq!(text, "hello"),
@@ -855,11 +919,57 @@ mod tests {
 
         match content {
             Content::Parts(parts) => {
-                assert!(matches!(parts.first(), Some(ContentPart::Text { text }) if text == "vv:\n"));
+                assert!(
+                    matches!(parts.first(), Some(ContentPart::Text { text }) if text == "vv:\n")
+                );
                 assert!(matches!(parts.get(1), Some(ContentPart::ImageUrl { .. })));
             }
             other => panic!("expected parts content, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn single_chat_sender_system_prompt_is_inserted_after_soul() {
+        let mut history = vec![
+            Message::system("agent"),
+            Message::system("soul"),
+            Message::system("long-term"),
+        ];
+
+        insert_single_chat_sender_system_prompt(
+            &mut history,
+            2,
+            single_chat_sender_system_prompt(Some("p2p"), Some("Alice"), Some("uuid-1")),
+        );
+
+        let contents: Vec<String> = history
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect();
+        assert_eq!(contents[0], "agent");
+        assert_eq!(contents[1], "soul");
+        assert_eq!(
+            contents[2],
+            "当前是单聊场景。当前正在与你对话的用户是 Alice（内部ID: uuid-1）。"
+        );
+        assert_eq!(contents[3], "long-term");
+    }
+
+    #[test]
+    fn group_chat_does_not_get_single_chat_sender_system_prompt() {
+        assert!(
+            single_chat_sender_system_prompt(Some("group"), Some("Alice"), Some("uuid-1"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn single_chat_sender_system_prompt_uses_uuid_when_username_missing() {
+        let prompt = single_chat_sender_system_prompt(Some("p2p"), None, Some("uuid-1"));
+        assert_eq!(
+            prompt.as_deref(),
+            Some("当前是单聊场景。当前正在与你对话的用户内部ID是 uuid-1。")
+        );
     }
 }
 

@@ -129,12 +129,25 @@ async fn main() -> Result<()> {
     // ── CLI flags ─────────────────────────────────────────────────────────
     let local_mode = std::env::args().any(|a| a == "--local");
 
+    // ── Sentry ────────────────────────────────────────────────────────────
+    let _sentry_guard = sentry::init((
+        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+
     // ── Logging ───────────────────────────────────────────────────────────
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "remi_daemon=info,im_feishu=info".into()),
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "remi_daemon=info,im_feishu=info".into()),
+            ),
         )
+        .with(sentry::integrations::tracing::layer())
         .init();
 
     // ── Config ────────────────────────────────────────────────────────────

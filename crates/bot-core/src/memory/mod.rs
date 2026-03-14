@@ -13,6 +13,7 @@
 //! ```text
 //! [System: Agent.md]      (if file exists)
 //! [System: Soul.md]       (if file exists)
+//! [System: current DM user]   (single-chat only; injected per turn)
 //! [System: LONG-TERM index]  (if any entries)
 //! [System: MID-TERM index]   (if any entries)
 //! ... short-term messages ...

@@ -39,12 +39,25 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── Logging ───────────────────────────────────────────────────────────
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "remi_cat_agent=info,bot_core=info".into()),
+    // ── Sentry ────────────────────────────────────────────────────
+    let _sentry_guard = sentry::init((
+        std::env::var("SENTRY_DSN").unwrap_or_default(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+
+    // ── Logging ───────────────────────────────────────────────────
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "remi_cat_agent=info,bot_core=info".into()),
+            ),
         )
+        .with(sentry::integrations::tracing::layer())
         .init();
 
     info!("remi-cat starting up");
