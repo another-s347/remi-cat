@@ -312,7 +312,7 @@ pub fn latest_unfinished_batch_system_prompt(user_state: &serde_json::Value) -> 
 
 pub fn current_todo_card_markdown(user_state: &serde_json::Value) -> Option<String> {
     let todos = todos_from_user_state(user_state);
-    if todos.is_empty() {
+    if todos.is_empty() || todos.iter().all(|todo| todo.done) {
         return None;
     }
 
@@ -754,5 +754,33 @@ mod tests {
                 "📝 **当前 Todo**\n```\n[Batch] Release launch\n  [○] 1 Draft changelog\n      Include breaking changes\n\n[Ungrouped]\n  [✓] 2 Legacy follow-up\n```"
             )
         );
+    }
+
+    #[test]
+    fn current_todo_card_markdown_omits_fully_completed_plans() {
+        let user_state = json!({
+            "__todos": [
+                TodoItem {
+                    id: 1,
+                    content: "Draft changelog".to_string(),
+                    description: None,
+                    done: true,
+                    batch_id: Some(1),
+                    batch_title: Some("Release launch".to_string()),
+                    batch_index: Some(0),
+                },
+                TodoItem {
+                    id: 2,
+                    content: "Publish notes".to_string(),
+                    description: None,
+                    done: true,
+                    batch_id: Some(1),
+                    batch_title: Some("Release launch".to_string()),
+                    batch_index: Some(1),
+                }
+            ],
+        });
+
+        assert_eq!(current_todo_card_markdown(&user_state), None);
     }
 }

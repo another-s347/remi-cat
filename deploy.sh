@@ -68,7 +68,7 @@ else
     info "Skipping build (using existing target/release binaries)"
 fi
 
-# ── 2. stage files ────────────────────────────────────────────────────────────
+# ── 2. stage and encode ───────────────────────────────────────────────────────
 STAGE=$(mktemp -d)
 trap 'rm -rf "${STAGE}"' EXIT
 
@@ -78,73 +78,122 @@ for bin in remi-cat-agent remi-daemon remi-admin; do
     dst="${STAGE}/${bin}-linux-x86_64"
     [[ -f "$src" ]] || { error "Binary not found: ${src}"; exit 1; }
     cp "$src" "$dst"
-    sha256sum "$dst" > "${dst}.sha256"
 done
 
-info "Staged binaries:"
-ls -lh "${STAGE}/"
+info "Encoding binaries for transfer (this may take a moment)..."
+TAR_B64=$(tar -C "${STAGE}" -czf - . | base64 | tr -d '\n')
+ENCODED_KB=$(( ${#TAR_B64} / 1024 ))
+success "Encoded ${ENCODED_KB} KB — ready to transfer"
 
-# ── 3. stop daemon on remote ──────────────────────────────────────────────────
-info "Stopping remote daemon (if running)..."
-ssh "${SSH_HOST}" '
-    if pgrep -f remi-daemon-linux-x86_64 > /dev/null 2>&1; then
-        pkill -f remi-daemon-linux-x86_64 || true
-        sleep 1
-        echo "daemon stopped"
-    else
-        echo "daemon was not running"
-    fi
-'
+COMPOSE_B64=$(base64 < "${SCRIPT_DIR}/docker-compose.yml" | tr -d '\n')
+SOUL_B64=""
+if [[ -f "${SCRIPT_DIR}/soul.md" ]]; then
+    SOUL_B64=$(base64 < "${SCRIPT_DIR}/soul.md" | tr -d '\n')
+fi
+AGENT_MD_B64=""
+REMI_DATA_DIR="${REMI_DATA_DIR:-.remi-cat}"
+if [[ -f "${SCRIPT_DIR}/${REMI_DATA_DIR}/Agent.md" ]]; then
+    AGENT_MD_B64=$(base64 < "${SCRIPT_DIR}/${REMI_DATA_DIR}/Agent.md" | tr -d '\n')
+fi
 
-# ── 4. upload binaries ────────────────────────────────────────────────────────
-info "Uploading binaries to ${SSH_HOST}:${REMOTE_BIN}/ ..."
-ssh "${SSH_HOST}" "mkdir -p '${REMOTE_BIN}'"
-scp "${STAGE}"/* "${SSH_HOST}:${REMOTE_BIN}/"
-success "Upload complete"
+# ── 3-6. Single SSH session: upload + all remote steps ───────────────────────
+info "Connecting to ${SSH_HOST} (you will be prompted for password once)..."
 
-# ── 5. rebuild Docker image with new agent binary ─────────────────────────────
-if [[ $SKIP_DOCKER -eq 0 ]]; then
-    info "Rebuilding Docker image with local agent binary..."
-    ssh "${SSH_HOST}" "
-        cd '${REMOTE_DIR}' || exit 1
+ssh -o StrictHostKeyChecking=accept-new "${SSH_HOST}" bash << REMOTESCRIPT
+set -euo pipefail
 
-        # Build image from local binary (no network download)
-        docker build -t remi-cat:latest -f- . <<'DOCKERFILE'
+REMOTE_DIR='${REMOTE_DIR}'
+REMOTE_BIN='${REMOTE_BIN}'
+SKIP_DOCKER='${SKIP_DOCKER}'
+DAEMON_BIN="\${REMOTE_BIN}/remi-daemon-linux-x86_64"
+REMI_DATA_DIR='${REMI_DATA_DIR}'
+
+# ── extract binaries ─────────────────────────────────────────────────────────
+echo "==> Extracting binaries..."
+mkdir -p "\${REMOTE_BIN}"
+base64 -d << '__REMI_TAR_EOF__' | tar -xzf - -C "\${REMOTE_BIN}"
+${TAR_B64}
+__REMI_TAR_EOF__
+chmod +x "\${REMOTE_BIN}"/*-linux-x86_64
+ls -lh "\${REMOTE_BIN}/"
+
+# ── write support files ──────────────────────────────────────────────────────
+echo "==> Writing docker-compose.yml..."
+mkdir -p "\${REMOTE_DIR}"
+base64 -d << '__COMPOSE_EOF__' > "\${REMOTE_DIR}/docker-compose.yml"
+${COMPOSE_B64}
+__COMPOSE_EOF__
+
+if [[ -n '${SOUL_B64}' ]]; then
+    echo "==> Writing soul.md..."
+    base64 -d << '__SOUL_EOF__' > "\${REMOTE_DIR}/soul.md"
+${SOUL_B64}
+__SOUL_EOF__
+fi
+
+mkdir -p "\${REMOTE_DIR}/\${REMI_DATA_DIR}"
+if [[ -n '${AGENT_MD_B64}' ]]; then
+    echo "==> Writing Agent.md..."
+    base64 -d << '__AGENT_MD_EOF__' > "\${REMOTE_DIR}/\${REMI_DATA_DIR}/Agent.md"
+${AGENT_MD_B64}
+__AGENT_MD_EOF__
+fi
+
+touch "\${REMOTE_DIR}/soul.md"
+touch "\${REMOTE_DIR}/\${REMI_DATA_DIR}/Agent.md"
+
+# ── stop existing daemon ─────────────────────────────────────────────────────
+echo "==> Stopping daemon..."
+if pgrep -xf "\${DAEMON_BIN}" > /dev/null 2>&1; then
+    pkill -xf "\${DAEMON_BIN}" || true
+    sleep 2
+    echo "    daemon stopped"
+else
+    echo "    daemon was not running"
+fi
+
+# ── rebuild Docker image ─────────────────────────────────────────────────────
+if [[ "\${SKIP_DOCKER}" == "0" ]]; then
+    echo "==> Rebuilding Docker image..."
+    cd "\${REMOTE_DIR}"
+    docker build -t remi-cat:latest -f- . << 'DOCKERFILE'
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY bin/remi-cat-agent-linux-x86_64 /usr/local/bin/remi-cat-agent
 RUN chmod +x /usr/local/bin/remi-cat-agent
-VOLUME [\"/app/data\"]
+VOLUME ["/app/data"]
 WORKDIR /app/data
-ENTRYPOINT [\"/usr/local/bin/remi-cat-agent\"]
+ENTRYPOINT ["/usr/local/bin/remi-cat-agent"]
 DOCKERFILE
-
-        # Restart container
-        docker compose down 2>/dev/null || true
-        docker compose up -d
-        echo 'container restarted'
-    "
-    success "Docker image rebuilt and container restarted"
+    echo "==> Restarting container..."
+    docker compose down 2>/dev/null || true
+    docker compose up -d
+    echo "    container restarted"
 fi
 
-# ── 6. restart daemon ─────────────────────────────────────────────────────────
-info "Starting daemon..."
-ssh "${SSH_HOST}" "
-    cd '${REMOTE_DIR}'
-    chmod +x bin/remi-daemon-linux-x86_64
-    nohup bin/remi-daemon-linux-x86_64 > daemon.log 2>&1 &
-    sleep 2
-    if pgrep -f remi-daemon-linux-x86_64 > /dev/null; then
-        echo 'daemon started OK'
-    else
-        echo 'ERROR: daemon failed to start'
-        tail -20 daemon.log
-        exit 1
-    fi
-"
+# ── start daemon ─────────────────────────────────────────────────────────────
+echo "==> Starting daemon..."
+cd "\${REMOTE_DIR}"
+if [[ -f .env ]]; then
+    set -o allexport
+    source .env
+    set +o allexport
+fi
+nohup "\${DAEMON_BIN}" >> daemon.log 2>&1 &
+disown
+sleep 3
+if pgrep -xf "\${DAEMON_BIN}" > /dev/null 2>&1; then
+    echo "    daemon started OK"
+else
+    echo "ERROR: daemon failed to start — last log lines:"
+    tail -30 daemon.log
+    exit 1
+fi
 
-# ── 7. summary ────────────────────────────────────────────────────────────────
+echo "==> Running processes:"
+ps aux | grep remi | grep -v grep || true
+REMOTESCRIPT
+
 echo
 success "Deploy complete!"
-info  "Running processes:"
-ssh "${SSH_HOST}" 'ps aux | grep remi | grep -v grep || true'
+

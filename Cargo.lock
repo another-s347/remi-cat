@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "bot-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "im-feishu"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "im-gateway"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "matcher"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "serde",
@@ -1722,7 +1722,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mgmt-api"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -2577,7 +2577,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "remi-admin"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "remi-daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "remi-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "prost",
  "tonic",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "user-store"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "rand 0.8.5",
