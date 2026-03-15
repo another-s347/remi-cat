@@ -1,11 +1,13 @@
 use async_stream::stream;
 use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult};
+use remi_agentloop::prelude::{
+    AgentError, Tool, ToolContext, ToolDefinitionContext, ToolOutput, ToolResult,
+};
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
 use std::sync::Arc;
 
-use super::store::SkillStore;
+use super::store::{SkillStore, SkillSummary};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -21,6 +23,31 @@ fn strip_frontmatter(content: &str) -> &str {
     } else {
         content
     }
+}
+
+fn render_skill_summary(summary: &SkillSummary) -> String {
+    match summary.description.as_deref() {
+        Some(description) => format!("- {} — {}", summary.name, description),
+        None => format!("- {} — (no description)", summary.name),
+    }
+}
+
+fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
+    if skills.is_empty() {
+        return "You can use skill__search with one or more keywords to discover local skills by name and description.".to_string();
+    }
+
+    let mut prompt = String::from(
+        "Recent local skill snapshot (cached for up to 30 minutes; ordered by recent successful skill__get):\n",
+    );
+    for skill in skills {
+        prompt.push_str(&render_skill_summary(skill));
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "Use skill__search with one or more keywords to discover additional local skills beyond this snapshot.",
+    );
+    prompt
 }
 
 // ── SkillSaveTool ─────────────────────────────────────────────────────────────
@@ -93,6 +120,11 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     fn description(&self) -> &str {
         "Retrieve the full markdown content of a previously saved skill by name."
     }
+    fn extra_prompt(&self, _ctx: &ToolDefinitionContext) -> Option<String> {
+        Some(render_skill_get_extra_prompt(
+            &self.store.featured_summaries(),
+        ))
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -123,38 +155,100 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     }
 }
 
-// ── SkillListTool ─────────────────────────────────────────────────────────────
+// ── SkillSearchTool ───────────────────────────────────────────────────────────
 
-pub struct SkillListTool<S> {
+pub struct SkillSearchTool<S> {
     pub(crate) store: Arc<S>,
 }
 
-impl<S: SkillStore + 'static> Tool for SkillListTool<S> {
+impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
     fn name(&self) -> &str {
-        "skill__list"
+        "skill__search"
     }
     fn description(&self) -> &str {
-        "List the names of all saved skills."
+        "Search saved skills by keyword across skill names and descriptions. Accepts multiple keywords and favors recall over strict matching."
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({ "type": "object", "properties": {} })
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "One or more keywords separated by spaces. Search matches skill names and descriptions with OR semantics."
+                }
+            },
+            "required": ["query"]
+        })
     }
     async fn execute(
         &self,
-        _arguments: serde_json::Value,
+        arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        let query = arguments["query"]
+            .as_str()
+            .ok_or_else(|| AgentError::tool("skill__search", "missing 'query'"))?
+            .trim()
+            .to_string();
         let store = self.store.clone();
-        let names = store.list().await?;
-        let result = if names.is_empty() {
-            "No skills saved yet.".to_string()
+        let matches = store.search(&query).await?;
+        let result = if matches.is_empty() {
+            format!(
+                "No skills matched '{query}'. Search checks skill names and descriptions; try broader keywords."
+            )
         } else {
-            names.join(", ")
+            let mut text = format!("Found {} matching skill(s) for '{query}':\n", matches.len());
+            for skill in matches {
+                text.push_str(&render_skill_summary(&skill));
+                text.push('\n');
+            }
+            text.push_str("Use skill__get with the exact skill name to open one.");
+            text
         };
         Ok(ToolResult::Output(
             stream! { yield ToolOutput::text(result); },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_skill_get_extra_prompt, SkillGetTool};
+    use crate::skill::store::{InMemorySkillStore, SkillStore, SkillSummary};
+    use remi_agentloop::prelude::{Tool, ToolDefinitionContext};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn skill_get_extra_prompt_lists_at_most_eight_skills_and_search_hint() {
+        let store = Arc::new(InMemorySkillStore::new());
+        for index in 0..9 {
+            let name = format!("skill-{index}");
+            let content =
+                format!("---\nname: {name}\ndescription: Description {index}\n---\n\nBody {index}");
+            store.save(&name, &content).await.unwrap();
+        }
+
+        let tool = SkillGetTool {
+            store: Arc::clone(&store),
+        };
+        let prompt = tool
+            .extra_prompt(&ToolDefinitionContext::default())
+            .expect("skill__get should always advertise discovery guidance");
+
+        assert!(prompt.contains("skill__search"));
+        assert_eq!(
+            prompt.lines().filter(|line| line.starts_with("- ")).count(),
+            8
+        );
+        assert!(!prompt.contains("skill-0 — Description 0"));
+        assert!(prompt.contains("skill-8 — Description 8"));
+    }
+
+    #[test]
+    fn empty_featured_prompt_still_points_to_search() {
+        let prompt = render_skill_get_extra_prompt(&Vec::<SkillSummary>::new());
+        assert!(prompt.contains("skill__search"));
     }
 }
 

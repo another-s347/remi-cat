@@ -5,7 +5,7 @@
 //! ```text
 //! CatBot
 //!   └── CatAgent<AgentLoop<OpenAIClient>>
-//!         ├── local_tools: skill__save / skill__get / skill__list / skill__delete
+//!         ├── local_tools: skill__save / skill__get / skill__search / skill__delete
 //!         ├── local_tools: todo__add / todo__list / todo__complete / todo__update / todo__remove
 //!         └── local_tools: memory__get_detail
 //!   └── MemoryStore  (shared via Arc)
@@ -918,8 +918,8 @@ impl CatBotBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        memory::{build_injected_history, MemoryContext, MemoryIndex},
         insert_single_chat_sender_system_prompt, kimi_thinking_extra_options,
+        memory::{build_injected_history, MemoryContext, MemoryIndex},
         prepend_group_sender_username, single_chat_sender_system_prompt, Content, ContentPart,
         KimiThinkingMode, Message, REMI_KIMI_THINKING_ENV,
     };
@@ -1132,7 +1132,8 @@ mod tests {
 
     #[tokio::test]
     async fn intermediate_state_updates_are_persisted_and_forwarded() {
-        let data_dir = std::env::temp_dir().join(format!("remi-cat-state-update-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("remi-cat-state-update-{}", Uuid::new_v4()));
         let memory = super::MemoryStore {
             data_dir: data_dir.clone(),
             agent_md_path: None,
@@ -1157,7 +1158,8 @@ mod tests {
             }]
         });
 
-        let event = super::persist_intermediate_user_state(&memory, "thread-1", user_state.clone()).await;
+        let event =
+            super::persist_intermediate_user_state(&memory, "thread-1", user_state.clone()).await;
 
         match event {
             super::CatEvent::StateUpdate(forwarded) => assert_eq!(forwarded, user_state),
@@ -1167,8 +1169,8 @@ mod tests {
         let persisted = tokio::fs::read_to_string(data_dir.join("memory/thread-1/user_state.json"))
             .await
             .expect("intermediate user_state should be saved to disk");
-        let persisted: serde_json::Value = serde_json::from_str(&persisted)
-            .expect("persisted user_state should deserialize");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&persisted).expect("persisted user_state should deserialize");
         assert_eq!(persisted, user_state);
 
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
@@ -1177,7 +1179,7 @@ mod tests {
 
 fn default_system_prompt() -> String {
     "You are a helpful AI assistant. \
-     You have access to skill memory tools (skill__save/get/list/delete) \
+    You have access to skill memory tools (skill__save/get/search/delete) \
      to store and recall reusable procedures, todo tools \
      (todo__add/list/complete/update/remove) to track multi-step work per thread; \
      todo__add creates a titled batch of child todos and returns their IDs, \

@@ -16,7 +16,7 @@ use tracing::debug;
 
 use remi_agentloop::prelude::{
     AgentConfig, AgentError, Content, LoopInput, Message, ParsedToolCall, ToolCallOutcome,
-    ToolContext, ToolOutput, ToolResult,
+    ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::types::AgentEvent;
@@ -57,13 +57,14 @@ where
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
         let overflow_bytes = self.overflow_bytes;
+        let tool_def_ctx = build_tool_definition_ctx(&input);
         let dynamic_tools = build_dynamic_tools(
-            input_metadata(&input),
+            tool_def_ctx.metadata.clone(),
             data_dir.clone(),
             self.im_bridge.clone(),
         );
-        let mut extra_defs = self.local_tools.definitions(&serde_json::Value::Null);
-        extra_defs.extend(dynamic_tools.definitions(&serde_json::Value::Null));
+        let extra_defs =
+            merge_runtime_tool_definitions(&self.local_tools, &dynamic_tools, &tool_def_ctx, &[]);
 
         stream! {
             let run_start = Instant::now();
@@ -207,6 +208,12 @@ where
                                 return;
                             }
 
+                            refresh_runtime_tool_definitions(
+                                &mut state,
+                                &self.local_tools,
+                                &dynamic_tools,
+                            );
+
                             next_input = Some(LoopInput::Resume { state, results: all_outcomes });
                             break;
                         }
@@ -289,6 +296,64 @@ fn inject_extra_tools(
     }
 }
 
+fn build_tool_definition_ctx(input: &LoopInput) -> ToolDefinitionContext {
+    match input {
+        LoopInput::Start {
+            metadata,
+            user_state,
+            ..
+        } => ToolDefinitionContext {
+            metadata: metadata.clone(),
+            user_state: user_state.clone().unwrap_or(serde_json::Value::Null),
+            ..ToolDefinitionContext::default()
+        },
+        LoopInput::Resume { state, .. } | LoopInput::Cancel { state } => ToolDefinitionContext {
+            thread_id: Some(state.thread_id.clone()),
+            run_id: Some(state.run_id.clone()),
+            metadata: state.config.metadata.clone(),
+            user_state: state.user_state.clone(),
+        },
+    }
+}
+
+fn merge_runtime_tool_definitions(
+    local_tools: &DefaultToolRegistry,
+    dynamic_tools: &DefaultToolRegistry,
+    ctx: &ToolDefinitionContext,
+    external_defs: &[ToolDefinition],
+) -> Vec<ToolDefinition> {
+    let mut defs = local_tools.definitions_with_context(ctx);
+    defs.extend(dynamic_tools.definitions_with_context(ctx));
+    defs.extend_from_slice(external_defs);
+    defs
+}
+
+fn refresh_runtime_tool_definitions(
+    state: &mut remi_agentloop::prelude::AgentState,
+    local_tools: &DefaultToolRegistry,
+    dynamic_tools: &DefaultToolRegistry,
+) {
+    let external_defs: Vec<_> = state
+        .tool_definitions
+        .iter()
+        .filter(|definition| {
+            let name = definition.function.name.as_str();
+            !local_tools.contains(name) && !dynamic_tools.contains(name)
+        })
+        .cloned()
+        .collect();
+
+    let ctx = ToolDefinitionContext {
+        thread_id: Some(state.thread_id.clone()),
+        run_id: Some(state.run_id.clone()),
+        metadata: state.config.metadata.clone(),
+        user_state: state.user_state.clone(),
+    };
+
+    state.tool_definitions =
+        merge_runtime_tool_definitions(local_tools, dynamic_tools, &ctx, &external_defs);
+}
+
 fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
     ToolContext {
         config: AgentConfig::default(),
@@ -296,14 +361,6 @@ fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
         run_id: state.run_id.clone(),
         metadata: state.config.metadata.clone(),
         user_state: Arc::new(RwLock::new(state.user_state.clone())),
-    }
-}
-
-fn input_metadata(input: &LoopInput) -> Option<serde_json::Value> {
-    match input {
-        LoopInput::Start { metadata, .. } => metadata.clone(),
-        LoopInput::Resume { state, .. } => state.config.metadata.clone(),
-        LoopInput::Cancel { state } => state.config.metadata.clone(),
     }
 }
 

@@ -2,9 +2,9 @@ pub mod store;
 pub mod tools;
 
 pub use store::{FileSkillStore, InMemorySkillStore, SkillStore};
-pub use tools::{SkillDeleteTool, SkillGetTool, SkillListTool, SkillSaveTool};
+pub use tools::{SkillDeleteTool, SkillGetTool, SkillSaveTool, SkillSearchTool};
 
-use remi_agentloop::prelude::{AgentError, ParsedToolCall};
+use remi_agentloop::prelude::ParsedToolCall;
 use std::sync::Arc;
 
 use crate::events::SkillEvent;
@@ -20,12 +20,31 @@ pub fn register_skill_tools<S: SkillStore>(
     registry.register(SkillGetTool {
         store: Arc::clone(&store),
     });
-    registry.register(SkillListTool {
+    registry.register(SkillSearchTool {
         store: Arc::clone(&store),
     });
     registry.register(SkillDeleteTool {
         store: Arc::clone(&store),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{register_skill_tools, InMemorySkillStore};
+    use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
+    use std::sync::Arc;
+
+    #[test]
+    fn registry_exposes_search_and_not_list() {
+        let mut registry = DefaultToolRegistry::new();
+        register_skill_tools(&mut registry, Arc::new(InMemorySkillStore::new()));
+
+        let defs = registry.definitions(&serde_json::Value::Null);
+        let names: Vec<_> = defs.into_iter().map(|def| def.function.name).collect();
+
+        assert!(names.iter().any(|name| name == "skill__search"));
+        assert!(!names.iter().any(|name| name == "skill__list"));
+    }
 }
 
 /// Produce a `SkillEvent` for mutation tools (save/delete).

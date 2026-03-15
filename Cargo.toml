@@ -13,3 +13,6 @@ members = [
 ]
 default-members = ["crates/daemon", "crates/agent", "crates/admin-ui"]
 resolver = "2"
+
+[patch."https://github.com/another-s347/remi-agentloop.git"]
+remi-agentloop = { path = "../remi-agentloop/remi-agentloop" }
