@@ -441,6 +441,7 @@ async fn handle_message(
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
         chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
         platform: Some(ev.platform.clone()).filter(|s| !s.is_empty()),
+        todo_create_via_sdk: ev.todo_create_via_sdk,
         im_attachments: ev
             .attachments
             .iter()
@@ -470,6 +471,7 @@ async fn handle_message(
         sender_user_id = %ev.sender_user_id,
         sender_username = %ev.sender_username,
         has_sender_username = !ev.sender_username.trim().is_empty(),
+        todo_create_via_sdk = ev.todo_create_via_sdk,
         "handle_message: built StreamOptions"
     );
     let stream = bot.stream_with_options(&ev.chat_id, content, opts);

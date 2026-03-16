@@ -16,7 +16,7 @@ serde_json = "1"
 tracing = "0.1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
@@ -25,3 +25,5 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 aho-corasick = "1"
 html2md = "0.2.15"
+remi-client-sdk = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-client-sdk", branch = "main" }
+remi-things-crdt = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-things-crdt", branch = "main" }

@@ -143,6 +143,8 @@ pub struct StreamOptions {
     pub chat_type: Option<String>,
     /// Current IM platform identifier (for example `feishu`).
     pub platform: Option<String>,
+    /// Route newly-created todo batches to the remi-sdk backend when true.
+    pub todo_create_via_sdk: bool,
     /// Downloadable IM attachments referenced by the current message.
     pub im_attachments: Vec<ImAttachment>,
     /// Feishu document links referenced by the current message.
@@ -164,6 +166,7 @@ type InnerAgent = AgentLoop<OpenAIClient<ReqwestTransport>>;
 pub struct CatBot {
     inner: CatAgent<InnerAgent>,
     memory: Arc<MemoryStore>,
+    todo_backend: Arc<todo::HybridTodoBackend>,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
 }
@@ -252,10 +255,22 @@ impl CatBot {
         let thread_id_owned = thread_id.to_string();
         stream! {
             // 1. Load memory context (triggers mid->long-term promotion if needed).
-            let ctx = match self.memory.load_context(&thread_id_owned).await {
+            let mut ctx = match self.memory.load_context(&thread_id_owned).await {
                 Ok(c) => c,
                 Err(e) => { yield CatEvent::Error(e); return; }
             };
+
+            if let Err(err) = self
+                .todo_backend
+                .refresh_thread_user_state(&thread_id_owned, &mut ctx.user_state)
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id_owned,
+                    error = %err,
+                    "failed to refresh sdk-backed todo state before turn"
+                );
+            }
 
             let requested_user_name = opts
                 .sender_username
@@ -289,6 +304,9 @@ impl CatBot {
             }
             if let Some(ref platform) = opts.platform {
                 meta["platform"] = serde_json::Value::String(platform.clone());
+            }
+            if opts.todo_create_via_sdk {
+                meta["todo_create_via_sdk"] = serde_json::Value::Bool(true);
             }
 
             let mut msg_meta = serde_json::Map::new();
@@ -857,9 +875,10 @@ impl CatBotBuilder {
 
         let skill_store = Arc::new(FileSkillStore::new(self.skills_dir));
         let data_dir = memory.data_dir.clone();
+        let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
         let mut local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut local_tools, skill_store);
-        todo::register_todo_tools(&mut local_tools);
+        todo::register_todo_tools(&mut local_tools, Arc::clone(&todo_backend));
         local_tools.register(MemoryGetDetailTool {
             store: Arc::clone(&memory),
         });
@@ -910,6 +929,7 @@ impl CatBotBuilder {
                 im_bridge: self.im_bridge,
             },
             memory,
+            todo_backend,
             redactor,
         })
     }
@@ -1096,6 +1116,9 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(0),
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
             }]
         });
         let ctx = MemoryContext {
@@ -1155,6 +1178,9 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Knowledge synthesis".to_string()),
                 batch_index: Some(0),
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
             }]
         });
 

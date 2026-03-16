@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
     // Each item carries the Feishu message together with the resolved user UUID
     // and cached sender username, if we have one.
     let chat_queues: Arc<
-        Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String, Option<String>)>>>,
+        Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String, Option<String>, bool)>>>,
     > = Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
@@ -597,7 +597,8 @@ async fn main() -> Result<()> {
                     }
                     queues[&chat_id].clone()
                 };
-                match queue_tx.try_send((msg, user_uuid, sender_username)) {
+                let todo_create_via_sdk = is_owner(&matcher, &user_uuid);
+                match queue_tx.try_send((msg, user_uuid, sender_username, todo_create_via_sdk)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
@@ -778,15 +779,15 @@ async fn main() -> Result<()> {
 /// The worker blocks on one message at a time (enrich → react → agent →
 /// await completion) so messages from the same chat are processed in order.
 ///
-/// Each queue item is `(FeishuMessage, user_uuid, sender_username)` where
-/// `user_uuid` is the internal UUID resolved by the caller before enqueue.
+/// Each queue item is `(FeishuMessage, user_uuid, sender_username, todo_create_via_sdk)`
+/// where `user_uuid` is the internal UUID resolved by the caller before enqueue.
 fn spawn_queue_worker(
     chat_id: String,
     gateway: FeishuGateway,
     rpc: RpcServer,
-) -> mpsc::Sender<(FeishuMessage, String, Option<String>)> {
+) -> mpsc::Sender<(FeishuMessage, String, Option<String>, bool)> {
     let (tx, mut rx) =
-        mpsc::channel::<(FeishuMessage, String, Option<String>)>(CHAT_QUEUE_CAPACITY);
+        mpsc::channel::<(FeishuMessage, String, Option<String>, bool)>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
         // Holds the completion receiver for the currently in-flight message,
         // if any.  We drop it (without awaiting) when a newer message preempts.
@@ -800,7 +801,7 @@ fn spawn_queue_worker(
             // we send a cancel signal to the Agent, drop the old completion
             // receiver (the Agent's eventual Done for that message becomes a
             // no-op on the daemon side), and process the newest item instead.
-            let item: (FeishuMessage, String, Option<String>) = if completion_rx.is_some() {
+            let item: (FeishuMessage, String, Option<String>, bool) = if completion_rx.is_some() {
                 let mut comp = completion_rx.take().unwrap();
                 tokio::select! {
                     _ = &mut comp => {
@@ -834,7 +835,7 @@ fn spawn_queue_worker(
                 }
             };
 
-            let (msg, user_uuid, sender_username) = item;
+            let (msg, user_uuid, sender_username, todo_create_via_sdk) = item;
             let message_id = msg.message_id.clone();
             let enriched = enrich_message(&gateway, msg).await;
 
@@ -857,6 +858,7 @@ fn spawn_queue_worker(
                 uuid = %user_uuid,
                 sender_username = sender_username.as_deref().unwrap_or(""),
                 has_sender_username = sender_username.is_some(),
+                todo_create_via_sdk,
                 "queue worker forwarding message to agent"
             );
 
@@ -866,8 +868,12 @@ fn spawn_queue_worker(
                 .map_err(|e| warn!("add_reaction failed: {e:#}"))
                 .ok();
 
-            let daemon_msg =
-                daemon_msg_im_message(&enriched, &user_uuid, sender_username.as_deref());
+            let daemon_msg = daemon_msg_im_message(
+                &enriched,
+                &user_uuid,
+                sender_username.as_deref(),
+                todo_create_via_sdk,
+            );
             match rpc.send_to_agent_and_await(daemon_msg, &message_id).await {
                 Some(comp_rx) => {
                     if let Some(rid) = reaction_id {

@@ -47,6 +47,7 @@ message ImMessageEvent {
   repeated ImAttachmentRef attachments     = 9;
   repeated ImDocumentRef   documents       = 10;
   string                   sender_username = 11;
+  bool                     todo_create_via_sdk = 12;
 }
 
 message ImAttachmentRef {

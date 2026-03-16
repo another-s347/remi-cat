@@ -4,6 +4,7 @@
 //! automatically serialised into every `AgentState` checkpoint.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_stream::stream;
 use futures::Stream;
@@ -12,12 +13,33 @@ use remi_agentloop::types::ResumePayload;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const TODOS_STATE_KEY: &str = "__todos";
+use super::backend::HybridTodoBackend;
+
+pub(crate) const TODOS_STATE_KEY: &str = "__todos";
 const UNGROUPED_SECTION_TITLE: &str = "Ungrouped";
 const TODO_BATCH_PROMPT_HEADER: &str = "[CURRENT TODO BATCH]";
 const TODO_BATCH_EXECUTION_GUIDANCE: &str = "When this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.";
 
 // ── Todo item ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStorageKind {
+    Simple,
+    RemiSdk,
+}
+
+impl Default for TodoStorageKind {
+    fn default() -> Self {
+        Self::Simple
+    }
+}
+
+impl TodoStorageKind {
+    pub fn is_simple(&self) -> bool {
+        matches!(self, Self::Simple)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
@@ -33,30 +55,36 @@ pub struct TodoItem {
     pub batch_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "TodoStorageKind::is_simple")]
+    pub storage_kind: TodoStorageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thing_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TodoBatchAddRequest {
+pub(crate) struct TodoBatchAddRequest {
     title: String,
     items: Vec<TodoBatchAddItemRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TodoBatchAddItemRequest {
+pub(crate) struct TodoBatchAddItemRequest {
     title: String,
     description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TodoBatchAddResult {
-    batch_id: u64,
-    batch_title: String,
-    todo_ids: Vec<u64>,
-    items: Vec<TodoBatchAddResultItem>,
+pub(crate) struct TodoBatchAddResult {
+    pub(crate) batch_id: u64,
+    pub(crate) batch_title: String,
+    pub(crate) todo_ids: Vec<u64>,
+    pub(crate) items: Vec<TodoBatchAddResultItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TodoBatchAddResultItem {
+pub(crate) struct TodoBatchAddResultItem {
     id: u64,
     title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,14 +113,14 @@ struct TodoBatchGroup {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-pub fn todos_from_user_state(user_state: &serde_json::Value) -> Vec<TodoItem> {
+pub(crate) fn todos_from_user_state(user_state: &serde_json::Value) -> Vec<TodoItem> {
     match user_state.get(TODOS_STATE_KEY) {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
         None => vec![],
     }
 }
 
-fn write_todos_to_user_state(user_state: &mut serde_json::Value, todos: &[TodoItem]) {
+pub(crate) fn write_todos_to_user_state(user_state: &mut serde_json::Value, todos: &[TodoItem]) {
     if !user_state.is_object() {
         *user_state = json!({});
     }
@@ -102,19 +130,6 @@ fn write_todos_to_user_state(user_state: &mut serde_json::Value, todos: &[TodoIt
             serde_json::to_value(todos).unwrap_or(json!([])),
         );
     }
-}
-
-fn read_todos(ctx: &ToolContext) -> Vec<TodoItem> {
-    let us = ctx.user_state.read().unwrap();
-    todos_from_user_state(&us)
-}
-
-fn modify_todos<T>(ctx: &ToolContext, f: impl FnOnce(Vec<TodoItem>) -> (Vec<TodoItem>, T)) -> T {
-    let mut us = ctx.user_state.write().unwrap();
-    let todos = todos_from_user_state(&us);
-    let (updated, ret) = f(todos);
-    write_todos_to_user_state(&mut us, &updated);
-    ret
 }
 
 fn next_id(todos: &[TodoItem]) -> u64 {
@@ -161,7 +176,7 @@ fn parse_add_request(arguments: serde_json::Value) -> Result<TodoBatchAddRequest
     Ok(TodoBatchAddRequest { title, items })
 }
 
-fn add_batch_to_todos(
+pub(crate) fn add_batch_to_todos(
     mut todos: Vec<TodoItem>,
     request: TodoBatchAddRequest,
 ) -> (Vec<TodoItem>, TodoBatchAddResult) {
@@ -187,6 +202,9 @@ fn add_batch_to_todos(
             batch_id: Some(batch_id),
             batch_title: Some(batch_title.clone()),
             batch_index: Some(index as u64),
+            storage_kind: TodoStorageKind::Simple,
+            collection_uuid: None,
+            thing_uuid: None,
         });
     }
 
@@ -321,7 +339,15 @@ pub fn current_todo_card_markdown(user_state: &serde_json::Value) -> Option<Stri
 
 // ── TodoAddTool ───────────────────────────────────────────────────────────────
 
-pub struct TodoAddTool;
+pub struct TodoAddTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoAddTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 impl Tool for TodoAddTool {
     fn name(&self) -> &str {
@@ -370,10 +396,7 @@ impl Tool for TodoAddTool {
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let request = parse_add_request(arguments)?;
-        let result = modify_todos(ctx, |todos| {
-            let (updated, result) = add_batch_to_todos(todos, request);
-            (updated, result)
-        });
+        let result = self.backend.add_batch(ctx, request).await?;
         Ok(ToolResult::Output(stream! {
             let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| {
                 json!({
@@ -390,7 +413,15 @@ impl Tool for TodoAddTool {
 
 // ── TodoListTool ──────────────────────────────────────────────────────────────
 
-pub struct TodoListTool;
+pub struct TodoListTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoListTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 impl Tool for TodoListTool {
     fn name(&self) -> &str {
@@ -408,7 +439,7 @@ impl Tool for TodoListTool {
         _resume: Option<ResumePayload>,
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let todos = read_todos(ctx);
+        let todos = self.backend.list(ctx).await;
         let text = fmt_todos(&todos);
         Ok(ToolResult::Output(
             stream! { yield ToolOutput::text(text); },
@@ -418,7 +449,15 @@ impl Tool for TodoListTool {
 
 // ── TodoCompleteTool ──────────────────────────────────────────────────────────
 
-pub struct TodoCompleteTool;
+pub struct TodoCompleteTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoCompleteTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 impl Tool for TodoCompleteTool {
     fn name(&self) -> &str {
@@ -445,23 +484,22 @@ impl Tool for TodoCompleteTool {
         let id = arguments["id"]
             .as_u64()
             .ok_or_else(|| AgentError::tool("todo__complete", "missing 'id'"))?;
-        let msg = modify_todos(ctx, |mut todos| {
-            let msg = match todos.iter_mut().find(|t| t.id == id) {
-                Some(t) => {
-                    t.done = true;
-                    format!("Todo #{id} marked as done.")
-                }
-                None => format!("Todo #{id} not found."),
-            };
-            (todos, msg)
-        });
+        let msg = self.backend.complete(ctx, id).await?;
         Ok(ToolResult::Output(stream! { yield ToolOutput::text(msg); }))
     }
 }
 
 // ── TodoUpdateTool ────────────────────────────────────────────────────────────
 
-pub struct TodoUpdateTool;
+pub struct TodoUpdateTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoUpdateTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 impl Tool for TodoUpdateTool {
     fn name(&self) -> &str {
@@ -496,23 +534,22 @@ impl Tool for TodoUpdateTool {
                 .as_str()
                 .ok_or_else(|| AgentError::tool("todo__update", "missing 'content'"))?,
         )?;
-        let msg = modify_todos(ctx, |mut todos| {
-            let msg = match todos.iter_mut().find(|t| t.id == id) {
-                Some(t) => {
-                    t.content = content.clone();
-                    format!("Updated todo #{id}: {content}")
-                }
-                None => format!("Todo #{id} not found."),
-            };
-            (todos, msg)
-        });
+        let msg = self.backend.update(ctx, id, content).await?;
         Ok(ToolResult::Output(stream! { yield ToolOutput::text(msg); }))
     }
 }
 
 // ── TodoRemoveTool ────────────────────────────────────────────────────────────
 
-pub struct TodoRemoveTool;
+pub struct TodoRemoveTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoRemoveTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
 
 impl Tool for TodoRemoveTool {
     fn name(&self) -> &str {
@@ -539,18 +576,9 @@ impl Tool for TodoRemoveTool {
         let id = arguments["id"]
             .as_u64()
             .ok_or_else(|| AgentError::tool("todo__remove", "missing 'id'"))?;
-        let removed = modify_todos(ctx, |mut todos| {
-            let before = todos.len();
-            todos.retain(|t| t.id != id);
-            let removed = before != todos.len();
-            (todos, removed)
-        });
+        let msg = self.backend.remove(ctx, id).await?;
         Ok(ToolResult::Output(stream! {
-            if removed {
-                yield ToolOutput::text(format!("Removed todo #{id}."));
-            } else {
-                yield ToolOutput::text(format!("Todo #{id} not found."));
-            }
+            yield ToolOutput::text(msg);
         }))
     }
 }
@@ -560,7 +588,7 @@ mod tests {
     use super::{
         add_batch_to_todos, current_todo_card_markdown, fmt_todos,
         latest_unfinished_batch_system_prompt, todos_from_user_state, write_todos_to_user_state,
-        TodoBatchAddItemRequest, TodoBatchAddRequest, TodoItem,
+        TodoBatchAddItemRequest, TodoBatchAddRequest, TodoItem, TodoStorageKind,
     };
     use serde_json::json;
 
@@ -586,6 +614,9 @@ mod tests {
             batch_id: None,
             batch_title: None,
             batch_index: None,
+            storage_kind: TodoStorageKind::Simple,
+            collection_uuid: None,
+            thing_uuid: None,
         }
     }
 
@@ -652,6 +683,9 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(0),
+                storage_kind: TodoStorageKind::Simple,
+                collection_uuid: None,
+                thing_uuid: None,
             },
             TodoItem {
                 id: 2,
@@ -661,6 +695,9 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(1),
+                storage_kind: TodoStorageKind::Simple,
+                collection_uuid: None,
+                thing_uuid: None,
             },
             legacy_todo(3, "Legacy follow-up"),
         ];
@@ -735,6 +772,9 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(0),
+                    storage_kind: TodoStorageKind::Simple,
+                    collection_uuid: None,
+                    thing_uuid: None,
                 },
                 TodoItem {
                     id: 2,
@@ -744,6 +784,9 @@ mod tests {
                     batch_id: None,
                     batch_title: None,
                     batch_index: None,
+                    storage_kind: TodoStorageKind::Simple,
+                    collection_uuid: None,
+                    thing_uuid: None,
                 }
             ],
         });
@@ -768,6 +811,9 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(0),
+                    storage_kind: TodoStorageKind::Simple,
+                    collection_uuid: None,
+                    thing_uuid: None,
                 },
                 TodoItem {
                     id: 2,
@@ -777,6 +823,9 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(1),
+                    storage_kind: TodoStorageKind::Simple,
+                    collection_uuid: None,
+                    thing_uuid: None,
                 }
             ],
         });

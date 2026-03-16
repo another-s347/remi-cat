@@ -1,5 +1,7 @@
+pub mod backend;
 pub mod tools;
 
+pub use backend::HybridTodoBackend;
 pub use tools::{
     current_todo_card_markdown, latest_unfinished_batch_system_prompt, TodoAddTool,
     TodoCompleteTool, TodoListTool, TodoRemoveTool, TodoUpdateTool,
@@ -11,12 +13,15 @@ use serde::Deserialize;
 use crate::events::TodoEvent;
 
 /// Register all five todo tools into a registry.
-pub fn register_todo_tools(registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry) {
-    registry.register(TodoAddTool);
-    registry.register(TodoListTool);
-    registry.register(TodoCompleteTool);
-    registry.register(TodoUpdateTool);
-    registry.register(TodoRemoveTool);
+pub fn register_todo_tools(
+    registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry,
+    backend: std::sync::Arc<HybridTodoBackend>,
+) {
+    registry.register(TodoAddTool::new(backend.clone()));
+    registry.register(TodoListTool::new(backend.clone()));
+    registry.register(TodoCompleteTool::new(backend.clone()));
+    registry.register(TodoUpdateTool::new(backend.clone()));
+    registry.register(TodoRemoveTool::new(backend));
 }
 
 #[derive(Debug, Deserialize)]

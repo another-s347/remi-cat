@@ -16,3 +16,10 @@ resolver = "2"
 
 [patch."https://github.com/another-s347/remi-agentloop.git"]
 remi-agentloop = { path = "../remi-agentloop/remi-agentloop" }
+remi-agentloop-core = { path = "../remi-agentloop/remi-agentloop-core" }
+remi-agentloop-guest = { path = "../remi-agentloop/remi-agentloop-guest" }
+remi-agentloop-macros = { path = "../remi-agentloop/remi-agentloop-macros" }
+remi-agentloop-model = { path = "../remi-agentloop/remi-agentloop-model" }
+remi-agentloop-tool = { path = "../remi-agentloop/remi-agentloop-tool" }
+remi-agentloop-transport = { path = "../remi-agentloop/remi-agentloop-transport" }
+remi-agentloop-wasm = { path = "../remi-agentloop/remi-agentloop-wasm" }

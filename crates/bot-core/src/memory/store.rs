@@ -20,7 +20,6 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use chrono::Utc;
 use remi_agentloop::prelude::{AgentError, Message, Role};

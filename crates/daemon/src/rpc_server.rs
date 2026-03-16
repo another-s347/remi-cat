@@ -530,12 +530,14 @@ pub fn daemon_msg_im_message(
     ev: &im_feishu::FeishuMessage,
     user_uuid: &str,
     sender_username: Option<&str>,
+    todo_create_via_sdk: bool,
 ) -> DaemonMessage {
     info!(
         message_id = %ev.message_id,
         sender_user_id = %user_uuid,
         sender_username = sender_username.unwrap_or(""),
         has_sender_username = sender_username.map(str::trim).map(|value| !value.is_empty()).unwrap_or(false),
+        todo_create_via_sdk,
         "daemon_msg_im_message: building ImMessageEvent"
     );
     DaemonMessage {
@@ -579,6 +581,7 @@ pub fn daemon_msg_im_message(
                 })
                 .collect(),
             sender_username: sender_username.unwrap_or_default().to_string(),
+            todo_create_via_sdk,
         })),
     }
 }
