@@ -79,6 +79,21 @@ const PAIR_CHANNEL_COMMAND: &str = "/pair-channel";
 /// are rejected with a backpressure reply.
 const CHAT_QUEUE_CAPACITY: usize = 5;
 
+const REMI_APP_KEY_ENV: &str = "REMI_APP_KEY";
+const REMI_PUBLIC_GRPC_ADDR_ENV: &str = "REMI_PUBLIC_GRPC_ADDR";
+
+fn sdk_todo_backend_enabled() -> bool {
+    let has_app_key = std::env::var(REMI_APP_KEY_ENV)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let has_public_grpc_addr = std::env::var(REMI_PUBLIC_GRPC_ADDR_ENV)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    has_app_key && has_public_grpc_addr
+}
+
 fn decode_agent_file_key(value: &str) -> Option<(&str, &str)> {
     let value = value.trim();
     for separator in [AGENT_FILE_KEY_SEPARATOR, LEGACY_AGENT_FILE_KEY_SEPARATOR] {
@@ -114,6 +129,7 @@ fn encode_agent_file_key(message_id: &str, file_key: &str) -> String {
 async fn main() -> Result<()> {
     // Load .env file if present (silently ignored when absent)
     let _ = dotenvy::dotenv();
+    let sdk_todo_enabled = sdk_todo_backend_enabled();
 
     // ── CLI dispatch ──────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -597,7 +613,7 @@ async fn main() -> Result<()> {
                     }
                     queues[&chat_id].clone()
                 };
-                let todo_create_via_sdk = is_owner(&matcher, &user_uuid);
+                let todo_create_via_sdk = sdk_todo_enabled && is_owner(&matcher, &user_uuid);
                 match queue_tx.try_send((msg, user_uuid, sender_username, todo_create_via_sdk)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {

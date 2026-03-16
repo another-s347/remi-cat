@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use remi_agentloop::prelude::{AgentError, ToolContext};
 use remi_client_sdk::auth::auth_set_app_key;
 use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingUpsert, ThingsSnapshot};
+use remi_client_sdk::things_events::ThingsEvent;
 use remi_client_sdk::things_sync::sync_v3_documents_with_server;
 use remi_client_sdk::transport::configure_shared_transport;
 use remi_client_sdk::{TriggerClient, TriggerSdk};
@@ -64,7 +65,7 @@ impl HybridTodoBackend {
         let mut user_state = self.load_user_state(ctx).await;
         let todos = todos_from_user_state(&user_state);
 
-        if should_create_via_sdk(ctx) {
+        if should_create_via_sdk(ctx) && self.sdk_config.is_some() {
             let runtime = self.require_sdk("todo__add").await?;
             let (mut updated, result) = add_batch_to_todos(todos, request);
             let new_todos = tag_new_sdk_batch(thread_id, &result, &mut updated);
@@ -299,8 +300,8 @@ impl SdkTodoConfig {
 
 struct SdkTodoRuntime {
     config: SdkTodoConfig,
-    sdk: TriggerSdk,
-    lock: Mutex<()>,
+    sdk: Arc<TriggerSdk>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl SdkTodoRuntime {
@@ -320,11 +321,21 @@ impl SdkTodoRuntime {
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
 
+        let sdk = Arc::new(
+            TriggerSdk::initialize(&config.db_path).with_context(|| {
+                format!(
+                    "failed to initialize sdk todo database at {}",
+                    config.db_path.display()
+                )
+            })?,
+        );
+        let lock = Arc::new(Mutex::new(()));
+        spawn_things_sync_task(Arc::clone(&sdk), config.clone(), Arc::clone(&lock));
+
         Ok(Self {
-            sdk: TriggerSdk::initialize(&config.db_path)
-                .with_context(|| format!("failed to initialize sdk todo database at {}", config.db_path.display()))?,
+            sdk,
             config,
-            lock: Mutex::new(()),
+            lock,
         })
     }
 
@@ -385,7 +396,6 @@ impl SdkTodoRuntime {
             )?;
             self.patch_thing_attrs_locked(collection_uuid, thing_uuid, todo_attrs_json(thread_id, todo))?;
         }
-        self.sync_best_effort_locked().await;
         Ok(())
     }
 
@@ -398,9 +408,6 @@ impl SdkTodoRuntime {
         let updated = self
             .sdk
             .set_thing_status(&self.config.device_id, thing_uuid, "done")?;
-        if updated {
-            self.sync_best_effort_locked().await;
-        }
         Ok(updated)
     }
 
@@ -428,9 +435,6 @@ impl SdkTodoRuntime {
             .and_then(Value::as_str)
             .map(|value| value != "thing_not_found")
             .unwrap_or(true);
-        if found {
-            self.sync_best_effort_locked().await;
-        }
         Ok(found)
     }
 
@@ -459,7 +463,6 @@ impl SdkTodoRuntime {
                     .sdk
                     .things_delete_collection(&self.config.device_id, collection_uuid);
             }
-            self.sync_best_effort_locked().await;
         }
         Ok(removed)
     }
@@ -515,11 +518,7 @@ impl SdkTodoRuntime {
     }
 
     async fn sync_best_effort_locked(&self) {
-        let sync_result = async {
-            let mut client = TriggerClient::new_with_shared_transport(String::new()).await?;
-            sync_v3_documents_with_server(&self.sdk, &mut client, &self.config.device_id).await
-        }
-        .await;
+        let sync_result = sync_sdk_todos(&self.sdk, &self.config).await;
         if let Err(err) = sync_result {
             warn!(
                 device_id = %self.config.device_id,
@@ -528,6 +527,67 @@ impl SdkTodoRuntime {
             );
         }
     }
+}
+
+fn spawn_things_sync_task(
+    sdk: Arc<TriggerSdk>,
+    config: SdkTodoConfig,
+    lock: Arc<Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        let mut rx = sdk.things_subscribe();
+        loop {
+            let should_sync = match rx.recv().await {
+                Ok(event) => should_sync_on_things_event(&event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        device_id = %config.device_id,
+                        skipped,
+                        "sdk todo things event subscriber lagged; forcing sync"
+                    );
+                    true
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            if !should_sync {
+                continue;
+            }
+
+            while let Ok(event) = rx.try_recv() {
+                if should_sync_on_things_event(&event) {
+                    continue;
+                }
+            }
+
+            let _guard = lock.lock().await;
+            if let Err(err) = sync_sdk_todos(&sdk, &config).await {
+                warn!(
+                    device_id = %config.device_id,
+                    error = %err,
+                    "sdk todo sync triggered by things event failed"
+                );
+            }
+        }
+    });
+}
+
+fn should_sync_on_things_event(event: &ThingsEvent) -> bool {
+    matches!(
+        event,
+        ThingsEvent::CollectionUpsert { .. }
+            | ThingsEvent::CollectionDelete { .. }
+            | ThingsEvent::ThingUpsert { .. }
+            | ThingsEvent::ThingDelete { .. }
+            | ThingsEvent::ThingStatusSet { .. }
+            | ThingsEvent::ThingMarkdownSplice { .. }
+    )
+}
+
+async fn sync_sdk_todos(sdk: &TriggerSdk, config: &SdkTodoConfig) -> Result<()> {
+    let mut client = TriggerClient::new_with_shared_transport(String::new()).await?;
+    let _ = sync_v3_documents_with_server(sdk, &mut client, &config.device_id).await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
