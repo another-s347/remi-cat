@@ -29,7 +29,7 @@ use im_feishu::{FeishuGateway, StreamingCard};
 use remi_proto::{
     AgentPayload, AgentStats, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer,
     ImAttachmentRef, ImBridgeRequest, ImBridgeResponse, ImDocumentRef, ImDownloadedFile,
-    ImMessageEvent, ImReactionEvent, ImUploadedFile, SecretsSync, ShutdownSignal,
+    ImMessageEvent, ImReactionEvent, ImUploadedFile, SecretsSync, ShutdownSignal, TriggerRunEvent,
 };
 
 use crate::secret_store::SecretStore;
@@ -43,6 +43,9 @@ pub type ReactionMap = Arc<Mutex<HashMap<String, String>>>;
 /// Shared map: Feishu message_id → oneshot sender, for signalling queue workers
 /// when the Agent finishes processing a message.
 pub type CompletionMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
+
+/// Shared map: execution_id → actual Feishu message_id used for reply routing.
+pub type ReplyTargetMap = Arc<Mutex<HashMap<String, String>>>;
 
 fn decode_agent_file_key(value: &str) -> Option<(&str, &str)> {
     let value = value.trim();
@@ -91,6 +94,8 @@ pub struct RpcServer {
     reactions: ReactionMap,
     /// oneshot completion senders keyed by message_id, for queue backpressure.
     completions: CompletionMap,
+    /// Maps internal execution ids to the actual Feishu message ids they reply under.
+    reply_targets: ReplyTargetMap,
     /// Shared secret store — read on connect and on manual sync.
     secret_store: Arc<RwLock<SecretStore>>,
 }
@@ -107,6 +112,7 @@ impl RpcServer {
                 agent_sink: sink.clone(),
                 reactions: Arc::new(Mutex::new(HashMap::new())),
                 completions: Arc::new(Mutex::new(HashMap::new())),
+                reply_targets: Arc::new(Mutex::new(HashMap::new())),
                 secret_store,
             },
             sink,
@@ -160,15 +166,32 @@ impl RpcServer {
         msg: DaemonMessage,
         message_id: &str,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.send_to_agent_and_await_with_reply_target(msg, message_id, message_id)
+            .await
+    }
+
+    pub async fn send_to_agent_and_await_with_reply_target(
+        &self,
+        msg: DaemonMessage,
+        execution_id: &str,
+        reply_to_message_id: &str,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.completions
             .lock()
             .await
-            .insert(message_id.to_string(), tx);
+            .insert(execution_id.to_string(), tx);
+        if execution_id != reply_to_message_id {
+            self.reply_targets
+                .lock()
+                .await
+                .insert(execution_id.to_string(), reply_to_message_id.to_string());
+        }
         if self.send_to_agent(msg).await {
             Some(rx)
         } else {
-            self.completions.lock().await.remove(message_id);
+            self.completions.lock().await.remove(execution_id);
+            self.reply_targets.lock().await.remove(execution_id);
             None
         }
     }
@@ -246,6 +269,7 @@ impl DaemonService for RpcServer {
         let sink = self.agent_sink.clone();
         let reactions = self.reactions.clone();
         let completions = self.completions.clone();
+        let reply_targets = self.reply_targets.clone();
 
         tokio::spawn(async move {
             let mut inbound = request.into_inner();
@@ -262,8 +286,14 @@ impl DaemonService for RpcServer {
                     }
                 };
 
-                let reply_to = agent_msg.reply_to_message_id.clone();
-                debug!(reply_to = %reply_to, "received AgentMessage");
+                let execution_id = agent_msg.reply_to_message_id.clone();
+                let reply_to = reply_targets
+                    .lock()
+                    .await
+                    .get(&execution_id)
+                    .cloned()
+                    .unwrap_or_else(|| execution_id.clone());
+                debug!(execution_id = %execution_id, reply_to = %reply_to, "received AgentMessage");
 
                 match agent_msg.payload {
                     Some(AgentPayload::ImBridgeRequest(req)) => {
@@ -332,11 +362,13 @@ impl DaemonService for RpcServer {
                     Some(AgentPayload::Done(_)) => {
                         finalize_reply(
                             &gateway,
+                            &execution_id,
                             &reply_to,
                             &mut cards,
                             &mut todo_cards,
                             &reactions,
                             &completions,
+                            &reply_targets,
                         )
                         .await;
                     }
@@ -349,11 +381,13 @@ impl DaemonService for RpcServer {
                         card.push(&msg).await.ok();
                         finalize_reply(
                             &gateway,
+                            &execution_id,
                             &reply_to,
                             &mut cards,
                             &mut todo_cards,
                             &reactions,
                             &completions,
+                            &reply_targets,
                         )
                         .await;
                     }
@@ -376,6 +410,7 @@ impl DaemonService for RpcServer {
             for (_, tx) in completions.lock().await.drain() {
                 let _ = tx.send(());
             }
+            reply_targets.lock().await.clear();
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -531,6 +566,7 @@ pub fn daemon_msg_im_message(
     user_uuid: &str,
     sender_username: Option<&str>,
     todo_create_via_sdk: bool,
+    trigger_tools_enabled: bool,
 ) -> DaemonMessage {
     info!(
         message_id = %ev.message_id,
@@ -538,6 +574,7 @@ pub fn daemon_msg_im_message(
         sender_username = sender_username.unwrap_or(""),
         has_sender_username = sender_username.map(str::trim).map(|value| !value.is_empty()).unwrap_or(false),
         todo_create_via_sdk,
+        trigger_tools_enabled,
         "daemon_msg_im_message: building ImMessageEvent"
     );
     DaemonMessage {
@@ -582,6 +619,7 @@ pub fn daemon_msg_im_message(
                 .collect(),
             sender_username: sender_username.unwrap_or_default().to_string(),
             todo_create_via_sdk,
+            trigger_tools_enabled,
         })),
     }
 }
@@ -597,6 +635,39 @@ pub fn daemon_msg_im_reaction(ev: &im_feishu::FeishuReaction, user_uuid: &str) -
     }
 }
 
+pub fn daemon_msg_trigger_run(
+    execution_id: &str,
+    trigger_uuid: &str,
+    trigger_name: &str,
+    reply_to_message_id: &str,
+    sender_user_id: &str,
+    sender_username: Option<&str>,
+    chat_id: &str,
+    chat_type: Option<&str>,
+    request: &str,
+    platform: Option<&str>,
+    todo_create_via_sdk: bool,
+    trigger_tools_enabled: bool,
+) -> DaemonMessage {
+    DaemonMessage {
+        payload: Some(DaemonPayload::TriggerRun(TriggerRunEvent {
+            execution_id: execution_id.to_string(),
+            trigger_uuid: trigger_uuid.to_string(),
+            trigger_name: trigger_name.to_string(),
+            reply_to_message_id: reply_to_message_id.to_string(),
+            sender_user_id: sender_user_id.to_string(),
+            sender_username: sender_username.unwrap_or_default().to_string(),
+            chat_id: chat_id.to_string(),
+            chat_type: chat_type.unwrap_or_default().to_string(),
+            request: request.to_string(),
+            platform: platform.unwrap_or_default().to_string(),
+            todo_create_via_sdk,
+            trigger_tools_enabled,
+        })),
+    }
+}
+
+#[allow(dead_code)]
 pub fn daemon_msg_shutdown() -> DaemonMessage {
     DaemonMessage {
         payload: Some(DaemonPayload::Shutdown(remi_proto::ShutdownSignal {})),
@@ -638,11 +709,13 @@ fn normalize_todo_card_markdown(markdown: &str) -> Option<String> {
 
 async fn finalize_reply(
     gateway: &FeishuGateway,
+    execution_id: &str,
     reply_to: &str,
     cards: &mut HashMap<String, StreamingCard>,
     todo_cards: &mut HashMap<String, String>,
     reactions: &ReactionMap,
     completions: &CompletionMap,
+    reply_targets: &ReplyTargetMap,
 ) {
     let todo_card = todo_cards.remove(reply_to);
 
@@ -662,9 +735,10 @@ async fn finalize_reply(
         }
     }
 
-    if let Some(tx) = completions.lock().await.remove(reply_to) {
+    if let Some(tx) = completions.lock().await.remove(execution_id) {
         let _ = tx.send(());
     }
+    reply_targets.lock().await.remove(execution_id);
 }
 
 fn stats_block(stats: &AgentStats) -> String {

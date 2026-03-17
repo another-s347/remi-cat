@@ -15,8 +15,8 @@ use futures::{Stream, StreamExt};
 use tracing::debug;
 
 use remi_agentloop::prelude::{
-    AgentConfig, AgentError, Content, LoopInput, Message, ParsedToolCall, ToolCallOutcome,
-    ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    AgentConfig, AgentError, Content, ContentPart, LoopInput, Message, ParsedToolCall,
+    ToolCallOutcome, ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::types::AgentEvent;
@@ -25,6 +25,13 @@ use crate::events::CatEvent;
 use crate::im_tools::{register_im_tools, ImFileBridge};
 use crate::skill;
 use crate::todo;
+use crate::trigger;
+
+const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] = &[
+    "trigger__upsert",
+    "trigger__list",
+    "trigger__delete",
+];
 
 // ── CatAgent ─────────────────────────────────────────────────────────────────
 
@@ -78,29 +85,32 @@ where
             loop {
                 let inner_stream = match self.inner.chat(current).await {
                     Ok(s) => s,
-                    Err(e) => { yield CatEvent::Error(e); return; }
+                    Err(e) => {
+                        yield CatEvent::Error(e);
+                        return;
+                    }
                 };
                 let mut inner_stream = std::pin::pin!(inner_stream);
                 let mut next_input: Option<LoopInput> = None;
 
                 while let Some(ev) = inner_stream.next().await {
                     match ev {
-                        // ── Text deltas pass through ─────────────────────────
                         AgentEvent::TextDelta(t) => yield CatEvent::Text(t),
-
-                        // ── Thinking / reasoning ─────────────────────────────
                         AgentEvent::ThinkingEnd { content } => {
                             yield CatEvent::Thinking(content);
                         }
-
-                        // ── Token usage ──────────────────────────────────────
-                        AgentEvent::Usage { prompt_tokens, completion_tokens } => {
+                        AgentEvent::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                        } => {
                             total_prompt_tokens += prompt_tokens;
                             total_completion_tokens += completion_tokens;
                         }
-
-                        // ── Tool execution ───────────────────────────────────
-                        AgentEvent::NeedToolExecution { mut state, tool_calls, completed_results } => {
+                        AgentEvent::NeedToolExecution {
+                            mut state,
+                            tool_calls,
+                            completed_results,
+                        } => {
                             let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
                                 .iter()
                                 .cloned()
@@ -122,7 +132,6 @@ where
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
 
                             if !local.is_empty() {
-                                // Emit ToolCall events before execution
                                 for tc in &local {
                                     yield CatEvent::ToolCall {
                                         name: tc.name.clone(),
@@ -131,39 +140,41 @@ where
                                 }
 
                                 let resume_map = HashMap::new();
-                                let results = self.local_tools
+                                let results = self
+                                    .local_tools
                                     .execute_parallel(&local, &resume_map, &tool_ctx)
                                     .await;
 
                                 for (call_id, result) in results {
                                     let tc = local.iter().find(|t| t.id == call_id).unwrap();
                                     debug!(tool = %tc.name, "agent: collecting tool result");
-                                    let result_str = collect_result_with_overflow(result, &data_dir, overflow_bytes).await;
-                                    debug!(tool = %tc.name, len = result_str.len(), "agent: tool done");
+                                    let collected =
+                                        collect_result_with_overflow(result, &data_dir, overflow_bytes)
+                                            .await;
+                                    debug!(
+                                        tool = %tc.name,
+                                        preview_len = collected.preview.len(),
+                                        multimodal = collected.content.is_multimodal(),
+                                        "agent: tool done"
+                                    );
 
-                                    // Emit ToolCallResult
                                     yield CatEvent::ToolCallResult {
                                         name: tc.name.clone(),
-                                        result: result_str.clone(),
+                                        result: collected.preview.clone(),
                                     };
 
-                                    // Emit side events for mutations
-                                    for side_ev in make_side_events(tc, &result_str) {
+                                    for side_ev in make_side_events(tc, &collected.preview) {
                                         yield side_ev;
                                     }
 
                                     all_outcomes.push(ToolCallOutcome::Result {
                                         tool_call_id: call_id,
                                         tool_name: tc.name.clone(),
-                                        content: Content::text(result_str),
+                                        content: collected.content,
                                     });
                                 }
 
-                                // Write back user_state changes (todo tools)
-                                state.user_state =
-                                    tool_ctx.user_state.read().unwrap().clone();
-
-                                // Notify lib.rs to persist user_state eagerly
+                                state.user_state = tool_ctx.user_state.read().unwrap().clone();
                                 yield CatEvent::StateUpdate(state.user_state.clone());
                             }
 
@@ -183,27 +194,40 @@ where
                                 for (call_id, result) in results {
                                     let tc = dynamic.iter().find(|t| t.id == call_id).unwrap();
                                     debug!(tool = %tc.name, "agent: collecting dynamic tool result");
-                                    let result_str = collect_result_with_overflow(result, &data_dir, overflow_bytes).await;
-                                    debug!(tool = %tc.name, len = result_str.len(), "agent: dynamic tool done");
+                                    let collected =
+                                        collect_result_with_overflow(result, &data_dir, overflow_bytes)
+                                            .await;
+                                    debug!(
+                                        tool = %tc.name,
+                                        preview_len = collected.preview.len(),
+                                        multimodal = collected.content.is_multimodal(),
+                                        "agent: dynamic tool done"
+                                    );
 
                                     yield CatEvent::ToolCallResult {
                                         name: tc.name.clone(),
-                                        result: result_str.clone(),
+                                        result: collected.preview.clone(),
                                     };
 
                                     all_outcomes.push(ToolCallOutcome::Result {
                                         tool_call_id: call_id,
                                         tool_name: tc.name.clone(),
-                                        content: Content::text(result_str),
+                                        content: collected.content,
                                     });
                                 }
                             }
 
                             if !external.is_empty() {
-                                // We don't handle external tools — surface the error.
                                 yield CatEvent::Error(AgentError::tool(
                                     "external",
-                                    format!("unhandled external tools: {}", external.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")),
+                                    format!(
+                                        "unhandled external tools: {}",
+                                        external
+                                            .iter()
+                                            .map(|t| t.name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ),
                                 ));
                                 return;
                             }
@@ -214,17 +238,16 @@ where
                                 &dynamic_tools,
                             );
 
-                            next_input = Some(LoopInput::Resume { state, results: all_outcomes });
+                            next_input = Some(LoopInput::Resume {
+                                state,
+                                results: all_outcomes,
+                            });
                             break;
                         }
-
-                        // ── Capture messages from checkpoints ────────────────
                         AgentEvent::Checkpoint(cp) => {
                             last_messages = cp.state.messages.clone();
                             last_user_state = cp.state.user_state.clone();
                         }
-
-                        // ── Terminal events ──────────────────────────────────
                         AgentEvent::Done => {
                             let elapsed_ms = run_start.elapsed().as_millis() as u64;
                             yield CatEvent::Stats {
@@ -244,8 +267,6 @@ where
                             yield CatEvent::Done;
                             return;
                         }
-
-                        // ── Ignore other events (ToolDelta, ToolResult, RunStart, …) ─
                         _ => {}
                     }
                 }
@@ -325,7 +346,7 @@ fn merge_runtime_tool_definitions(
     let mut defs = local_tools.definitions_with_context(ctx);
     defs.extend(dynamic_tools.definitions_with_context(ctx));
     defs.extend_from_slice(external_defs);
-    defs
+    filter_trigger_management_tool_definitions(ctx, defs)
 }
 
 fn refresh_runtime_tool_definitions(
@@ -352,6 +373,21 @@ fn refresh_runtime_tool_definitions(
 
     state.tool_definitions =
         merge_runtime_tool_definitions(local_tools, dynamic_tools, &ctx, &external_defs);
+}
+
+fn filter_trigger_management_tool_definitions(
+    ctx: &ToolDefinitionContext,
+    defs: Vec<ToolDefinition>,
+) -> Vec<ToolDefinition> {
+    if !crate::suppress_trigger_management(ctx.metadata.as_ref()) {
+        return defs;
+    }
+
+    defs.into_iter()
+        .filter(|definition| {
+            !TRIGGER_MANAGEMENT_TOOL_NAMES.contains(&definition.function.name.as_str())
+        })
+        .collect()
 }
 
 fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
@@ -389,21 +425,97 @@ fn build_dynamic_tools(
 /// [`CatAgent::overflow_bytes`] which is derived from the model profile.
 const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
 
-async fn collect_result(
-    result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
-) -> String {
-    match result {
-        Err(e) => format!("error: {e}"),
-        Ok(ToolResult::Interrupt(_)) => "interrupted".to_string(),
-        Ok(ToolResult::Output(s)) => {
-            let mut s = std::pin::pin!(s);
-            let mut last = String::new();
-            while let Some(out) = s.next().await {
-                if let ToolOutput::Result(c) = out {
-                    last = c.text_content();
+#[derive(Debug, Clone)]
+struct CollectedToolResult {
+    content: Content,
+    preview: String,
+}
+
+impl CollectedToolResult {
+    fn text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            content: Content::text(text.clone()),
+            preview: text,
+        }
+    }
+}
+
+fn preview_text_for_content(content: &Content) -> String {
+    let text = content.text_content();
+    if !text.is_empty() {
+        return text;
+    }
+
+    match content {
+        Content::Text(_) => String::new(),
+        Content::Parts(parts) => {
+            let mut image_count = 0usize;
+            let mut audio_count = 0usize;
+            let mut file_count = 0usize;
+
+            for part in parts {
+                match part {
+                    ContentPart::Text { .. } => {}
+                    ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. } => {
+                        image_count += 1;
+                    }
+                    ContentPart::Audio { .. } => {
+                        audio_count += 1;
+                    }
+                    ContentPart::File { .. } => {
+                        file_count += 1;
+                    }
                 }
             }
-            last
+
+            let mut segments = Vec::new();
+            if image_count > 0 {
+                segments.push(format!(
+                    "{image_count} image{}",
+                    if image_count == 1 { "" } else { "s" }
+                ));
+            }
+            if audio_count > 0 {
+                segments.push(format!(
+                    "{audio_count} audio part{}",
+                    if audio_count == 1 { "" } else { "s" }
+                ));
+            }
+            if file_count > 0 {
+                segments.push(format!(
+                    "{file_count} file{}",
+                    if file_count == 1 { "" } else { "s" }
+                ));
+            }
+
+            if segments.is_empty() {
+                String::new()
+            } else {
+                format!("[multimodal tool result: {}]", segments.join(", "))
+            }
+        }
+    }
+}
+
+async fn collect_result(
+    result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
+) -> CollectedToolResult {
+    match result {
+        Err(e) => CollectedToolResult::text(format!("error: {e}")),
+        Ok(ToolResult::Interrupt(_)) => CollectedToolResult::text("interrupted"),
+        Ok(ToolResult::Output(s)) => {
+            let mut s = std::pin::pin!(s);
+            let mut last = Content::text(String::new());
+            while let Some(out) = s.next().await {
+                if let ToolOutput::Result(c) = out {
+                    last = c;
+                }
+            }
+            CollectedToolResult {
+                preview: preview_text_for_content(&last),
+                content: last,
+            }
         }
     }
 }
@@ -412,34 +524,112 @@ async fn collect_result_with_overflow(
     result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
     data_dir: &Path,
     overflow_bytes: usize,
-) -> String {
-    let text = collect_result(result).await;
-    if text.len() <= overflow_bytes {
-        return text;
+) -> CollectedToolResult {
+    let collected = collect_result(result).await;
+    if collected.content.is_multimodal() {
+        return collected;
     }
-    // Spill to tmp file so the agent can read it in chunks via fs_read.
+
+    let text = collected.content.text_content();
+    if text.len() <= overflow_bytes {
+        return CollectedToolResult::text(text);
+    }
+
     let tmp_dir = data_dir.join("tmp");
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
     let filename = format!("tool_out_{}.txt", uuid::Uuid::new_v4());
     let file_path = tmp_dir.join(&filename);
     let total = text.len();
     match tokio::fs::write(&file_path, text.as_bytes()).await {
-        Ok(()) => format!(
+        Ok(()) => CollectedToolResult::text(format!(
             "[Output too large ({total} bytes) — saved to tmp/{filename}]\n\
              Use fs_read with path=\"tmp/{filename}\" (offset=0, length=8192) \
              and increment offset until remaining=0."
-        ),
-        Err(_) => text, // fall back to inline if write fails
+        )),
+        Err(_) => CollectedToolResult::text(text),
     }
 }
 
 fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
     let mut evs = Vec::new();
-    if let Some(ev) = skill::make_skill_event(tc) {
+    if let Some(ev) = skill::make_skill_event(tc, result_str) {
         evs.push(CatEvent::Skill(ev));
     }
     for ev in todo::make_todo_events(tc, result_str) {
         evs.push(CatEvent::Todo(ev));
     }
+    for ev in trigger::make_trigger_events(tc, result_str) {
+        evs.push(CatEvent::Trigger(ev));
+    }
     evs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_result_with_overflow;
+    use futures::stream;
+    use remi_agentloop::prelude::{Content, ContentPart, ToolOutput, ToolResult};
+    use std::path::PathBuf;
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "remi-agent-result-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn multimodal_results_are_preserved_for_resume() {
+        let root = test_root();
+        let content = Content::parts(vec![
+            ContentPart::text("image summary"),
+            ContentPart::image_url("data:image/png;base64,abc"),
+        ]);
+        let collected = collect_result_with_overflow(
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::Result(
+                content.clone(),
+            )]))),
+            &root,
+            8,
+        )
+        .await;
+
+        assert_eq!(collected.preview, "image summary");
+        match collected.content {
+            Content::Parts(parts) => {
+                assert!(matches!(
+                    parts.get(1),
+                    Some(ContentPart::ImageUrl { image_url })
+                        if image_url.url == "data:image/png;base64,abc"
+                ));
+            }
+            other => panic!("expected multimodal content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_text_results_still_spill_to_tmp_file() {
+        let root = test_root();
+        let collected = collect_result_with_overflow(
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
+                "x".repeat(64),
+            )]))),
+            &root,
+            8,
+        )
+        .await;
+
+        let preview = collected.preview;
+        assert!(preview.contains("[Output too large (64 bytes)"));
+        assert!(matches!(collected.content, Content::Text(ref text) if text == &preview));
+
+        let mut entries = tokio::fs::read_dir(root.join("tmp"))
+            .await
+            .expect("tmp dir should exist after overflow spill");
+        assert!(entries
+            .next_entry()
+            .await
+            .expect("tmp dir should be readable")
+            .is_some());
+    }
 }

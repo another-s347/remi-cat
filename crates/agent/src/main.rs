@@ -120,12 +120,13 @@ async fn run_session(addr: &str) -> Result<()> {
     // remove keys that have been deleted from the store.
     let mut last_secret_keys: HashSet<String> = HashSet::new();
 
-// Per-chat active task handles — used to cancel running LLM calls.
-                // Each entry is (join_handle, cancel_notify) so cancellation is
-                // cooperative: signalling the Notify lets stream_with_options
-                // persist partial content and emit Done before the task exits.
-                let active: Rc<RefCell<HashMap<String, (tokio::task::JoinHandle<()>, Arc<tokio::sync::Notify>)>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    // Per-chat active task handles — used to cancel running LLM calls.
+    // Each entry is (join_handle, cancel_notify) so cancellation is
+    // cooperative: signalling the Notify lets stream_with_options
+    // persist partial content and emit Done before the task exits.
+    let active: Rc<
+        RefCell<HashMap<String, (tokio::task::JoinHandle<()>, Arc<tokio::sync::Notify>)>>,
+    > = Rc::new(RefCell::new(HashMap::new()));
 
     // Outgoing channel: per-message tasks → single gRPC outbound stream.
     let (out_tx, out_rx) = mpsc::channel::<AgentMessage>(512);
@@ -215,7 +216,8 @@ async fn run_session(addr: &str) -> Result<()> {
                             .send(AgentMessage {
                                 reply_to_message_id: reply_to.clone(),
                                 payload: Some(AgentPayload::TextDelta(AgentTextDelta {
-                                    text: "✅ 已取消正在运行的任务（如有），已记录的内容将被保存。".into(),
+                                    text: "✅ 已取消正在运行的任务（如有），已记录的内容将被保存。"
+                                        .into(),
                                 })),
                             })
                             .await;
@@ -284,6 +286,55 @@ async fn run_session(addr: &str) -> Result<()> {
                         handle_reaction(ev, bot_rc, tx).await;
                     });
                 }
+            }
+            DaemonPayload::TriggerRun(ev) => {
+                info!(
+                    execution_id = %ev.execution_id,
+                    trigger_uuid = %ev.trigger_uuid,
+                    trigger_name = %ev.trigger_name,
+                    chat_id = %ev.chat_id,
+                    sender_user_id = %ev.sender_user_id,
+                    "agent received trigger run event"
+                );
+                let Some(bot_rc) = bot.as_ref().map(Rc::clone) else {
+                    let tx = out_tx.clone();
+                    let reply_to = ev.execution_id.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to.clone(),
+                                payload: Some(AgentPayload::TextDelta(AgentTextDelta {
+                                    text: "⚠️ Agent 正在初始化（等待凭证同步），本次 trigger 延后失败。"
+                                        .into(),
+                                })),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to,
+                                payload: Some(AgentPayload::Done(AgentDone {})),
+                            })
+                            .await;
+                    });
+                    continue;
+                };
+
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                if let Some((old_handle, old_cancel)) = active.borrow_mut().remove(&ev.chat_id) {
+                    old_cancel.notify_one();
+                    drop(old_handle);
+                }
+                let chat_id = ev.chat_id.clone();
+                let chat_id_for_task = chat_id.clone();
+                let bot_m = Rc::clone(&bot_rc);
+                let tx = out_tx.clone();
+                let active_m = Rc::clone(&active);
+                let cancel_m = Arc::clone(&cancel);
+                let handle = tokio::task::spawn_local(async move {
+                    handle_trigger_run(ev, bot_m, tx, cancel_m).await;
+                    active_m.borrow_mut().remove(&chat_id_for_task);
+                });
+                active.borrow_mut().insert(chat_id, (handle, cancel));
             }
             DaemonPayload::ChatCancel(ev) => {
                 // The daemon queue worker preempted an in-flight task for this
@@ -382,18 +433,31 @@ async fn handle_message(
             Ok(n) => format!("✅ 已将 {n} 条短期记忆压缩为中期记忆。"),
             Err(e) => format!("❌ 压缩失败: {e:#}"),
         };
-        let _ = tx
-            .send(AgentMessage {
-                reply_to_message_id: reply_to.clone(),
-                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
-            })
-            .await;
-        let _ = tx
-            .send(AgentMessage {
-                reply_to_message_id: reply_to,
-                payload: Some(AgentPayload::Done(AgentDone {})),
-            })
-            .await;
+        send_command_reply(&tx, &reply_to, text).await;
+        return;
+    }
+    if trimmed == "/trigger" || trimmed.starts_with("/trigger ") {
+        let text = match parse_trigger_slash_command(trimmed) {
+            Ok(TriggerSlashCommand::Help) => trigger_command_help_text(),
+            Ok(TriggerSlashCommand::List) => bot
+                .trigger_list_command(&ev.chat_id, trigger_command_stream_options(&ev))
+                .await
+                .unwrap_or_else(|err| format!("❌ trigger list 失败: {err:#}")),
+            Ok(TriggerSlashCommand::Delete { id }) => bot
+                .trigger_delete_command(&ev.chat_id, id, trigger_command_stream_options(&ev))
+                .await
+                .unwrap_or_else(|err| format!("❌ trigger delete 失败: {err:#}")),
+            Ok(TriggerSlashCommand::Upsert { arguments_json }) => bot
+                .trigger_upsert_command(
+                    &ev.chat_id,
+                    &arguments_json,
+                    trigger_command_stream_options(&ev),
+                )
+                .await
+                .unwrap_or_else(|err| format!("❌ trigger upsert 失败: {err:#}")),
+            Err(err) => format!("❌ {err}\n\n{}", trigger_command_help_text()),
+        };
+        send_command_reply(&tx, &reply_to, text).await;
         return;
     }
     // Unknown slash command — return error, do NOT invoke LLM.
@@ -409,20 +473,10 @@ async fn handle_message(
             "❌ 未知指令: `/{cmd_name}`\n\n**Agent 支持的指令：**\n\
              • `/compact` — 压缩短期记忆\n\
              • `/cancel` — 取消正在运行的任务\n\
-             • `/tools` — 列出可用工具"
+             • `/tools` — 列出可用工具\n\
+             • `/trigger` — 管理当前线程的触发器"
         );
-        let _ = tx
-            .send(AgentMessage {
-                reply_to_message_id: reply_to.clone(),
-                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
-            })
-            .await;
-        let _ = tx
-            .send(AgentMessage {
-                reply_to_message_id: reply_to,
-                payload: Some(AgentPayload::Done(AgentDone {})),
-            })
-            .await;
+        send_command_reply(&tx, &reply_to, text).await;
         return;
     }
 
@@ -435,13 +489,167 @@ async fn handle_message(
         ev.documents.len(),
     );
 
+    let opts = stream_options_from_im_message(&ev, Some(cancel));
+    info!(
+        message_id = %ev.message_id,
+        chat_id = %ev.chat_id,
+        sender_user_id = %ev.sender_user_id,
+        sender_username = %ev.sender_username,
+        has_sender_username = !ev.sender_username.trim().is_empty(),
+        todo_create_via_sdk = ev.todo_create_via_sdk,
+        trigger_tools_enabled = ev.trigger_tools_enabled,
+        "handle_message: built StreamOptions"
+    );
+    let stream = bot.stream_with_options(&ev.chat_id, content, opts);
+    forward_stream(reply_to, stream, tx).await;
+}
+
+async fn handle_reaction(
+    ev: remi_proto::ImReactionEvent,
+    bot: Rc<CatBot>,
+    tx: mpsc::Sender<AgentMessage>,
+) {
+    let reply_to = ev.message_id.clone();
+    let text = format!("[用户对该消息使用了「{}」表情]", ev.emoji_type);
+    let stream = bot.stream(&ev.chat_id, text);
+    forward_stream(reply_to, stream, tx).await;
+}
+
+async fn handle_trigger_run(
+    ev: remi_proto::TriggerRunEvent,
+    bot: Rc<CatBot>,
+    tx: mpsc::Sender<AgentMessage>,
+    cancel: Arc<tokio::sync::Notify>,
+) {
+    let reply_to = ev.execution_id.clone();
     let opts = StreamOptions {
+        sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
+        sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
+        message_id: Some(ev.reply_to_message_id.clone()).filter(|s| !s.is_empty()),
+        chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
+        platform: Some(ev.platform.clone()).filter(|s| !s.is_empty()),
+        todo_create_via_sdk: ev.todo_create_via_sdk,
+        trigger_tools_enabled: ev.trigger_tools_enabled,
+        trigger_run: true,
+        im_attachments: Vec::new(),
+        im_documents: Vec::new(),
+        cancel: Some(cancel),
+    };
+    let stream = bot.stream_with_options(&ev.chat_id, Content::text(ev.request), opts);
+    forward_stream(reply_to, stream, tx).await;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TriggerSlashCommand {
+    Help,
+    List,
+    Delete { id: u64 },
+    Upsert { arguments_json: String },
+}
+
+fn parse_trigger_slash_command(text: &str) -> Result<TriggerSlashCommand, String> {
+    let trimmed = text.trim();
+    if !(trimmed == "/trigger" || trimmed.starts_with("/trigger ")) {
+        return Err("not a /trigger command".to_string());
+    }
+
+    let rest = trimmed["/trigger".len()..].trim();
+    if rest.is_empty() || rest.eq_ignore_ascii_case("help") {
+        return Ok(TriggerSlashCommand::Help);
+    }
+
+    if rest.eq_ignore_ascii_case("list") || rest.eq_ignore_ascii_case("ls") {
+        return Ok(TriggerSlashCommand::List);
+    }
+
+    if let Some(args) = rest
+        .strip_prefix("delete")
+        .or_else(|| rest.strip_prefix("del"))
+        .or_else(|| rest.strip_prefix("rm"))
+    {
+        let id = args
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "`/trigger delete` 需要一个数字 id。".to_string())?;
+        return Ok(TriggerSlashCommand::Delete { id });
+    }
+
+    if let Some(arguments_json) = rest.strip_prefix("upsert") {
+        let arguments_json = strip_optional_json_fence(arguments_json);
+        if arguments_json.is_empty() {
+            return Err("`/trigger upsert` 后面需要一个 JSON 对象。".to_string());
+        }
+        return Ok(TriggerSlashCommand::Upsert { arguments_json });
+    }
+
+    Err(format!("未知 trigger 子命令: `{rest}`"))
+}
+
+fn strip_optional_json_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    for prefix in ["```json", "```"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if let Some(stripped) = rest.strip_suffix("```") {
+                return stripped.trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn trigger_command_help_text() -> String {
+    "**Trigger 指令**\n\n\
+• `/trigger` — 显示这份帮助\n\
+• `/trigger list` — 列出当前线程的触发器\n\
+• `/trigger delete <id>` — 删除一个触发器\n\
+• `/trigger upsert <json>` — 创建或更新一个触发器\n\n\
+`/trigger upsert` 的 JSON 需要和 `trigger__upsert` 一致，例如：\n\
+```json\n\
+{\n\
+  \"name\": \"Morning summary\",\n\
+  \"request\": \"Send me a concise work summary for today.\",\n\
+  \"precondition\": [\n\
+    {\n\
+      \"rule\": \"cron('0 9 * * *')\",\n\
+      \"description\": \"Every day at 09:00\"\n\
+    }\n\
+  ],\n\
+  \"condition\": []\n\
+}\n\
+```"
+        .to_string()
+}
+
+fn trigger_command_stream_options(ev: &remi_proto::ImMessageEvent) -> StreamOptions {
+    StreamOptions {
         sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
         sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
         chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
         platform: Some(ev.platform.clone()).filter(|s| !s.is_empty()),
         todo_create_via_sdk: ev.todo_create_via_sdk,
+        trigger_tools_enabled: ev.trigger_tools_enabled,
+        trigger_run: false,
+        im_attachments: Vec::new(),
+        im_documents: Vec::new(),
+        cancel: None,
+    }
+}
+
+fn stream_options_from_im_message(
+    ev: &remi_proto::ImMessageEvent,
+    cancel: Option<Arc<tokio::sync::Notify>>,
+) -> StreamOptions {
+    StreamOptions {
+        sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
+        sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
+        message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
+        chat_type: Some(ev.chat_type.clone()).filter(|s| !s.is_empty()),
+        platform: Some(ev.platform.clone()).filter(|s| !s.is_empty()),
+        todo_create_via_sdk: ev.todo_create_via_sdk,
+        trigger_tools_enabled: ev.trigger_tools_enabled,
+        trigger_run: false,
         im_attachments: ev
             .attachments
             .iter()
@@ -463,30 +671,8 @@ async fn handle_message(
                 token: document.token.clone(),
             })
             .collect(),
-        cancel: Some(cancel),
-    };
-    info!(
-        message_id = %ev.message_id,
-        chat_id = %ev.chat_id,
-        sender_user_id = %ev.sender_user_id,
-        sender_username = %ev.sender_username,
-        has_sender_username = !ev.sender_username.trim().is_empty(),
-        todo_create_via_sdk = ev.todo_create_via_sdk,
-        "handle_message: built StreamOptions"
-    );
-    let stream = bot.stream_with_options(&ev.chat_id, content, opts);
-    forward_stream(reply_to, stream, tx).await;
-}
-
-async fn handle_reaction(
-    ev: remi_proto::ImReactionEvent,
-    bot: Rc<CatBot>,
-    tx: mpsc::Sender<AgentMessage>,
-) {
-    let reply_to = ev.message_id.clone();
-    let text = format!("[用户对该消息使用了「{}」表情]", ev.emoji_type);
-    let stream = bot.stream(&ev.chat_id, text);
-    forward_stream(reply_to, stream, tx).await;
+        cancel,
+    }
 }
 
 fn build_message_content(
@@ -538,6 +724,25 @@ fn fallback_message_text(
         (false, false, true) => "[用户发送了文档链接]".to_string(),
         (false, false, false) => "[用户发送了一条空白消息]".to_string(),
     }
+}
+
+async fn send_command_reply(
+    tx: &mpsc::Sender<AgentMessage>,
+    reply_to: &str,
+    text: String,
+) {
+    let _ = tx
+        .send(AgentMessage {
+            reply_to_message_id: reply_to.to_string(),
+            payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+        })
+        .await;
+    let _ = tx
+        .send(AgentMessage {
+            reply_to_message_id: reply_to.to_string(),
+            payload: Some(AgentPayload::Done(AgentDone {})),
+        })
+        .await;
 }
 
 // ── CatEvent → AgentMessage forwarding ───────────────────────────────────────
@@ -626,4 +831,45 @@ async fn forward_stream(
     })
     .await
     .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_trigger_slash_command, strip_optional_json_fence, TriggerSlashCommand};
+
+    #[test]
+    fn parses_trigger_list_command() {
+        assert_eq!(
+            parse_trigger_slash_command("/trigger list").expect("list command should parse"),
+            TriggerSlashCommand::List
+        );
+    }
+
+    #[test]
+    fn parses_trigger_delete_command() {
+        assert_eq!(
+            parse_trigger_slash_command("/trigger delete 7")
+                .expect("delete command should parse"),
+            TriggerSlashCommand::Delete { id: 7 }
+        );
+    }
+
+    #[test]
+    fn parses_trigger_upsert_command_with_code_fence() {
+        assert_eq!(
+            parse_trigger_slash_command("/trigger upsert ```json\n{\"name\":\"n\"}\n```")
+                .expect("upsert command should parse"),
+            TriggerSlashCommand::Upsert {
+                arguments_json: "{\"name\":\"n\"}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn strips_optional_json_fence() {
+        assert_eq!(
+            strip_optional_json_fence("```json\n{\"ok\":true}\n```"),
+            "{\"ok\":true}"
+        );
+    }
 }

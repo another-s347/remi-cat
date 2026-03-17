@@ -52,7 +52,9 @@ impl HybridTodoBackend {
             return Ok(());
         };
 
-        runtime.refresh_thread_user_state(thread_id, user_state).await
+        runtime
+            .refresh_thread_user_state(thread_id, user_state)
+            .await
     }
 
     pub(crate) async fn add_batch(
@@ -73,7 +75,12 @@ impl HybridTodoBackend {
             runtime
                 .create_batch(thread_id, &result.batch_title, &new_todos)
                 .await
-                .map_err(|err| AgentError::tool("todo__add", format!("failed to create sdk todo batch: {err:#}")))?;
+                .map_err(|err| {
+                    AgentError::tool(
+                        "todo__add",
+                        format!("failed to create sdk todo batch: {err:#}"),
+                    )
+                })?;
 
             write_todos_to_user_state(&mut user_state, &updated);
             store_user_state(ctx, user_state);
@@ -111,10 +118,12 @@ impl HybridTodoBackend {
             }
             TodoStorageKind::RemiSdk => {
                 let runtime = self.require_sdk("todo__complete").await?;
-                let updated = runtime
-                    .complete_todo(&todo)
-                    .await
-                    .map_err(|err| AgentError::tool("todo__complete", format!("failed to update sdk todo status: {err:#}")))?;
+                let updated = runtime.complete_todo(&todo).await.map_err(|err| {
+                    AgentError::tool(
+                        "todo__complete",
+                        format!("failed to update sdk todo status: {err:#}"),
+                    )
+                })?;
 
                 if updated {
                     todos[index].done = true;
@@ -159,7 +168,12 @@ impl HybridTodoBackend {
                 let updated = runtime
                     .update_todo_title(&todo, &content)
                     .await
-                    .map_err(|err| AgentError::tool("todo__update", format!("failed to update sdk todo title: {err:#}")))?;
+                    .map_err(|err| {
+                        AgentError::tool(
+                            "todo__update",
+                            format!("failed to update sdk todo title: {err:#}"),
+                        )
+                    })?;
 
                 if updated {
                     todos[index].content = content.clone();
@@ -196,10 +210,12 @@ impl HybridTodoBackend {
             }
             TodoStorageKind::RemiSdk => {
                 let runtime = self.require_sdk("todo__remove").await?;
-                let removed = runtime
-                    .remove_todo(&todo)
-                    .await
-                    .map_err(|err| AgentError::tool("todo__remove", format!("failed to remove sdk todo: {err:#}")))?;
+                let removed = runtime.remove_todo(&todo).await.map_err(|err| {
+                    AgentError::tool(
+                        "todo__remove",
+                        format!("failed to remove sdk todo: {err:#}"),
+                    )
+                })?;
                 todos.remove(index);
                 write_todos_to_user_state(&mut user_state, &todos);
                 store_user_state(ctx, user_state);
@@ -235,7 +251,9 @@ impl HybridTodoBackend {
 
         let runtime = self
             .sdk_runtime
-            .get_or_try_init(|| async move { SdkTodoRuntime::initialize(config).await.map(Arc::new) })
+            .get_or_try_init(
+                || async move { SdkTodoRuntime::initialize(config).await.map(Arc::new) },
+            )
             .await?;
         Ok(Some(runtime.clone()))
     }
@@ -243,7 +261,10 @@ impl HybridTodoBackend {
     async fn load_user_state(&self, ctx: &ToolContext) -> Value {
         let mut user_state = { ctx.user_state.read().unwrap().clone() };
         if let Some(thread_id) = thread_id_from_ctx(ctx) {
-            if let Err(err) = self.refresh_thread_user_state(thread_id, &mut user_state).await {
+            if let Err(err) = self
+                .refresh_thread_user_state(thread_id, &mut user_state)
+                .await
+            {
                 warn!(
                     thread_id,
                     error = %err,
@@ -321,25 +342,23 @@ impl SdkTodoRuntime {
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
 
-        let sdk = Arc::new(
-            TriggerSdk::initialize(&config.db_path).with_context(|| {
-                format!(
-                    "failed to initialize sdk todo database at {}",
-                    config.db_path.display()
-                )
-            })?,
-        );
+        let sdk = Arc::new(TriggerSdk::initialize(&config.db_path).with_context(|| {
+            format!(
+                "failed to initialize sdk todo database at {}",
+                config.db_path.display()
+            )
+        })?);
         let lock = Arc::new(Mutex::new(()));
         spawn_things_sync_task(Arc::clone(&sdk), config.clone(), Arc::clone(&lock));
 
-        Ok(Self {
-            sdk,
-            config,
-            lock,
-        })
+        Ok(Self { sdk, config, lock })
     }
 
-    async fn refresh_thread_user_state(&self, thread_id: &str, user_state: &mut Value) -> Result<()> {
+    async fn refresh_thread_user_state(
+        &self,
+        thread_id: &str,
+        user_state: &mut Value,
+    ) -> Result<()> {
         let _guard = self.lock.lock().await;
         self.sync_best_effort_locked().await;
         let sdk_todos = self.thread_todos_from_snapshot_locked(thread_id)?;
@@ -394,7 +413,11 @@ impl SdkTodoRuntime {
                 &self.config.device_id,
                 &serde_json::to_string(&payload)?,
             )?;
-            self.patch_thing_attrs_locked(collection_uuid, thing_uuid, todo_attrs_json(thread_id, todo))?;
+            self.patch_thing_attrs_locked(
+                collection_uuid,
+                thing_uuid,
+                todo_attrs_json(thread_id, todo),
+            )?;
         }
         Ok(())
     }
@@ -449,9 +472,9 @@ impl SdkTodoRuntime {
             .as_deref()
             .context("missing thing uuid for sdk todo item")?;
 
-        let removed = self
-            .sdk
-            .things_delete_thing(&self.config.device_id, collection_uuid, thing_uuid)?;
+        let removed =
+            self.sdk
+                .things_delete_thing(&self.config.device_id, collection_uuid, thing_uuid)?;
         if removed {
             let snapshot = self.snapshot_locked()?;
             let has_remaining_items = snapshot
@@ -529,11 +552,7 @@ impl SdkTodoRuntime {
     }
 }
 
-fn spawn_things_sync_task(
-    sdk: Arc<TriggerSdk>,
-    config: SdkTodoConfig,
-    lock: Arc<Mutex<()>>,
-) {
+fn spawn_things_sync_task(sdk: Arc<TriggerSdk>, config: SdkTodoConfig, lock: Arc<Mutex<()>>) {
     tokio::spawn(async move {
         let mut rx = sdk.things_subscribe();
         loop {
@@ -609,17 +628,28 @@ fn should_create_via_sdk(ctx: &ToolContext) -> bool {
     ctx.metadata
         .as_ref()
         .and_then(|value| value.get(TODO_CREATE_VIA_SDK_META_KEY))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .is_some_and(metadata_flag_enabled)
+}
+
+fn metadata_flag_enabled(value: &Value) -> bool {
+    value.as_bool().unwrap_or_else(|| {
+        value
+            .as_str()
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false)
+    })
 }
 
 fn thread_id_from_ctx<'a>(ctx: &'a ToolContext) -> Option<&'a str> {
-    ctx.thread_id.as_ref().map(|thread_id| thread_id.0.as_str()).or_else(|| {
-        ctx.metadata
-            .as_ref()
-            .and_then(|value| value.get("thread_id"))
-            .and_then(Value::as_str)
-    })
+    ctx.thread_id
+        .as_ref()
+        .map(|thread_id| thread_id.0.as_str())
+        .or_else(|| {
+            ctx.metadata
+                .as_ref()
+                .and_then(|value| value.get("thread_id"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn default_device_id(data_dir: &Path) -> String {
@@ -628,7 +658,10 @@ fn default_device_id(data_dir: &Path) -> String {
         .unwrap_or_else(|_| data_dir.to_path_buf());
     format!(
         "remi-cat-{}",
-        Uuid::new_v5(&Uuid::NAMESPACE_URL, stable_path.to_string_lossy().as_bytes())
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            stable_path.to_string_lossy().as_bytes()
+        )
     )
 }
 
@@ -705,7 +738,9 @@ fn thread_todos_from_snapshot(thread_id: &str, snapshot: &ThingsSnapshot) -> Vec
     todos
 }
 
-fn stored_attrs_from_thing(thing: &remi_client_sdk::things_crdt::ThingEntry) -> Option<StoredSdkTodoAttrs> {
+fn stored_attrs_from_thing(
+    thing: &remi_client_sdk::things_crdt::ThingEntry,
+) -> Option<StoredSdkTodoAttrs> {
     let attrs = thing.data.get("attrs")?;
     let attrs = attrs.get(SDK_ATTRS_ROOT_KEY)?;
     serde_json::from_value(attrs.clone()).ok()
@@ -741,13 +776,20 @@ fn thing_uuid_for(thread_id: &str, todo_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_sdk_todos, thread_todos_from_snapshot, SDK_ATTRS_ROOT_KEY, SDK_ATTRS_SOURCE};
+    use super::{
+        merge_sdk_todos, thread_todos_from_snapshot, SDK_ATTRS_ROOT_KEY, SDK_ATTRS_SOURCE,
+    };
     use crate::todo::tools::{TodoItem, TodoStorageKind};
     use remi_client_sdk::things_crdt::{ThingCollectionEntry, ThingEntry, ThingsSnapshot};
     use remi_things_crdt::ThingDatatype;
     use serde_json::json;
 
-    fn sdk_attrs(thread_id: &str, local_id: u64, batch_id: u64, batch_index: u64) -> serde_json::Value {
+    fn sdk_attrs(
+        thread_id: &str,
+        local_id: u64,
+        batch_id: u64,
+        batch_index: u64,
+    ) -> serde_json::Value {
         json!({
             SDK_ATTRS_ROOT_KEY: {
                 "source": SDK_ATTRS_SOURCE,

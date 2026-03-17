@@ -573,7 +573,11 @@ impl MgmtServer {
         };
         let old_a = self.ctx.user_store.resolve(&p.channel_a, &p.user_id_a);
         let old_b = self.ctx.user_store.resolve(&p.channel_b, &p.user_id_b);
-        match self.ctx.user_store.link(&p.channel_a, &p.user_id_a, &p.channel_b, &p.user_id_b) {
+        match self
+            .ctx
+            .user_store
+            .link(&p.channel_a, &p.user_id_a, &p.channel_b, &p.user_id_b)
+        {
             Ok(uuid) => {
                 let old_ids: Vec<String> = old_a.into_iter().chain(old_b).collect();
                 if let Err(e) = self.ctx.owner.migrate_blacklist(&old_ids, &uuid) {

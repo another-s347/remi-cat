@@ -8,6 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::store::{SkillStore, SkillSummary};
+use crate::{suppress_trigger_management, trigger::BUILTIN_TRIGGER_SKILL_NAME};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -34,7 +35,7 @@ fn render_skill_summary(summary: &SkillSummary) -> String {
 
 fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
-        return "You can use skill__search with one or more keywords to discover local skills by name and description.".to_string();
+        return "You can use skill__search with one or more keywords to discover local skills by name and description, including builtin read-only skills.".to_string();
     }
 
     let mut prompt = String::from(
@@ -45,9 +46,24 @@ fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
         prompt.push('\n');
     }
     prompt.push_str(
-        "Use skill__search with one or more keywords to discover additional local skills beyond this snapshot.",
+        "Use skill__search with one or more keywords to discover additional local skills beyond this snapshot, including builtin read-only skills.",
     );
     prompt
+}
+
+fn filter_trigger_skill(skills: Vec<SkillSummary>, suppress: bool) -> Vec<SkillSummary> {
+    if !suppress {
+        return skills;
+    }
+
+    skills
+        .into_iter()
+        .filter(|skill| skill.name != BUILTIN_TRIGGER_SKILL_NAME)
+        .collect()
+}
+
+fn hides_trigger_skill(name: &str, suppress: bool) -> bool {
+    suppress && name.trim() == BUILTIN_TRIGGER_SKILL_NAME
 }
 
 // ── SkillSaveTool ─────────────────────────────────────────────────────────────
@@ -63,7 +79,7 @@ impl<S: SkillStore + 'static> Tool for SkillSaveTool<S> {
     fn description(&self) -> &str {
         "Save a reusable skill as a named markdown document. Use this to record \
         step-by-step procedures, best practices, or any knowledge worth reusing \
-        in later sessions."
+        in later sessions. Builtin skill names are reserved and cannot be overwritten."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -118,12 +134,14 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         "skill__get"
     }
     fn description(&self) -> &str {
-        "Retrieve the full markdown content of a previously saved skill by name."
+        "Retrieve the full markdown content of a local skill by name, including builtin read-only skills."
     }
-    fn extra_prompt(&self, _ctx: &ToolDefinitionContext) -> Option<String> {
-        Some(render_skill_get_extra_prompt(
-            &self.store.featured_summaries(),
-        ))
+    fn extra_prompt(&self, ctx: &ToolDefinitionContext) -> Option<String> {
+        let skills = filter_trigger_skill(
+            self.store.featured_summaries(),
+            suppress_trigger_management(ctx.metadata.as_ref()),
+        );
+        Some(render_skill_get_extra_prompt(&skills))
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -138,16 +156,21 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let name = arguments["name"]
             .as_str()
             .ok_or_else(|| AgentError::tool("skill__get", "missing 'name'"))?
             .to_string();
-        let store = self.store.clone();
-        let result = match store.get(&name).await? {
-            Some(content) => content,
-            None => format!("Skill '{name}' not found."),
+        let suppress = suppress_trigger_management(ctx.metadata.as_ref());
+        let result = if hides_trigger_skill(&name, suppress) {
+            format!("Skill '{name}' not found.")
+        } else {
+            let store = self.store.clone();
+            match store.get(&name).await? {
+                Some(content) => content,
+                None => format!("Skill '{name}' not found."),
+            }
         };
         Ok(ToolResult::Output(
             stream! { yield ToolOutput::text(result); },
@@ -166,7 +189,7 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
         "skill__search"
     }
     fn description(&self) -> &str {
-        "Search saved skills by keyword across skill names and descriptions. Accepts multiple keywords and favors recall over strict matching."
+        "Search local skills by keyword across skill names and descriptions. Accepts multiple keywords and favors recall over strict matching. Results may include builtin read-only skills and user-saved skills."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -184,7 +207,7 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let query = arguments["query"]
             .as_str()
@@ -192,7 +215,10 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
             .trim()
             .to_string();
         let store = self.store.clone();
-        let matches = store.search(&query).await?;
+        let matches = filter_trigger_skill(
+            store.search(&query).await?,
+            suppress_trigger_management(ctx.metadata.as_ref()),
+        );
         let result = if matches.is_empty() {
             format!(
                 "No skills matched '{query}'. Search checks skill names and descriptions; try broader keywords."
@@ -214,7 +240,7 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_skill_get_extra_prompt, SkillGetTool};
+    use super::{filter_trigger_skill, render_skill_get_extra_prompt, SkillGetTool};
     use crate::skill::store::{InMemorySkillStore, SkillStore, SkillSummary};
     use remi_agentloop::prelude::{Tool, ToolDefinitionContext};
     use std::sync::Arc;
@@ -250,6 +276,26 @@ mod tests {
         let prompt = render_skill_get_extra_prompt(&Vec::<SkillSummary>::new());
         assert!(prompt.contains("skill__search"));
     }
+
+    #[test]
+    fn filter_trigger_skill_removes_builtin_entry_when_suppressed() {
+        let filtered = filter_trigger_skill(
+            vec![
+                SkillSummary {
+                    name: "trigger".to_string(),
+                    description: Some("builtin trigger skill".to_string()),
+                },
+                SkillSummary {
+                    name: "rust-build".to_string(),
+                    description: Some("build help".to_string()),
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "rust-build");
+    }
 }
 
 // ── SkillDeleteTool ───────────────────────────────────────────────────────────
@@ -263,7 +309,7 @@ impl<S: SkillStore + 'static> Tool for SkillDeleteTool<S> {
         "skill__delete"
     }
     fn description(&self) -> &str {
-        "Permanently delete a saved skill by name."
+        "Permanently delete a saved user skill by name. Builtin skills cannot be deleted."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({

@@ -14,15 +14,57 @@ use std::time::Duration;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use async_stream::stream;
+use base64::Engine as _;
 use futures::Stream;
 use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
+    AgentError, Content, ContentPart, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
 };
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
 fn resolve(root: &Path, path: &str) -> PathBuf {
     root.join(path.trim_start_matches('/'))
+}
+
+fn detect_inline_image_media_type(path: &str, bytes: &[u8]) -> Option<&'static str> {
+    detect_inline_image_media_type_from_magic(bytes)
+        .or_else(|| detect_inline_image_media_type_from_extension(path))
+}
+
+fn detect_inline_image_media_type_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+fn detect_inline_image_media_type_from_extension(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn inline_image_summary(path: &str, mime_type: &str, total_bytes: usize) -> String {
+    format!(
+        "Read image file {path} inline.\n[mime_type={mime_type} total_bytes={total_bytes}]\n[offset/length are ignored for auto-detected images]"
+    )
 }
 
 // ── SecretRedactor ────────────────────────────────────────────────────────────
@@ -234,16 +276,18 @@ impl Tool for RootedFsReadTool {
         "fs_read"
     }
     fn description(&self) -> &str {
-        "Read a file in the workspace. Supports `offset` + `length` for chunked reading. \
-         Always check `[total_bytes]` in the result and call again with offset += length if needed."
+        "Read a file in the workspace. Text files support `offset` + `length` for chunked reading. \
+         Common images (JPEG, PNG, GIF, WebP) are auto-detected and returned inline as images; \
+         for those files `offset` and `length` are ignored. Always check `[total_bytes]` in text results \
+         and call again with offset += length if needed."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path":   { "type": "string",  "description": "File path (relative to workspace root)" },
-                "offset": { "type": "integer", "description": "Byte offset to start (default 0)" },
-                "length": { "type": "integer", "description": "Max bytes to return (default 8192)" }
+                "offset": { "type": "integer", "description": "Byte offset to start for text files (default 0)" },
+                "length": { "type": "integer", "description": "Max bytes to return for text files (default 8192)" }
             },
             "required": ["path"]
         })
@@ -269,6 +313,22 @@ impl Tool for RootedFsReadTool {
                 match tokio::fs::read(&full).await {
                     Err(e) => yield ToolOutput::text(format!("error: {e}")),
                     Ok(bytes) => {
+                        if let Some(mime_type) = detect_inline_image_media_type(&path_str, &bytes) {
+                            let summary = redactor
+                                .read()
+                                .unwrap()
+                                .redact(&inline_image_summary(&path_str, mime_type, bytes.len()));
+                            let data_url = format!(
+                                "data:{mime_type};base64,{}",
+                                base64::engine::general_purpose::STANDARD.encode(&bytes)
+                            );
+                            yield ToolOutput::Result(Content::parts(vec![
+                                ContentPart::text(summary),
+                                ContentPart::image_url(data_url),
+                            ]));
+                            return;
+                        }
+
                         let total = bytes.len();
                         let start = offset.min(total);
                         let end   = (start + length).min(total);
@@ -801,4 +861,172 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RootedFsReadTool, SecretRedactor};
+    use futures::StreamExt;
+    use remi_agentloop::prelude::{AgentConfig, Content, Tool, ToolContext, ToolOutput, ToolResult};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    const ONE_BY_ONE_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+        0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+        0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "remi-fs-read-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn test_tool_context() -> ToolContext {
+        ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        }
+    }
+
+    async fn collect_tool_content(
+        result: ToolResult<impl futures::Stream<Item = ToolOutput>>,
+    ) -> Content {
+        match result {
+            ToolResult::Interrupt(_) => Content::text("interrupted"),
+            ToolResult::Output(output) => {
+                let mut output = std::pin::pin!(output);
+                let mut last = Content::text(String::new());
+                while let Some(item) = output.next().await {
+                    if let ToolOutput::Result(content) = item {
+                        last = content;
+                    }
+                }
+                last
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_returns_multimodal_content_for_png() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("tiny.png"), ONE_BY_ONE_PNG)
+            .await
+            .expect("png fixture should be written");
+
+        let tool = RootedFsReadTool {
+            root: root.clone(),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "tiny.png", "offset": 5, "length": 3 }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await;
+
+        match content {
+            Content::Parts(parts) => {
+                assert!(matches!(
+                    parts.first(),
+                    Some(remi_agentloop::prelude::ContentPart::Text { text })
+                        if text.contains("mime_type=image/png")
+                            && text.contains("offset/length are ignored")
+                ));
+                assert!(matches!(
+                    parts.get(1),
+                    Some(remi_agentloop::prelude::ContentPart::ImageUrl { image_url })
+                        if image_url.url.starts_with("data:image/png;base64,")
+                ));
+            }
+            other => panic!("expected multimodal content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_keeps_text_chunking_for_plain_text() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "hello world")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            root: root.clone(),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 6, "length": 5 }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await;
+
+        let text = content.text_content();
+        assert!(text.contains("world"));
+        assert!(text.contains("[offset=6 length=5 total_bytes=11 remaining=0]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_keeps_non_image_binary_on_text_path() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("blob.bin"), [0x00_u8, 0x9f, 0x92, 0x96])
+            .await
+            .expect("binary fixture should be written");
+
+        let tool = RootedFsReadTool {
+            root: root.clone(),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "blob.bin" }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await;
+
+        assert!(matches!(content, Content::Text(_)));
+        assert!(content
+            .text_content()
+            .contains("[offset=0 length=4 total_bytes=4 remaining=0]"));
+    }
 }

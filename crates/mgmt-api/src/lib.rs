@@ -303,4 +303,3 @@ pub struct UserBanParams {
 pub struct UserBanListResult {
     pub users: Vec<String>,
 }
-

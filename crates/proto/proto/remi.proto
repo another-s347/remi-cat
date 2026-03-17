@@ -21,6 +21,7 @@ message DaemonMessage {
     SecretsSync      secrets_sync       = 4;
     ImBridgeResponse im_bridge_response = 5;
     ChatCancelSignal chat_cancel        = 6;
+    TriggerRunEvent  trigger_run        = 7;
   }
 }
 
@@ -48,6 +49,7 @@ message ImMessageEvent {
   repeated ImDocumentRef   documents       = 10;
   string                   sender_username = 11;
   bool                     todo_create_via_sdk = 12;
+  bool                     trigger_tools_enabled = 13;
 }
 
 message ImAttachmentRef {
@@ -70,6 +72,21 @@ message ImReactionEvent {
   string chat_id        = 2;
   string sender_user_id = 3;
   string emoji_type     = 4;
+}
+
+message TriggerRunEvent {
+  string execution_id          = 1;
+  string trigger_uuid          = 2;
+  string trigger_name          = 3;
+  string reply_to_message_id   = 4;
+  string sender_user_id        = 5;
+  string sender_username       = 6;
+  string chat_id               = 7;
+  string chat_type             = 8;
+  string request               = 9;
+  string platform              = 10;
+  bool   todo_create_via_sdk   = 11;
+  bool   trigger_tools_enabled = 12;
 }
 
 message ShutdownSignal {}

@@ -272,7 +272,13 @@ fn help_text() -> String {
 `/secrets delete KEY` — 删除 Secret
 
 **会话指令（由 Agent 处理，不调用 LLM）：**
-`/compact` — 立即将短期记忆压缩为中期记忆"#
+`/compact` — 立即将短期记忆压缩为中期记忆
+`/cancel` — 取消当前正在运行的任务
+`/tools` — 查看当前可用工具
+`/trigger` — 查看 trigger 指令帮助
+`/trigger list` — 查看当前线程的触发器
+`/trigger delete <id>` — 删除一个触发器
+`/trigger upsert <json>` — 创建或更新一个触发器（仅 owner）"#
         .to_string()
 }
 

@@ -23,23 +23,26 @@ pub mod model_profile;
 pub mod skill;
 pub mod todo;
 pub mod tools;
+pub mod trigger;
 
 pub use agent::CatAgent;
-pub use events::{CatEvent, SkillEvent, TodoEvent};
+pub use events::{CatEvent, SkillEvent, TodoEvent, TriggerEvent};
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use memory::MemoryStore;
 pub use model_profile::ModelProfile;
 pub use remi_agentloop::prelude::{Content, ContentPart, Message};
-pub use skill::store::{FileSkillStore, InMemorySkillStore};
+pub use skill::store::{BuiltinSkillStore, FileSkillStore, InMemorySkillStore};
 pub use tools::SharedRedactor;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use remi_agentloop::agent_loop::AgentLoop;
-use remi_agentloop::prelude::{AgentBuilder, LoopInput, OpenAIClient, ReqwestTransport};
+use remi_agentloop::prelude::{
+    AgentBuilder, AgentConfig, LoopInput, OpenAIClient, ReqwestTransport, ToolContext,
+};
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 
 use crate::im_tools::register_fetch_tool;
@@ -51,6 +54,28 @@ use tools::{
 };
 
 const REMI_KIMI_THINKING_ENV: &str = "REMI_KIMI_THINKING";
+pub(crate) const TRIGGER_RUN_META_KEY: &str = "trigger_run";
+
+pub(crate) fn metadata_flag_enabled(
+    metadata: Option<&serde_json::Value>,
+    key: &str,
+) -> bool {
+    metadata
+        .and_then(|value| value.get(key))
+        .map(|value| {
+            value.as_bool().unwrap_or_else(|| {
+                value
+                    .as_str()
+                    .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) -> bool {
+    metadata_flag_enabled(metadata, TRIGGER_RUN_META_KEY)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KimiThinkingMode {
@@ -145,6 +170,11 @@ pub struct StreamOptions {
     pub platform: Option<String>,
     /// Route newly-created todo batches to the remi-sdk backend when true.
     pub todo_create_via_sdk: bool,
+    /// Enable trigger management tools for the current turn.
+    pub trigger_tools_enabled: bool,
+    /// Marks the request as an automatic trigger execution.
+    /// Trigger management tools and the builtin trigger skill are hidden for these runs.
+    pub trigger_run: bool,
     /// Downloadable IM attachments referenced by the current message.
     pub im_attachments: Vec<ImAttachment>,
     /// Feishu document links referenced by the current message.
@@ -167,6 +197,7 @@ pub struct CatBot {
     inner: CatAgent<InnerAgent>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
+    trigger_backend: Arc<trigger::TriggerBackend>,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
 }
@@ -197,6 +228,69 @@ impl CatBot {
         thread_id: &str,
     ) -> Result<usize, remi_agentloop::prelude::AgentError> {
         self.memory.compact_now(thread_id).await
+    }
+
+    /// List triggers for the current thread without invoking the LLM.
+    pub async fn trigger_list_command(
+        &self,
+        thread_id: &str,
+        opts: StreamOptions,
+    ) -> Result<String, remi_agentloop::prelude::AgentError> {
+        let ctx = trigger_command_tool_ctx(thread_id, &opts);
+        let items = self.trigger_backend.list(&ctx).await?;
+        if items.is_empty() {
+            Ok("当前线程没有触发器。".to_string())
+        } else {
+            Ok(format!(
+                "**当前线程的触发器：**\n\n{}",
+                crate::trigger::tools::format_trigger_list(&items)
+            ))
+        }
+    }
+
+    /// Delete one trigger for the current thread without invoking the LLM.
+    pub async fn trigger_delete_command(
+        &self,
+        thread_id: &str,
+        id: u64,
+        opts: StreamOptions,
+    ) -> Result<String, remi_agentloop::prelude::AgentError> {
+        let ctx = trigger_command_tool_ctx(thread_id, &opts);
+        let result = self.trigger_backend.delete(&ctx, id).await?;
+        if result.starts_with("Removed trigger #") {
+            Ok(format!("✅ 已删除触发器 #{id}。"))
+        } else if result.contains("not found") {
+            Ok(format!("❌ 触发器 #{id} 不存在。"))
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Create or update one trigger from a JSON payload without invoking the LLM.
+    pub async fn trigger_upsert_command(
+        &self,
+        thread_id: &str,
+        arguments_json: &str,
+        opts: StreamOptions,
+    ) -> Result<String, remi_agentloop::prelude::AgentError> {
+        let args = serde_json::from_str(arguments_json).map_err(|err| {
+            remi_agentloop::prelude::AgentError::tool(
+                "trigger",
+                format!("invalid trigger JSON: {err}"),
+            )
+        })?;
+        let request = crate::trigger::tools::parse_upsert_request(args)?;
+        let ctx = trigger_command_tool_ctx(thread_id, &opts);
+        let result = self.trigger_backend.upsert(&ctx, request).await?;
+        let action = if result.operation == "updated" {
+            "已更新"
+        } else {
+            "已创建"
+        };
+        Ok(format!(
+            "✅ {action}触发器。\n\n{}",
+            crate::trigger::tools::format_trigger_item(&result.item)
+        ))
     }
 
     /// Rebuild the secret redactor from a new `key → value` map.
@@ -272,6 +366,18 @@ impl CatBot {
                 );
             }
 
+            if let Err(err) = self
+                .trigger_backend
+                .refresh_thread_user_state(&thread_id_owned, &mut ctx.user_state)
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id_owned,
+                    error = %err,
+                    "failed to refresh sdk-backed trigger state before turn"
+                );
+            }
+
             let requested_user_name = opts
                 .sender_username
                 .as_deref()
@@ -306,7 +412,13 @@ impl CatBot {
                 meta["platform"] = serde_json::Value::String(platform.clone());
             }
             if opts.todo_create_via_sdk {
-                meta["todo_create_via_sdk"] = serde_json::Value::Bool(true);
+                meta["todo_create_via_sdk"] = serde_json::Value::String("true".to_string());
+            }
+            if opts.trigger_tools_enabled {
+                meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
+            }
+            if opts.trigger_run {
+                meta[TRIGGER_RUN_META_KEY] = serde_json::Value::String("true".to_string());
             }
 
             let mut msg_meta = serde_json::Map::new();
@@ -698,6 +810,43 @@ fn preview_url_header(url: &str) -> &str {
     }
 }
 
+fn trigger_command_tool_ctx(thread_id: &str, opts: &StreamOptions) -> ToolContext {
+    ToolContext {
+        config: AgentConfig::default(),
+        thread_id: Some(
+            serde_json::from_value(serde_json::json!(thread_id))
+                .expect("thread_id should deserialize"),
+        ),
+        run_id: serde_json::from_value(serde_json::json!(format!("trigger-command:{thread_id}")))
+            .expect("run_id should deserialize"),
+        metadata: Some(trigger_command_metadata(thread_id, opts)),
+        user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+    }
+}
+
+fn trigger_command_metadata(thread_id: &str, opts: &StreamOptions) -> serde_json::Value {
+    let mut meta = serde_json::json!({ "thread_id": thread_id });
+    if let Some(ref sender_user_id) = opts.sender_user_id {
+        meta["sender_user_id"] = serde_json::Value::String(sender_user_id.clone());
+    }
+    if let Some(ref sender_username) = opts.sender_username {
+        meta["sender_username"] = serde_json::Value::String(sender_username.clone());
+    }
+    if let Some(ref message_id) = opts.message_id {
+        meta["message_id"] = serde_json::Value::String(message_id.clone());
+    }
+    if let Some(ref chat_type) = opts.chat_type {
+        meta["chat_type"] = serde_json::Value::String(chat_type.clone());
+    }
+    if let Some(ref platform) = opts.platform {
+        meta["platform"] = serde_json::Value::String(platform.clone());
+    }
+    if opts.trigger_tools_enabled {
+        meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
+    }
+    meta
+}
+
 // -- CatBotBuilder ------------------------------------------------------------
 
 pub struct CatBotBuilder {
@@ -873,12 +1022,17 @@ impl CatBotBuilder {
             memory_days: self.memory_days,
         });
 
-        let skill_store = Arc::new(FileSkillStore::new(self.skills_dir));
+        let skill_store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::new(self.skills_dir),
+            [trigger::builtin_trigger_skill()],
+        ));
         let data_dir = memory.data_dir.clone();
         let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
+        let trigger_backend = Arc::new(trigger::TriggerBackend::new(data_dir.clone()));
         let mut local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut local_tools, skill_store);
         todo::register_todo_tools(&mut local_tools, Arc::clone(&todo_backend));
+        trigger::register_trigger_tools(&mut local_tools, Arc::clone(&trigger_backend));
         local_tools.register(MemoryGetDetailTool {
             store: Arc::clone(&memory),
         });
@@ -930,6 +1084,7 @@ impl CatBotBuilder {
             },
             memory,
             todo_backend,
+            trigger_backend,
             redactor,
         })
     }

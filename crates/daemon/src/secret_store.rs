@@ -86,8 +86,8 @@ impl SecretStore {
     pub fn load(path: PathBuf) -> Result<Self> {
         let cipher = load_or_create_key(&path)?;
         let data = if path.exists() {
-            let raw = std::fs::read(&path)
-                .with_context(|| format!("reading secret store {path:?}"))?;
+            let raw =
+                std::fs::read(&path).with_context(|| format!("reading secret store {path:?}"))?;
             if looks_like_plaintext_json(&raw) {
                 // ── Migration: plaintext → encrypted ─────────────────────
                 warn!(
@@ -98,10 +98,17 @@ impl SecretStore {
                 let data = serde_json::from_slice::<StoreData>(&raw).unwrap_or_else(|_| {
                     let entries: HashMap<String, String> =
                         serde_json::from_slice(&raw).unwrap_or_default();
-                    StoreData { entries, system_keys: HashSet::new() }
+                    StoreData {
+                        entries,
+                        system_keys: HashSet::new(),
+                    }
                 });
                 // Write encrypted version immediately.
-                let store = Self { data: data.clone(), path: path.clone(), cipher };
+                let store = Self {
+                    data: data.clone(),
+                    path: path.clone(),
+                    cipher,
+                };
                 store.save()?;
                 return Ok(store);
             } else {
@@ -205,7 +212,9 @@ impl SecretStore {
 
     /// Non-system entries only — forwarded to the Agent via `SecretsSync`.
     pub fn agent_entries(&self) -> HashMap<String, String> {
-        self.data.entries.iter()
+        self.data
+            .entries
+            .iter()
             .filter(|(k, _)| !self.data.system_keys.contains(k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
@@ -214,8 +223,7 @@ impl SecretStore {
     // ── Persistence ───────────────────────────────────────────────────────
 
     fn save(&self) -> Result<()> {
-        let json =
-            serde_json::to_string(&self.data).context("serialising secret store")?;
+        let json = serde_json::to_string(&self.data).context("serialising secret store")?;
 
         // Encrypt: random nonce || ciphertext+tag
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -229,8 +237,7 @@ impl SecretStore {
         blob.extend_from_slice(&ciphertext);
 
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &blob)
-            .with_context(|| format!("writing secret store tmp {tmp:?}"))?;
+        std::fs::write(&tmp, &blob).with_context(|| format!("writing secret store tmp {tmp:?}"))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming secret store {tmp:?} → {:?}", self.path))?;
         debug!(path = ?self.path, count = self.data.entries.len(), "secret store saved");
@@ -256,8 +263,7 @@ fn key_path(data_path: &Path) -> PathBuf {
 fn load_or_create_key(data_path: &Path) -> Result<Aes256Gcm> {
     let kp = key_path(data_path);
     let key_bytes: [u8; 32] = if kp.exists() {
-        let raw = std::fs::read(&kp)
-            .with_context(|| format!("reading secret store key {kp:?}"))?;
+        let raw = std::fs::read(&kp).with_context(|| format!("reading secret store key {kp:?}"))?;
         raw.try_into()
             .map_err(|_| anyhow::anyhow!("key file {kp:?} must be exactly 32 bytes"))?
     } else {
@@ -275,8 +281,7 @@ fn load_or_create_key(data_path: &Path) -> Result<Aes256Gcm> {
 /// Write `key_bytes` to `path` with owner-only permissions (0600 on Unix).
 fn write_key_file(path: &Path, key_bytes: &[u8; 32]) -> Result<()> {
     // Write first (creates the file).
-    std::fs::write(path, key_bytes)
-        .with_context(|| format!("writing key file {path:?}"))?;
+    std::fs::write(path, key_bytes).with_context(|| format!("writing key file {path:?}"))?;
     // Restrict permissions on Unix.
     #[cfg(unix)]
     {
@@ -300,27 +305,24 @@ fn looks_like_plaintext_json(data: &[u8]) -> bool {
 /// Decrypt the on-disk blob and parse as [`StoreData`].
 ///
 /// Automatically migrates old stores that were a plain `{"KEY":"value"}` object.
-fn decrypt_entries(
-    cipher: &Aes256Gcm,
-    blob: &[u8],
-    path: &Path,
-) -> Result<StoreData> {
+fn decrypt_entries(cipher: &Aes256Gcm, blob: &[u8], path: &Path) -> Result<StoreData> {
     if blob.len() < 28 {
         anyhow::bail!("secret store {path:?} is too short to be valid");
     }
     let nonce = Nonce::from_slice(&blob[..12]);
-    let plaintext = cipher
-        .decrypt(nonce, &blob[12..])
-        .map_err(|_| anyhow::anyhow!(
-            "failed to decrypt secret store {path:?} — key mismatch or data corrupted"
-        ))?;
+    let plaintext = cipher.decrypt(nonce, &blob[12..]).map_err(|_| {
+        anyhow::anyhow!("failed to decrypt secret store {path:?} — key mismatch or data corrupted")
+    })?;
     // Try new StoreData format first; fall back to old flat HashMap for existing stores.
     if let Ok(data) = serde_json::from_slice::<StoreData>(&plaintext) {
         return Ok(data);
     }
     let entries = serde_json::from_slice::<HashMap<String, String>>(&plaintext)
         .with_context(|| format!("parsing decrypted secret store {path:?}"))?;
-    Ok(StoreData { entries, system_keys: HashSet::new() })
+    Ok(StoreData {
+        entries,
+        system_keys: HashSet::new(),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

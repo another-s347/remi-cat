@@ -14,8 +14,8 @@ use axum::{
 };
 use mgmt_api::{
     methods, AgentFileParams, ContainerOpParams, MgmtRequest, SecretDeleteParams, SecretSetParams,
-    UserBanParams, VolumeAddParams, VolumeRemoveParams,
-    UserDeleteParams, UserLinkParams, UserUnlinkParams,
+    UserBanParams, UserDeleteParams, UserLinkParams, UserUnlinkParams, VolumeAddParams,
+    VolumeRemoveParams,
 };
 use serde::Deserialize;
 use serde_json::json;

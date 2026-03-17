@@ -18,6 +18,20 @@ pub enum TodoEvent {
     Removed { id: u64 },
 }
 
+// ── Trigger events ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum TriggerEvent {
+    Upserted {
+        id: u64,
+        name: String,
+        enabled: bool,
+    },
+    Deleted {
+        id: u64,
+    },
+}
+
 // ── Top-level CatEvent ───────────────────────────────────────────────────────
 
 /// All events emitted by `CatBot::stream()`.
@@ -30,6 +44,8 @@ pub enum CatEvent {
     Skill(SkillEvent),
     /// A todo tool mutated the todo list.
     Todo(TodoEvent),
+    /// A trigger tool mutated thread trigger state.
+    Trigger(TriggerEvent),
     /// Run completed normally.
     Done,
     /// An error occurred (run aborted).

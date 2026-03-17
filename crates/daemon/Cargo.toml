@@ -13,6 +13,7 @@ im-feishu = { path = "../im-feishu" }
 im-gateway = { path = "../im-gateway" }
 matcher = { path = "../matcher" }
 user-store = { path = "../user-store" }
+remi-client-sdk = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-client-sdk", branch = "main" }
 
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"
@@ -54,6 +55,7 @@ hex = "0.4"
 rand = "0.8"
 bytes = "1"
 sysinfo = "0.30"
+uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
 tempfile = "3"

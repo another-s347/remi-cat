@@ -1,7 +1,7 @@
 pub mod store;
 pub mod tools;
 
-pub use store::{FileSkillStore, InMemorySkillStore, SkillStore};
+pub use store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, InMemorySkillStore, SkillStore};
 pub use tools::{SkillDeleteTool, SkillGetTool, SkillSaveTool, SkillSearchTool};
 
 use remi_agentloop::prelude::ParsedToolCall;
@@ -48,7 +48,11 @@ mod tests {
 }
 
 /// Produce a `SkillEvent` for mutation tools (save/delete).
-pub fn make_skill_event(tc: &ParsedToolCall) -> Option<SkillEvent> {
+pub fn make_skill_event(tc: &ParsedToolCall, result_str: &str) -> Option<SkillEvent> {
+    if result_str.starts_with("error:") {
+        return None;
+    }
+
     match tc.name.as_str() {
         "skill__save" => {
             let name = tc.arguments["name"].as_str()?.to_string();

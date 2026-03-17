@@ -47,6 +47,7 @@ mod mgmt_server;
 mod restart;
 mod rpc_server;
 mod secret_store;
+mod trigger_scheduler;
 mod volume_store;
 
 use anyhow::{Context, Result};
@@ -55,9 +56,11 @@ use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
 use matcher::{BanResult, OwnerMatcher, OwnerStatus, UnbanResult, PAIR_COMMAND};
 use mgmt_server::MgmtContext;
 use restart::{signal_ready, RestartHandle};
-use rpc_server::{daemon_msg_im_message, daemon_msg_im_reaction, RpcServer};
+use rpc_server::{
+    daemon_msg_im_message, daemon_msg_im_reaction, daemon_msg_trigger_run, RpcServer,
+};
 use secret_store::SecretStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,6 +68,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::Server;
 use tracing::{debug, error, info, warn};
 use user_store::{PairTokenStore, UserStore};
+use uuid::Uuid;
 use volume_store::VolumeStore;
 
 /// Feishu channel name used when recording channel identities.
@@ -123,6 +127,40 @@ fn encode_agent_file_key(message_id: &str, file_key: &str) -> String {
         return file_key.to_string();
     }
     format!("{message_id}{AGENT_FILE_KEY_SEPARATOR}{file_key}")
+}
+
+#[derive(Debug)]
+enum ChatQueueItem {
+    ImMessage {
+        msg: FeishuMessage,
+        user_uuid: String,
+        sender_username: Option<String>,
+        todo_create_via_sdk: bool,
+        trigger_tools_enabled: bool,
+    },
+    TriggerRun(TriggerQueueItem),
+}
+
+impl ChatQueueItem {
+    fn is_preemptive(&self) -> bool {
+        matches!(self, Self::ImMessage { .. })
+    }
+}
+
+#[derive(Debug)]
+struct TriggerQueueItem {
+    execution_id: String,
+    trigger_uuid: String,
+    trigger_name: String,
+    reply_to_message_id: String,
+    chat_id: String,
+    chat_type: Option<String>,
+    request: String,
+    sender_user_id: String,
+    sender_username: Option<String>,
+    platform: Option<String>,
+    todo_create_via_sdk: bool,
+    trigger_tools_enabled: bool,
 }
 
 #[tokio::main]
@@ -255,11 +293,10 @@ async fn main() -> Result<()> {
     let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
-    // Each item carries the Feishu message together with the resolved user UUID
-    // and cached sender username, if we have one.
-    let chat_queues: Arc<
-        Mutex<HashMap<String, mpsc::Sender<(FeishuMessage, String, Option<String>, bool)>>>,
-    > = Arc::new(Mutex::new(HashMap::new()));
+    // Each queue item is either a user IM message or a daemon-originated
+    // trigger execution request.
+    let chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<ChatQueueItem>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     info!("remi-daemon starting up");
     if let Some(id) = matcher.owner_id() {
@@ -317,6 +354,75 @@ async fn main() -> Result<()> {
         );
         let supervisor = local_agent::LocalAgentSupervisor::new(connect_addr)?;
         tokio::spawn(supervisor.supervise());
+    }
+
+    let (trigger_dispatch_tx, mut trigger_dispatch_rx) =
+        mpsc::channel::<trigger_scheduler::TriggerDispatch>(32);
+    trigger_scheduler::spawn_trigger_scheduler(data_dir.clone(), trigger_dispatch_tx);
+
+    {
+        let gateway = gateway.clone();
+        let rpc = rpc.clone();
+        let matcher = matcher.clone();
+        let chat_queues = Arc::clone(&chat_queues);
+        tokio::spawn(async move {
+            while let Some(dispatch) = trigger_dispatch_rx.recv().await {
+                let Some(owner_user_id) = dispatch.owner_user_id.clone() else {
+                    warn!(trigger_uuid = %dispatch.trigger_uuid, "dropping trigger run without owner identity");
+                    continue;
+                };
+                if !is_owner(&matcher, &owner_user_id) {
+                    warn!(trigger_uuid = %dispatch.trigger_uuid, owner_user_id = %owner_user_id, "dropping trigger run for a non-owner identity");
+                    continue;
+                }
+
+                let reply_to_message_id = match dispatch
+                    .reply_to_message_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(message_id) => message_id,
+                    None => match gateway
+                        .send_text(
+                            &dispatch.chat_id,
+                            &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
+                        )
+                        .await
+                    {
+                        Ok(message_id) => message_id,
+                        Err(err) => {
+                            warn!(trigger_uuid = %dispatch.trigger_uuid, chat_id = %dispatch.chat_id, error = %err, "failed to create fallback anchor message for trigger run");
+                            continue;
+                        }
+                    },
+                };
+
+                let queue_tx = get_or_spawn_chat_queue(
+                    &dispatch.chat_id,
+                    &chat_queues,
+                    gateway.clone(),
+                    rpc.clone(),
+                )
+                .await;
+                let queue_item = ChatQueueItem::TriggerRun(TriggerQueueItem {
+                    execution_id: Uuid::new_v4().to_string(),
+                    trigger_uuid: dispatch.trigger_uuid.clone(),
+                    trigger_name: dispatch.trigger_name.clone(),
+                    reply_to_message_id,
+                    chat_id: dispatch.chat_id.clone(),
+                    chat_type: dispatch.chat_type.clone(),
+                    request: dispatch.request.clone(),
+                    sender_user_id: owner_user_id,
+                    sender_username: dispatch.owner_username.clone(),
+                    platform: dispatch.platform.clone(),
+                    todo_create_via_sdk: sdk_todo_enabled,
+                    trigger_tools_enabled: false,
+                });
+                if let Err(err) = queue_tx.send(queue_item).await {
+                    warn!(trigger_uuid = %dispatch.trigger_uuid, error = %err, "failed to enqueue trigger run");
+                }
+            }
+        });
     }
 
     // Spawn gRPC serve task.
@@ -600,21 +706,17 @@ async fn main() -> Result<()> {
                 // ── Forward to Agent ───────────────────────────────────────
                 let chat_id = msg.chat_id.clone();
                 let msg_id = msg.message_id.clone();
-                let queue_tx = {
-                    let mut queues = chat_queues.lock().await;
-                    // Respawn worker if the channel was closed.
-                    if queues
-                        .get(&chat_id)
-                        .map(|tx| tx.is_closed())
-                        .unwrap_or(true)
-                    {
-                        let tx = spawn_queue_worker(chat_id.clone(), gateway.clone(), rpc.clone());
-                        queues.insert(chat_id.clone(), tx);
-                    }
-                    queues[&chat_id].clone()
-                };
-                let todo_create_via_sdk = sdk_todo_enabled && is_owner(&matcher, &user_uuid);
-                match queue_tx.try_send((msg, user_uuid, sender_username, todo_create_via_sdk)) {
+                let queue_tx =
+                    get_or_spawn_chat_queue(&chat_id, &chat_queues, gateway.clone(), rpc.clone())
+                        .await;
+                let owner_sdk_tools_enabled = sdk_todo_enabled && is_owner(&matcher, &user_uuid);
+                match queue_tx.try_send(ChatQueueItem::ImMessage {
+                    msg,
+                    user_uuid,
+                    sender_username,
+                    todo_create_via_sdk: owner_sdk_tools_enabled,
+                    trigger_tools_enabled: owner_sdk_tools_enabled,
+                }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
@@ -790,60 +892,84 @@ async fn main() -> Result<()> {
 
 // ── Chat queue worker ─────────────────────────────────────────────────────────
 
+async fn get_or_spawn_chat_queue(
+    chat_id: &str,
+    chat_queues: &Arc<Mutex<HashMap<String, mpsc::Sender<ChatQueueItem>>>>,
+    gateway: FeishuGateway,
+    rpc: RpcServer,
+) -> mpsc::Sender<ChatQueueItem> {
+    let mut queues = chat_queues.lock().await;
+    if queues.get(chat_id).map(|tx| tx.is_closed()).unwrap_or(true) {
+        let tx = spawn_queue_worker(chat_id.to_string(), gateway, rpc);
+        queues.insert(chat_id.to_string(), tx);
+    }
+    queues[chat_id].clone()
+}
+
+fn coalesce_latest_preemptive_item(
+    rx: &mut mpsc::Receiver<ChatQueueItem>,
+    mut latest: ChatQueueItem,
+    pending: &mut VecDeque<ChatQueueItem>,
+) -> ChatQueueItem {
+    loop {
+        match rx.try_recv() {
+            Ok(item) if item.is_preemptive() => latest = item,
+            Ok(item) => pending.push_back(item),
+            Err(_) => break,
+        }
+    }
+    latest
+}
+
 /// Spawn a serial queue worker for `chat_id`.
 ///
 /// The worker blocks on one message at a time (enrich → react → agent →
 /// await completion) so messages from the same chat are processed in order.
-///
-/// Each queue item is `(FeishuMessage, user_uuid, sender_username, todo_create_via_sdk)`
-/// where `user_uuid` is the internal UUID resolved by the caller before enqueue.
 fn spawn_queue_worker(
     chat_id: String,
     gateway: FeishuGateway,
     rpc: RpcServer,
-) -> mpsc::Sender<(FeishuMessage, String, Option<String>, bool)> {
-    let (tx, mut rx) =
-        mpsc::channel::<(FeishuMessage, String, Option<String>, bool)>(CHAT_QUEUE_CAPACITY);
+) -> mpsc::Sender<ChatQueueItem> {
+    let (tx, mut rx) = mpsc::channel::<ChatQueueItem>(CHAT_QUEUE_CAPACITY);
     tokio::spawn(async move {
         // Holds the completion receiver for the currently in-flight message,
         // if any.  We drop it (without awaiting) when a newer message preempts.
         let mut completion_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
+        let mut pending: VecDeque<ChatQueueItem> = VecDeque::new();
 
         loop {
-            // ── Obtain the next item to process ──────────────────────────
-            //
-            // If a task is in-flight we race between its completion and a new
-            // incoming queue item.  A new arrival preempts the in-flight task:
-            // we send a cancel signal to the Agent, drop the old completion
-            // receiver (the Agent's eventual Done for that message becomes a
-            // no-op on the daemon side), and process the newest item instead.
-            let item: (FeishuMessage, String, Option<String>, bool) = if completion_rx.is_some() {
+            if completion_rx.is_some() {
                 let mut comp = completion_rx.take().unwrap();
                 tokio::select! {
                     _ = &mut comp => {
-                        // In-flight task finished normally — wait for next item.
-                        match rx.recv().await {
-                            Some(item) => item,
-                            None => return,
-                        }
+                        completion_rx = None;
                     }
                     item = rx.recv() => {
-                        let Some(item) = item else { return };
-                        // New message arrived while a task is in-flight — preempt.
-                        info!(chat = %chat_id, "new message preempts in-flight task — cancelling");
-                        rpc.cancel_chat(&chat_id).await;
-                        // comp is dropped here; agent's eventual Done is a no-op.
-                        // Drain any additional queued items: latest-message wins.
-                        let mut latest = item;
-                        loop {
-                            match rx.try_recv() {
-                                Ok(newer) => latest = newer,
-                                Err(_) => break,
+                        match item {
+                            Some(item) if item.is_preemptive() => {
+                                info!(chat = %chat_id, "new message preempts in-flight task — cancelling");
+                                rpc.cancel_chat(&chat_id).await;
+                                let latest = coalesce_latest_preemptive_item(&mut rx, item, &mut pending);
+                                pending.push_front(latest);
+                                completion_rx = None;
+                            }
+                            Some(item) => {
+                                pending.push_back(item);
+                                completion_rx = Some(comp);
+                            }
+                            None => {
+                                completion_rx = Some(comp);
                             }
                         }
-                        latest
                     }
                 }
+                if completion_rx.is_some() {
+                    continue;
+                }
+            }
+
+            let item = if let Some(item) = pending.pop_front() {
+                item
             } else {
                 match rx.recv().await {
                     Some(item) => item,
@@ -851,64 +977,110 @@ fn spawn_queue_worker(
                 }
             };
 
-            let (msg, user_uuid, sender_username, todo_create_via_sdk) = item;
-            let message_id = msg.message_id.clone();
-            let enriched = enrich_message(&gateway, msg).await;
+            match item {
+                ChatQueueItem::ImMessage {
+                    msg,
+                    user_uuid,
+                    sender_username,
+                    todo_create_via_sdk,
+                    trigger_tools_enabled,
+                } => {
+                    let message_id = msg.message_id.clone();
+                    let enriched = enrich_message(&gateway, msg).await;
 
-            // Feishu folder-type attachments cannot be downloaded via the API.
-            // Reply with a canned message and skip the agent entirely.
-            if enriched.files.iter().any(|f| f.file_type == "folder") {
-                info!(message_id = %message_id, "folder attachment — sending unsupported notice");
-                send_reply(
-                    &gateway,
-                    &enriched.message_id,
-                    &enriched.chat_id,
-                    "📁 暂不支持读取飞书「文件夹」类型的附件，请将文件夹压缩成 zip 后重新上传。",
-                )
-                .await;
-                continue;
-            }
-
-            info!(
-                message_id = %message_id,
-                uuid = %user_uuid,
-                sender_username = sender_username.as_deref().unwrap_or(""),
-                has_sender_username = sender_username.is_some(),
-                todo_create_via_sdk,
-                "queue worker forwarding message to agent"
-            );
-
-            let reaction_id = gateway
-                .add_reaction(&enriched.message_id, "THINKING")
-                .await
-                .map_err(|e| warn!("add_reaction failed: {e:#}"))
-                .ok();
-
-            let daemon_msg = daemon_msg_im_message(
-                &enriched,
-                &user_uuid,
-                sender_username.as_deref(),
-                todo_create_via_sdk,
-            );
-            match rpc.send_to_agent_and_await(daemon_msg, &message_id).await {
-                Some(comp_rx) => {
-                    if let Some(rid) = reaction_id {
-                        rpc.record_reaction(&message_id, rid).await;
+                    if enriched.files.iter().any(|f| f.file_type == "folder") {
+                        info!(message_id = %message_id, "folder attachment — sending unsupported notice");
+                        send_reply(
+                            &gateway,
+                            &enriched.message_id,
+                            &enriched.chat_id,
+                            "📁 暂不支持读取飞书「文件夹」类型的附件，请将文件夹压缩成 zip 后重新上传。",
+                        )
+                        .await;
+                        continue;
                     }
-                    // Store the completion receiver; the top of the loop will
-                    // race it against future queue arrivals.
-                    completion_rx = Some(comp_rx);
+
+                    info!(
+                        message_id = %message_id,
+                        uuid = %user_uuid,
+                        sender_username = sender_username.as_deref().unwrap_or(""),
+                        has_sender_username = sender_username.is_some(),
+                        todo_create_via_sdk,
+                        trigger_tools_enabled,
+                        "queue worker forwarding message to agent"
+                    );
+
+                    let reaction_id = gateway
+                        .add_reaction(&enriched.message_id, "THINKING")
+                        .await
+                        .map_err(|e| warn!("add_reaction failed: {e:#}"))
+                        .ok();
+
+                    let daemon_msg = daemon_msg_im_message(
+                        &enriched,
+                        &user_uuid,
+                        sender_username.as_deref(),
+                        todo_create_via_sdk,
+                        trigger_tools_enabled,
+                    );
+                    match rpc.send_to_agent_and_await(daemon_msg, &message_id).await {
+                        Some(comp_rx) => {
+                            if let Some(rid) = reaction_id {
+                                rpc.record_reaction(&message_id, rid).await;
+                            }
+                            completion_rx = Some(comp_rx);
+                        }
+                        None => {
+                            if let Some(rid) = reaction_id {
+                                gateway.delete_reaction(&message_id, &rid).await.ok();
+                            }
+                            rpc.reply_agent_unavailable(&message_id).await;
+                        }
+                    }
                 }
-                None => {
-                    // Agent not connected.
-                    if let Some(rid) = reaction_id {
-                        gateway.delete_reaction(&message_id, &rid).await.ok();
+                ChatQueueItem::TriggerRun(run) => {
+                    info!(
+                        execution_id = %run.execution_id,
+                        trigger_uuid = %run.trigger_uuid,
+                        trigger_name = %run.trigger_name,
+                        chat_id = %run.chat_id,
+                        reply_to_message_id = %run.reply_to_message_id,
+                        sender_user_id = %run.sender_user_id,
+                        "queue worker forwarding trigger run to agent"
+                    );
+
+                    let daemon_msg = daemon_msg_trigger_run(
+                        &run.execution_id,
+                        &run.trigger_uuid,
+                        &run.trigger_name,
+                        &run.reply_to_message_id,
+                        &run.sender_user_id,
+                        run.sender_username.as_deref(),
+                        &run.chat_id,
+                        run.chat_type.as_deref(),
+                        &run.request,
+                        run.platform.as_deref(),
+                        run.todo_create_via_sdk,
+                        run.trigger_tools_enabled,
+                    );
+                    match rpc
+                        .send_to_agent_and_await_with_reply_target(
+                            daemon_msg,
+                            &run.execution_id,
+                            &run.reply_to_message_id,
+                        )
+                        .await
+                    {
+                        Some(comp_rx) => {
+                            completion_rx = Some(comp_rx);
+                        }
+                        None => {
+                            rpc.reply_agent_unavailable(&run.reply_to_message_id).await;
+                        }
                     }
-                    rpc.reply_agent_unavailable(&message_id).await;
                 }
             }
         }
-        info!(chat = %chat_id, "chat queue worker exiting");
     });
     tx
 }

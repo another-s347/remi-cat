@@ -17,6 +17,22 @@ pub struct SkillSummary {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinSkill {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub content: &'static str,
+}
+
+impl BuiltinSkill {
+    fn summary(&self) -> SkillSummary {
+        SkillSummary {
+            name: self.name.to_string(),
+            description: Some(self.description.to_string()),
+        }
+    }
+}
+
 /// Persistent backend for named skill documents.
 #[allow(async_fn_in_trait)]
 pub trait SkillStore: Send + Sync + 'static {
@@ -31,6 +47,119 @@ pub trait SkillStore: Send + Sync + 'static {
     async fn delete(&self, name: &str) -> Result<bool, AgentError>;
     /// Return the cached featured-skill snapshot used by prompt injection.
     fn featured_summaries(&self) -> Vec<SkillSummary>;
+}
+
+pub struct BuiltinSkillStore<S> {
+    inner: S,
+    builtins: BTreeMap<String, BuiltinSkill>,
+}
+
+impl<S> BuiltinSkillStore<S> {
+    pub fn new(inner: S, builtins: impl IntoIterator<Item = BuiltinSkill>) -> Self {
+        let builtins = builtins
+            .into_iter()
+            .map(|skill| (skill.name.to_string(), skill))
+            .collect();
+        Self { inner, builtins }
+    }
+
+    fn builtin(&self, name: &str) -> Option<&BuiltinSkill> {
+        if let Some(skill) = self.builtins.get(name) {
+            return Some(skill);
+        }
+
+        let lookup = sanitize_skill_name(name);
+        self.builtins
+            .values()
+            .find(|skill| sanitize_skill_name(skill.name) == lookup)
+    }
+
+    fn builtin_matches(&self, query: &str) -> Vec<SkillSummary> {
+        let keywords = parse_keywords(query);
+        if keywords.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<(usize, SkillSummary)> = self
+            .builtins
+            .values()
+            .filter_map(|skill| {
+                let hit_count = builtin_keyword_hit_count(skill, &keywords);
+                (hit_count > 0).then_some((hit_count, skill.summary()))
+            })
+            .collect();
+
+        matches.sort_by(|(hits_a, summary_a), (hits_b, summary_b)| {
+            hits_b
+                .cmp(hits_a)
+                .then_with(|| summary_a.name.cmp(&summary_b.name))
+        });
+
+        matches.into_iter().map(|(_, summary)| summary).collect()
+    }
+}
+
+impl<S: SkillStore> SkillStore for BuiltinSkillStore<S> {
+    async fn save(&self, name: &str, content: &str) -> Result<String, AgentError> {
+        if self.builtin(name).is_some() {
+            return Err(AgentError::other(format!(
+                "skill '{name}' is builtin and read-only"
+            )));
+        }
+        self.inner.save(name, content).await
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<String>, AgentError> {
+        if let Some(skill) = self.builtin(name) {
+            return Ok(Some(skill.content.to_string()));
+        }
+        self.inner.get(name).await
+    }
+
+    async fn search(&self, query: &str) -> Result<Vec<SkillSummary>, AgentError> {
+        let mut results = self.builtin_matches(query);
+        let mut seen: HashSet<String> = results.iter().map(|entry| entry.name.clone()).collect();
+
+        for entry in self.inner.search(query).await? {
+            if seen.insert(entry.name.clone()) {
+                results.push(entry);
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn delete(&self, name: &str) -> Result<bool, AgentError> {
+        if self.builtin(name).is_some() {
+            return Err(AgentError::other(format!(
+                "skill '{name}' is builtin and read-only"
+            )));
+        }
+        self.inner.delete(name).await
+    }
+
+    fn featured_summaries(&self) -> Vec<SkillSummary> {
+        let mut featured = Vec::new();
+        let mut seen = HashSet::new();
+
+        for skill in self.builtins.values() {
+            let summary = skill.summary();
+            seen.insert(summary.name.clone());
+            featured.push(summary);
+        }
+
+        for summary in self.inner.featured_summaries() {
+            if seen.insert(summary.name.clone()) {
+                featured.push(summary);
+            }
+            if featured.len() >= FEATURED_SKILL_LIMIT {
+                break;
+            }
+        }
+
+        featured.truncate(FEATURED_SKILL_LIMIT);
+        featured
+    }
 }
 
 // ── Shared metadata/index helpers ────────────────────────────────────────────
@@ -243,6 +372,16 @@ fn keyword_hit_count(entry: &SkillMetadata, keywords: &[String]) -> usize {
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
+
+    keywords
+        .iter()
+        .filter(|keyword| name.contains(keyword.as_str()) || description.contains(keyword.as_str()))
+        .count()
+}
+
+fn builtin_keyword_hit_count(skill: &BuiltinSkill, keywords: &[String]) -> usize {
+    let name = skill.name.to_ascii_lowercase();
+    let description = skill.description.to_ascii_lowercase();
 
     keywords
         .iter()
@@ -584,7 +723,7 @@ impl SkillStore for InMemorySkillStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSkillStore, InMemorySkillStore, SkillStore};
+    use super::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, InMemorySkillStore, SkillStore};
     use chrono::{Duration, Utc};
     use uuid::Uuid;
 
@@ -682,5 +821,61 @@ mod tests {
         assert_eq!(results[0].name, "rust-sender-map");
         assert!(results.iter().any(|entry| entry.name == "rust-build"));
         assert!(results.iter().any(|entry| entry.name == "feishu-sender"));
+    }
+
+    #[tokio::test]
+    async fn builtin_skills_are_searchable_and_featured() {
+        let inner = InMemorySkillStore::new();
+        inner
+            .save(
+                "rust-build",
+                "---\nname: rust-build\ndescription: Build the Rust workspace\n---\n\nBody",
+            )
+            .await
+            .unwrap();
+
+        let store = BuiltinSkillStore::new(
+            inner,
+            [BuiltinSkill {
+                name: "trigger",
+                description: "Builtin trigger capability reference",
+                content: "trigger body",
+            }],
+        );
+
+        let results = store.search("trigger").await.unwrap();
+        assert_eq!(results[0].name, "trigger");
+        assert_eq!(
+            store.get("trigger").await.unwrap().as_deref(),
+            Some("trigger body")
+        );
+
+        let featured = store.featured_summaries();
+        assert_eq!(featured[0].name, "trigger");
+        assert!(featured.iter().any(|entry| entry.name == "rust-build"));
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_names_are_reserved() {
+        let store = BuiltinSkillStore::new(
+            InMemorySkillStore::new(),
+            [BuiltinSkill {
+                name: "trigger",
+                description: "Builtin trigger capability reference",
+                content: "trigger body",
+            }],
+        );
+
+        let save_error = store
+            .save("trigger", "---\nname: trigger\n---\n\nBody")
+            .await
+            .expect_err("saving builtin skills should fail");
+        assert!(save_error.to_string().contains("builtin and read-only"));
+
+        let delete_error = store
+            .delete("trigger")
+            .await
+            .expect_err("deleting builtin skills should fail");
+        assert!(delete_error.to_string().contains("builtin and read-only"));
     }
 }

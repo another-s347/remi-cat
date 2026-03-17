@@ -330,7 +330,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("matcher_{name}_{}_{}.json", std::process::id(), stamp))
+        std::env::temp_dir().join(format!(
+            "matcher_{name}_{}_{}.json",
+            std::process::id(),
+            stamp
+        ))
     }
 
     fn make_matcher(owner_id: Option<&str>) -> OwnerMatcher {

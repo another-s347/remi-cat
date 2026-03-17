@@ -483,7 +483,8 @@ impl FeishuGateway {
                 // Determine if the bot was @mentioned, and strip the mention
                 // placeholder from the text so the LLM sees clean input.
                 let (text, at_bot) = strip_bot_mention(&raw_text, &msg.mentions, bot_open_id);
-                let documents = merge_documents(content_documents, extract_doc_links_from_text(&text));
+                let documents =
+                    merge_documents(content_documents, extract_doc_links_from_text(&text));
 
                 debug!(
                     message_id = %msg.message_id,
@@ -500,19 +501,18 @@ impl FeishuGateway {
                 // P2P messages always address the bot.
                 let at_bot = at_bot || msg.chat_type != "group";
 
+                fn preview_message_content(content: &str) -> &str {
+                    const MAX_PREVIEW: usize = 160;
+                    if content.len() <= MAX_PREVIEW {
+                        return content;
+                    }
 
-fn preview_message_content(content: &str) -> &str {
-    const MAX_PREVIEW: usize = 160;
-    if content.len() <= MAX_PREVIEW {
-        return content;
-    }
-
-    let mut end = MAX_PREVIEW;
-    while !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    &content[..end]
-}
+                    let mut end = MAX_PREVIEW;
+                    while !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &content[..end]
+                }
                 let sender_id = ev
                     .sender
                     .sender_id
@@ -774,14 +774,13 @@ fn preview_message_content(content: &str) -> &str {
         file_key: &str,
         file_type: &str,
     ) -> Result<(String, String, Vec<u8>)> {
-        self.client.download_file(message_id, file_key, file_type).await
+        self.client
+            .download_file(message_id, file_key, file_type)
+            .await
     }
 
     /// Download a Feishu document referenced by URL.
-    pub async fn download_document(
-        &self,
-        document_url: &str,
-    ) -> Result<(String, String, Vec<u8>)> {
+    pub async fn download_document(&self, document_url: &str) -> Result<(String, String, Vec<u8>)> {
         self.client.download_document(document_url).await
     }
     pub async fn download_drive_file(
@@ -798,22 +797,37 @@ fn preview_message_content(content: &str) -> &str {
         content: &[u8],
         file_type: &str,
     ) -> Result<String> {
-        self.client.upload_file(file_name, mime_type, content, file_type).await
+        self.client
+            .upload_file(file_name, mime_type, content, file_type)
+            .await
     }
 
     /// Reply to an existing message with a file attachment.
-    pub async fn reply_file(&self, message_id: &str, file_key: &str, file_type: &str) -> Result<String> {
-        self.client.reply_file(message_id, file_key, file_type).await
+    pub async fn reply_file(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
+        self.client
+            .reply_file(message_id, file_key, file_type)
+            .await
     }
 
     /// Send a file attachment into a chat.
-    pub async fn send_file(&self, chat_id: &str, file_key: &str, file_type: &str) -> Result<String> {
+    pub async fn send_file(
+        &self,
+        chat_id: &str,
+        file_key: &str,
+        file_type: &str,
+    ) -> Result<String> {
         self.client.send_file(chat_id, file_key, file_type).await
     }
 
     /// Return an authenticated Feishu resource URL for a sent file message.
     pub fn file_resource_url(&self, message_id: &str, file_key: &str, file_type: &str) -> String {
-        self.client.file_resource_url(message_id, file_key, file_type)
+        self.client
+            .file_resource_url(message_id, file_key, file_type)
     }
 
     /// Delete (withdraw) a message sent by the bot.
@@ -847,10 +861,7 @@ fn preview_message_content(content: &str) -> &str {
     /// Returns `None` when the message cannot be found or has an unsupported type.
     /// Images are returned as raw keys; callers must download them using this
     /// `message_id` as the resource owner (not the replying message's ID).
-    pub async fn fetch_parent_content(
-        &self,
-        message_id: &str,
-    ) -> Result<Option<ParentContent>> {
+    pub async fn fetch_parent_content(&self, message_id: &str) -> Result<Option<ParentContent>> {
         let Some((msg_type, content_str)) = self.client.get_message_raw(message_id).await? else {
             return Ok(None);
         };
@@ -955,7 +966,9 @@ fn strip_bot_mention(
 }
 
 /// Extract text content and image keys from a Feishu `post` message body.
-fn extract_from_post(content_str: &str) -> (String, Vec<String>, Vec<FeishuFile>, Vec<FeishuDocument>) {
+fn extract_from_post(
+    content_str: &str,
+) -> (String, Vec<String>, Vec<FeishuFile>, Vec<FeishuDocument>) {
     let v: serde_json::Value = match serde_json::from_str(content_str) {
         Ok(v) => v,
         Err(_) => return (String::new(), vec![], vec![], vec![]),
@@ -1004,7 +1017,12 @@ fn extract_from_post(content_str: &str) -> (String, Vec<String>, Vec<FeishuFile>
         }
     }
 
-    (texts.join("").trim().to_string(), images, vec![], unique_documents(documents))
+    (
+        texts.join("").trim().to_string(),
+        images,
+        vec![],
+        unique_documents(documents),
+    )
 }
 
 /// Extract plain text from a Feishu interactive card content JSON string.
@@ -1042,7 +1060,10 @@ fn extract_doc_links_from_text(text: &str) -> Vec<FeishuDocument> {
             .filter_map(|part| {
                 let candidate = part.trim_matches(|c: char| {
                     c.is_ascii_whitespace()
-                        || matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';')
+                        || matches!(
+                            c,
+                            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+                        )
                 });
                 parse_feishu_document_url(candidate)
             })
@@ -1050,7 +1071,10 @@ fn extract_doc_links_from_text(text: &str) -> Vec<FeishuDocument> {
     )
 }
 
-fn merge_documents(mut left: Vec<FeishuDocument>, right: Vec<FeishuDocument>) -> Vec<FeishuDocument> {
+fn merge_documents(
+    mut left: Vec<FeishuDocument>,
+    right: Vec<FeishuDocument>,
+) -> Vec<FeishuDocument> {
     left.extend(right);
     unique_documents(left)
 }
@@ -1077,10 +1101,7 @@ fn collect_doc_links_from_value(value: &serde_json::Value, docs: &mut Vec<Feishu
             }
         }
         serde_json::Value::Object(map) => {
-            let title = map
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let title = map.get("text").and_then(|v| v.as_str()).unwrap_or_default();
 
             for key in ["href", "link", "url"] {
                 if let Some(url) = map.get(key).and_then(|v| v.as_str()) {
@@ -1223,10 +1244,9 @@ mod tests {
 
     #[test]
     fn parses_feishu_drive_file_url_with_query() {
-        let doc = parse_feishu_document_url(
-            "https://example.feishu.cn/drive/file/XyZ789abc?from=im",
-        )
-        .expect("drive file url with query should parse");
+        let doc =
+            parse_feishu_document_url("https://example.feishu.cn/drive/file/XyZ789abc?from=im")
+                .expect("drive file url with query should parse");
         assert_eq!(doc.doc_type, "file");
         assert_eq!(doc.token, "XyZ789abc");
     }
@@ -1236,7 +1256,10 @@ mod tests {
         use crate::FeishuClient;
         let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
         let url = client.file_resource_url("msg_id", "file_key_abc", "file");
-        assert!(url.ends_with("?type=file"), "expected ?type=file, got {url}");
+        assert!(
+            url.ends_with("?type=file"),
+            "expected ?type=file, got {url}"
+        );
     }
 
     #[test]
@@ -1245,7 +1268,10 @@ mod tests {
         let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
         let url = client.file_resource_url("msg_id", "file_key_abc", "folder");
         // Feishu IM resource API only accepts image/file — folder must also use type=file
-        assert!(url.ends_with("?type=file"), "expected ?type=file for folder, got {url}");
+        assert!(
+            url.ends_with("?type=file"),
+            "expected ?type=file for folder, got {url}"
+        );
     }
 
     #[test]
@@ -1253,6 +1279,9 @@ mod tests {
         use crate::FeishuClient;
         let client = FeishuClient::new(String::from("app_id"), String::from("app_secret"));
         let url = client.file_resource_url("msg_id", "img_key_abc", "image");
-        assert!(url.ends_with("?type=image"), "expected ?type=image, got {url}");
+        assert!(
+            url.ends_with("?type=image"),
+            "expected ?type=image, got {url}"
+        );
     }
 }
