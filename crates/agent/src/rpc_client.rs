@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bot_core::im_tools::{
-    DownloadedImFile, ImDownloadRequest, ImFileBridge, ImUploadRequest, UploadedImFile,
+    AcpBindingDeleteRequest, AcpBindingUpsertRequest, DownloadedImFile, ImDownloadRequest,
+    ImFileBridge, ImUploadRequest, UploadedImFile,
 };
 use remi_proto::{AgentMessage, AgentPayload, ImBridgeRequest, ImBridgeResponse};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -137,6 +138,59 @@ impl ImFileBridge for GrpcImFileBridge {
                 }
                 Some(_) => Err(anyhow!("unexpected IM bridge response payload for upload")),
                 None => Err(anyhow!("missing IM bridge upload payload")),
+            }
+        })
+    }
+
+    fn acp_binding_upsert<'a>(
+        &'a self,
+        request: AcpBindingUpsertRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let reply_to = request.channel_id.clone();
+            let response = self
+                .request(
+                    &reply_to,
+                    remi_proto::im_bridge_request::Payload::AcpBindingUpsert(
+                        remi_proto::AcpBindingUpsertRequest {
+                            session_id: request.session_id,
+                            platform: request.platform,
+                            channel_id: request.channel_id,
+                        },
+                    ),
+                )
+                .await?;
+
+            if response.error.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(response.error))
+            }
+        })
+    }
+
+    fn acp_binding_delete<'a>(
+        &'a self,
+        request: AcpBindingDeleteRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let reply_to = request.channel_id.clone();
+            let response = self
+                .request(
+                    &reply_to,
+                    remi_proto::im_bridge_request::Payload::AcpBindingDelete(
+                        remi_proto::AcpBindingDeleteRequest {
+                            platform: request.platform,
+                            channel_id: request.channel_id,
+                        },
+                    ),
+                )
+                .await?;
+
+            if response.error.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(response.error))
             }
         })
     }

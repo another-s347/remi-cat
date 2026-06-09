@@ -1,7 +1,7 @@
 //! `im-feishu` — Feishu IM platform adapter (standalone).
 //!
-//! Uses **WebSocket long connection** for inbound events and Feishu REST APIs
-//! for outbound messages and card updates.
+//! Supports **WebSocket long connection** and **Event Hook HTTP callback**
+//! inbound events, plus Feishu REST APIs for outbound messages and card updates.
 //!
 //! # Wire protocol
 //!
@@ -28,12 +28,19 @@ pub mod client;
 pub mod frame;
 pub mod streaming;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -93,6 +100,8 @@ pub struct FeishuMessage {
     pub documents: Vec<FeishuDocument>,
     /// Parent message ID when this message quotes/replies to another.
     pub parent_id: Option<String>,
+    /// Feishu topic/thread ID. Present for messages inside topic-enabled groups.
+    pub thread_id: Option<String>,
     /// `true` when this message @-mentions the bot (always `true` for p2p).
     pub at_bot: bool,
     /// Non-bot @mentions preserved from the original event payload.
@@ -129,8 +138,105 @@ pub struct FeishuMention {
 pub struct FeishuReaction {
     pub message_id: String,
     pub chat_id: String,
+    pub thread_id: Option<String>,
     pub sender_user_id: String,
     pub emoji_type: String,
+}
+
+/// HTTP Event Hook listener settings.
+#[derive(Debug, Clone)]
+pub struct FeishuEventHookConfig {
+    pub addr: SocketAddr,
+    pub path: String,
+    pub verification_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct FeishuEventHookState {
+    gateway: FeishuGateway,
+    tx: mpsc::Sender<FeishuEvent>,
+    verification_token: Option<String>,
+}
+
+async fn feishu_event_hook(
+    State(state): State<FeishuEventHookState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if body.get("type").and_then(|value| value.as_str()) == Some("url_verification") {
+        if !token_matches(&state.verification_token, &body) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "verification token mismatch" })),
+            );
+        }
+        let challenge = body
+            .get("challenge")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        return (StatusCode::OK, Json(json!({ "challenge": challenge })));
+    }
+
+    if !token_matches(&state.verification_token, &body) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "verification token mismatch" })),
+        );
+    }
+
+    let bot_open_id = state.gateway.client.get_bot_open_id().await;
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            warn!("failed to serialize Feishu Event Hook body: {err}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid event body" })),
+            );
+        }
+    };
+    let Some(event) = FeishuGateway::extract_event(&payload, bot_open_id.as_deref()) else {
+        return (StatusCode::OK, Json(json!({ "code": 0 })));
+    };
+    match state.tx.try_send(event) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "code": 0 }))),
+        Err(mpsc::error::TrySendError::Full(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "event queue full" })),
+        ),
+        Err(mpsc::error::TrySendError::Closed(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "event receiver closed" })),
+        ),
+    }
+}
+
+fn token_matches(expected: &Option<String>, body: &serde_json::Value) -> bool {
+    let Some(expected) = expected
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+
+    let actual = body
+        .get("token")
+        .or_else(|| body.get("header").and_then(|header| header.get("token")))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    actual == expected
+}
+
+fn normalize_hook_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return "/feishu/events".to_string();
+    }
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 // ── Event payload JSON types ──────────────────────────────────────────────────
@@ -164,6 +270,7 @@ struct RawMessage {
     message_type: String,
     content: Option<String>,
     parent_id: Option<String>,
+    thread_id: Option<String>,
     #[serde(default)]
     mentions: Vec<RawMention>,
 }
@@ -260,6 +367,44 @@ impl FeishuGateway {
                     info!("event receiver dropped — stopping WS task");
                     break;
                 }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Start an HTTP Event Hook receiver and return the event channel.
+    ///
+    /// Feishu URL verification requests are answered immediately. Normal event
+    /// callbacks are parsed and enqueued, then acknowledged with HTTP 200 so
+    /// downstream bot processing does not block the hook deadline.
+    pub async fn start_event_hook(
+        &self,
+        config: FeishuEventHookConfig,
+    ) -> Result<mpsc::Receiver<FeishuEvent>> {
+        self.client.refresh_token().await?;
+
+        if let Err(e) = self.client.init_bot_info().await {
+            warn!("failed to fetch bot info (group @mention filter disabled): {e:#}");
+        };
+
+        let (tx, rx) = mpsc::channel::<FeishuEvent>(256);
+        let state = FeishuEventHookState {
+            gateway: self.clone(),
+            tx,
+            verification_token: config.verification_token,
+        };
+        let path = normalize_hook_path(&config.path);
+        let app = Router::new()
+            .route(&path, post(feishu_event_hook))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(config.addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        tokio::spawn(async move {
+            info!("Feishu Event Hook listening on http://{local_addr}{path}");
+            if let Err(err) = axum::serve(listener, app).await {
+                error!("Feishu Event Hook server stopped: {err:#}");
             }
         });
 
@@ -408,6 +553,7 @@ impl FeishuGateway {
                     chat_id = %msg.chat_id,
                     chat_type = %msg.chat_type,
                     message_type = %msg.message_type,
+                    thread_id = msg.thread_id.as_deref().unwrap_or(""),
                     content_len = content_str.len(),
                     content_preview = %preview_message_content(content_str),
                     mention_count = msg.mentions.len(),
@@ -540,6 +686,7 @@ impl FeishuGateway {
                     files,
                     documents,
                     parent_id: msg.parent_id.clone(),
+                    thread_id: msg.thread_id.clone(),
                     at_bot,
                     mentions,
                 }))
@@ -556,6 +703,11 @@ impl FeishuGateway {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .unwrap_or_default();
+                let thread_id = event_body
+                    .get("thread_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string);
                 let sender_user_id = event_body
                     .get("user_id")?
                     .get("open_id")?
@@ -570,6 +722,7 @@ impl FeishuGateway {
                 Some(FeishuEvent::ReactionReceived(FeishuReaction {
                     message_id,
                     chat_id,
+                    thread_id,
                     sender_user_id,
                     emoji_type,
                 }))
@@ -712,6 +865,17 @@ impl FeishuGateway {
 
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {
         self.client.send_text(chat_id, text).await
+    }
+
+    pub async fn create_sub_session_chat(
+        &self,
+        name: &str,
+        description: &str,
+        owner_open_id: Option<&str>,
+    ) -> Result<String> {
+        self.client
+            .create_sub_session_chat(name, description, owner_open_id)
+            .await
     }
 
     pub async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
@@ -1171,7 +1335,63 @@ pub(crate) fn parse_feishu_document_url(raw: &str) -> Option<FeishuDocument> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_doc_links_from_text, extract_from_post, parse_feishu_document_url};
+    use super::{
+        extract_doc_links_from_text, extract_from_post, normalize_hook_path,
+        parse_feishu_document_url, token_matches, FeishuEvent, FeishuGateway,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn hook_path_defaults_and_adds_leading_slash() {
+        assert_eq!(normalize_hook_path(""), "/feishu/events");
+        assert_eq!(normalize_hook_path("feishu/events"), "/feishu/events");
+        assert_eq!(normalize_hook_path("/custom"), "/custom");
+    }
+
+    #[test]
+    fn hook_token_accepts_empty_expected_token() {
+        assert!(token_matches(&None, &json!({})));
+        assert!(token_matches(&Some(String::new()), &json!({})));
+    }
+
+    #[test]
+    fn hook_token_checks_top_level_or_header_token() {
+        let expected = Some("secret".to_string());
+        assert!(token_matches(&expected, &json!({ "token": "secret" })));
+        assert!(token_matches(
+            &expected,
+            &json!({ "header": { "token": "secret" } })
+        ));
+        assert!(!token_matches(&expected, &json!({ "token": "wrong" })));
+    }
+
+    #[test]
+    fn extracts_thread_id_from_topic_message_event() {
+        let payload = json!({
+            "schema": "2.0",
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_id": "om_msg",
+                    "chat_id": "oc_chat",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "thread_id": "omt_topic",
+                    "mentions": []
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let event = FeishuGateway::extract_event(&bytes, None).expect("event should parse");
+        match event {
+            FeishuEvent::MessageReceived(message) => {
+                assert_eq!(message.thread_id.as_deref(), Some("omt_topic"));
+            }
+            other => panic!("expected message event, got {other:?}"),
+        }
+    }
 
     #[test]
     fn extracts_images_from_direct_post_shape() {

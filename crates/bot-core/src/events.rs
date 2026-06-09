@@ -1,4 +1,7 @@
 use remi_agentloop::prelude::{AgentError, Message};
+use remi_agentloop::types::SubSessionEvent;
+
+use crate::goal::SupervisorReport;
 
 // ── Skill events ─────────────────────────────────────────────────────────────
 
@@ -35,6 +38,7 @@ pub enum TriggerEvent {
 // ── Top-level CatEvent ───────────────────────────────────────────────────────
 
 /// All events emitted by `CatBot::stream()`.
+#[derive(Debug, Clone)]
 pub enum CatEvent {
     /// Streaming text delta from the assistant.
     Text(String),
@@ -46,6 +50,10 @@ pub enum CatEvent {
     Todo(TodoEvent),
     /// A trigger tool mutated thread trigger state.
     Trigger(TriggerEvent),
+    /// A nested ACP or sub-agent session emitted observable progress.
+    SubSession(SubSessionEvent),
+    /// Supervisor evaluated an active goal after a main-agent round.
+    Supervisor(SupervisorReport),
     /// Run completed normally.
     Done,
     /// An error occurred (run aborted).

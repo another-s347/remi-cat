@@ -1,5 +1,9 @@
 /target
-.remi-cat/
+.remi-cat/*
+!.remi-cat/agents/
+!.remi-cat/agents/*.md
+!.remi-cat/models/
+!.remi-cat/models/*.yaml
 
 # ── Secrets and credentials (never commit these) ────────────────────────────
 .env

@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use async_stream::stream;
-use futures::{Stream, StreamExt};
+use futures::{future::join_all, Stream, StreamExt};
 use tracing::debug;
 
 use remi_agentloop::prelude::{
@@ -19,6 +19,7 @@ use remi_agentloop::prelude::{
     ToolCallOutcome, ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
+use remi_agentloop::tool::BoxedToolResult;
 use remi_agentloop::types::AgentEvent;
 
 use crate::events::CatEvent;
@@ -27,11 +28,8 @@ use crate::skill;
 use crate::todo;
 use crate::trigger;
 
-const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] = &[
-    "trigger__upsert",
-    "trigger__list",
-    "trigger__delete",
-];
+const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
+    &["trigger__upsert", "trigger__list", "trigger__delete"];
 
 // ── CatAgent ─────────────────────────────────────────────────────────────────
 
@@ -48,6 +46,8 @@ pub struct CatAgent<I> {
     pub overflow_bytes: usize,
     /// Optional daemon-mediated IM bridge used for per-platform upload/download tools.
     pub im_bridge: Option<Arc<dyn ImFileBridge>>,
+    /// Optional explicit tool allowlist from the active agent profile.
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 impl<I> CatAgent<I>
@@ -64,14 +64,20 @@ where
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
         let overflow_bytes = self.overflow_bytes;
+        let tool_allowlist = self.tool_allowlist.clone();
         let tool_def_ctx = build_tool_definition_ctx(&input);
         let dynamic_tools = build_dynamic_tools(
             tool_def_ctx.metadata.clone(),
             data_dir.clone(),
             self.im_bridge.clone(),
         );
-        let extra_defs =
-            merge_runtime_tool_definitions(&self.local_tools, &dynamic_tools, &tool_def_ctx, &[]);
+        let extra_defs = merge_runtime_tool_definitions(
+            &self.local_tools,
+            &dynamic_tools,
+            &tool_def_ctx,
+            &[],
+            tool_allowlist.as_deref(),
+        );
 
         stream! {
             let run_start = Instant::now();
@@ -114,10 +120,10 @@ where
                             let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
                                 .iter()
                                 .cloned()
-                                .partition(|tc| self.local_tools.contains(&tc.name));
+                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && self.local_tools.contains(&tc.name));
                             let (dynamic, external): (Vec<_>, Vec<_>) = remaining
                                 .into_iter()
-                                .partition(|tc| dynamic_tools.contains(&tc.name));
+                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && dynamic_tools.contains(&tc.name));
 
                             if !local.is_empty() {
                                 let names: Vec<&str> = local.iter().map(|t| t.name.as_str()).collect();
@@ -145,12 +151,15 @@ where
                                     .execute_parallel(&local, &resume_map, &tool_ctx)
                                     .await;
 
-                                for (call_id, result) in results {
+                                let collected_results = collect_tool_results_parallel(
+                                    results,
+                                    &data_dir,
+                                    overflow_bytes,
+                                )
+                                .await;
+
+                                for (call_id, collected) in collected_results {
                                     let tc = local.iter().find(|t| t.id == call_id).unwrap();
-                                    debug!(tool = %tc.name, "agent: collecting tool result");
-                                    let collected =
-                                        collect_result_with_overflow(result, &data_dir, overflow_bytes)
-                                            .await;
                                     debug!(
                                         tool = %tc.name,
                                         preview_len = collected.preview.len(),
@@ -166,6 +175,9 @@ where
                                     for side_ev in make_side_events(tc, &collected.preview) {
                                         yield side_ev;
                                     }
+                                    for side_ev in collected.side_events.clone() {
+                                        yield side_ev;
+                                    }
 
                                     all_outcomes.push(ToolCallOutcome::Result {
                                         tool_call_id: call_id,
@@ -173,7 +185,6 @@ where
                                         content: collected.content,
                                     });
                                 }
-
                                 state.user_state = tool_ctx.user_state.read().unwrap().clone();
                                 yield CatEvent::StateUpdate(state.user_state.clone());
                             }
@@ -191,12 +202,15 @@ where
                                     .execute_parallel(&dynamic, &resume_map, &tool_ctx)
                                     .await;
 
-                                for (call_id, result) in results {
+                                let collected_results = collect_tool_results_parallel(
+                                    results,
+                                    &data_dir,
+                                    overflow_bytes,
+                                )
+                                .await;
+
+                                for (call_id, collected) in collected_results {
                                     let tc = dynamic.iter().find(|t| t.id == call_id).unwrap();
-                                    debug!(tool = %tc.name, "agent: collecting dynamic tool result");
-                                    let collected =
-                                        collect_result_with_overflow(result, &data_dir, overflow_bytes)
-                                            .await;
                                     debug!(
                                         tool = %tc.name,
                                         preview_len = collected.preview.len(),
@@ -208,6 +222,9 @@ where
                                         name: tc.name.clone(),
                                         result: collected.preview.clone(),
                                     };
+                                    for side_ev in collected.side_events.clone() {
+                                        yield side_ev;
+                                    }
 
                                     all_outcomes.push(ToolCallOutcome::Result {
                                         tool_call_id: call_id,
@@ -236,6 +253,7 @@ where
                                 &mut state,
                                 &self.local_tools,
                                 &dynamic_tools,
+                                tool_allowlist.as_deref(),
                             );
 
                             next_input = Some(LoopInput::Resume {
@@ -342,17 +360,20 @@ fn merge_runtime_tool_definitions(
     dynamic_tools: &DefaultToolRegistry,
     ctx: &ToolDefinitionContext,
     external_defs: &[ToolDefinition],
+    tool_allowlist: Option<&[String]>,
 ) -> Vec<ToolDefinition> {
     let mut defs = local_tools.definitions_with_context(ctx);
     defs.extend(dynamic_tools.definitions_with_context(ctx));
     defs.extend_from_slice(external_defs);
-    filter_trigger_management_tool_definitions(ctx, defs)
+    let defs = filter_trigger_management_tool_definitions(ctx, defs);
+    filter_tool_allowlist(tool_allowlist, defs)
 }
 
 fn refresh_runtime_tool_definitions(
     state: &mut remi_agentloop::prelude::AgentState,
     local_tools: &DefaultToolRegistry,
     dynamic_tools: &DefaultToolRegistry,
+    tool_allowlist: Option<&[String]>,
 ) {
     let external_defs: Vec<_> = state
         .tool_definitions
@@ -371,8 +392,13 @@ fn refresh_runtime_tool_definitions(
         user_state: state.user_state.clone(),
     };
 
-    state.tool_definitions =
-        merge_runtime_tool_definitions(local_tools, dynamic_tools, &ctx, &external_defs);
+    state.tool_definitions = merge_runtime_tool_definitions(
+        local_tools,
+        dynamic_tools,
+        &ctx,
+        &external_defs,
+        tool_allowlist,
+    );
 }
 
 fn filter_trigger_management_tool_definitions(
@@ -388,6 +414,24 @@ fn filter_trigger_management_tool_definitions(
             !TRIGGER_MANAGEMENT_TOOL_NAMES.contains(&definition.function.name.as_str())
         })
         .collect()
+}
+
+fn filter_tool_allowlist(
+    tool_allowlist: Option<&[String]>,
+    defs: Vec<ToolDefinition>,
+) -> Vec<ToolDefinition> {
+    let Some(tool_allowlist) = tool_allowlist else {
+        return defs;
+    };
+    defs.into_iter()
+        .filter(|definition| tool_allowed(Some(tool_allowlist), &definition.function.name))
+        .collect()
+}
+
+fn tool_allowed(tool_allowlist: Option<&[String]>, name: &str) -> bool {
+    tool_allowlist
+        .map(|allowlist| allowlist.iter().any(|tool| tool == name))
+        .unwrap_or(true)
 }
 
 fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
@@ -429,6 +473,7 @@ const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
 struct CollectedToolResult {
     content: Content,
     preview: String,
+    side_events: Vec<CatEvent>,
 }
 
 impl CollectedToolResult {
@@ -437,6 +482,7 @@ impl CollectedToolResult {
         Self {
             content: Content::text(text.clone()),
             preview: text,
+            side_events: Vec::new(),
         }
     }
 }
@@ -498,6 +544,22 @@ fn preview_text_for_content(content: &Content) -> String {
     }
 }
 
+async fn collect_tool_results_parallel<'a>(
+    results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
+    data_dir: &Path,
+    overflow_bytes: usize,
+) -> Vec<(String, CollectedToolResult)> {
+    let data_dir = data_dir.to_path_buf();
+    let futures = results.into_iter().map(|(call_id, result)| {
+        let data_dir = data_dir.clone();
+        async move {
+            let collected = collect_result_with_overflow(result, &data_dir, overflow_bytes).await;
+            (call_id, collected)
+        }
+    });
+    join_all(futures).await
+}
+
 async fn collect_result(
     result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
 ) -> CollectedToolResult {
@@ -507,14 +569,18 @@ async fn collect_result(
         Ok(ToolResult::Output(s)) => {
             let mut s = std::pin::pin!(s);
             let mut last = Content::text(String::new());
+            let mut side_events = Vec::new();
             while let Some(out) = s.next().await {
-                if let ToolOutput::Result(c) = out {
-                    last = c;
+                match out {
+                    ToolOutput::Result(c) => last = c,
+                    ToolOutput::SubSession(event) => side_events.push(CatEvent::SubSession(event)),
+                    _ => {}
                 }
             }
             CollectedToolResult {
                 preview: preview_text_for_content(&last),
                 content: last,
+                side_events,
             }
         }
     }
@@ -530,9 +596,13 @@ async fn collect_result_with_overflow(
         return collected;
     }
 
+    let side_events = collected.side_events.clone();
     let text = collected.content.text_content();
     if text.len() <= overflow_bytes {
-        return CollectedToolResult::text(text);
+        return CollectedToolResult {
+            side_events,
+            ..CollectedToolResult::text(text)
+        };
     }
 
     let tmp_dir = data_dir.join("tmp");
@@ -540,14 +610,16 @@ async fn collect_result_with_overflow(
     let filename = format!("tool_out_{}.txt", uuid::Uuid::new_v4());
     let file_path = tmp_dir.join(&filename);
     let total = text.len();
-    match tokio::fs::write(&file_path, text.as_bytes()).await {
+    let mut result = match tokio::fs::write(&file_path, text.as_bytes()).await {
         Ok(()) => CollectedToolResult::text(format!(
             "[Output too large ({total} bytes) — saved to tmp/{filename}]\n\
              Use fs_read with path=\"tmp/{filename}\" (offset=0, length=8192) \
              and increment offset until remaining=0."
         )),
         Err(_) => CollectedToolResult::text(text),
-    }
+    };
+    result.side_events = side_events;
+    result
 }
 
 fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
@@ -566,16 +638,21 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_result_with_overflow;
-    use futures::stream;
-    use remi_agentloop::prelude::{Content, ContentPart, ToolOutput, ToolResult};
+    use super::{collect_result_with_overflow, collect_tool_results_parallel, CatAgent};
+    use crate::events::CatEvent;
+    use futures::{stream, Stream, StreamExt};
+    use remi_agentloop::prelude::{
+        Agent, AgentError, AgentState, Content, ContentPart, LoopInput, ParsedToolCall, StepConfig,
+        ToolCallOutcome, ToolContext, ToolOutput, ToolResult,
+    };
+    use remi_agentloop::tool::{
+        registry::DefaultToolRegistry, BoxedToolResult, BoxedToolStream, Tool,
+    };
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn test_root() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "remi-agent-result-test-{}",
-            uuid::Uuid::new_v4()
-        ))
+        std::env::temp_dir().join(format!("remi-agent-result-test-{}", uuid::Uuid::new_v4()))
     }
 
     #[tokio::test]
@@ -631,5 +708,157 @@ mod tests {
             .await
             .expect("tmp dir should be readable")
             .is_some());
+    }
+
+    fn delayed_boxed_result(
+        label: &'static str,
+        delay: Duration,
+    ) -> Result<BoxedToolResult<'static>, remi_agentloop::prelude::AgentError> {
+        let output: BoxedToolStream<'static> = Box::pin(async_stream::stream! {
+            tokio::time::sleep(delay).await;
+            yield ToolOutput::text(label);
+        });
+        Ok(ToolResult::Output(output))
+    }
+
+    #[tokio::test]
+    async fn tool_result_streams_are_collected_in_parallel() {
+        let root = test_root();
+        let started = Instant::now();
+        let results = collect_tool_results_parallel(
+            vec![
+                (
+                    "call_a".to_string(),
+                    delayed_boxed_result("a", Duration::from_millis(300)),
+                ),
+                (
+                    "call_b".to_string(),
+                    delayed_boxed_result("b", Duration::from_millis(300)),
+                ),
+            ],
+            &root,
+            8_192,
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(started.elapsed() < Duration::from_millis(550));
+        assert_eq!(results[0].1.preview, "a");
+        assert_eq!(results[1].1.preview, "b");
+    }
+
+    struct ParallelToolInnerAgent;
+
+    impl Agent for ParallelToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::NeedToolExecution {
+                        state: AgentState::new(StepConfig::new("test-model")),
+                        tool_calls: vec![
+                            ParsedToolCall {
+                                id: "call_a".to_string(),
+                                name: "lazy_wait".to_string(),
+                                arguments: serde_json::json!({ "label": "a" }),
+                            },
+                            ParsedToolCall {
+                                id: "call_b".to_string(),
+                                name: "lazy_wait".to_string(),
+                                arguments: serde_json::json!({ "label": "b" }),
+                            },
+                        ],
+                        completed_results: vec![],
+                    },
+                ])),
+                LoopInput::Resume { results, .. } => {
+                    let labels = results
+                        .iter()
+                        .filter_map(|result| match result {
+                            ToolCallOutcome::Result { content, .. } => Some(content.text_content()),
+                            ToolCallOutcome::Error { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::TextDelta(labels),
+                        remi_agentloop::types::AgentEvent::Done,
+                    ]))
+                }
+                LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
+        }
+    }
+
+    struct LazyWaitTool;
+
+    impl Tool for LazyWaitTool {
+        fn name(&self) -> &str {
+            "lazy_wait"
+        }
+
+        fn description(&self) -> &str {
+            "Waits before returning the supplied label."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string" }
+                },
+                "required": ["label"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            arguments: serde_json::Value,
+            _resume: Option<remi_agentloop::types::ResumePayload>,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+            let label = arguments
+                .get("label")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(ToolResult::Output(async_stream::stream! {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                yield ToolOutput::text(label);
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn cat_agent_collects_parallel_tool_streams_end_to_end() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(LazyWaitTool);
+        let agent = CatAgent {
+            inner: ParallelToolInnerAgent,
+            local_tools,
+            data_dir: test_root(),
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+        };
+
+        let started = Instant::now();
+        let events = agent
+            .stream_with_input(LoopInput::start("run parallel tools"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(started.elapsed() < Duration::from_millis(550));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
     }
 }

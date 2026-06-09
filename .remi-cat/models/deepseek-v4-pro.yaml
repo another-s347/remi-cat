@@ -1,0 +1,12 @@
+id: deepseek-v4-pro
+name: DeepSeek V4 Pro
+description: Higher-capability text-first DeepSeek profile.
+provider: deepseek
+model: deepseek-v4-pro
+base_url: https://api.deepseek.com
+max_output_tokens: 393216
+context_tokens: 1000000
+supports_images: false
+short_term_tokens: 24000
+overflow_bytes: 32000
+auto_compress: true

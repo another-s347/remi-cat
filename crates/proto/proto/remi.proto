@@ -50,6 +50,7 @@ message ImMessageEvent {
   string                   sender_username = 11;
   bool                     todo_create_via_sdk = 12;
   bool                     trigger_tools_enabled = 13;
+  string                   acp_session_id = 14;
 }
 
 message ImAttachmentRef {
@@ -135,9 +136,22 @@ message ImBridgeRequest {
   string request_id = 1;
 
   oneof payload {
-    ImDownloadRequest download = 2;
-    ImUploadRequest   upload   = 3;
+    ImDownloadRequest        download           = 2;
+    ImUploadRequest          upload             = 3;
+    AcpBindingUpsertRequest  acp_binding_upsert = 4;
+    AcpBindingDeleteRequest  acp_binding_delete = 5;
   }
+}
+
+message AcpBindingUpsertRequest {
+  string session_id  = 1;
+  string platform    = 2;
+  string channel_id  = 3;
+}
+
+message AcpBindingDeleteRequest {
+  string platform    = 1;
+  string channel_id  = 2;
 }
 
 message ImDownloadRequest {

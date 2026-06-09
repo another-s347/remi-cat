@@ -257,6 +257,27 @@ async fn run_session(addr: &str) -> Result<()> {
                     continue;
                 }
 
+                if trimmed == "/acp" || trimmed.starts_with("/acp ") {
+                    let bot_t = Rc::clone(&bot_rc);
+                    let tx = out_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        let text = handle_acp_command(&ev, bot_t).await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to.clone(),
+                                payload: Some(AgentPayload::TextDelta(AgentTextDelta { text })),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                reply_to_message_id: reply_to,
+                                payload: Some(AgentPayload::Done(AgentDone {})),
+                            })
+                            .await;
+                    });
+                    continue;
+                }
+
                 // ── Regular message — spawn task and track the handle ─────
                 let cancel = Arc::new(tokio::sync::Notify::new());
                 // If there is already an in-flight task for this chat (shouldn't
@@ -274,7 +295,11 @@ async fn run_session(addr: &str) -> Result<()> {
                 let chat_id_m = chat_id.clone();
                 let cancel_m = Arc::clone(&cancel);
                 let handle = tokio::task::spawn_local(async move {
-                    handle_message(ev, bot_m, tx, cancel_m).await;
+                    if !ev.acp_session_id.trim().is_empty() {
+                        handle_acp_bound_message(ev, bot_m, tx, cancel_m).await;
+                    } else {
+                        handle_message(ev, bot_m, tx, cancel_m).await;
+                    }
                     active_m.borrow_mut().remove(&chat_id_m);
                 });
                 active.borrow_mut().insert(chat_id, (handle, cancel));
@@ -502,6 +527,44 @@ async fn handle_message(
     );
     let stream = bot.stream_with_options(&ev.chat_id, content, opts);
     forward_stream(reply_to, stream, tx).await;
+}
+
+async fn handle_acp_bound_message(
+    ev: remi_proto::ImMessageEvent,
+    bot: Rc<CatBot>,
+    tx: mpsc::Sender<AgentMessage>,
+    _cancel: Arc<tokio::sync::Notify>,
+) {
+    let reply_to = ev.message_id.clone();
+    let text = match bot
+        .acp_bound_message(&ev.acp_session_id, ev.text.trim())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(err) => format!("❌ ACP 对话失败: {err:#}"),
+    };
+    send_command_reply(&tx, &reply_to, text).await;
+}
+
+async fn handle_acp_command(ev: &remi_proto::ImMessageEvent, bot: Rc<CatBot>) -> String {
+    let command = ev.text.trim();
+    let platform = ev.platform.trim();
+    let channel_id = ev.chat_id.trim();
+    if platform.is_empty() || channel_id.is_empty() {
+        return "❌ 当前消息缺少 platform/channel 上下文，无法执行 ACP 命令。".to_string();
+    }
+
+    match command {
+        "/acp" | "/acp status" => bot
+            .acp_binding_status(platform, channel_id)
+            .await
+            .unwrap_or_else(|err| format!("❌ ACP status 失败: {err:#}")),
+        "/acp unbind" => bot
+            .acp_unbind_channel(platform, channel_id)
+            .await
+            .unwrap_or_else(|err| format!("❌ ACP unbind 失败: {err:#}")),
+        _ => "❌ 支持的 ACP 命令：`/acp status`、`/acp unbind`".to_string(),
+    }
 }
 
 async fn handle_reaction(

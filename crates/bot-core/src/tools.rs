@@ -7,12 +7,13 @@
 //!
 //! `ExaSearchTool` calls the Exa Search API when `EXA_API_KEY` is set.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aho_corasick::{AhoCorasick, MatchKind};
+use anyhow::Context;
 use async_stream::stream;
 use base64::Engine as _;
 use futures::Stream;
@@ -20,11 +21,9 @@ use remi_agentloop::prelude::{
     AgentError, Content, ContentPart, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
 };
 
-// ── helper ────────────────────────────────────────────────────────────────────
+use crate::sandbox::Sandbox;
 
-fn resolve(root: &Path, path: &str) -> PathBuf {
-    root.join(path.trim_start_matches('/'))
-}
+// ── helper ────────────────────────────────────────────────────────────────────
 
 fn detect_inline_image_media_type(path: &str, bytes: &[u8]) -> Option<&'static str> {
     detect_inline_image_media_type_from_magic(bytes)
@@ -167,18 +166,13 @@ pub enum BashMode {
 // ── WorkspaceBashTool ─────────────────────────────────────────────────────────
 
 pub struct WorkspaceBashTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
     pub redactor: SharedRedactor,
-    pub mode: BashMode,
 }
 
 impl WorkspaceBashTool {
-    pub fn new(root: impl Into<PathBuf>, redactor: SharedRedactor, mode: BashMode) -> Self {
-        Self {
-            root: root.into(),
-            redactor,
-            mode,
-        }
+    pub fn new(sandbox: Arc<dyn Sandbox>, redactor: SharedRedactor) -> Self {
+        Self { sandbox, redactor }
     }
 }
 
@@ -187,28 +181,16 @@ impl Tool for WorkspaceBashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        match self.mode {
-            BashMode::Local => {
-                "Execute a bash command in the agent workspace (local mode). \
-                 Working directory is the agent data folder; relative paths resolve there. \
-                 ⚠️ Each invocation is a fresh one-time session — no state \
-                 (variables, directory changes, background processes) persists \
-                 between calls. Write results to files if you need them later."
-            }
-            BashMode::Docker => {
-                "Execute a bash command in the agent workspace. \
-                 Working directory is the agent workspace root (contains soul.md, memory/, etc.). \
-                 ⚠️ Each invocation is a fresh one-time session — no state \
-                 (variables, directory changes, background processes) persists \
-                 between calls. Write results to files if you need them later."
-            }
-        }
+        "Execute a bash command in the workspace. Relative paths resolve in the \
+         same workspace used by fs_read/fs_write. Pass `named` to reuse a shell \
+         and preserve state such as cd and exported variables."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command":    { "type": "string",  "description": "Shell command to execute" },
+                "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." },
                 "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds" }
             },
             "required": ["command"]
@@ -221,33 +203,32 @@ impl Tool for WorkspaceBashTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
-        let mode = self.mode;
         async move {
             let command = arguments["command"]
                 .as_str()
                 .ok_or_else(|| AgentError::tool("bash", "missing 'command'"))?
                 .to_string();
+            let named = arguments["named"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
-                tracing::debug!(cmd = %command, timeout_ms, ?mode, "bash: running");
-                let mut cmd = tokio::process::Command::new("bash");
-                cmd.arg("-c").arg(&command);
-                let _ = std::fs::create_dir_all(&root);
-                cmd.current_dir(&root);
-                let run = cmd.output();
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
-                    Err(_) => {
+                tracing::debug!(cmd = %command, timeout_ms, sandbox = %sandbox.kind(), "bash: running");
+                match sandbox.bash(&command, named.as_deref(), timeout_ms).await {
+                    Ok(output) if output.timed_out => {
                         tracing::warn!(cmd = %command, timeout_ms, "bash: timed out");
                         yield ToolOutput::text(format!("[timed out after {timeout_ms}ms]"));
                     }
-                    Ok(Err(e)) => yield ToolOutput::text(format!("error: {e}")),
-                    Ok(Ok(o)) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-                        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-                        let code   = o.status.code().unwrap_or(-1);
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(output) => {
+                        let stdout = output.stdout;
+                        let stderr = output.stderr;
+                        let code   = output.exit_code;
                         tracing::debug!(cmd = %command, code, "bash: done");
                         let mut r = stdout;
                         if !stderr.is_empty() {
@@ -267,7 +248,7 @@ impl Tool for WorkspaceBashTool {
 // ── RootedFsReadTool ──────────────────────────────────────────────────────────
 
 pub struct RootedFsReadTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
     pub redactor: SharedRedactor,
 }
 
@@ -299,7 +280,7 @@ impl Tool for RootedFsReadTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         async move {
             let path_str = arguments["path"]
@@ -308,10 +289,9 @@ impl Tool for RootedFsReadTool {
                 .to_string();
             let offset = arguments["offset"].as_u64().unwrap_or(0) as usize;
             let length = arguments["length"].as_u64().unwrap_or(8192) as usize;
-            let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
-                match tokio::fs::read(&full).await {
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
+                match sandbox.read(&path_str).await {
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
                     Ok(bytes) => {
                         if let Some(mime_type) = detect_inline_image_media_type(&path_str, &bytes) {
                             let summary = redactor
@@ -351,7 +331,7 @@ impl Tool for RootedFsReadTool {
 // ── RootedFsWriteTool ─────────────────────────────────────────────────────────
 
 pub struct RootedFsWriteTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
 }
 
 impl Tool for RootedFsWriteTool {
@@ -360,7 +340,9 @@ impl Tool for RootedFsWriteTool {
     }
     fn description(&self) -> &str {
         "Write text to a file in the workspace. Path is relative to workspace root. \
-         Parent directories must already exist."
+         Parent directories must already exist. Prefer apply_patch for editing existing \
+         files; use fs_write only when creating a new file or intentionally replacing an \
+         entire file after reading it."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -379,7 +361,7 @@ impl Tool for RootedFsWriteTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
                 .as_str()
@@ -390,41 +372,47 @@ impl Tool for RootedFsWriteTool {
                 .ok_or_else(|| AgentError::tool("fs_write", "missing 'content'"))?
                 .to_string();
             let bytes = content.len();
-            let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
-                match tokio::fs::write(&full, content.as_bytes()).await {
+                match sandbox.write(&path_str, content.as_bytes()).await {
                     Ok(()) => yield ToolOutput::text(format!("wrote {bytes} bytes to {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
                 }
             }))
         }
     }
 }
 
-// ── RootedFsReplaceTool ───────────────────────────────────────────────────────
+// ── RootedFsApplyPatchTool ────────────────────────────────────────────────────
 
-pub struct RootedFsReplaceTool {
-    pub root: PathBuf,
+pub struct RootedFsApplyPatchTool {
+    pub sandbox: Arc<dyn Sandbox>,
 }
 
-impl Tool for RootedFsReplaceTool {
+impl Tool for RootedFsApplyPatchTool {
     fn name(&self) -> &str {
-        "fs_replace"
+        "apply_patch"
     }
     fn description(&self) -> &str {
-        "Replace the first (and only) occurrence of `old` with `new` inside a file. \
-         Returns an error if `old` is not found, or if it matches more than once \
-         (include more surrounding context to make the match unique)."
+        "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
+         existing files. The patch must be a standard unified diff, such as output \
+         from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
+         hunks. `diff --git` headers are accepted. Each old hunk must match \
+         exactly once."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path (relative to workspace root)" },
-                "old":  { "type": "string", "description": "Exact text to find (must appear exactly once)" },
-                "new":  { "type": "string", "description": "Replacement text" }
+                "patch": {
+                    "type": "string",
+                    "description": "Standard unified diff text, such as output from git diff or diff -u"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional workspace-relative directory that patch paths are relative to, e.g. `repo` for a diff generated inside repo/"
+                }
             },
-            "required": ["path", "old", "new"]
+            "required": ["patch"]
         })
     }
     fn execute(
@@ -434,53 +422,359 @@ impl Tool for RootedFsReplaceTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         async move {
-            let path_str = arguments["path"]
+            let patch = arguments["patch"]
                 .as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'path'"))?
+                .ok_or_else(|| AgentError::tool("apply_patch", "missing 'patch'"))?
                 .to_string();
-            let old = arguments["old"]
-                .as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'old'"))?
-                .to_string();
-            let new = arguments["new"]
-                .as_str()
-                .ok_or_else(|| AgentError::tool("fs_replace", "missing 'new'"))?
-                .to_string();
-            let full = resolve(&root, &path_str);
+            let workdir = arguments["workdir"].as_str().map(str::to_string);
             Ok(ToolResult::Output(stream! {
-                match tokio::fs::read_to_string(&full).await {
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
-                    Ok(content) => {
-                        let count = content.matches(old.as_str()).count();
-                        if count == 0 {
-                            yield ToolOutput::text(format!("error: 'old' string not found in {path_str}"));
-                        } else if count > 1 {
-                            yield ToolOutput::text(format!(
-                                "error: 'old' matches {count} times in {path_str} — \
-                                 add more surrounding context to make it unique"
-                            ));
-                        } else {
-                            let replaced = content.replacen(old.as_str(), new.as_str(), 1);
-                            match tokio::fs::write(&full, replaced.as_bytes()).await {
-                                Ok(()) => yield ToolOutput::text(format!(
-                                    "replaced 1 occurrence in {path_str}"
-                                )),
-                                Err(e) => yield ToolOutput::text(format!("error writing: {e}")),
-                            }
-                        }
-                    }
+                match apply_patch_to_sandbox(sandbox.as_ref(), &patch, workdir.as_deref()).await {
+                    Ok(summary) => yield ToolOutput::text(summary.to_string()),
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
                 }
             }))
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedPatchOp {
+    Add { path: String, content: String },
+    Delete { path: String },
+    Update { path: String, hunks: Vec<PatchHunk> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchHunk {
+    old: String,
+    new: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ApplyPatchSummary {
+    added: Vec<String>,
+    updated: Vec<String>,
+    deleted: Vec<String>,
+}
+
+impl std::fmt::Display for ApplyPatchSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!(
+                "added {} file(s): {}",
+                self.added.len(),
+                self.added.join(", ")
+            ));
+        }
+        if !self.updated.is_empty() {
+            parts.push(format!(
+                "updated {} file(s): {}",
+                self.updated.len(),
+                self.updated.join(", ")
+            ));
+        }
+        if !self.deleted.is_empty() {
+            parts.push(format!(
+                "deleted {} file(s): {}",
+                self.deleted.len(),
+                self.deleted.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            write!(f, "patch applied with no file changes")
+        } else {
+            write!(f, "patch applied: {}", parts.join("; "))
+        }
+    }
+}
+
+async fn apply_patch_to_sandbox(
+    sandbox: &dyn Sandbox,
+    patch: &str,
+    workdir: Option<&str>,
+) -> anyhow::Result<ApplyPatchSummary> {
+    let mut ops = parse_apply_patch(patch).map_err(|err| anyhow::anyhow!(err))?;
+    if let Some(raw_workdir) = workdir {
+        if let Some(workdir) = normalize_patch_workdir(raw_workdir)? {
+            for op in &mut ops {
+                prefix_patch_op_path(op, &workdir);
+            }
+        }
+    }
+    let mut seen_paths = HashSet::new();
+    let mut staged: HashMap<String, Option<String>> = HashMap::new();
+
+    for op in &ops {
+        let path = patch_op_path(op);
+        if !seen_paths.insert(path.to_string()) {
+            anyhow::bail!("patch contains multiple operations for {path}");
+        }
+        match op {
+            ParsedPatchOp::Add { path, content } => {
+                if sandbox.read(path).await.is_ok() {
+                    anyhow::bail!("cannot add {path}: file already exists");
+                }
+                staged.insert(path.clone(), Some(content.clone()));
+            }
+            ParsedPatchOp::Delete { path } => {
+                sandbox
+                    .read(path)
+                    .await
+                    .with_context(|| format!("cannot delete {path}"))?;
+                staged.insert(path.clone(), None);
+            }
+            ParsedPatchOp::Update { path, hunks } => {
+                let bytes = sandbox
+                    .read(path)
+                    .await
+                    .with_context(|| format!("cannot update {path}"))?;
+                let mut content = String::from_utf8(bytes)
+                    .with_context(|| format!("cannot update {path}: file is not UTF-8 text"))?;
+                for hunk in hunks {
+                    if hunk.old.is_empty() {
+                        anyhow::bail!("update hunk for {path} has no old content");
+                    }
+                    let count = content.matches(&hunk.old).count();
+                    if count == 0 {
+                        anyhow::bail!("update hunk did not match {path}");
+                    }
+                    if count > 1 {
+                        anyhow::bail!(
+                            "update hunk matched {count} times in {path}; add more context"
+                        );
+                    }
+                    content = content.replacen(&hunk.old, &hunk.new, 1);
+                }
+                staged.insert(path.clone(), Some(content));
+            }
+        }
+    }
+
+    let mut summary = ApplyPatchSummary::default();
+    for op in ops {
+        match op {
+            ParsedPatchOp::Add { path, .. } => {
+                let content = staged
+                    .remove(&path)
+                    .and_then(|value| value)
+                    .unwrap_or_default();
+                sandbox
+                    .write(&path, content.as_bytes())
+                    .await
+                    .with_context(|| format!("adding {path}"))?;
+                summary.added.push(path);
+            }
+            ParsedPatchOp::Delete { path } => {
+                sandbox
+                    .remove(&path, false)
+                    .await
+                    .with_context(|| format!("deleting {path}"))?;
+                let _ = staged.remove(&path);
+                summary.deleted.push(path);
+            }
+            ParsedPatchOp::Update { path, .. } => {
+                let content = staged
+                    .remove(&path)
+                    .and_then(|value| value)
+                    .unwrap_or_default();
+                sandbox
+                    .write(&path, content.as_bytes())
+                    .await
+                    .with_context(|| format!("updating {path}"))?;
+                summary.updated.push(path);
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn patch_op_path(op: &ParsedPatchOp) -> &str {
+    match op {
+        ParsedPatchOp::Add { path, .. }
+        | ParsedPatchOp::Delete { path }
+        | ParsedPatchOp::Update { path, .. } => path,
+    }
+}
+
+fn prefix_patch_op_path(op: &mut ParsedPatchOp, workdir: &str) {
+    let path = match op {
+        ParsedPatchOp::Add { path, .. }
+        | ParsedPatchOp::Delete { path }
+        | ParsedPatchOp::Update { path, .. } => path,
+    };
+    if !path.starts_with(&format!("{workdir}/")) {
+        *path = format!("{workdir}/{path}");
+    }
+}
+
+fn normalize_patch_workdir(workdir: &str) -> anyhow::Result<Option<String>> {
+    let workdir = workdir.trim().trim_matches('/');
+    if workdir.is_empty() || workdir == "." {
+        return Ok(None);
+    }
+    if workdir
+        .split('/')
+        .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        anyhow::bail!("invalid apply_patch workdir: {workdir}");
+    }
+    Ok(Some(workdir.to_string()))
+}
+
+fn parse_apply_patch(patch: &str) -> Result<Vec<ParsedPatchOp>, String> {
+    parse_unified_patch(patch)
+}
+
+fn parse_unified_patch(patch: &str) -> Result<Vec<ParsedPatchOp>, String> {
+    let lines: Vec<&str> = patch.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        return Err("patch must not be empty".to_string());
+    }
+    let mut index = 0;
+    let mut ops = Vec::new();
+    while index < lines.len() {
+        let line = trim_line(lines[index]);
+        if line.is_empty()
+            || line.starts_with("diff --git ")
+            || is_unified_patch_metadata_line(line)
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some(old_path_raw) = line.strip_prefix("--- ") else {
+            return Err(format!("expected unified diff file header, got: {line}"));
+        };
+        index += 1;
+        if index >= lines.len() {
+            return Err("missing +++ file header".to_string());
+        }
+        let new_header = trim_line(lines[index]);
+        let Some(new_path_raw) = new_header.strip_prefix("+++ ") else {
+            return Err(format!("expected +++ file header, got: {new_header}"));
+        };
+        index += 1;
+
+        let old_path = parse_unified_path(old_path_raw)?;
+        let new_path = parse_unified_path(new_path_raw)?;
+        let path = match (old_path.as_deref(), new_path.as_deref()) {
+            (None, None) => return Err("patch cannot use /dev/null for both paths".to_string()),
+            (None, Some(path)) | (Some(path), None) | (Some(_), Some(path)) => path.to_string(),
+        };
+
+        let mut hunks = Vec::new();
+        while index < lines.len() {
+            let marker = trim_line(lines[index]);
+            if marker.starts_with("diff --git ") || marker.starts_with("--- ") {
+                break;
+            }
+            if is_unified_patch_metadata_line(marker) {
+                index += 1;
+                continue;
+            }
+            if !marker.starts_with("@@") {
+                return Err(format!(
+                    "file {path} expected @@ hunk marker, got: {marker}"
+                ));
+            }
+            index += 1;
+            let mut old = String::new();
+            let mut new = String::new();
+            let mut saw_line = false;
+            while index < lines.len() {
+                let next = trim_line(lines[index]);
+                if next.starts_with("@@")
+                    || next.starts_with("diff --git ")
+                    || next.starts_with("--- ")
+                {
+                    break;
+                }
+                let line = lines[index];
+                if let Some(rest) = line.strip_prefix(' ') {
+                    old.push_str(rest);
+                    new.push_str(rest);
+                } else if let Some(rest) = line.strip_prefix('-') {
+                    old.push_str(rest);
+                } else if let Some(rest) = line.strip_prefix('+') {
+                    new.push_str(rest);
+                } else if next == r"\ No newline at end of file" {
+                    // Informational marker emitted by unified diff.
+                } else {
+                    return Err(format!(
+                        "file {path} hunk lines must start with space, '-' or '+'"
+                    ));
+                }
+                saw_line = true;
+                index += 1;
+            }
+            if !saw_line {
+                return Err(format!("file {path} has an empty hunk"));
+            }
+            hunks.push(PatchHunk { old, new });
+        }
+
+        if hunks.is_empty() {
+            return Err(format!("file {path} must contain at least one hunk"));
+        }
+        match (old_path, new_path) {
+            (None, Some(_)) => {
+                let content = hunks.into_iter().map(|hunk| hunk.new).collect();
+                ops.push(ParsedPatchOp::Add { path, content });
+            }
+            (Some(_), None) => ops.push(ParsedPatchOp::Delete { path }),
+            (Some(_), Some(_)) => ops.push(ParsedPatchOp::Update { path, hunks }),
+            (None, None) => unreachable!("handled above"),
+        }
+    }
+
+    if ops.is_empty() {
+        return Err("patch contains no file changes".to_string());
+    }
+    Ok(ops)
+}
+
+fn parse_unified_path(path: &str) -> Result<Option<String>, String> {
+    let path = path
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "patch file path must not be empty".to_string())?;
+    if path == "/dev/null" {
+        return Ok(None);
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    if path.is_empty() {
+        return Err("patch file path must not be empty".to_string());
+    }
+    Ok(Some(path.to_string()))
+}
+
+fn trim_line(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_unified_patch_metadata_line(line: &str) -> bool {
+    line.starts_with("index ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("dissimilarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+}
+
 // ── RootedFsCreateTool ────────────────────────────────────────────────────────
 
 pub struct RootedFsCreateTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
 }
 
 impl Tool for RootedFsCreateTool {
@@ -507,23 +801,17 @@ impl Tool for RootedFsCreateTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
                 .as_str()
                 .ok_or_else(|| AgentError::tool("fs_mkdir", "missing 'path'"))?
                 .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
-            let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
-                let result = if recursive {
-                    tokio::fs::create_dir_all(&full).await
-                } else {
-                    tokio::fs::create_dir(&full).await
-                };
-                match result {
+                match sandbox.mkdir(&path_str, recursive).await {
                     Ok(()) => yield ToolOutput::text(format!("created {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
                 }
             }))
         }
@@ -533,7 +821,7 @@ impl Tool for RootedFsCreateTool {
 // ── RootedFsRemoveTool ────────────────────────────────────────────────────────
 
 pub struct RootedFsRemoveTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
 }
 
 impl Tool for RootedFsRemoveTool {
@@ -560,25 +848,17 @@ impl Tool for RootedFsRemoveTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
                 .as_str()
                 .ok_or_else(|| AgentError::tool("fs_remove", "missing 'path'"))?
                 .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
-            let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
-                let result = if recursive {
-                    tokio::fs::remove_dir_all(&full).await
-                } else if full.is_dir() {
-                    tokio::fs::remove_dir(&full).await
-                } else {
-                    tokio::fs::remove_file(&full).await
-                };
-                match result {
+                match sandbox.remove(&path_str, recursive).await {
                     Ok(()) => yield ToolOutput::text(format!("removed {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
+                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
                 }
             }))
         }
@@ -588,7 +868,7 @@ impl Tool for RootedFsRemoveTool {
 // ── RootedFsLsTool ────────────────────────────────────────────────────────────
 
 pub struct RootedFsLsTool {
-    pub root: PathBuf,
+    pub sandbox: Arc<dyn Sandbox>,
     pub redactor: SharedRedactor,
 }
 
@@ -614,22 +894,14 @@ impl Tool for RootedFsLsTool {
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
-        let root = self.root.clone();
+        let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         async move {
             let path_str = arguments["path"].as_str().unwrap_or(".").to_string();
-            let full = resolve(&root, &path_str);
             Ok(ToolResult::Output(stream! {
-                match tokio::fs::read_dir(&full).await {
-                    Err(e) => yield ToolOutput::text(format!("error: {e}")),
-                    Ok(mut rd) => {
-                        let mut entries = Vec::new();
-                        while let Ok(Some(entry)) = rd.next_entry().await {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            let suffix = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) { "/" } else { "" };
-                            entries.push(format!("{name}{suffix}"));
-                        }
-                        entries.sort();
+                match sandbox.list(&path_str).await {
+                        Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(entries) => {
                         let listing = entries.join("\n");
                         let listing = redactor.read().unwrap().redact(&listing);
                         yield ToolOutput::text(listing);
@@ -865,27 +1137,26 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RootedFsReadTool, SecretRedactor};
+    use super::{RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor};
+    use crate::sandbox::NoSandbox;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{AgentConfig, Content, Tool, ToolContext, ToolOutput, ToolResult};
+    use remi_agentloop::prelude::{
+        AgentConfig, Content, Tool, ToolContext, ToolOutput, ToolResult,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
 
     const ONE_BY_ONE_PNG: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-        0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
-        0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
         0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
     fn test_root() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "remi-fs-read-test-{}",
-            uuid::Uuid::new_v4()
-        ))
+        std::env::temp_dir().join(format!("remi-fs-read-test-{}", uuid::Uuid::new_v4()))
     }
 
     fn test_tool_context() -> ToolContext {
@@ -931,7 +1202,7 @@ mod tests {
             .expect("png fixture should be written");
 
         let tool = RootedFsReadTool {
-            root: root.clone(),
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
             redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
         };
 
@@ -976,7 +1247,7 @@ mod tests {
             .expect("text fixture should be written");
 
         let tool = RootedFsReadTool {
-            root: root.clone(),
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
             redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
         };
 
@@ -1008,7 +1279,7 @@ mod tests {
             .expect("binary fixture should be written");
 
         let tool = RootedFsReadTool {
-            root: root.clone(),
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
             redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
         };
 
@@ -1028,5 +1299,155 @@ mod tests {
         assert!(content
             .text_content()
             .contains("[offset=0 length=4 total_bytes=4 remaining=0]"));
+    }
+
+    #[tokio::test]
+    async fn apply_patch_updates_adds_and_deletes_multiple_files() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("a.txt"), "alpha\nbeta\n")
+            .await
+            .expect("a fixture should be written");
+        tokio::fs::write(root.join("b.txt"), "remove me\n")
+            .await
+            .expect("b fixture should be written");
+
+        let tool = RootedFsApplyPatchTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+        };
+        let patch = r#"diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+-alpha
++ALPHA
+ beta
+diff --git a/c.txt b/c.txt
+new file mode 100644
+--- /dev/null
++++ b/c.txt
+@@ -0,0 +1 @@
++created
+diff --git a/b.txt b/b.txt
+deleted file mode 100644
+--- a/b.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-remove me
+"#;
+
+        let content = collect_tool_content(
+            <RootedFsApplyPatchTool as Tool>::execute(
+                &tool,
+                json!({ "patch": patch }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("apply_patch should succeed"),
+        )
+        .await;
+
+        assert!(content.text_content().contains("updated 1 file(s): a.txt"));
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("a.txt")).await.unwrap(),
+            "ALPHA\nbeta\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("c.txt")).await.unwrap(),
+            "created\n"
+        );
+        assert!(!root.join("b.txt").exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn apply_patch_rejects_ambiguous_update_hunks() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "same\nsame\n")
+            .await
+            .expect("fixture should be written");
+
+        let tool = RootedFsApplyPatchTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+        };
+        let patch = r#"diff --git a/note.txt b/note.txt
+--- a/note.txt
++++ b/note.txt
+@@ -1 +1 @@
+-same
++changed
+"#;
+
+        let content = collect_tool_content(
+            <RootedFsApplyPatchTool as Tool>::execute(
+                &tool,
+                json!({ "patch": patch }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("apply_patch should return tool output"),
+        )
+        .await;
+
+        assert!(content.text_content().contains("matched 2 times"));
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("note.txt"))
+                .await
+                .unwrap(),
+            "same\nsame\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn apply_patch_supports_standard_diff_relative_to_workdir() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("repo"))
+            .await
+            .expect("test repo should be created");
+        tokio::fs::write(root.join("repo/app.py"), "print('old')\n")
+            .await
+            .expect("fixture should be written");
+
+        let tool = RootedFsApplyPatchTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+        };
+        let patch = r#"diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-print('old')
++print('new')
+"#;
+
+        let content = collect_tool_content(
+            <RootedFsApplyPatchTool as Tool>::execute(
+                &tool,
+                json!({ "patch": patch, "workdir": "repo" }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("apply_patch should succeed"),
+        )
+        .await;
+
+        assert!(content
+            .text_content()
+            .contains("updated 1 file(s): repo/app.py"));
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("repo/app.py"))
+                .await
+                .unwrap(),
+            "print('new')\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

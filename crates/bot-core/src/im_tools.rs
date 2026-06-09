@@ -71,6 +71,37 @@ pub struct ImUploadRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct AcpBindingUpsertRequest {
+    pub session_id: String,
+    pub platform: String,
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpBindingDeleteRequest {
+    pub platform: String,
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubSessionBindingUpsertRequest {
+    pub parent_session_id: String,
+    pub sub_session_id: String,
+    pub kind: String,
+    pub target: String,
+    pub title: Option<String>,
+    pub platform: String,
+    pub parent_channel_id: String,
+    pub actor_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundImChannel {
+    pub platform: String,
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct UploadedImFile {
     pub file_name: String,
     pub file_key: String,
@@ -92,6 +123,25 @@ pub trait ImFileBridge: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<UploadedImFile>> + Send + 'a>,
     >;
+
+    fn acp_binding_upsert<'a>(
+        &'a self,
+        request: AcpBindingUpsertRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+    fn acp_binding_delete<'a>(
+        &'a self,
+        request: AcpBindingDeleteRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+    fn sub_session_binding_upsert<'a>(
+        &'a self,
+        _request: SubSessionBindingUpsertRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Option<BoundImChannel>>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,15 +4,17 @@ version = "0.1.7"
 edition = "2021"
 
 [dependencies]
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", branch = "main", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
     "http-client",
     "tracing-langsmith",
 ] }
+remi-agentloop-deepagent = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop-deepagent", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tracing = "0.1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -25,5 +27,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 aho-corasick = "1"
 html2md = "0.2.15"
-remi-client-sdk = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-client-sdk", branch = "main" }
-remi-things-crdt = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-things-crdt", branch = "main" }
+remi-client-sdk = { path = "../../../remi-sdk/remi-client-sdk" }
+remi-things-crdt = { path = "../../../remi-sdk/remi-things-crdt" }
+
+[dev-dependencies]
+tempfile = "3"

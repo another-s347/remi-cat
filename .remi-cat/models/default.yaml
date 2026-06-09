@@ -1,0 +1,12 @@
+id: default
+name: Default GPT-4o
+description: Balanced multimodal default profile for local development.
+provider: openai
+model: gpt-4o
+base_url: https://api.openai.com/v1
+max_output_tokens: 16384
+context_tokens: 128000
+supports_images: true
+short_term_tokens: 20000
+overflow_bytes: 32000
+auto_compress: true

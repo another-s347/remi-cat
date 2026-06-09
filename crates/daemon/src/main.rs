@@ -12,6 +12,8 @@
 //! |----------------------------------------|--------------------------------------------------------------|
 //! | *(none)*                               | Start the daemon normally.                                   |
 //! | `--local`                              | Local mode: skip Docker entirely.                            |
+//! | `--cli-im`                             | Local interactive CLI IM channel (requires `--local`).       |
+//! | `--cli-im-once <TEXT>`                 | Send one local CLI IM message and exit (requires `--local`). |
 //! | `secrets set <KEY> <VALUE>`            | Write a secret to the encrypted store and exit.              |
 //! | `secrets delete <KEY>`                 | Remove a secret from the encrypted store and exit.           |
 //! | `secrets list`                         | Print all stored secret keys (not values) and exit.          |
@@ -40,10 +42,13 @@
 //!
 //! \* Can also be stored in the encrypted secret store (see `secret_store.rs`).
 
+mod acp_bindings;
 mod command;
 mod docker;
 mod local_agent;
+mod local_cli;
 mod mgmt_server;
+mod reply_transport;
 mod restart;
 mod rpc_server;
 mod secret_store;
@@ -51,10 +56,13 @@ mod trigger_scheduler;
 mod volume_store;
 
 use anyhow::{Context, Result};
+use acp_bindings::AcpBindingStore;
 use base64::Engine as _;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
+use local_cli::{CliEvent, CliGateway, CLI_CHANNEL, CLI_CHAT_ID, CLI_USER_ID, CLI_USERNAME};
 use matcher::{BanResult, OwnerMatcher, OwnerStatus, UnbanResult, PAIR_COMMAND};
 use mgmt_server::MgmtContext;
+use reply_transport::ReplyTransport;
 use restart::{signal_ready, RestartHandle};
 use rpc_server::{
     daemon_msg_im_message, daemon_msg_im_reaction, daemon_msg_trigger_run, RpcServer,
@@ -137,6 +145,7 @@ enum ChatQueueItem {
         sender_username: Option<String>,
         todo_create_via_sdk: bool,
         trigger_tools_enabled: bool,
+        acp_session_id: Option<String>,
     },
     TriggerRun(TriggerQueueItem),
 }
@@ -215,6 +224,14 @@ async fn main() -> Result<()> {
 
     // ── CLI flags ─────────────────────────────────────────────────────────
     let local_mode = std::env::args().any(|a| a == "--local");
+    let cli_im_mode = std::env::args().any(|a| a == "--cli-im");
+    let cli_im_once = parse_cli_im_once_message(&args);
+
+    if (cli_im_mode || cli_im_once.is_some()) && !local_mode {
+        return Err(anyhow::anyhow!(
+            "`--cli-im` and `--cli-im-once` require `--local`"
+        ));
+    }
 
     // ── Sentry ────────────────────────────────────────────────────────────
     let _sentry_guard = sentry::init((
@@ -242,14 +259,23 @@ async fn main() -> Result<()> {
     // as a fallback when the corresponding env vars are not set.
     let secret_store_inner = SecretStore::load(SecretStore::resolve_path())?;
 
-    let app_id = config_or_secret("FEISHU_APP_ID", &secret_store_inner)
-        .ok_or_else(|| anyhow::anyhow!("FEISHU_APP_ID must be set (env var or secret store)"))?;
-    let app_secret =
-        config_or_secret("FEISHU_APP_SECRET", &secret_store_inner).ok_or_else(|| {
-            anyhow::anyhow!("FEISHU_APP_SECRET must be set (env var or secret store)")
+    let feishu_gateway = if cli_im_mode || cli_im_once.is_some() {
+        None
+    } else {
+        let app_id = config_or_secret("FEISHU_APP_ID", &secret_store_inner).ok_or_else(|| {
+            anyhow::anyhow!("FEISHU_APP_ID must be set (env var or secret store)")
         })?;
+        let app_secret =
+            config_or_secret("FEISHU_APP_SECRET", &secret_store_inner).ok_or_else(|| {
+                anyhow::anyhow!("FEISHU_APP_SECRET must be set (env var or secret store)")
+            })?;
+        Some(FeishuGateway::new(&app_id, &app_secret))
+    };
 
     let secret_store = Arc::new(RwLock::new(secret_store_inner));
+    let acp_bindings = Arc::new(tokio::sync::Mutex::new(AcpBindingStore::load(
+        AcpBindingStore::default_path(),
+    )?));
 
     let grpc_addr: SocketAddr = std::env::var("DAEMON_GRPC_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
@@ -265,7 +291,11 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| anyhow::anyhow!("failed to create data dir {data_dir:?}: {e}"))?;
 
-    let gateway = FeishuGateway::new(&app_id, &app_secret);
+    let transport = if let Some(gateway) = feishu_gateway.clone() {
+        ReplyTransport::Feishu(gateway)
+    } else {
+        ReplyTransport::Cli(CliGateway::new())
+    };
     let matcher = OwnerMatcher::load();
 
     // ── User identity store ───────────────────────────────────────────────
@@ -290,7 +320,8 @@ async fn main() -> Result<()> {
     let restart = RestartHandle::new();
     let start_time = Instant::now();
     let volume_store = Arc::new(RwLock::new(VolumeStore::load(VolumeStore::resolve_path())?));
-    let (rpc, _agent_sink) = RpcServer::new(gateway.clone(), Arc::clone(&secret_store));
+    let (rpc, _agent_sink) =
+        RpcServer::new(transport.clone(), Arc::clone(&secret_store), Arc::clone(&acp_bindings));
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
     // Each queue item is either a user IM message or a daemon-originated
@@ -361,7 +392,7 @@ async fn main() -> Result<()> {
     trigger_scheduler::spawn_trigger_scheduler(data_dir.clone(), trigger_dispatch_tx);
 
     {
-        let gateway = gateway.clone();
+        let transport = transport.clone();
         let rpc = rpc.clone();
         let matcher = matcher.clone();
         let chat_queues = Arc::clone(&chat_queues);
@@ -382,17 +413,32 @@ async fn main() -> Result<()> {
                     .filter(|value| !value.trim().is_empty())
                 {
                     Some(message_id) => message_id,
-                    None => match gateway
-                        .send_text(
-                            &dispatch.chat_id,
-                            &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
-                        )
-                        .await
-                    {
-                        Ok(message_id) => message_id,
-                        Err(err) => {
-                            warn!(trigger_uuid = %dispatch.trigger_uuid, chat_id = %dispatch.chat_id, error = %err, "failed to create fallback anchor message for trigger run");
-                            continue;
+                    None => match &transport {
+                        ReplyTransport::Feishu(gateway) => match gateway
+                            .send_text(
+                                &dispatch.chat_id,
+                                &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
+                            )
+                            .await
+                        {
+                            Ok(message_id) => message_id,
+                            Err(err) => {
+                                warn!(trigger_uuid = %dispatch.trigger_uuid, chat_id = %dispatch.chat_id, error = %err, "failed to create fallback anchor message for trigger run");
+                                continue;
+                            }
+                        },
+                        ReplyTransport::Cli(cli) => {
+                            if let Err(err) = cli
+                                .send_text(
+                                    &dispatch.chat_id,
+                                    &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
+                                )
+                                .await
+                            {
+                                warn!(trigger_uuid = %dispatch.trigger_uuid, chat_id = %dispatch.chat_id, error = %err, "failed to print fallback anchor message for trigger run");
+                                continue;
+                            }
+                            format!("trigger-anchor-{}", Uuid::new_v4())
                         }
                     },
                 };
@@ -400,7 +446,7 @@ async fn main() -> Result<()> {
                 let queue_tx = get_or_spawn_chat_queue(
                     &dispatch.chat_id,
                     &chat_queues,
-                    gateway.clone(),
+                    transport.clone(),
                     rpc.clone(),
                 )
                 .await;
@@ -433,19 +479,71 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Start Feishu gateway ──────────────────────────────────────────────
-    let mut rx = gateway.start().await?;
-
     info!("remi-daemon ready");
+
+    if let Some(message) = cli_im_once {
+        let cli = match &transport {
+            ReplyTransport::Cli(cli) => cli.clone(),
+            ReplyTransport::Feishu(_) => unreachable!(),
+        };
+        cli.print_system("CLI one-shot mode starting.").await;
+        let msg = cli.next_message(message);
+        handle_cli_single_message(
+            msg,
+            &transport,
+            &rpc,
+            &matcher,
+            &user_store,
+            docker.clone(),
+            restart.clone(),
+            Arc::clone(&secret_store),
+            sdk_todo_enabled,
+        )
+        .await;
+        return Ok(());
+    }
+
+    if cli_im_mode {
+        let cli = match &transport {
+            ReplyTransport::Cli(cli) => cli.clone(),
+            ReplyTransport::Feishu(_) => unreachable!(),
+        };
+        let mut rx = cli.start().await?;
+        while let Some(event) = rx.recv().await {
+            match event {
+                CliEvent::MessageReceived(msg) => {
+                    handle_cli_message_event(
+                        msg,
+                        &transport,
+                        &rpc,
+                        &matcher,
+                        &user_store,
+                        docker.clone(),
+                        restart.clone(),
+                        Arc::clone(&secret_store),
+                        Arc::clone(&chat_queues),
+                        sdk_todo_enabled,
+                    )
+                    .await;
+                }
+                CliEvent::ShutdownRequested => break,
+            }
+        }
+        return Ok(());
+    }
+
+    let gateway = feishu_gateway.expect("feishu gateway required outside cli mode");
+    let mut rx = gateway.start().await?;
 
     // ── Main event loop ───────────────────────────────────────────────────
     while let Some(event) = rx.recv().await {
         match event {
             FeishuEvent::MessageReceived(msg) => {
                 let text = msg.text.trim().to_string();
+                let acp_binding = rpc.get_acp_binding(FEISHU_CHANNEL, &msg.chat_id).await;
 
                 // ── Group chat: only handle @-mentions ────────────────────
-                if msg.chat_type == "group" && !msg.at_bot {
+                if acp_binding.is_none() && msg.chat_type == "group" && !msg.at_bot {
                     debug!(
                         sender = %msg.sender_user_id,
                         chat   = %msg.chat_id,
@@ -476,7 +574,7 @@ async fn main() -> Result<()> {
 
                 let sender_username = ensure_im_username(
                     &user_store,
-                    &gateway,
+                    &transport,
                     &user_uuid,
                     &msg.sender_user_id,
                     Some(&msg.message_id),
@@ -506,7 +604,7 @@ async fn main() -> Result<()> {
                         OwnerStatus::Owner => "您已是我的主人。".into(),
                         OwnerStatus::NotOwner => "我已有主人 :)".into(),
                     };
-                    send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                    send_reply(&transport, &msg.message_id, &msg.chat_id, &reply).await;
                     continue;
                 }
 
@@ -525,13 +623,13 @@ async fn main() -> Result<()> {
                         let reply = format!(
                             "🔗 您的频道配对码：**{token}**\n有效期 5 分钟。\n请在另一个频道发送 `/pair-channel {token}` 完成配对。"
                         );
-                        send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                        send_reply(&transport, &msg.message_id, &msg.chat_id, &reply).await;
                     } else {
                         // Token provided — attempt to complete pairing.
                         match pair_tokens.consume(&arg) {
                             None => {
                                 send_reply(
-                                    &gateway,
+                                    &transport,
                                     &msg.message_id,
                                     &msg.chat_id,
                                     "⚠️ 配对码无效或已过期，请重新生成。",
@@ -543,7 +641,7 @@ async fn main() -> Result<()> {
                                     && pending.user_id == msg.sender_user_id
                                 {
                                     send_reply(
-                                        &gateway,
+                                        &transport,
                                         &msg.message_id,
                                         &msg.chat_id,
                                         "⚠️ 不能将同一账号与自身配对。",
@@ -583,7 +681,7 @@ async fn main() -> Result<()> {
                                                 merged_uuid
                                             );
                                             send_reply(
-                                                &gateway,
+                                                &transport,
                                                 &msg.message_id,
                                                 &msg.chat_id,
                                                 &reply,
@@ -593,7 +691,7 @@ async fn main() -> Result<()> {
                                         Err(e) => {
                                             warn!("user link failed: {e:#}");
                                             send_reply(
-                                                &gateway,
+                                                &transport,
                                                 &msg.message_id,
                                                 &msg.chat_id,
                                                 "❌ 频道配对失败，请稍后重试。",
@@ -619,7 +717,7 @@ async fn main() -> Result<()> {
                         // Daemon commands: owner-only AND private chat (单聊) only.
                         if msg.chat_type != "p2p" {
                             send_reply(
-                                &gateway,
+                                &transport,
                                 &msg.message_id,
                                 &msg.chat_id,
                                 "⚠️ 系统指令只能在单聊中执行。",
@@ -629,7 +727,7 @@ async fn main() -> Result<()> {
                         }
                         if !is_owner(&matcher, &user_uuid) {
                             send_reply(
-                                &gateway,
+                                &transport,
                                 &msg.message_id,
                                 &msg.chat_id,
                                 "⚠️ 仅主人可以执行系统指令。",
@@ -671,12 +769,12 @@ async fn main() -> Result<()> {
                                 },
                                 Err(err) => err,
                             };
-                            send_reply(&gateway, &msg.message_id, &msg.chat_id, &reply).await;
+                            send_reply(&transport, &msg.message_id, &msg.chat_id, &reply).await;
                             continue;
                         }
                         let docker = docker.clone();
                         let restart = restart.clone();
-                        let gateway = gateway.clone();
+                        let transport = transport.clone();
                         let rpc = rpc.clone();
                         let secret_store = Arc::clone(&secret_store);
                         let msg_id = msg.message_id.clone();
@@ -689,13 +787,13 @@ async fn main() -> Result<()> {
                                 &restart,
                                 &secret_store,
                                 &rpc,
-                                &gateway,
+                                &transport,
                                 &msg_id,
                             )
                             .await
                             .unwrap_or_else(|e| format!("❌ 命令失败: {e:#}"));
                             if !reply.is_empty() {
-                                send_reply(&gateway, &msg_id, &chat_id, &reply).await;
+                                send_reply(&transport, &msg_id, &chat_id, &reply).await;
                             }
                         });
                         continue;
@@ -707,7 +805,7 @@ async fn main() -> Result<()> {
                 let chat_id = msg.chat_id.clone();
                 let msg_id = msg.message_id.clone();
                 let queue_tx =
-                    get_or_spawn_chat_queue(&chat_id, &chat_queues, gateway.clone(), rpc.clone())
+                    get_or_spawn_chat_queue(&chat_id, &chat_queues, transport.clone(), rpc.clone())
                         .await;
                 let owner_sdk_tools_enabled = sdk_todo_enabled && is_owner(&matcher, &user_uuid);
                 match queue_tx.try_send(ChatQueueItem::ImMessage {
@@ -716,12 +814,13 @@ async fn main() -> Result<()> {
                     sender_username,
                     todo_create_via_sdk: owner_sdk_tools_enabled,
                     trigger_tools_enabled: owner_sdk_tools_enabled,
+                    acp_session_id: acp_binding.as_ref().map(|binding| binding.session_id.clone()),
                 }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
                         send_reply(
-                            &gateway,
+                            &transport,
                             &msg_id,
                             &chat_id,
                             &format!(
@@ -733,7 +832,7 @@ async fn main() -> Result<()> {
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue worker died");
                         chat_queues.lock().await.remove(&chat_id);
-                        send_reply(&gateway, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。").await;
+                        send_reply(&transport, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。").await;
                     }
                 }
             }
@@ -759,7 +858,7 @@ async fn main() -> Result<()> {
 
                 let _ = ensure_im_username(
                     &user_store,
-                    &gateway,
+                    &transport,
                     &user_uuid,
                     &reaction.sender_user_id,
                     None,
@@ -791,7 +890,7 @@ async fn main() -> Result<()> {
 
                 let _ = ensure_im_username(
                     &user_store,
-                    &gateway,
+                    &transport,
                     &user_uuid,
                     &user_open_id,
                     None,
@@ -892,15 +991,268 @@ async fn main() -> Result<()> {
 
 // ── Chat queue worker ─────────────────────────────────────────────────────────
 
+async fn handle_cli_message_event(
+    msg: FeishuMessage,
+    transport: &ReplyTransport,
+    rpc: &RpcServer,
+    matcher: &OwnerMatcher,
+    user_store: &UserStore,
+    docker: Option<docker::DockerManager>,
+    restart: RestartHandle,
+    secret_store: Arc<RwLock<SecretStore>>,
+    chat_queues: Arc<Mutex<HashMap<String, mpsc::Sender<ChatQueueItem>>>>,
+    sdk_todo_enabled: bool,
+) {
+    let text = msg.text.trim().to_string();
+    let user_uuid = user_store.resolve_or_create(CLI_CHANNEL, CLI_USER_ID);
+    let acp_binding = rpc.get_acp_binding(CLI_CHANNEL, CLI_CHAT_ID).await;
+    let sender_username = Some(CLI_USERNAME.to_string());
+
+    if text == PAIR_COMMAND {
+        send_reply(
+            transport,
+            &msg.message_id,
+            &msg.chat_id,
+            "本地 CLI 调试模式默认视为 owner，无需 `/pair`。",
+        )
+        .await;
+        return;
+    }
+
+    if let Some(cmd) =
+        im_gateway::ImCommand::parse(&msg.message_id, &msg.sender_user_id, &msg.chat_id, &text)
+    {
+        if command::is_daemon_command(&cmd.name) {
+            if is_blacklist_command(&cmd.name) {
+                let reply = match resolve_blacklist_target(
+                    &cmd.name,
+                    &cmd.args,
+                    &msg,
+                    user_store,
+                    matcher,
+                ) {
+                    Ok(target_uuid) => match cmd.name.as_str() {
+                        "ban" => match matcher.ban(&target_uuid) {
+                            Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
+                            Ok(BanResult::AlreadyBanned) => {
+                                format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
+                            }
+                            Ok(BanResult::ProtectedOwner) => {
+                                "⚠️ 不能拉黑主人或系统放行用户。".into()
+                            }
+                            Err(e) => format!("❌ 拉黑失败: {e}"),
+                        },
+                        "unban" => match matcher.unban(&target_uuid) {
+                            Ok(UnbanResult::Removed) => {
+                                format!("✅ 已解除拉黑：{}", target_uuid)
+                            }
+                            Ok(UnbanResult::NotBanned) => {
+                                format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
+                            }
+                            Err(e) => format!("❌ 解除拉黑失败: {e}"),
+                        },
+                        _ => unreachable!("checked by is_blacklist_command"),
+                    },
+                    Err(err) => err,
+                };
+                send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
+                return;
+            }
+            let reply = command::execute_daemon_command(
+                &cmd.name,
+                &cmd.args,
+                docker.as_ref(),
+                &restart,
+                &secret_store,
+                rpc,
+                transport,
+                &msg.message_id,
+            )
+            .await
+            .unwrap_or_else(|e| format!("❌ 命令失败: {e:#}"));
+            if !reply.is_empty() {
+                send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
+            }
+            return;
+        }
+    }
+
+    let chat_id = msg.chat_id.clone();
+    let msg_id = msg.message_id.clone();
+    let queue_tx = get_or_spawn_chat_queue(&chat_id, &chat_queues, transport.clone(), rpc.clone())
+        .await;
+    match queue_tx.try_send(ChatQueueItem::ImMessage {
+        msg,
+        user_uuid,
+        sender_username,
+        todo_create_via_sdk: sdk_todo_enabled,
+        trigger_tools_enabled: sdk_todo_enabled,
+        acp_session_id: acp_binding.as_ref().map(|binding| binding.session_id.clone()),
+    }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(chat = %chat_id, msg = %msg_id, "chat queue full");
+            send_reply(
+                transport,
+                &msg_id,
+                &chat_id,
+                &format!(
+                    "⚠️ 消息队列已满（最多 {CHAT_QUEUE_CAPACITY} 条待处理），请等当前消息处理完成后再发送。"
+                ),
+            )
+            .await;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!(chat = %chat_id, msg = %msg_id, "chat queue worker died");
+            chat_queues.lock().await.remove(&chat_id);
+            send_reply(transport, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。").await;
+        }
+    }
+}
+
+async fn handle_cli_single_message(
+    msg: FeishuMessage,
+    transport: &ReplyTransport,
+    rpc: &RpcServer,
+    matcher: &OwnerMatcher,
+    user_store: &UserStore,
+    docker: Option<docker::DockerManager>,
+    restart: RestartHandle,
+    secret_store: Arc<RwLock<SecretStore>>,
+    sdk_todo_enabled: bool,
+) {
+    let text = msg.text.trim().to_string();
+    let user_uuid = user_store.resolve_or_create(CLI_CHANNEL, CLI_USER_ID);
+    let acp_binding = rpc.get_acp_binding(CLI_CHANNEL, CLI_CHAT_ID).await;
+    if text == PAIR_COMMAND {
+        send_reply(
+            transport,
+            &msg.message_id,
+            &msg.chat_id,
+            "本地 CLI 调试模式默认视为 owner，无需 `/pair`。",
+        )
+        .await;
+        return;
+    }
+    if let Some(cmd) =
+        im_gateway::ImCommand::parse(&msg.message_id, &msg.sender_user_id, &msg.chat_id, &text)
+    {
+        if command::is_daemon_command(&cmd.name) {
+            if is_blacklist_command(&cmd.name) {
+                let reply = match resolve_blacklist_target(
+                    &cmd.name,
+                    &cmd.args,
+                    &msg,
+                    user_store,
+                    matcher,
+                ) {
+                    Ok(target_uuid) => match cmd.name.as_str() {
+                        "ban" => match matcher.ban(&target_uuid) {
+                            Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
+                            Ok(BanResult::AlreadyBanned) => {
+                                format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
+                            }
+                            Ok(BanResult::ProtectedOwner) => {
+                                "⚠️ 不能拉黑主人或系统放行用户。".into()
+                            }
+                            Err(e) => format!("❌ 拉黑失败: {e}"),
+                        },
+                        "unban" => match matcher.unban(&target_uuid) {
+                            Ok(UnbanResult::Removed) => {
+                                format!("✅ 已解除拉黑：{}", target_uuid)
+                            }
+                            Ok(UnbanResult::NotBanned) => {
+                                format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
+                            }
+                            Err(e) => format!("❌ 解除拉黑失败: {e}"),
+                        },
+                        _ => unreachable!("checked by is_blacklist_command"),
+                    },
+                    Err(err) => err,
+                };
+                send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
+                return;
+            }
+            let reply = command::execute_daemon_command(
+                &cmd.name,
+                &cmd.args,
+                docker.as_ref(),
+                &restart,
+                &secret_store,
+                rpc,
+                transport,
+                &msg.message_id,
+            )
+            .await
+            .unwrap_or_else(|e| format!("❌ 命令失败: {e:#}"));
+            if !reply.is_empty() {
+                send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
+            }
+            return;
+        }
+    }
+    let daemon_msg = daemon_msg_im_message(
+        &msg,
+        CLI_CHANNEL,
+        &user_uuid,
+        Some(CLI_USERNAME),
+        sdk_todo_enabled,
+        sdk_todo_enabled,
+        acp_binding.as_ref().map(|binding| binding.session_id.as_str()),
+    );
+    match rpc
+        .send_to_agent_and_await(daemon_msg, &msg.message_id)
+        .await
+    {
+        Some(comp_rx) => {
+            if comp_rx.await.is_err() {
+                warn!(message_id = %msg.message_id, "cli one-shot completion channel dropped");
+            }
+        }
+        None => {
+            send_reply(
+                transport,
+                &msg.message_id,
+                &msg.chat_id,
+                "⚠️ Agent 未连接，请稍后再试。",
+            )
+            .await;
+        }
+    }
+}
+
+fn parse_cli_im_once_message(args: &[String]) -> Option<String> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if let Some(value) = arg.strip_prefix("--cli-im-once=") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+            return None;
+        }
+        if arg == "--cli-im-once" {
+            let value = args.get(idx + 1)?.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+            return None;
+        }
+        idx += 1;
+    }
+    None
+}
+
 async fn get_or_spawn_chat_queue(
     chat_id: &str,
     chat_queues: &Arc<Mutex<HashMap<String, mpsc::Sender<ChatQueueItem>>>>,
-    gateway: FeishuGateway,
+    transport: ReplyTransport,
     rpc: RpcServer,
 ) -> mpsc::Sender<ChatQueueItem> {
     let mut queues = chat_queues.lock().await;
     if queues.get(chat_id).map(|tx| tx.is_closed()).unwrap_or(true) {
-        let tx = spawn_queue_worker(chat_id.to_string(), gateway, rpc);
+        let tx = spawn_queue_worker(chat_id.to_string(), transport, rpc);
         queues.insert(chat_id.to_string(), tx);
     }
     queues[chat_id].clone()
@@ -927,7 +1279,7 @@ fn coalesce_latest_preemptive_item(
 /// await completion) so messages from the same chat are processed in order.
 fn spawn_queue_worker(
     chat_id: String,
-    gateway: FeishuGateway,
+    transport: ReplyTransport,
     rpc: RpcServer,
 ) -> mpsc::Sender<ChatQueueItem> {
     let (tx, mut rx) = mpsc::channel::<ChatQueueItem>(CHAT_QUEUE_CAPACITY);
@@ -984,14 +1336,18 @@ fn spawn_queue_worker(
                     sender_username,
                     todo_create_via_sdk,
                     trigger_tools_enabled,
+                    acp_session_id,
                 } => {
                     let message_id = msg.message_id.clone();
-                    let enriched = enrich_message(&gateway, msg).await;
+                    let enriched = match &transport {
+                        ReplyTransport::Feishu(gateway) => enrich_message(gateway, msg).await,
+                        ReplyTransport::Cli(_) => msg,
+                    };
 
                     if enriched.files.iter().any(|f| f.file_type == "folder") {
                         info!(message_id = %message_id, "folder attachment — sending unsupported notice");
                         send_reply(
-                            &gateway,
+                            &transport,
                             &enriched.message_id,
                             &enriched.chat_id,
                             "📁 暂不支持读取飞书「文件夹」类型的附件，请将文件夹压缩成 zip 后重新上传。",
@@ -1010,18 +1366,24 @@ fn spawn_queue_worker(
                         "queue worker forwarding message to agent"
                     );
 
-                    let reaction_id = gateway
+                    let reaction_id = transport
                         .add_reaction(&enriched.message_id, "THINKING")
                         .await
                         .map_err(|e| warn!("add_reaction failed: {e:#}"))
-                        .ok();
+                        .ok()
+                        .flatten();
 
                     let daemon_msg = daemon_msg_im_message(
                         &enriched,
+                        match &transport {
+                            ReplyTransport::Feishu(_) => FEISHU_CHANNEL,
+                            ReplyTransport::Cli(_) => CLI_CHANNEL,
+                        },
                         &user_uuid,
                         sender_username.as_deref(),
                         todo_create_via_sdk,
                         trigger_tools_enabled,
+                        acp_session_id.as_deref(),
                     );
                     match rpc.send_to_agent_and_await(daemon_msg, &message_id).await {
                         Some(comp_rx) => {
@@ -1032,7 +1394,7 @@ fn spawn_queue_worker(
                         }
                         None => {
                             if let Some(rid) = reaction_id {
-                                gateway.delete_reaction(&message_id, &rid).await.ok();
+                                transport.delete_reaction(&message_id, &rid).await.ok();
                             }
                             rpc.reply_agent_unavailable(&message_id).await;
                         }
@@ -1098,7 +1460,7 @@ pub fn config_or_secret(env_var: &str, store: &secret_store::SecretStore) -> Opt
 
 async fn ensure_im_username(
     user_store: &UserStore,
-    gateway: &FeishuGateway,
+    transport: &ReplyTransport,
     user_uuid: &str,
     channel_user_id: &str,
     message_id: Option<&str>,
@@ -1109,7 +1471,7 @@ async fn ensure_im_username(
         return Some(username);
     }
 
-    match gateway.get_user_name(channel_user_id).await {
+    match transport.get_user_name(channel_user_id).await {
         Ok(Some(username)) => {
             let username = username.trim().to_string();
             if username.is_empty() {
@@ -1141,7 +1503,7 @@ async fn ensure_im_username(
             None
         }
         Err(e) => {
-            if let Some(message_id) = message_id {
+            if let (Some(message_id), ReplyTransport::Feishu(gateway)) = (message_id, transport) {
                 let _ = maybe_notify_feishu_permission_issue(
                     gateway,
                     message_id,
@@ -1231,10 +1593,14 @@ fn resolve_blacklist_channel_id(
     }
 }
 
-async fn send_reply(gateway: &FeishuGateway, message_id: &str, chat_id: &str, text: &str) {
-    if let Err(e) = gateway.reply_text(message_id, text).await {
-        warn!("reply_text failed: {e:#}");
-        gateway.send_text(chat_id, text).await.ok();
+async fn send_reply(
+    transport: &ReplyTransport,
+    message_id: &str,
+    chat_id: &str,
+    text: &str,
+) {
+    if let Err(e) = transport.reply_text(message_id, chat_id, text).await {
+        warn!("send reply failed: {e:#}");
     }
 }
 

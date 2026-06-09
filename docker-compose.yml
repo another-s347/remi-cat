@@ -1,6 +1,9 @@
 
 # docker-compose.yml — runs the remi-cat container only.
 #
+# Legacy compose file for the old daemon + agent-container architecture.
+# The current primary deployment is a single host executable: `remi-cat`.
+#
 # remi-daemon runs on the HOST (outside Docker) and manages this container.
 # Run daemon on the host:
 #   FEISHU_APP_ID=xxx FEISHU_APP_SECRET=xxx ./remi-daemon
@@ -61,4 +64,3 @@ services:
 
 volumes:
   remi-cat-data:
-

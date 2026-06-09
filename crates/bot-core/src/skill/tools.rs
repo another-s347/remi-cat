@@ -10,43 +10,30 @@ use std::sync::Arc;
 use super::store::{SkillStore, SkillSummary};
 use crate::{suppress_trigger_management, trigger::BUILTIN_TRIGGER_SKILL_NAME};
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Remove an existing YAML frontmatter block from the start of `content`.
-fn strip_frontmatter(content: &str) -> &str {
-    if !content.starts_with("---") {
-        return content;
-    }
-    let rest = content["---".len()..].trim_start_matches('\n');
-    if let Some(end) = rest.find("\n---") {
-        let after = &rest[end + "\n---".len()..];
-        after.trim_start_matches('\n')
-    } else {
-        content
-    }
-}
+pub const READ_SKILLS_STATE_KEY: &str = "__read_skills";
+const LEGACY_ACTIVATED_SKILLS_STATE_KEY: &str = "__activated_skills";
 
 fn render_skill_summary(summary: &SkillSummary) -> String {
-    match summary.description.as_deref() {
-        Some(description) => format!("- {} — {}", summary.name, description),
-        None => format!("- {} — (no description)", summary.name),
-    }
+    format!(
+        "- {} - {} ({})",
+        summary.name, summary.description, summary.source
+    )
 }
 
 fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
-        return "You can use skill__search with one or more keywords to discover local skills by name and description, including builtin read-only skills.".to_string();
+        return "Local skills follow the Agent Skills SKILL.md directory format. Use skill__search with keywords to discover skills by name and description. Use skill__get to read one skill's instructions for the current turn; reading a skill also makes its resources available through skill__read_resource.".to_string();
     }
 
     let mut prompt = String::from(
-        "Recent local skill snapshot (cached for up to 30 minutes; ordered by recent successful skill__get):\n",
+        "Available local skills (catalog only; full instructions are loaded by skill__get):\n",
     );
     for skill in skills {
         prompt.push_str(&render_skill_summary(skill));
         prompt.push('\n');
     }
     prompt.push_str(
-        "Use skill__search with one or more keywords to discover additional local skills beyond this snapshot, including builtin read-only skills.",
+        "Use skill__search to discover additional skills. Use skill__get with the exact skill name to read one skill's instructions for the current turn.",
     );
     prompt
 }
@@ -66,64 +53,50 @@ fn hides_trigger_skill(name: &str, suppress: bool) -> bool {
     suppress && name.trim() == BUILTIN_TRIGGER_SKILL_NAME
 }
 
-// ── SkillSaveTool ─────────────────────────────────────────────────────────────
-
-pub struct SkillSaveTool<S> {
-    pub(crate) store: Arc<S>,
+pub fn read_skill_names(user_state: &serde_json::Value) -> Vec<String> {
+    let mut names = Vec::new();
+    for key in [READ_SKILLS_STATE_KEY, LEGACY_ACTIVATED_SKILLS_STATE_KEY] {
+        if let Some(items) = user_state.get(key).and_then(serde_json::Value::as_array) {
+            for name in items.iter().filter_map(serde_json::Value::as_str) {
+                if !names.iter().any(|seen| seen == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
-impl<S: SkillStore + 'static> Tool for SkillSaveTool<S> {
-    fn name(&self) -> &str {
-        "skill__save"
+fn mark_skill_read(ctx: &ToolContext, name: &str) {
+    let mut state = ctx.user_state.write().unwrap();
+    if !state.is_object() {
+        *state = json!({});
     }
-    fn description(&self) -> &str {
-        "Save a reusable skill as a named markdown document. Use this to record \
-        step-by-step procedures, best practices, or any knowledge worth reusing \
-        in later sessions. Builtin skill names are reserved and cannot be overwritten."
+    let Some(map) = state.as_object_mut() else {
+        return;
+    };
+    let entry = map
+        .entry(READ_SKILLS_STATE_KEY.to_string())
+        .or_insert_with(|| json!([]));
+    if !entry.is_array() {
+        *entry = json!([]);
     }
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name":        { "type": "string", "description": "Short identifier (kebab-case, e.g. 'setup-rust-project')" },
-                "description": { "type": "string", "description": "One-sentence summary of the skill" },
-                "content":     { "type": "string", "description": "Markdown body of the skill document" }
-            },
-            "required": ["name", "content"]
-        })
-    }
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let name = arguments["name"]
-            .as_str()
-            .ok_or_else(|| AgentError::tool("skill__save", "missing 'name'"))?
-            .to_string();
-        let description = arguments["description"].as_str().unwrap_or("").to_string();
-        let content = arguments["content"]
-            .as_str()
-            .ok_or_else(|| AgentError::tool("skill__save", "missing 'content'"))?
-            .to_string();
-
-        let body = strip_frontmatter(content.trim_start());
-        let full_content = if description.is_empty() {
-            format!("---\nname: {name}\n---\n\n{body}")
-        } else {
-            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}")
-        };
-
-        let store = self.store.clone();
-        let path = store.save(&name, &full_content).await?;
-        Ok(ToolResult::Output(stream! {
-            yield ToolOutput::text(format!("Skill '{name}' saved to {path}"));
-        }))
+    let Some(items) = entry.as_array_mut() else {
+        return;
+    };
+    if !items
+        .iter()
+        .any(|item| item.as_str().is_some_and(|value| value == name))
+    {
+        items.push(serde_json::Value::String(name.to_string()));
     }
 }
 
-// ── SkillGetTool ──────────────────────────────────────────────────────────────
+fn skill_was_read(ctx: &ToolContext, name: &str) -> bool {
+    read_skill_names(&ctx.user_state.read().unwrap())
+        .iter()
+        .any(|item| item == name)
+}
 
 pub struct SkillGetTool<S> {
     pub(crate) store: Arc<S>,
@@ -133,9 +106,11 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     fn name(&self) -> &str {
         "skill__get"
     }
+
     fn description(&self) -> &str {
-        "Retrieve the full markdown content of a local skill by name, including builtin read-only skills."
+        "Read the full SKILL.md instructions for a local skill by name. The instructions are returned in this tool result; reading a skill also enables skill__read_resource for files in that skill."
     }
+
     fn extra_prompt(&self, ctx: &ToolDefinitionContext) -> Option<String> {
         let skills = filter_trigger_skill(
             self.store.featured_summaries(),
@@ -143,15 +118,17 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         );
         Some(render_skill_get_extra_prompt(&skills))
     }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "Skill identifier" }
+                "name": { "type": "string", "description": "Skill name from the catalog" }
             },
             "required": ["name"]
         })
     }
+
     async fn execute(
         &self,
         arguments: serde_json::Value,
@@ -166,9 +143,16 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         let result = if hides_trigger_skill(&name, suppress) {
             format!("Skill '{name}' not found.")
         } else {
-            let store = self.store.clone();
-            match store.get(&name).await? {
-                Some(content) => content,
+            match self.store.get(&name).await? {
+                Some(doc) => {
+                    mark_skill_read(ctx, &doc.name);
+                    format!(
+                        "{}\n\n[skill read: {} from {}; resources available via skill__read_resource]",
+                        doc.content.trim_end(),
+                        doc.name,
+                        doc.source
+                    )
+                }
                 None => format!("Skill '{name}' not found."),
             }
         };
@@ -178,8 +162,6 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     }
 }
 
-// ── SkillSearchTool ───────────────────────────────────────────────────────────
-
 pub struct SkillSearchTool<S> {
     pub(crate) store: Arc<S>,
 }
@@ -188,21 +170,24 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
     fn name(&self) -> &str {
         "skill__search"
     }
+
     fn description(&self) -> &str {
-        "Search local skills by keyword across skill names and descriptions. Accepts multiple keywords and favors recall over strict matching. Results may include builtin read-only skills and user-saved skills."
+        "Search the local skill catalog by keyword across skill names and descriptions. Results contain only name, description, and source; use skill__get to read a skill."
     }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "One or more keywords separated by spaces. Search matches skill names and descriptions with OR semantics."
+                    "description": "One or more keywords separated by spaces. Empty query lists the catalog."
                 }
             },
             "required": ["query"]
         })
     }
+
     async fn execute(
         &self,
         arguments: serde_json::Value,
@@ -214,9 +199,8 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
             .ok_or_else(|| AgentError::tool("skill__search", "missing 'query'"))?
             .trim()
             .to_string();
-        let store = self.store.clone();
         let matches = filter_trigger_skill(
-            store.search(&query).await?,
+            self.store.search(&query).await?,
             suppress_trigger_management(ctx.metadata.as_ref()),
         );
         let result = if matches.is_empty() {
@@ -229,8 +213,67 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
                 text.push_str(&render_skill_summary(&skill));
                 text.push('\n');
             }
-            text.push_str("Use skill__get with the exact skill name to open one.");
+            text.push_str("Use skill__get with the exact skill name to read one.");
             text
+        };
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(result); },
+        ))
+    }
+}
+
+pub struct SkillReadResourceTool<S> {
+    pub(crate) store: Arc<S>,
+}
+
+impl<S: SkillStore + 'static> Tool for SkillReadResourceTool<S> {
+    fn name(&self) -> &str {
+        "skill__read_resource"
+    }
+
+    fn description(&self) -> &str {
+        "Read a UTF-8 text resource from a skill directory after that skill has been read with skill__get. Use this for scripts, templates, and reference files mentioned by SKILL.md."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "skill": { "type": "string", "description": "Skill name previously read with skill__get" },
+                "path": { "type": "string", "description": "Relative path inside the skill directory" }
+            },
+            "required": ["skill", "path"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        let skill = arguments["skill"]
+            .as_str()
+            .ok_or_else(|| AgentError::tool("skill__read_resource", "missing 'skill'"))?
+            .to_string();
+        let path = arguments["path"]
+            .as_str()
+            .ok_or_else(|| AgentError::tool("skill__read_resource", "missing 'path'"))?
+            .to_string();
+        let result = if !skill_was_read(ctx, &skill) {
+            format!(
+                "Skill '{skill}' has not been read in this session. Read it first with skill__get."
+            )
+        } else {
+            let resource = self.store.read_resource(&skill, &path).await?;
+            if resource.binary {
+                format!(
+                    "Resource '{}' in skill '{}' is binary ({} bytes); binary content was not inlined.",
+                    resource.path, resource.skill, resource.size
+                )
+            } else {
+                resource.content.unwrap_or_default()
+            }
         };
         Ok(ToolResult::Output(
             stream! { yield ToolOutput::text(result); },
@@ -240,41 +283,23 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_trigger_skill, render_skill_get_extra_prompt, SkillGetTool};
-    use crate::skill::store::{InMemorySkillStore, SkillStore, SkillSummary};
-    use remi_agentloop::prelude::{Tool, ToolDefinitionContext};
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn skill_get_extra_prompt_lists_at_most_eight_skills_and_search_hint() {
-        let store = Arc::new(InMemorySkillStore::new());
-        for index in 0..9 {
-            let name = format!("skill-{index}");
-            let content =
-                format!("---\nname: {name}\ndescription: Description {index}\n---\n\nBody {index}");
-            store.save(&name, &content).await.unwrap();
-        }
-
-        let tool = SkillGetTool {
-            store: Arc::clone(&store),
-        };
-        let prompt = tool
-            .extra_prompt(&ToolDefinitionContext::default())
-            .expect("skill__get should always advertise discovery guidance");
-
-        assert!(prompt.contains("skill__search"));
-        assert_eq!(
-            prompt.lines().filter(|line| line.starts_with("- ")).count(),
-            8
-        );
-        assert!(!prompt.contains("skill-0 — Description 0"));
-        assert!(prompt.contains("skill-8 — Description 8"));
-    }
+    use super::{
+        filter_trigger_skill, read_skill_names, render_skill_get_extra_prompt, SkillGetTool,
+    };
+    use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, SkillSummary};
+    use futures::StreamExt;
+    use remi_agentloop::prelude::{
+        AgentConfig, Tool, ToolContext, ToolDefinitionContext, ToolOutput, ToolResult,
+    };
+    use std::sync::{Arc, RwLock};
 
     #[test]
-    fn empty_featured_prompt_still_points_to_search() {
+    fn empty_featured_prompt_points_to_search_and_get() {
         let prompt = render_skill_get_extra_prompt(&Vec::<SkillSummary>::new());
         assert!(prompt.contains("skill__search"));
+        assert!(prompt.contains("skill__get"));
+        assert!(prompt.contains("current turn"));
+        assert!(prompt.contains("skill__read_resource"));
     }
 
     #[test]
@@ -283,11 +308,13 @@ mod tests {
             vec![
                 SkillSummary {
                     name: "trigger".to_string(),
-                    description: Some("builtin trigger skill".to_string()),
+                    description: "builtin trigger skill".to_string(),
+                    source: "builtin".to_string(),
                 },
                 SkillSummary {
                     name: "rust-build".to_string(),
-                    description: Some("build help".to_string()),
+                    description: "build help".to_string(),
+                    source: ".remi-cat/skills".to_string(),
                 },
             ],
             true,
@@ -296,49 +323,81 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "rust-build");
     }
-}
 
-// ── SkillDeleteTool ───────────────────────────────────────────────────────────
+    #[test]
+    fn skill_get_extra_prompt_lists_catalog_without_body() {
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::with_roots([]),
+            [BuiltinSkill {
+                name: "trigger",
+                description: "Builtin trigger capability reference",
+                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nSecret body",
+            }],
+        ));
+        let tool = SkillGetTool { store };
+        let prompt = tool
+            .extra_prompt(&ToolDefinitionContext::default())
+            .expect("skill__get should always advertise discovery guidance");
 
-pub struct SkillDeleteTool<S> {
-    pub(crate) store: Arc<S>,
-}
+        assert!(prompt.contains("trigger"));
+        assert!(prompt.contains("Builtin trigger capability reference"));
+        assert!(!prompt.contains("Secret body"));
+    }
 
-impl<S: SkillStore + 'static> Tool for SkillDeleteTool<S> {
-    fn name(&self) -> &str {
-        "skill__delete"
+    #[test]
+    fn read_skill_names_reads_current_and_legacy_session_state() {
+        let state = serde_json::json!({
+            "__read_skills": ["docs", "researcher"],
+            "__activated_skills": ["researcher", "legacy"]
+        });
+        assert_eq!(
+            read_skill_names(&state),
+            vec!["docs", "researcher", "legacy"]
+        );
     }
-    fn description(&self) -> &str {
-        "Permanently delete a saved user skill by name. Builtin skills cannot be deleted."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Skill identifier to delete" }
-            },
-            "required": ["name"]
-        })
-    }
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let name = arguments["name"]
-            .as_str()
-            .ok_or_else(|| AgentError::tool("skill__delete", "missing 'name'"))?
-            .to_string();
-        let store = self.store.clone();
-        let existed = store.delete(&name).await?;
-        let result = if existed {
-            format!("Skill '{name}' deleted.")
-        } else {
-            format!("Skill '{name}' not found.")
+
+    #[tokio::test]
+    async fn skill_get_returns_instruction_as_tool_result_and_marks_resource_access() {
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::with_roots([]),
+            [BuiltinSkill {
+                name: "researcher",
+                description: "Research workflow",
+                content: "---\nname: researcher\ndescription: Research workflow\n---\n\nUse primary sources.",
+            }],
+        ));
+        let tool = SkillGetTool { store };
+        let ctx = ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         };
-        Ok(ToolResult::Output(
-            stream! { yield ToolOutput::text(result); },
-        ))
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "researcher" }), None, &ctx)
+            .await
+            .expect("skill__get should succeed");
+        let ToolResult::Output(stream) = result else {
+            panic!("expected tool output");
+        };
+        let mut stream = std::pin::pin!(stream);
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+
+        assert!(output.contains("Use primary sources."));
+        assert!(output.contains("[skill read: researcher"));
+        assert!(!output.contains("[skill activated:"));
+        assert_eq!(
+            read_skill_names(&ctx.user_state.read().unwrap()),
+            vec!["researcher"]
+        );
     }
 }

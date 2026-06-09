@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use remi_client_sdk::auth::auth_set_app_key;
-use remi_client_sdk::things_crdt::{ThingEntry, ThingsSnapshot};
+use remi_client_sdk::things_crdt::{ThingEntry, ThingsSnapshotState};
 use remi_client_sdk::things_sync::sync_v3_documents_with_server;
 use remi_client_sdk::transport::configure_shared_transport;
 use remi_client_sdk::{
@@ -218,7 +218,7 @@ impl SchedulerRuntime {
 
     fn dispatch_from_summary(
         &self,
-        snapshot: &ThingsSnapshot,
+        snapshot: &ThingsSnapshotState,
         summary: &TriggerExecutionSummary,
     ) -> Result<Option<TriggerDispatch>> {
         let (thing_uuids, _) = self
@@ -309,12 +309,10 @@ impl SchedulerRuntime {
         Ok(wait_until_next_fire.min(SYNC_INTERVAL))
     }
 
-    fn snapshot(&self) -> Result<ThingsSnapshot> {
-        let snapshot_json = self
-            .sdk
-            .things_list_snapshot_json_lite(&self.config.device_id)
-            .context("failed to read daemon trigger snapshot")?;
-        serde_json::from_str(&snapshot_json).context("failed to parse daemon trigger snapshot")
+    fn snapshot(&self) -> Result<ThingsSnapshotState> {
+        self.sdk
+            .things_list_snapshot_lite(&self.config.device_id)
+            .context("failed to read daemon trigger snapshot")
     }
 }
 

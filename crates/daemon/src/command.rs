@@ -5,12 +5,12 @@
 //! passed through to the Agent.
 
 use crate::docker::DockerManager;
+use crate::reply_transport::ReplyTransport;
 use crate::restart::RestartHandle;
 use crate::rpc_server::RpcServer;
 use crate::secret_store::SecretStore;
 use anyhow::Result;
 use im_feishu::client::build_secret_manager_card;
-use im_feishu::FeishuGateway;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -60,7 +60,7 @@ pub async fn execute_daemon_command(
     restart_handle: &RestartHandle,
     secret_store: &Arc<RwLock<SecretStore>>,
     rpc: &RpcServer,
-    gateway: &FeishuGateway,
+    transport: &ReplyTransport,
     reply_to_id: &str,
 ) -> Result<String> {
     // data_dir for diagnose/repair: derive from binary location or cwd.
@@ -236,12 +236,27 @@ pub async fn execute_daemon_command(
                     drop(guard);
                     let keys_ref: Vec<(&str, bool)> =
                         keys_info.iter().map(|(k, s)| (k.as_str(), *s)).collect();
-                    let card = build_secret_manager_card(&keys_ref);
-                    if let Err(e) = gateway.reply_card_raw(reply_to_id, card).await {
-                        return Err(e.context("failed to send secret manager card"));
+                    match transport {
+                        ReplyTransport::Feishu(_) => {
+                            let card = build_secret_manager_card(&keys_ref);
+                            if let Err(e) = transport.reply_card_raw(reply_to_id, card).await {
+                                return Err(e.context("failed to send secret manager card"));
+                            }
+                            Ok(String::new())
+                        }
+                        ReplyTransport::Cli(_) => {
+                            let mut text = String::from("**Secrets**\n\n");
+                            if keys_info.is_empty() {
+                                text.push_str("(empty)");
+                            } else {
+                                for (key, is_system) in &keys_info {
+                                    let suffix = if *is_system { " [system]" } else { "" };
+                                    text.push_str(&format!("- `{key}`{suffix}\n"));
+                                }
+                            }
+                            Ok(text)
+                        }
                     }
-                    // Return empty string — reply was sent directly as card.
-                    Ok(String::new())
                 }
             }
         }

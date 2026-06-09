@@ -5,14 +5,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use remi_agentloop::prelude::{AgentError, ToolContext};
 use remi_client_sdk::auth::auth_set_app_key;
-use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingUpsert, ThingsSnapshot};
+use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingUpsert, ThingsSnapshotState};
 use remi_client_sdk::things_sync::sync_v3_documents_with_server;
 use remi_client_sdk::transport::configure_shared_transport;
 use remi_client_sdk::{TriggerClient, TriggerRegistration, TriggerRule, TriggerSdk};
 use remi_things_crdt::{apply_collection_op, CollectionOp, ThingDatatype, TriggerUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -31,30 +31,29 @@ const SDK_DB_FILE_NAME: &str = "trigger-sdk.db";
 const TRIGGER_COLLECTION_TITLE: &str = "Semantic triggers";
 
 pub struct TriggerBackend {
-    sdk_config: Option<SdkTriggerConfig>,
-    sdk_runtime: OnceCell<Arc<SdkTriggerRuntime>>,
+    data_dir: PathBuf,
+    sdk_runtimes: Mutex<HashMap<String, Arc<SdkTriggerRuntime>>>,
 }
 
 impl TriggerBackend {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
-            sdk_config: SdkTriggerConfig::from_env(&data_dir),
-            sdk_runtime: OnceCell::new(),
+            data_dir,
+            sdk_runtimes: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn is_configured(&self) -> bool {
-        self.sdk_config.is_some()
+        true
     }
 
     pub async fn refresh_thread_user_state(
         &self,
         thread_id: &str,
+        user_id: Option<&str>,
         user_state: &mut Value,
     ) -> Result<()> {
-        let Some(runtime) = self.sdk_runtime().await? else {
-            return Ok(());
-        };
+        let runtime = self.sdk_runtime_for_user(user_id).await?;
 
         runtime
             .refresh_thread_user_state(thread_id, user_state)
@@ -123,7 +122,7 @@ impl TriggerBackend {
             platform: metadata_string(ctx, "platform"),
         };
 
-        let runtime = self.require_sdk("trigger__upsert").await?;
+        let runtime = self.require_sdk("trigger__upsert", ctx).await?;
         let item = runtime.upsert_trigger(draft).await.map_err(|err| {
             AgentError::tool(
                 "trigger__upsert",
@@ -169,7 +168,7 @@ impl TriggerBackend {
         };
 
         let item = triggers[index].clone();
-        let runtime = self.require_sdk("trigger__delete").await?;
+        let runtime = self.require_sdk("trigger__delete", ctx).await?;
         runtime.delete_trigger(&item).await.map_err(|err| {
             AgentError::tool(
                 "trigger__delete",
@@ -183,15 +182,16 @@ impl TriggerBackend {
         Ok(format!("Removed trigger #{id}."))
     }
 
-    async fn require_sdk(&self, tool_name: &str) -> Result<Arc<SdkTriggerRuntime>, AgentError> {
-        match self.sdk_runtime().await {
-            Ok(Some(runtime)) => Ok(runtime),
-            Ok(None) => Err(AgentError::tool(
-                tool_name,
-                format!(
-                    "remi trigger backend is not configured; set {REMI_APP_KEY_ENV} and {REMI_PUBLIC_GRPC_ADDR_ENV}"
-                ),
-            )),
+    async fn require_sdk(
+        &self,
+        tool_name: &str,
+        ctx: &ToolContext,
+    ) -> Result<Arc<SdkTriggerRuntime>, AgentError> {
+        match self
+            .sdk_runtime_for_user(metadata_string(ctx, "sender_user_id").as_deref())
+            .await
+        {
+            Ok(runtime) => Ok(runtime),
             Err(err) => Err(AgentError::tool(
                 tool_name,
                 format!("remi trigger backend is unavailable: {err:#}"),
@@ -199,25 +199,34 @@ impl TriggerBackend {
         }
     }
 
-    async fn sdk_runtime(&self) -> Result<Option<Arc<SdkTriggerRuntime>>> {
-        let Some(config) = self.sdk_config.clone() else {
-            return Ok(None);
-        };
+    async fn sdk_runtime_for_user(&self, user_id: Option<&str>) -> Result<Arc<SdkTriggerRuntime>> {
+        let user_key = sdk_user_key(user_id);
+        {
+            let runtimes = self.sdk_runtimes.lock().await;
+            if let Some(runtime) = runtimes.get(&user_key) {
+                return Ok(Arc::clone(runtime));
+            }
+        }
 
-        let runtime = self
-            .sdk_runtime
-            .get_or_try_init(
-                || async move { SdkTriggerRuntime::initialize(config).await.map(Arc::new) },
-            )
-            .await?;
-        Ok(Some(runtime.clone()))
+        let config = SdkTriggerConfig::from_env(&self.data_dir, &user_key);
+        let runtime = Arc::new(SdkTriggerRuntime::initialize(config).await?);
+        let mut runtimes = self.sdk_runtimes.lock().await;
+        Ok(Arc::clone(
+            runtimes
+                .entry(user_key)
+                .or_insert_with(|| Arc::clone(&runtime)),
+        ))
     }
 
     async fn load_user_state(&self, ctx: &ToolContext) -> Value {
         let mut user_state = { ctx.user_state.read().unwrap().clone() };
         if let Some(thread_id) = thread_id_from_ctx(ctx) {
             if let Err(err) = self
-                .refresh_thread_user_state(thread_id, &mut user_state)
+                .refresh_thread_user_state(
+                    thread_id,
+                    metadata_string(ctx, "sender_user_id").as_deref(),
+                    &mut user_state,
+                )
                 .await
             {
                 warn!(
@@ -233,14 +242,19 @@ impl TriggerBackend {
 
 #[derive(Debug, Clone)]
 struct SdkTriggerConfig {
-    app_key: String,
-    public_grpc_addr: String,
+    remote: Option<SdkRemoteConfig>,
     device_id: String,
     db_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct SdkRemoteConfig {
+    app_key: String,
+    public_grpc_addr: String,
+}
+
 impl SdkTriggerConfig {
-    fn from_env(data_dir: &Path) -> Option<Self> {
+    fn from_env(data_dir: &Path, user_key: &str) -> Self {
         let app_key = std::env::var(REMI_APP_KEY_ENV)
             .ok()
             .map(|value| value.trim().to_string())
@@ -250,26 +264,29 @@ impl SdkTriggerConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        match (app_key, public_grpc_addr) {
-            (Some(app_key), Some(public_grpc_addr)) => Some(Self {
+        let remote = match (app_key, public_grpc_addr) {
+            (Some(app_key), Some(public_grpc_addr)) => Some(SdkRemoteConfig {
                 app_key,
                 public_grpc_addr,
-                device_id: std::env::var(REMI_TRIGGER_DEVICE_ID_ENV)
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| default_device_id(data_dir)),
-                db_path: data_dir.join(SDK_DB_FILE_NAME),
             }),
             (None, None) => None,
             _ => {
                 warn!(
-                    "partial remi trigger configuration detected; trigger backend disabled until both {} and {} are set",
+                    "partial remi trigger configuration detected; remote sync disabled until both {} and {} are set",
                     REMI_APP_KEY_ENV,
                     REMI_PUBLIC_GRPC_ADDR_ENV,
                 );
                 None
             }
+        };
+        Self {
+            remote,
+            device_id: std::env::var(REMI_TRIGGER_DEVICE_ID_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| default_device_id(data_dir, user_key)),
+            db_path: sdk_user_dir(data_dir, user_key).join(SDK_DB_FILE_NAME),
         }
     }
 }
@@ -282,20 +299,26 @@ struct SdkTriggerRuntime {
 
 impl SdkTriggerRuntime {
     async fn initialize(config: SdkTriggerConfig) -> Result<Self> {
-        let transport_config = serde_json::json!({
-            "transportMode": "tcp",
-            "tcpGrpcAddr": config.public_grpc_addr,
-            "connectTimeoutMs": 3000,
-            "requestTimeoutMs": 10000,
-        })
-        .to_string();
+        if let Some(parent) = config.db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating trigger sdk dir {}", parent.display()))?;
+        }
+        if let Some(remote) = &config.remote {
+            let transport_config = serde_json::json!({
+                "transportMode": "tcp",
+                "tcpGrpcAddr": remote.public_grpc_addr,
+                "connectTimeoutMs": 3000,
+                "requestTimeoutMs": 10000,
+            })
+            .to_string();
 
-        configure_shared_transport(&transport_config)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        auth_set_app_key(config.app_key.clone())
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
+            configure_shared_transport(&transport_config)
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            auth_set_app_key(remote.app_key.clone())
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+        }
 
         let sdk = Arc::new(TriggerSdk::initialize(&config.db_path).with_context(|| {
             format!(
@@ -316,9 +339,17 @@ impl SdkTriggerRuntime {
         thread_id: &str,
         user_state: &mut Value,
     ) -> Result<()> {
-        let _guard = self.lock.lock().await;
-        self.sync_best_effort_locked().await;
-        let sdk_triggers = self.thread_triggers_from_snapshot_locked(thread_id)?;
+        let sdk_triggers = {
+            let _guard = self.lock.lock().await;
+            if let Err(err) = self.reconcile_local_trigger_state_locked() {
+                warn!(
+                    device_id = %self.config.device_id,
+                    error = %err,
+                    "local trigger reconciliation failed"
+                );
+            }
+            self.thread_triggers_from_snapshot_locked(thread_id)?
+        };
         write_triggers_to_user_state(user_state, &sdk_triggers);
         Ok(())
     }
@@ -385,17 +416,15 @@ impl SdkTriggerRuntime {
             created_at: None,
             updated_at: None,
         };
-        self.sdk.things_upsert_collection_json(
-            &self.config.device_id,
-            &serde_json::to_string(&collection)?,
-        )?;
+        self.sdk
+            .things_upsert_collection(&self.config.device_id, collection)?;
         Ok(())
     }
 
     fn upsert_request_thing_locked(&self, draft: &TriggerDraft) -> Result<()> {
         let payload = trigger_thing_payload(draft);
         self.sdk
-            .things_upsert_thing_json(&self.config.device_id, &serde_json::to_string(&payload)?)?;
+            .things_upsert_thing(&self.config.device_id, payload)?;
         self.patch_thing_attrs_locked(
             &draft.collection_uuid,
             &draft.thing_uuid,
@@ -415,6 +444,8 @@ impl SdkTriggerRuntime {
                 .map(trigger_rule_from_spec)
                 .collect(),
             condition: draft.condition.iter().map(trigger_rule_from_spec).collect(),
+            action_uuid: None,
+            action_args: serde_json::json!({}),
         })?;
         Ok(())
     }
@@ -423,12 +454,10 @@ impl SdkTriggerRuntime {
         Ok(self.list_trigger_info_map_locked()?.remove(trigger_uuid))
     }
 
-    fn snapshot_locked(&self) -> Result<ThingsSnapshot> {
-        let snapshot_json = self
-            .sdk
-            .things_list_snapshot_json_lite(&self.config.device_id)
-            .context("failed to read local trigger snapshot")?;
-        serde_json::from_str(&snapshot_json).context("failed to parse local trigger snapshot")
+    fn snapshot_locked(&self) -> Result<ThingsSnapshotState> {
+        self.sdk
+            .things_list_snapshot_lite(&self.config.device_id)
+            .context("failed to read local trigger snapshot")
     }
 
     fn thread_triggers_from_snapshot_locked(&self, thread_id: &str) -> Result<Vec<TriggerItem>> {
@@ -535,6 +564,16 @@ impl SdkTriggerRuntime {
     }
 
     async fn sync_best_effort_locked(&self) {
+        if self.config.remote.is_none() {
+            if let Err(err) = self.reconcile_local_trigger_state_locked() {
+                warn!(
+                    device_id = %self.config.device_id,
+                    error = %err,
+                    "local trigger reconciliation failed"
+                );
+            }
+            return;
+        }
         if let Err(err) = sync_sdk_triggers(&self.sdk, &self.config).await {
             warn!(
                 device_id = %self.config.device_id,
@@ -589,6 +628,8 @@ impl SdkTriggerRuntime {
                         .map(trigger_rule_from_spec)
                         .collect(),
                     condition: attrs.condition.iter().map(trigger_rule_from_spec).collect(),
+                    action_uuid: None,
+                    action_args: serde_json::json!({}),
                 })?;
             }
 
@@ -722,7 +763,7 @@ fn thread_id_from_ctx<'a>(ctx: &'a ToolContext) -> Option<&'a str> {
         })
 }
 
-fn default_device_id(data_dir: &Path) -> String {
+fn default_device_id(data_dir: &Path, user_key: &str) -> String {
     let stable_path = data_dir
         .canonicalize()
         .unwrap_or_else(|_| data_dir.to_path_buf());
@@ -730,9 +771,27 @@ fn default_device_id(data_dir: &Path) -> String {
         "remi-cat-trigger-{}",
         Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
-            stable_path.to_string_lossy().as_bytes()
+            format!("{}:{user_key}", stable_path.to_string_lossy()).as_bytes()
         )
     )
+}
+
+fn sdk_user_dir(data_dir: &Path, user_key: &str) -> PathBuf {
+    data_dir.join("sdk").join(user_key).join("trigger")
+}
+
+fn sdk_user_key(user_id: Option<&str>) -> String {
+    let raw = user_id.unwrap_or("anonymous").trim();
+    let raw = if raw.is_empty() { "anonymous" } else { raw };
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn collection_uuid_for(thread_id: &str) -> String {
@@ -863,6 +922,9 @@ mod tests {
 
         assert_eq!(payload.uuid, "thing-1");
         assert_eq!(payload.title, "Morning summary");
-        assert_eq!(payload.data, Some(Value::String("Send the summary".to_string())));
+        assert_eq!(
+            payload.data,
+            Some(Value::String("Send the summary".to_string()))
+        );
     }
 }

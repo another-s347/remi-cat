@@ -64,6 +64,18 @@ struct MessageData {
     message_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    code: i64,
+    msg: String,
+    data: Option<ChatData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatData {
+    chat_id: String,
+}
+
 // ── Generic API response ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -398,6 +410,74 @@ impl FeishuClient {
         ensure_ok(resp.code, &resp.msg, "send_text")?;
         debug!("Sent text to chat {chat_id}");
         Ok(message_id_from(resp.data))
+    }
+
+    /// Create a private group chat used to mirror a remi sub-session.
+    pub async fn create_sub_session_chat(
+        &self,
+        name: &str,
+        description: &str,
+        owner_open_id: Option<&str>,
+    ) -> Result<String> {
+        let res = self
+            .create_sub_session_chat_once(name, description, owner_open_id)
+            .await;
+        if res
+            .as_ref()
+            .err()
+            .map(is_token_expired_err)
+            .unwrap_or(false)
+        {
+            warn!("create_sub_session_chat: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self
+                .create_sub_session_chat_once(name, description, owner_open_id)
+                .await;
+        }
+        res
+    }
+
+    async fn create_sub_session_chat_once(
+        &self,
+        name: &str,
+        description: &str,
+        owner_open_id: Option<&str>,
+    ) -> Result<String> {
+        let token = self.token().await;
+        let mut body = serde_json::json!({
+            "name": name,
+            "description": description,
+            "chat_mode": "group",
+            "chat_type": "private",
+        });
+        if let Some(owner_open_id) = owner_open_id.filter(|value| !value.trim().is_empty()) {
+            body["owner_id"] = serde_json::Value::String(owner_open_id.to_string());
+            body["user_id_list"] = serde_json::json!([owner_open_id]);
+        }
+        // Feishu chat-create expects bot_id_list to contain app_id values,
+        // not the bot user's open_id returned by /bot/v3/info.
+        body["bot_id_list"] = serde_json::json!([self.app_id.clone()]);
+
+        let resp: ChatResponse = self
+            .http
+            .post(format!("{FEISHU_BASE}/im/v1/chats?user_id_type=open_id"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("create_sub_session_chat")?
+            .json()
+            .await
+            .context("parse create_sub_session_chat response")?;
+
+        ensure_ok(resp.code, &resp.msg, "create_sub_session_chat")?;
+        let chat_id = resp
+            .data
+            .map(|data| data.chat_id)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("create_sub_session_chat response missing chat_id"))?;
+        debug!("Created sub-session chat {chat_id}");
+        Ok(chat_id)
     }
 
     /// Reply to an existing message with plain text. Returns the new `message_id`.

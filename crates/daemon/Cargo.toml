@@ -13,7 +13,7 @@ im-feishu = { path = "../im-feishu" }
 im-gateway = { path = "../im-gateway" }
 matcher = { path = "../matcher" }
 user-store = { path = "../user-store" }
-remi-client-sdk = { git = "https://github.com/another-s347/remi-sdk.git", package = "remi-client-sdk", branch = "main" }
+remi-client-sdk = { path = "../../../remi-sdk/remi-client-sdk" }
 
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"
@@ -24,6 +24,7 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 # Docker API client — connects via Unix socket only, no TLS needed
 bollard = { version = "0.17", default-features = false }

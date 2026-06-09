@@ -1,25 +1,42 @@
+[package]
+name = "remi-cat"
+version = "0.2.0"
+edition = "2021"
+
 [workspace]
 members = [
+    ".",
     "crates/im-gateway",
     "crates/im-feishu",
     "crates/matcher",
     "crates/user-store",
     "crates/bot-core",
-    "crates/proto",
-    "crates/daemon",
-    "crates/agent",
     "crates/mgmt-api",
     "crates/admin-ui",
 ]
-default-members = ["crates/daemon", "crates/agent", "crates/admin-ui"]
+default-members = ["."]
 resolver = "2"
 
-[patch."https://github.com/another-s347/remi-agentloop.git"]
-remi-agentloop = { path = "../remi-agentloop/remi-agentloop" }
-remi-agentloop-core = { path = "../remi-agentloop/remi-agentloop-core" }
-remi-agentloop-guest = { path = "../remi-agentloop/remi-agentloop-guest" }
-remi-agentloop-macros = { path = "../remi-agentloop/remi-agentloop-macros" }
-remi-agentloop-model = { path = "../remi-agentloop/remi-agentloop-model" }
-remi-agentloop-tool = { path = "../remi-agentloop/remi-agentloop-tool" }
-remi-agentloop-transport = { path = "../remi-agentloop/remi-agentloop-transport" }
-remi-agentloop-wasm = { path = "../remi-agentloop/remi-agentloop-wasm" }
+[dependencies]
+bot-core = { path = "crates/bot-core" }
+im-feishu = { path = "crates/im-feishu" }
+user-store = { path = "crates/user-store" }
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
+    "http-client",
+    "tracing-langsmith",
+] }
+
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures = "0.3"
+sentry = { version = "0.47", features = ["tracing"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

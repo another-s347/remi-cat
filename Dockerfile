@@ -1,3 +1,9 @@
+# Legacy Dockerfile for the old remi-cat-agent sandbox architecture.
+#
+# The current runtime is delivered as a single host executable (`remi-cat`).
+# This file is retained only for historical deployments and is no longer part
+# of the primary release path.
+#
 # Dockerfile for remi-cat-agent (runs inside Docker as an isolation sandbox).
 # The binary is downloaded from GitHub Releases — no Rust toolchain needed.
 #
@@ -45,4 +51,3 @@ VOLUME ["/app/data"]
 WORKDIR /app/data
 
 ENTRYPOINT ["/usr/local/bin/remi-cat-agent"]
-
