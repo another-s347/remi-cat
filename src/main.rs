@@ -1,8 +1,13 @@
 mod host_admin;
+mod instance_profile;
+mod profile_command;
 mod runtime_config;
+mod secret_store;
 mod session;
+mod web_chat;
 
 use anyhow::Context;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -16,17 +21,25 @@ use bot_core::im_tools::{
     SubSessionBindingUpsertRequest, UploadedImFile,
 };
 use bot_core::{
-    install_embedded_agent_profiles, install_embedded_model_profiles, AgentProfile, AgentRegistry,
-    CatBot, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds, ImAttachment, ImDocument,
-    ModelProfileRegistry, StreamOptions,
+    install_embedded_agent_profiles, install_embedded_model_profiles, AccountBalance, AccountUsage,
+    AccountUsageStatus, AgentProfile, AgentRegistry, CatBot, CatBotBuilder, CatEvent, Content,
+    ContentPart, GoalMaxRounds, ImAttachment, ImDocument, ModelProfileRegistry, SkillDocument,
+    StreamOptions,
 };
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuEventHookConfig, FeishuGateway, FeishuMessage, StreamingCard};
+use instance_profile::InstanceProfile;
+use profile_command::{
+    apply_runtime_config_entries, available_container_name, configured_ports, first_available_port,
+    parse_profile_command, prefix_short_config_entry, print_port_adjustment,
+    run_noninteractive_setup, run_profile_command, ProfileCommand,
+};
 use remi_agentloop::types::{SubSessionEvent, SubSessionEventPayload};
 use runtime_config::{
     detect_setup_state, has_legacy_env_credentials, load_dotenv_pairs, upsert_dotenv_value,
     write_runtime_config, FeishuTransport, RuntimeConfig, RuntimeSandboxKind, SetupState,
 };
+use secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use session::{ChannelBinding, SessionRuntime, SubSessionKind};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -39,19 +52,40 @@ const CLI_CHANNEL: &str = "cli";
 const CLI_CHAT_ID: &str = "local-dev";
 const CLI_USER_ID: &str = "local-user";
 const CLI_USERNAME: &str = "local-user";
+const SESSION_DEBUG_METADATA_KEY: &str = "debug";
+const SESSION_MODEL_PROFILE_METADATA_KEY: &str = "model_profile_id";
+const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppCommand {
     Run(CliConfig),
-    Setup,
+    Setup(Vec<String>),
     Doctor,
+    Secrets(SecretCommand),
+    ConfigSet(Vec<String>),
+    SandboxSet(Vec<String>),
+    Profile(ProfileCommand),
     Feishu(FeishuCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalArgs {
+    profile: Option<String>,
+    command_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FeishuCommand {
     Init,
     Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecretCommand {
+    List,
+    Get(String),
+    Set { key: String, value: String },
+    Delete(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,11 +177,91 @@ impl CliConfig {
 
 fn parse_command(args: &[String]) -> anyhow::Result<AppCommand> {
     match args.first().map(String::as_str) {
-        Some("setup") => Ok(AppCommand::Setup),
+        Some("setup") => Ok(AppCommand::Setup(args[1..].to_vec())),
         Some("doctor") | Some("check") => Ok(AppCommand::Doctor),
+        Some("secrets") | Some("secret") => {
+            Ok(AppCommand::Secrets(parse_secret_command(&args[1..])?))
+        }
+        Some("config") => parse_config_command(&args[1..]),
+        Some("sandbox") => parse_sandbox_command(&args[1..]),
+        Some("profile") => Ok(AppCommand::Profile(parse_profile_command(&args[1..])?)),
         Some("feishu") => Ok(AppCommand::Feishu(parse_feishu_command(&args[1..])?)),
         _ => Ok(AppCommand::Run(CliConfig::from_args(args)?)),
     }
+}
+
+fn parse_secret_command(args: &[String]) -> anyhow::Result<SecretCommand> {
+    match args.first().map(String::as_str) {
+        Some("list") | None => Ok(SecretCommand::List),
+        Some("get") => Ok(SecretCommand::Get(next_arg(args, 0)?)),
+        Some("set") => {
+            let key = next_arg(args, 0)?;
+            let value = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if value.is_empty() {
+                anyhow::bail!("usage: remi-cat secrets set <KEY> <VALUE>");
+            }
+            Ok(SecretCommand::Set { key, value })
+        }
+        Some("delete") | Some("remove") | Some("unset") => {
+            Ok(SecretCommand::Delete(next_arg(args, 0)?))
+        }
+        Some(other) => anyhow::bail!("unknown `remi-cat secrets` subcommand `{other}`"),
+    }
+}
+
+fn parse_config_command(args: &[String]) -> anyhow::Result<AppCommand> {
+    match args.first().map(String::as_str) {
+        Some("set") => Ok(AppCommand::ConfigSet(args[1..].to_vec())),
+        Some(other) => anyhow::bail!("unknown `remi-cat config` subcommand `{other}`"),
+        None => anyhow::bail!("usage: remi-cat config set <key=value>..."),
+    }
+}
+
+fn parse_sandbox_command(args: &[String]) -> anyhow::Result<AppCommand> {
+    match args.first().map(String::as_str) {
+        Some("set") => Ok(AppCommand::SandboxSet(args[1..].to_vec())),
+        Some(other) => anyhow::bail!("unknown `remi-cat sandbox` subcommand `{other}`"),
+        None => anyhow::bail!("usage: remi-cat sandbox set <key=value>..."),
+    }
+}
+
+fn parse_global_args(args: &[String]) -> anyhow::Result<GlobalArgs> {
+    let mut profile = None;
+    let mut command_args = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" => {
+                let value = next_arg(args, i)?;
+                instance_profile::validate_profile_name(&value)?;
+                if profile.replace(value).is_some() {
+                    anyhow::bail!("--profile may only be specified once");
+                }
+                i += 2;
+            }
+            value if value.starts_with("--profile=") => {
+                let value = value.trim_start_matches("--profile=").to_string();
+                instance_profile::validate_profile_name(&value)?;
+                if profile.replace(value).is_some() {
+                    anyhow::bail!("--profile may only be specified once");
+                }
+                i += 1;
+            }
+            _ => {
+                command_args.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(GlobalArgs {
+        profile,
+        command_args,
+    })
 }
 
 fn parse_feishu_command(args: &[String]) -> anyhow::Result<FeishuCommand> {
@@ -289,6 +403,32 @@ impl ImFileBridge for LocalImFileBridge {
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("{} {}", request.target, request.sub_session_id));
             let chat_name = format!("remi {}: {}", request.kind, title);
+            if request.kind == "fork"
+                && request
+                    .parent_thread_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                let topic_text = format!(
+                    "Fork session `{}` is bound here.\nparent_session_id: {}\ntarget: {}",
+                    request.sub_session_id, request.parent_session_id, request.target
+                );
+                let (_, thread_id) = gateway
+                    .send_topic_text(&request.parent_channel_id, &topic_text)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "POST /open-apis/im/v1/messages failed while binding fork topic; parent_chat_id={}, parent_thread_id={:?}, sub_session_id={}",
+                            request.parent_channel_id,
+                            request.parent_thread_id,
+                            request.sub_session_id,
+                        )
+                    })?;
+                return Ok(Some(BoundImChannel {
+                    platform: FEISHU_CHANNEL.to_string(),
+                    channel_id: feishu_topic_channel_id(&request.parent_channel_id, &thread_id),
+                }));
+            }
             let chat_id = gateway
                 .create_sub_session_chat(
                     &chat_name,
@@ -327,6 +467,7 @@ impl ImFileBridge for LocalImFileBridge {
 
 struct Runtime {
     bot: Rc<CatBot>,
+    secret_store: Arc<Mutex<SecretStore>>,
     user_store: Arc<UserStore>,
     sessions: Arc<Mutex<SessionRuntime>>,
     im_bridge: Arc<dyn ImFileBridge>,
@@ -371,25 +512,61 @@ struct FeishuDoctorStatus {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let explicit_data_dir = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from);
     let _ = dotenvy::dotenv();
+    let secret_store = Arc::new(Mutex::new(SecretStore::from_env()));
+    let startup_secrets = secret_store.lock().await.entries()?;
+    apply_entries_to_env(&startup_secrets);
     init_observability();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = parse_command(&args)?;
-    let mut data_dir = initial_data_dir_for_command(&command);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let global_args = parse_global_args(&raw_args)?;
+    let command = parse_command(&global_args.command_args)?;
+    let selected_profile = resolve_instance_profile(global_args.profile, explicit_data_dir)?;
+    let mut data_dir = selected_profile.data_dir.clone();
+
+    if let AppCommand::Profile(profile_command) = &command {
+        run_profile_command(profile_command)?;
+        return Ok(());
+    }
+
     std::fs::create_dir_all(&data_dir)?;
 
     match command {
-        AppCommand::Setup => {
-            run_setup(&mut data_dir).await?;
+        AppCommand::Setup(entries) => {
+            if entries.is_empty() {
+                run_setup(&selected_profile, &mut data_dir, Arc::clone(&secret_store)).await?;
+            } else {
+                run_noninteractive_setup(&selected_profile, &data_dir, &entries)?;
+            }
             return Ok(());
         }
         AppCommand::Doctor => {
-            run_doctor(&data_dir)?;
+            run_doctor(&selected_profile, &data_dir)?;
             return Ok(());
         }
+        AppCommand::Secrets(command) => {
+            println!(
+                "{}",
+                run_secret_command(Arc::clone(&secret_store), &command, true).await?
+            );
+            return Ok(());
+        }
+        AppCommand::ConfigSet(entries) => {
+            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false)?;
+            return Ok(());
+        }
+        AppCommand::SandboxSet(entries) => {
+            let entries = entries
+                .iter()
+                .map(|entry| prefix_short_config_entry("sandbox", entry))
+                .collect::<Vec<_>>();
+            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false)?;
+            return Ok(());
+        }
+        AppCommand::Profile(_) => unreachable!(),
         AppCommand::Feishu(FeishuCommand::Init) => {
-            run_feishu_init().await?;
+            run_feishu_init(Arc::clone(&secret_store)).await?;
             return Ok(());
         }
         AppCommand::Feishu(FeishuCommand::Doctor) => {
@@ -397,6 +574,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         AppCommand::Run(ref cli) => {
+            unsafe {
+                std::env::set_var("REMI_DATA_DIR", &data_dir);
+            }
             if let SetupState::Initialized { config, .. } = detect_setup_state(&data_dir) {
                 config.apply_env_defaults();
                 data_dir = std::path::PathBuf::from(
@@ -419,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
 
     install_embedded_model_profiles(data_dir.join("models"))?;
     install_embedded_agent_profiles(data_dir.join("agents"))?;
+    std::fs::create_dir_all(data_dir.join("workflows"))?;
 
     let cli = match command {
         AppCommand::Run(cli) => cli,
@@ -433,9 +614,13 @@ async fn main() -> anyhow::Result<()> {
         let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
         maybe_start_admin(host_admin::AdminState {
             agents_dir,
+            skills_dir: data_dir.join("skills"),
+            workspace_dir: current_workspace_dir(&data_dir),
+            secret_store: Arc::clone(&secret_store),
             sessions,
             root_agent_id,
             setup_state: detect_setup_state(&data_dir),
+            web_chat: None,
         })
         .await?;
         tokio::signal::ctrl_c().await?;
@@ -445,11 +630,20 @@ async fn main() -> anyhow::Result<()> {
     let gateway = if cli.enabled || cli.once.is_some() {
         None
     } else {
-        let app_id = std::env::var("FEISHU_APP_ID")
-            .map_err(|_| anyhow::anyhow!("FEISHU_APP_ID must be set"))?;
-        let app_secret = std::env::var("FEISHU_APP_SECRET")
-            .map_err(|_| anyhow::anyhow!("FEISHU_APP_SECRET must be set"))?;
-        Some(FeishuGateway::new(app_id, app_secret))
+        match (
+            std::env::var("FEISHU_APP_ID").ok(),
+            std::env::var("FEISHU_APP_SECRET").ok(),
+        ) {
+            (Some(app_id), Some(app_secret))
+                if !app_id.trim().is_empty() && !app_secret.trim().is_empty() =>
+            {
+                Some(FeishuGateway::new(app_id, app_secret))
+            }
+            _ => {
+                info!("Feishu credentials are absent; starting in Web-only mode");
+                None
+            }
+        }
     };
 
     let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge {
@@ -460,29 +654,36 @@ async fn main() -> anyhow::Result<()> {
             .im_bridge(Arc::clone(&bridge))
             .build()?,
     );
+    bot.update_secret_redactor(&redaction_entries(&secret_store.lock().await.entries()?));
     let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
-    if !cli.pure_prompt {
-        maybe_start_admin(host_admin::AdminState {
-            agents_dir,
-            sessions: Arc::clone(&sessions),
-            root_agent_id: root_agent_id.clone(),
-            setup_state: detect_setup_state(&data_dir),
-        })
-        .await?;
-    }
-
     let runtime = Rc::new(Runtime {
         bot,
+        secret_store,
         user_store: Arc::new(UserStore::load(data_dir.join("users.json"))?),
         sessions,
         im_bridge: Arc::clone(&bridge),
         root_agent_id,
         data_dir: data_dir.clone(),
     });
+    let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
+    if !cli.pure_prompt {
+        maybe_start_admin(host_admin::AdminState {
+            agents_dir,
+            skills_dir: data_dir.join("skills"),
+            workspace_dir: current_workspace_dir(&data_dir),
+            secret_store: Arc::clone(&runtime.secret_store),
+            sessions: Arc::clone(&runtime.sessions),
+            root_agent_id: runtime.root_agent_id.clone(),
+            setup_state: detect_setup_state(&data_dir),
+            web_chat: Some(web_chat),
+        })
+        .await?;
+    }
 
     let local_set = tokio::task::LocalSet::new();
     local_set
         .run_until(async move {
+            tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
                     process_prompt_message(Rc::clone(&runtime), &cli, message).await?;
@@ -494,9 +695,38 @@ async fn main() -> anyhow::Result<()> {
             if cli.enabled {
                 return run_cli(runtime, cli).await;
             }
-            run_feishu(runtime, gateway.expect("gateway should exist")).await
+            match gateway {
+                Some(gateway) => run_feishu(runtime, gateway).await,
+                None => {
+                    info!("Web Chat ready; waiting for shutdown");
+                    tokio::signal::ctrl_c().await?;
+                    Ok(())
+                }
+            }
         })
         .await
+}
+
+fn resolve_instance_profile(
+    cli_profile: Option<String>,
+    explicit_data_dir: Option<PathBuf>,
+) -> anyhow::Result<InstanceProfile> {
+    if let Some(data_dir) = explicit_data_dir {
+        return Ok(InstanceProfile {
+            name: None,
+            data_dir,
+        });
+    }
+    if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
+        return InstanceProfile::named(&name);
+    }
+    if let Some(data_dir) = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from) {
+        return Ok(InstanceProfile {
+            name: None,
+            data_dir,
+        });
+    }
+    Ok(InstanceProfile::default_instance())
 }
 
 async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> {
@@ -522,6 +752,13 @@ async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn current_workspace_dir(data_dir: &Path) -> PathBuf {
+    std::env::var_os("REMI_SANDBOX_HOST_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
 fn init_observability() {
     let _sentry_guard = sentry::init((
         std::env::var("SENTRY_DSN").unwrap_or_default(),
@@ -542,12 +779,21 @@ fn init_observability() {
         .init();
 }
 
-async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
+async fn run_setup(
+    profile: &InstanceProfile,
+    data_dir: &mut std::path::PathBuf,
+    secret_store: Arc<Mutex<SecretStore>>,
+) -> anyhow::Result<()> {
     println!("remi-cat setup");
+    println!("Profile: {}", profile.label());
     println!("This wizard will configure the local runtime and verify one real chat round.\n");
 
-    let chosen_dir = prompt_with_default("Data dir", &data_dir.display().to_string())?;
-    *data_dir = std::path::PathBuf::from(chosen_dir);
+    if !profile.is_named() {
+        let chosen_dir = prompt_with_default("Data dir", &data_dir.display().to_string())?;
+        *data_dir = std::path::PathBuf::from(chosen_dir);
+    } else {
+        println!("Data dir: {}\n", data_dir.display());
+    }
     std::fs::create_dir_all(&data_dir)?;
     let existing_config = match detect_setup_state(data_dir) {
         SetupState::Initialized {
@@ -571,6 +817,7 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
     };
     install_embedded_model_profiles(data_dir.join("models"))?;
     install_embedded_agent_profiles(data_dir.join("agents"))?;
+    std::fs::create_dir_all(data_dir.join("workflows"))?;
 
     let agents_dir = data_dir.join("agents");
     let models_dir = data_dir.join("models");
@@ -654,6 +901,9 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
     config.data_dir = data_dir.display().to_string();
     config.root_agent_id = root_agent_id.clone();
     config.model_profile = model_profile.clone();
+    if profile.is_named() && previous_config.is_none() {
+        config.sandbox.container_name = format!("remi-cat-sandbox-{}", profile.label());
+    }
     match sandbox_kind.as_str() {
         "docker" => {
             config.sandbox.kind = RuntimeSandboxKind::Docker;
@@ -664,6 +914,8 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
             config.sandbox.image = prompt_with_default("Sandbox image", &config.sandbox.image)?;
             config.sandbox.container_name =
                 prompt_with_default("Sandbox container name", &config.sandbox.container_name)?;
+            config.sandbox.container_name =
+                available_container_name(&config.sandbox.container_name, data_dir)?;
         }
         _ => {
             config.sandbox.kind = if sandbox_kind == "disabled" {
@@ -673,6 +925,14 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
             };
             config.sandbox.host_dir = data_dir.display().to_string();
         }
+    }
+    config.admin.enabled = prompt_bool_with_default("Admin enabled", config.admin.enabled)?;
+    if config.admin.enabled {
+        config.admin.host = prompt_with_default("Admin listen host", &config.admin.host)?;
+        config.admin.port =
+            prompt_with_default("Admin listen port", &config.admin.port.to_string())?
+                .parse()
+                .context("invalid Admin listen port")?;
     }
     config.im.transport = match feishu_transport.as_str() {
         "event_hook" | "event-hook" | "hook" => FeishuTransport::EventHook,
@@ -695,20 +955,44 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
         )?;
     }
 
+    let mut reserved_ports = configured_ports(data_dir)?;
+    if config.admin.enabled {
+        let requested = config.admin.port;
+        config.admin.port = first_available_port(&config.admin.host, requested, &reserved_ports)?;
+        print_port_adjustment("Admin", requested, config.admin.port);
+        reserved_ports.insert(config.admin.port);
+    }
+    if matches!(config.im.transport, FeishuTransport::EventHook) {
+        let requested = config.im.event_hook.port;
+        config.im.event_hook.port =
+            first_available_port(&config.im.event_hook.host, requested, &reserved_ports)?;
+        print_port_adjustment("Feishu Event Hook", requested, config.im.event_hook.port);
+    }
+
     let runtime_path = write_runtime_config(data_dir, &config)?;
     match run_setup_smoke(data_dir, &config, api_key.trim()).await {
         Ok(reply) => {
             let env_path = std::path::PathBuf::from(".env");
-            upsert_dotenv_value(&env_path, "REMI_DATA_DIR", &config.data_dir)?;
+            if !profile.is_named() {
+                upsert_dotenv_value(&env_path, "REMI_DATA_DIR", &config.data_dir)?;
+            }
             if !api_key.trim().is_empty() {
-                upsert_dotenv_value(&env_path, "OPENAI_API_KEY", api_key.trim())?;
+                secret_store
+                    .lock()
+                    .await
+                    .set("OPENAI_API_KEY", api_key.trim())?;
             }
             println!("\nSetup verification succeeded.");
             println!("Smoke reply: {}", reply.trim());
             println!("Saved runtime config to {}", runtime_path.display());
             println!("\nNext steps:");
             println!(
-                "- Local chat: remi-cat cli --channel support --user alice --name Alice \"Hello\""
+                "- Local chat: remi-cat{} cli --channel support --user alice --name Alice \"Hello\"",
+                profile
+                    .name
+                    .as_ref()
+                    .map(|name| format!(" --profile {name}"))
+                    .unwrap_or_default()
             );
             println!("- Feishu: run `remi-cat feishu init`, then run remi-cat");
             println!("- ACP: configure ACP settings later when needed");
@@ -726,31 +1010,10 @@ async fn run_setup(data_dir: &mut std::path::PathBuf) -> anyhow::Result<()> {
     }
 }
 
-fn initial_data_dir_for_command(command: &AppCommand) -> PathBuf {
-    match command {
-        AppCommand::Setup => preferred_setup_data_dir(),
-        _ => std::env::var("REMI_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(".remi-cat")),
-    }
-}
-
-fn preferred_setup_data_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("REMI_DATA_DIR") {
-        let candidate = PathBuf::from(value);
-        if matches!(
-            detect_setup_state(&candidate),
-            SetupState::Initialized { .. }
-        ) {
-            return candidate;
-        }
-    }
-    PathBuf::from(".remi-cat")
-}
-
-fn run_doctor(data_dir: &Path) -> anyhow::Result<()> {
+fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
     let setup_state = detect_setup_state(data_dir);
     println!("remi-cat doctor");
+    println!("profile: {}", profile.label());
     println!("data_dir: {}", data_dir.display());
     println!("runtime_config: {}", setup_state.config_path().display());
     match &setup_state {
@@ -758,6 +1021,15 @@ fn run_doctor(data_dir: &Path) -> anyhow::Result<()> {
             println!("setup: initialized");
             println!("root_agent_id: {}", config.root_agent_id);
             println!("model_profile: {}", config.model_profile);
+            println!(
+                "admin: {}",
+                if config.admin.enabled {
+                    format!("http://{}:{}", config.admin.host, config.admin.port)
+                } else {
+                    "disabled".to_string()
+                }
+            );
+            println!("sandbox_container: {}", config.sandbox.container_name);
             println!("feishu_transport: {}", config.im.transport.as_env_value());
             if matches!(config.im.transport, FeishuTransport::EventHook) {
                 println!(
@@ -1278,7 +1550,88 @@ fn command_doctor_report(runtime: &Runtime) -> String {
     )
 }
 
-async fn run_feishu_init() -> anyhow::Result<()> {
+async fn run_secret_command(
+    store: Arc<Mutex<SecretStore>>,
+    command: &SecretCommand,
+    redact_values: bool,
+) -> anyhow::Result<String> {
+    let store = store.lock().await;
+    match command {
+        SecretCommand::List => {
+            let keys = store.keys()?;
+            if keys.is_empty() {
+                Ok(format!("secret store `{}` is empty", store.backend_label()))
+            } else {
+                Ok(format!(
+                    "secret store `{}` keys:\n{}",
+                    store.backend_label(),
+                    keys.into_iter()
+                        .map(|key| format!("- `{key}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+        }
+        SecretCommand::Get(key) => match store.get(key)? {
+            Some(value) if redact_values => Ok(format!("`{key}` is set: {}", mask_secret(&value))),
+            Some(value) => Ok(format!("{key}={value}")),
+            None => Ok(format!("`{key}` is not set")),
+        },
+        SecretCommand::Set { key, value } => {
+            store.set(key, value)?;
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Ok(format!(
+                "secret `{key}` saved to `{}`",
+                store.backend_label()
+            ))
+        }
+        SecretCommand::Delete(key) => {
+            store.delete(key)?;
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Ok(format!(
+                "secret `{key}` deleted from `{}`",
+                store.backend_label()
+            ))
+        }
+    }
+}
+
+async fn handle_runtime_secret_command(
+    runtime: &Runtime,
+    command: &SecretCommand,
+) -> anyhow::Result<String> {
+    let reply = run_secret_command(Arc::clone(&runtime.secret_store), command, true).await?;
+    let entries = runtime.secret_store.lock().await.entries()?;
+    runtime
+        .bot
+        .update_secret_redactor(&redaction_entries(&entries));
+    Ok(reply)
+}
+
+fn mask_secret(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 8 {
+        return "********".to_string();
+    }
+    format!(
+        "{}…{}",
+        chars.iter().take(4).collect::<String>(),
+        chars
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    )
+}
+
+async fn run_feishu_init(secret_store: Arc<Mutex<SecretStore>>) -> anyhow::Result<()> {
     let bin = lark_cli_bin();
     if !lark_cli_installed(&bin) {
         anyhow::bail!(
@@ -1344,8 +1697,23 @@ async fn run_feishu_init() -> anyhow::Result<()> {
     }
 
     if credential_choice == FeishuCredentialChoice::ReuseExisting {
+        {
+            let store = secret_store.lock().await;
+            store.set(
+                "FEISHU_APP_ID",
+                env_app_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("FEISHU_APP_ID must be set to reuse credentials")
+                })?,
+            )?;
+            store.set(
+                "FEISHU_APP_SECRET",
+                env_app_secret.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("FEISHU_APP_SECRET must be set to reuse credentials")
+                })?,
+            )?;
+        }
         println!("\nFeishu login verification succeeded.");
-        println!("Existing FEISHU_APP_ID / FEISHU_APP_SECRET were kept as-is.");
+        println!("Existing FEISHU_APP_ID / FEISHU_APP_SECRET were synced to the secret store.");
         println!("Next step: run `remi-cat` to start the Feishu gateway.");
         return Ok(());
     }
@@ -1378,9 +1746,11 @@ You can still finish manually by writing FEISHU_APP_ID / FEISHU_APP_SECRET into 
             )
         })?;
 
-    let env_path = PathBuf::from(".env");
-    upsert_dotenv_value(&env_path, "FEISHU_APP_ID", app_id)?;
-    upsert_dotenv_value(&env_path, "FEISHU_APP_SECRET", app_secret)?;
+    {
+        let store = secret_store.lock().await;
+        store.set("FEISHU_APP_ID", app_id)?;
+        store.set("FEISHU_APP_SECRET", app_secret)?;
+    }
     unsafe {
         std::env::set_var("FEISHU_APP_ID", app_id);
         std::env::set_var("FEISHU_APP_SECRET", app_secret);
@@ -1390,7 +1760,7 @@ You can still finish manually by writing FEISHU_APP_ID / FEISHU_APP_SECRET into 
     if let Some(path) = snapshot.path {
         println!("Imported app credentials from {}", path.display());
     }
-    println!("Updated .env with FEISHU_APP_ID / FEISHU_APP_SECRET.");
+    println!("Updated secret store with FEISHU_APP_ID / FEISHU_APP_SECRET.");
     println!("Next step: run `remi-cat` to start the Feishu gateway.");
     Ok(())
 }
@@ -1896,6 +2266,18 @@ fn choose_from_list(label: &str, options: &[String], default_id: &str) -> anyhow
     prompt_with_default("Enter id", default_id)
 }
 
+fn prompt_bool_with_default(label: &str, default: bool) -> anyhow::Result<bool> {
+    let default_text = if default { "yes" } else { "no" };
+    loop {
+        let value = prompt_with_default(label, default_text)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" | "1" | "on" => return Ok(true),
+            "n" | "no" | "false" | "0" | "off" => return Ok(false),
+            _ => println!("Please enter yes or no."),
+        }
+    }
+}
+
 fn prompt_secret(current: Option<&str>) -> anyhow::Result<String> {
     let prompt = if current.is_some() {
         "OpenAI-compatible API key [leave blank to keep current]: "
@@ -2054,7 +2436,36 @@ async fn process_prompt_message(
         &cli.channel_id,
         &runtime.root_agent_id,
     )?;
-    let mut stream = std::pin::pin!(runtime.bot.stream(&session_id, text));
+    let (text, command_prefix, skill_injections) =
+        match process_runtime_commands(&runtime, &session_id, text.trim()).await? {
+            RuntimeCommandPipelineResult::Reply(reply) => {
+                println!("{reply}");
+                return Ok(());
+            }
+            RuntimeCommandPipelineResult::Continue {
+                text,
+                prefix,
+                skill_injections,
+            } => (text, prefix, skill_injections),
+        };
+    if !command_prefix.is_empty() {
+        print!("{command_prefix}");
+        io::stdout().flush()?;
+    }
+    let model_profile_id = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+    let opts = StreamOptions {
+        model_profile_id,
+        skill_injections,
+        ..StreamOptions::default()
+    };
+    let mut stream =
+        std::pin::pin!(runtime
+            .bot
+            .stream_with_options(&session_id, Content::text(text), opts));
     let mut output = String::new();
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
@@ -2117,16 +2528,16 @@ async fn process_feishu_message(
     )
     .await;
     let reaction_id = gateway.add_reaction(&msg.message_id, "THINKING").await.ok();
-    let mut card = gateway.begin_streaming_reply(&msg.message_id);
+    let mut replies = FeishuReplyStream::new(gateway.clone(), msg.message_id.clone());
     collect_bot_reply(
         runtime,
         FEISHU_CHANNEL,
         msg.clone(),
         sender_username,
-        Some(&mut card),
+        Some(&mut replies),
     )
     .await?;
-    card.finish().await.ok();
+    replies.finish().await;
     if let Some(reaction_id) = reaction_id {
         gateway
             .delete_reaction(&msg.message_id, &reaction_id)
@@ -2139,65 +2550,48 @@ async fn process_feishu_message(
 async fn collect_bot_reply(
     runtime: Rc<Runtime>,
     platform: &str,
-    msg: FeishuMessage,
+    mut msg: FeishuMessage,
     sender_username: Option<String>,
-    mut card: Option<&mut StreamingCard>,
+    mut replies: Option<&mut FeishuReplyStream>,
 ) -> anyhow::Result<String> {
     let channel_id = feishu_session_channel_id(&msg);
-    if msg.text.trim() == "/tools" {
-        let reply = runtime
-            .bot
-            .tool_list()
-            .into_iter()
-            .map(|(name, desc)| format!("- `{name}`: {desc}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        append_reply_chunk(&mut String::new(), &mut card, &reply).await;
-        return Ok(reply);
-    }
-    if msg.text.trim().starts_with("/goal") {
-        let session_id = runtime.sessions.lock().await.resolve_channel(
-            platform,
-            &channel_id,
-            &runtime.root_agent_id,
-        )?;
-        let reply = handle_goal_command(&runtime.bot, &session_id, msg.text.trim()).await?;
-        append_reply_chunk(&mut String::new(), &mut card, &reply).await;
-        return Ok(reply);
-    }
-    if msg.text.trim() == "/compact" {
-        let session_id = runtime.sessions.lock().await.resolve_channel(
-            platform,
-            &channel_id,
-            &runtime.root_agent_id,
-        )?;
-        let n = runtime.bot.compact_memory(&session_id).await?;
-        let reply = format!("compacted {n} short-term message(s).");
-        append_reply_chunk(&mut String::new(), &mut card, &reply).await;
-        return Ok(reply);
-    }
-    if msg.text.trim() == "/clear" {
-        let session_id = runtime.sessions.lock().await.resolve_channel(
-            platform,
-            &channel_id,
-            &runtime.root_agent_id,
-        )?;
-        runtime.bot.clear_memory(&session_id).await?;
-        let reply = "已清空当前 session 的历史会话。Todo/trigger 等工具状态已保留。".to_string();
-        append_reply_chunk(&mut String::new(), &mut card, &reply).await;
-        return Ok(reply);
-    }
-    if msg.text.trim() == "/doctor" {
-        let reply = command_doctor_report(&runtime);
-        append_reply_chunk(&mut String::new(), &mut card, &reply).await;
-        return Ok(reply);
-    }
-
     let session_id = runtime.sessions.lock().await.resolve_channel(
         platform,
         &channel_id,
         &runtime.root_agent_id,
     )?;
+    if platform == FEISHU_CHANNEL && is_fork_command(msg.text.trim()) {
+        let reply = handle_feishu_fork_command(&runtime, &session_id, &msg).await?;
+        append_reply_chunk(
+            &mut String::new(),
+            &mut replies,
+            FeishuReplyKind::Text,
+            &reply,
+        )
+        .await;
+        return Ok(reply);
+    }
+    let (command_prefix, skill_injections) =
+        match process_runtime_commands(&runtime, &session_id, msg.text.trim()).await? {
+            RuntimeCommandPipelineResult::Reply(reply) => {
+                append_reply_chunk(
+                    &mut String::new(),
+                    &mut replies,
+                    FeishuReplyKind::Text,
+                    &reply,
+                )
+                .await;
+                return Ok(reply);
+            }
+            RuntimeCommandPipelineResult::Continue {
+                text,
+                prefix,
+                skill_injections: injections,
+            } => {
+                msg.text = text;
+                (prefix, injections)
+            }
+        };
 
     let im_attachments = msg
         .files
@@ -2220,7 +2614,14 @@ async fn collect_bot_reply(
             token: d.token.clone(),
         })
         .collect();
+    let model_profile_id = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
     let opts = StreamOptions {
+        model_profile_id,
+        skill_injections,
         sender_user_id: Some(msg.sender_user_id.clone()),
         sender_username,
         message_id: Some(msg.message_id.clone()),
@@ -2239,10 +2640,19 @@ async fn collect_bot_reply(
         msg.files.len(),
         msg.documents.len(),
     );
-    let mut output = String::new();
-    let buffer_for_goal = runtime.bot.goal_status(&session_id).await.is_some();
-    let mut buffered_card = if buffer_for_goal { card.take() } else { None };
-    let mut supervisor_prefix: Option<String> = None;
+    let mut output = command_prefix;
+    let mut streaming_tool_names = HashMap::<String, String>::new();
+    let debug_enabled = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_bool(&session_id, SESSION_DEBUG_METADATA_KEY);
+    if !output.is_empty() {
+        if let Some(replies) = replies.as_deref_mut() {
+            replies.push(FeishuReplyKind::Text, &output).await;
+        }
+    }
+    let mut supervisor_execution_started = false;
     let mut stream = std::pin::pin!(runtime.bot.stream_with_options(&session_id, content, opts));
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
@@ -2252,39 +2662,48 @@ async fn collect_bot_reply(
                 let Some(event) = event else { break };
                 match event {
                     CatEvent::Text(delta) => {
-                        if buffer_for_goal {
-                            output.push_str(&delta);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &delta).await;
-                        }
+                        supervisor_execution_started = false;
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Text, &delta).await;
                     }
                     CatEvent::Thinking(content) => {
                         let chunk = format!("\n\n**Thinking**\n{}\n", fenced_block("text", &content));
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
-                        }
+                        supervisor_execution_started = false;
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Thinking, &chunk).await;
                     }
-                    CatEvent::ToolCall { name, args } => {
-                        let json = serde_json::to_string_pretty(&args).unwrap_or_default();
-                        let chunk = format!("\n\n**Tool `{name}`**\n{}\n", fenced_block("json", &json));
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
-                        }
-                    }
-                    CatEvent::ToolCallResult { name, result } => {
-                        let chunk = format!(
-                            "\n\n**Tool result `{name}`**\n{}\n",
-                            fenced_block("text", &result)
+                    CatEvent::ToolCallStart { id, name } => {
+                        streaming_tool_names.insert(id.clone(), name.clone());
+                        let pretty = bot_core::PrettyToolCall::started(
+                            &id,
+                            &name,
+                            &serde_json::Value::Object(serde_json::Map::new()),
                         );
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
-                        }
+                        let line = format_feishu_tool_line(&pretty);
+                        supervisor_execution_started = false;
+                        update_tool_reply(&mut output, &mut replies, &id, &line, false).await;
+                    }
+                    CatEvent::ToolCallArgumentsDelta { .. } => {}
+                    CatEvent::ToolCall { id, name, args } => {
+                        streaming_tool_names.remove(&id);
+                        let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
+                        let line = format_feishu_tool_line(&pretty);
+                        supervisor_execution_started = false;
+                        update_tool_reply(&mut output, &mut replies, &id, &line, false).await;
+                    }
+                    CatEvent::ToolCallResult {
+                        id,
+                        name,
+                        args,
+                        result,
+                        success,
+                        elapsed_ms,
+                    } => {
+                        streaming_tool_names.remove(&id);
+                        let pretty = bot_core::PrettyToolCall::completed(
+                            &id, &name, &args, &result, success, elapsed_ms,
+                        );
+                        let line = format_feishu_tool_line(&pretty);
+                        supervisor_execution_started = false;
+                        update_tool_reply(&mut output, &mut replies, &id, &line, true).await;
                     }
                     CatEvent::SubSession(event) => {
                         record_sub_session_event(&runtime, &session_id, platform, &msg, &event).await;
@@ -2292,35 +2711,57 @@ async fn collect_bot_reply(
                             "\n\n**Sub-session** `{}` / `{}`\n",
                             event.agent_name, event.sub_thread_id.0
                         );
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::SubSession, &chunk).await;
+                    }
+                    CatEvent::SupervisorProgress(progress) => {
+                        let reply_kind = supervisor_reply_kind(&progress);
+                        let mut chunk = String::new();
+                        if !supervisor_execution_started {
+                            chunk.push_str("\n\n---\n\n**Supervisor execution**\n");
+                            supervisor_execution_started = true;
                         }
+                        chunk.push_str(&format_supervisor_progress(&progress));
+                        append_reply_chunk(&mut output, &mut replies, reply_kind, &chunk).await;
                     }
                     CatEvent::Supervisor(report) => {
-                        supervisor_prefix = Some(bot_core::goal::format_goal_prefix(&report));
+                        let context = runtime.bot.workflow_status(&session_id).await.map(|instance| instance.context).unwrap_or(serde_json::Value::Null);
+                        let chunk = bot_core::supervisor_workflow::format_prefix(&report, &context);
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Supervisor, &chunk).await;
+                        supervisor_execution_started = false;
                     }
-                    CatEvent::Stats { prompt_tokens, completion_tokens, elapsed_ms } => {
-                        let chunk = format!(
-                            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `elapsed: {elapsed_ms}ms`"
-                        );
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
+                    CatEvent::Stats {
+                        prompt_tokens,
+                        completion_tokens,
+                        max_prompt_tokens,
+                        elapsed_ms,
+                    } => {
+                        if !debug_enabled {
+                            continue;
                         }
+                        let model_profile_id = runtime
+                            .sessions
+                            .lock()
+                            .await
+                            .metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+                        let context_tokens = runtime
+                            .bot
+                            .model_context_tokens_for(model_profile_id.as_deref());
+                        let context_percent = if context_tokens == 0 {
+                            0.0
+                        } else {
+                            max_prompt_tokens as f64 / context_tokens as f64 * 100.0
+                        };
+                        let chunk = format!(
+                            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({context_percent:.1}%)` `elapsed: {elapsed_ms}ms`"
+                        );
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Stats, &chunk).await;
                     }
                     CatEvent::Error(err) => {
                         let chunk = format!(
                             "\n\n---\n**调试信息**\n\n**Error**\n{}",
                             fenced_block("text", &err.to_string())
                         );
-                        if buffer_for_goal {
-                            output.push_str(&chunk);
-                        } else {
-                            append_reply_chunk(&mut output, &mut card, &chunk).await;
-                        }
+                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Error, &chunk).await;
                         break;
                     }
                     CatEvent::Done => break,
@@ -2329,29 +2770,692 @@ async fn collect_bot_reply(
             }
             _ = &mut timeout => {
                 let chunk = "\n\n---\n**调试信息**\n\n**Timeout** reply timed out";
-                if buffer_for_goal {
-                    output.push_str(chunk);
-                } else {
-                    append_reply_chunk(&mut output, &mut card, chunk).await;
-                }
+                append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Error, chunk).await;
                 break;
             }
         }
     }
     if output.trim().is_empty() {
-        if buffer_for_goal {
-            output.push_str("（无响应）");
-        } else {
-            append_reply_chunk(&mut output, &mut card, "（无响应）").await;
-        }
-    }
-    if buffer_for_goal {
-        if let Some(prefix) = supervisor_prefix {
-            output = format!("{prefix}{output}");
-        }
-        append_reply_chunk(&mut String::new(), &mut buffered_card, &output).await;
+        append_reply_chunk(
+            &mut output,
+            &mut replies,
+            FeishuReplyKind::Text,
+            "（无响应）",
+        )
+        .await;
     }
     Ok(output)
+}
+
+pub(crate) enum RuntimeCommandResult {
+    Reply(String),
+    Continue {
+        text: String,
+        prefix: String,
+        skill_injections: Vec<SkillDocument>,
+    },
+}
+
+pub(crate) enum RuntimeCommandPipelineResult {
+    Reply(String),
+    Continue {
+        text: String,
+        prefix: String,
+        skill_injections: Vec<SkillDocument>,
+    },
+}
+
+pub(crate) async fn process_runtime_commands(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<RuntimeCommandPipelineResult> {
+    let mut text = command.trim().to_string();
+    let mut prefix = String::new();
+    let mut skill_injections = Vec::new();
+    for _ in 0..MAX_COMMAND_PREPROCESS_DEPTH {
+        match handle_runtime_command(runtime, session_id, text.trim()).await? {
+            Some(RuntimeCommandResult::Reply(reply)) => {
+                prefix.push_str(&reply);
+                return Ok(RuntimeCommandPipelineResult::Reply(prefix));
+            }
+            Some(RuntimeCommandResult::Continue {
+                text: next_text,
+                prefix: next_prefix,
+                skill_injections: mut next_skill_injections,
+            }) => {
+                prefix.push_str(&next_prefix);
+                skill_injections.append(&mut next_skill_injections);
+                text = next_text;
+                if text.trim().is_empty() {
+                    return Ok(RuntimeCommandPipelineResult::Reply(prefix));
+                }
+            }
+            None => {
+                return Ok(RuntimeCommandPipelineResult::Continue {
+                    text,
+                    prefix,
+                    skill_injections,
+                });
+            }
+        }
+    }
+    Ok(RuntimeCommandPipelineResult::Reply(
+        "command preprocessing exceeded the maximum nesting depth".to_string(),
+    ))
+}
+
+fn is_fork_command(command: &str) -> bool {
+    command == "/fork" || command.starts_with("/fork ")
+}
+
+async fn handle_feishu_fork_command(
+    runtime: &Runtime,
+    source_session_id: &str,
+    msg: &FeishuMessage,
+) -> anyhow::Result<String> {
+    if runtime.bot.is_thread_running(source_session_id).await {
+        return Ok("当前 session 正在运行，结束或取消后再 fork。".to_string());
+    }
+    let title = msg
+        .text
+        .trim()
+        .strip_prefix("/fork")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let temporary_channel_id = format!("fork:{}", uuid::Uuid::new_v4());
+    let fork = runtime
+        .sessions
+        .lock()
+        .await
+        .fork_session(
+            source_session_id,
+            FEISHU_CHANNEL,
+            &temporary_channel_id,
+            title,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("source session `{source_session_id}` not found"))?;
+    if let Err(error) = runtime
+        .bot
+        .fork_thread_data(source_session_id, &fork.id, Some(&msg.sender_user_id))
+        .await
+    {
+        let _ = runtime.sessions.lock().await.delete(&fork.id);
+        return Err(anyhow::Error::from(error));
+    }
+
+    let binding = runtime
+        .im_bridge
+        .sub_session_binding_upsert(SubSessionBindingUpsertRequest {
+            parent_session_id: source_session_id.to_string(),
+            sub_session_id: fork.id.clone(),
+            kind: "fork".to_string(),
+            target: "session".to_string(),
+            title: fork.title.clone(),
+            platform: FEISHU_CHANNEL.to_string(),
+            parent_channel_id: msg.chat_id.clone(),
+            parent_thread_id: msg.thread_id.clone(),
+            actor_user_id: Some(msg.sender_user_id.clone()),
+        })
+        .await;
+
+    match binding {
+        Ok(Some(binding)) => {
+            runtime.sessions.lock().await.set_channel_binding(
+                &fork.id,
+                &binding.platform,
+                &binding.channel_id,
+            )?;
+            Ok(format!(
+                "已 fork 当前 session。\n\n新 session: `{}`\n标题: {}\n已创建新的飞书子会话入口。",
+                fork.id,
+                fork.title.as_deref().unwrap_or("新对话")
+            ))
+        }
+        Ok(None) => Ok(format!(
+            "已 fork 当前 session。\n\n新 session: `{}`\n标题: {}\n未创建飞书子会话入口，可通过 session id 访问。",
+            fork.id,
+            fork.title.as_deref().unwrap_or("新对话")
+        )),
+        Err(error) => Ok(format!(
+            "已 fork 当前 session，但创建飞书子会话入口失败。\n\n新 session: `{}`\n标题: {}\n错误: {error:#}",
+            fork.id,
+            fork.title.as_deref().unwrap_or("新对话")
+        )),
+    }
+}
+
+pub(crate) async fn handle_runtime_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<Option<RuntimeCommandResult>> {
+    if command == "/tools" {
+        let reply = runtime
+            .bot
+            .tool_list()
+            .into_iter()
+            .map(|(name, desc)| format!("- `{name}`: {desc}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command == "/skill" || command.starts_with("/skill ") || command.starts_with("/skill:") {
+        let result = handle_skill_command(runtime, session_id, command).await?;
+        return Ok(Some(result));
+    }
+    if command.starts_with("/debug") {
+        let reply = handle_debug_command(runtime, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command.starts_with("/secrets") || command.starts_with("/secret") {
+        let args = command
+            .trim_start_matches('/')
+            .split_whitespace()
+            .skip(1)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let command = parse_secret_command(&args)?;
+        let reply = handle_runtime_secret_command(runtime, &command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command.starts_with("/goal") {
+        let reply = handle_goal_command(&runtime.bot, session_id, command).await?;
+        if is_goal_set_command(command) && reply.starts_with("已设置 goal。") {
+            let goal = runtime
+                .bot
+                .goal_status(session_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("goal was not persisted after set"))?;
+            return Ok(Some(RuntimeCommandResult::Continue {
+                text: goal.goal,
+                prefix: format!("{reply}\n\n---\n\n"),
+                skill_injections: Vec::new(),
+            }));
+        }
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command.starts_with("/workflow") {
+        let reply = handle_workflow_command(&runtime.bot, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command == "/model" || command.starts_with("/model ") {
+        let reply = handle_model_command(runtime, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command == "/compact" {
+        let n = runtime.bot.compact_memory(session_id).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(format!(
+            "compacted {n} short-term message(s)."
+        ))));
+    }
+    if command == "/clear" {
+        runtime.bot.clear_memory(session_id).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(
+            "已清空当前 session 的历史会话。Todo/trigger 等工具状态已保留。".to_string(),
+        )));
+    }
+    if command == "/doctor" {
+        return Ok(Some(RuntimeCommandResult::Reply(command_doctor_report(
+            runtime,
+        ))));
+    }
+    if command == "/usage" {
+        let model_profile_id = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        let usage = runtime
+            .bot
+            .account_usage_for(model_profile_id.as_deref())
+            .await?;
+        return Ok(Some(RuntimeCommandResult::Reply(format_account_usage(
+            &usage,
+        ))));
+    }
+    Ok(None)
+}
+
+async fn handle_model_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let rest = command.trim().strip_prefix("/model").unwrap_or("").trim();
+    if rest.is_empty() || rest == "status" {
+        let stored = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        return Ok(format_model_status(
+            &runtime.bot,
+            stored.as_deref(),
+            session_id,
+        ));
+    }
+    if rest == "list" {
+        let stored = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        return Ok(format_model_list(&runtime.bot, stored.as_deref()));
+    }
+    if rest == "reset" {
+        runtime
+            .sessions
+            .lock()
+            .await
+            .remove_metadata(session_id, SESSION_MODEL_PROFILE_METADATA_KEY)?;
+        return Ok(format!(
+            "已清除当前 session 的模型 override。\n\n{}",
+            format_model_status(&runtime.bot, None, session_id)
+        ));
+    }
+    if let Some(id) = rest.strip_prefix("use").map(str::trim) {
+        if id.is_empty() {
+            anyhow::bail!("用法：/model use <profile_id>");
+        }
+        let Some(profile) = runtime.bot.get_model_profile(id) else {
+            anyhow::bail!(
+                "unknown model profile `{id}`. Use `/model list` to see available profiles."
+            );
+        };
+        let profile_id = profile.id.clone();
+        runtime.sessions.lock().await.set_metadata_string(
+            session_id,
+            SESSION_MODEL_PROFILE_METADATA_KEY,
+            &profile_id,
+        )?;
+        return Ok(format!(
+            "已切换当前 session 模型为 `{}`。\n\n{}",
+            profile_id,
+            format_model_status(&runtime.bot, Some(&profile_id), session_id)
+        ));
+    }
+    Ok("用法：/model status，/model list，/model use <profile_id>，/model reset".to_string())
+}
+
+fn format_model_status(
+    bot: &CatBot,
+    stored_model_profile_id: Option<&str>,
+    session_id: &str,
+) -> String {
+    let effective = bot.effective_model_profile(stored_model_profile_id);
+    let source = if effective.invalid_session_model.is_none()
+        && stored_model_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    {
+        "session"
+    } else {
+        "default"
+    };
+    let mut lines = vec![
+        "**model status**".to_string(),
+        String::new(),
+        format!("session_id: `{session_id}`"),
+        format!("effective_model_profile: `{}`", effective.profile.id),
+        format!("source: `{source}`"),
+        format!("name: {}", effective.profile.name),
+        format!(
+            "provider: `{}`",
+            effective.profile.provider.as_deref().unwrap_or("unknown")
+        ),
+        format!("model: `{}`", effective.profile.model),
+        format!(
+            "base_url: `{}`",
+            effective.profile.base_url.as_deref().unwrap_or("-")
+        ),
+        format!("context_tokens: {}", effective.profile.context_tokens),
+        format!("max_output_tokens: {}", effective.profile.max_output_tokens),
+        format!("supports_images: {}", effective.profile.supports_images),
+    ];
+    if let Some(stored) = stored_model_profile_id {
+        lines.push(format!("session_override: `{stored}`"));
+    } else {
+        lines.push("session_override: none".to_string());
+    }
+    if let Some(invalid) = effective.invalid_session_model {
+        lines.push(format!(
+            "warning: stored session override `{invalid}` is invalid; using fallback `{}`",
+            effective.profile.id
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_model_list(bot: &CatBot, stored_model_profile_id: Option<&str>) -> String {
+    let effective = bot.effective_model_profile(stored_model_profile_id);
+    let default_id = &bot.default_model_profile().id;
+    let mut profiles = bot.model_profiles();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut lines = vec!["**model profiles**".to_string(), String::new()];
+    for profile in profiles {
+        let mut markers = Vec::new();
+        if profile.id == effective.profile.id {
+            markers.push("current");
+        }
+        if &profile.id == default_id {
+            markers.push("default");
+        }
+        let marker = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", markers.join(", "))
+        };
+        lines.push(format!(
+            "- `{}`{}: {} / `{}` / context={} / images={}",
+            profile.id,
+            marker,
+            profile.provider.as_deref().unwrap_or("unknown"),
+            profile.model,
+            profile.context_tokens,
+            profile.supports_images
+        ));
+    }
+    if let Some(invalid) = effective.invalid_session_model {
+        lines.push(format!(
+            "\nwarning: stored session override `{invalid}` is invalid; using fallback `{}`",
+            effective.profile.id
+        ));
+    }
+    lines.join("\n")
+}
+
+async fn handle_skill_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<RuntimeCommandResult> {
+    let trimmed = command.trim();
+    if trimmed == "/skill" || trimmed == "/skill list" {
+        return Ok(RuntimeCommandResult::Reply(format_skill_list(&runtime.bot)));
+    }
+    if trimmed == "/skill status" {
+        let names = runtime.bot.read_skill_names(session_id).await;
+        return Ok(RuntimeCommandResult::Reply(format_skill_status(&names)));
+    }
+    if trimmed.starts_with("/skill:") {
+        let (skills, rest) = parse_skill_prefixes(&runtime.bot, trimmed).await?;
+        if rest.trim().is_empty() {
+            let names = skills
+                .iter()
+                .map(|skill| format!("`{}`", skill.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(RuntimeCommandResult::Reply(format!(
+                "已加载 skill {names}。请在同一条消息中提供要执行的任务。"
+            )));
+        }
+        let prefix = skills
+            .iter()
+            .map(|skill| format!("已加载 skill `{}`。\n", skill.name))
+            .collect::<String>();
+        return Ok(RuntimeCommandResult::Continue {
+            text: rest.trim().to_string(),
+            prefix,
+            skill_injections: skills,
+        });
+    }
+    Ok(RuntimeCommandResult::Reply(
+        "用法：/skill list，/skill status，/skill:<name> <任务>".to_string(),
+    ))
+}
+
+async fn parse_skill_prefixes(
+    bot: &CatBot,
+    mut text: &str,
+) -> anyhow::Result<(Vec<SkillDocument>, String)> {
+    let mut skills = Vec::new();
+    loop {
+        let Some(rest) = text.trim_start().strip_prefix("/skill:") else {
+            break;
+        };
+        let rest = rest.trim_start();
+        let split_at = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let name = rest[..split_at].trim();
+        if name.is_empty() {
+            anyhow::bail!("用法：/skill:<name> <任务>");
+        }
+        let Some(doc) = bot.get_skill(name).await? else {
+            anyhow::bail!("Skill `{name}` not found. Use `/skill list` to see available skills.");
+        };
+        skills.push(doc);
+        text = &rest[split_at..];
+    }
+    Ok((skills, text.to_string()))
+}
+
+fn format_skill_list(bot: &CatBot) -> String {
+    let mut skills = bot.skill_summaries();
+    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
+    if skills.is_empty() {
+        return "No skills are available.".to_string();
+    }
+    let mut lines = vec!["**skills**".to_string(), String::new()];
+    for skill in skills {
+        lines.push(format!(
+            "- `/skill:{}` - {} ({})",
+            skill.name, skill.description, skill.source
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_skill_status(names: &[String]) -> String {
+    if names.is_empty() {
+        return "当前 session 尚未读取 skill。".to_string();
+    }
+    format!(
+        "**read skills**\n\n{}",
+        names
+            .iter()
+            .map(|name| format!("- `{name}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn format_account_usage(usage: &AccountUsage) -> String {
+    let mut lines = vec![
+        "**model usage**".to_string(),
+        String::new(),
+        format!("provider: `{}`", usage.provider),
+        format!("model_profile: `{}`", usage.model_profile_id),
+        format!("model: `{}`", usage.model),
+    ];
+
+    match &usage.status {
+        AccountUsageStatus::Unknown { reason } => {
+            lines.push("status: `unknown`".to_string());
+            lines.push(format!("reason: {reason}"));
+        }
+        AccountUsageStatus::Available { balances } => {
+            lines.push("status: `available`".to_string());
+            if balances.is_empty() {
+                lines.push("balance: none returned".to_string());
+            } else {
+                for balance in balances {
+                    lines.push(format_balance_line(balance));
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_balance_line(balance: &AccountBalance) -> String {
+    let mut parts = Vec::new();
+    if let Some(currency) = &balance.currency {
+        parts.push(format!("currency={currency}"));
+    }
+    if let Some(total) = &balance.total {
+        parts.push(format!("total={total}"));
+    }
+    if let Some(granted) = &balance.granted {
+        parts.push(format!("granted={granted}"));
+    }
+    if let Some(topped_up) = &balance.topped_up {
+        parts.push(format!("topped_up={topped_up}"));
+    }
+    if let Some(voucher) = &balance.voucher {
+        parts.push(format!("voucher={voucher}"));
+    }
+    if let Some(cash) = &balance.cash {
+        parts.push(format!("cash={cash}"));
+    }
+    if let Some(available) = balance.available {
+        parts.push(format!("available={available}"));
+    }
+
+    if parts.is_empty() {
+        "- balance: unknown".to_string()
+    } else {
+        format!("- balance: {}", parts.join(", "))
+    }
+}
+
+async fn handle_debug_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let rest = command.trim().strip_prefix("/debug").unwrap_or("").trim();
+    match rest {
+        "" | "status" => {
+            let enabled = runtime
+                .sessions
+                .lock()
+                .await
+                .metadata_bool(session_id, SESSION_DEBUG_METADATA_KEY);
+            Ok(format!(
+                "debug 信息当前为：{}",
+                if enabled { "开启" } else { "关闭" }
+            ))
+        }
+        "on" | "enable" | "enabled" | "true" | "1" => {
+            runtime.sessions.lock().await.set_metadata_bool(
+                session_id,
+                SESSION_DEBUG_METADATA_KEY,
+                true,
+            )?;
+            Ok("已开启本 session 的 debug 信息。之后每轮会返回最后的 Stats 调试块。".to_string())
+        }
+        "off" | "disable" | "disabled" | "false" | "0" => {
+            runtime.sessions.lock().await.set_metadata_bool(
+                session_id,
+                SESSION_DEBUG_METADATA_KEY,
+                false,
+            )?;
+            Ok("已关闭本 session 的 debug 信息。之后不再返回最后的 Stats 调试块。".to_string())
+        }
+        _ => Ok("用法：/debug on，/debug off，/debug status".to_string()),
+    }
+}
+
+async fn handle_workflow_command(
+    bot: &CatBot,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let rest = command
+        .trim()
+        .strip_prefix("/workflow")
+        .unwrap_or("")
+        .trim();
+    if rest.is_empty() || rest == "status" {
+        return Ok(match bot.workflow_status(session_id).await {
+            Some(instance) => format_workflow_status(&instance),
+            None => "当前 session 没有 supervisor workflow。".to_string(),
+        });
+    }
+    if rest == "pause" || rest == "stop" {
+        bot.pause_workflow(session_id).await?;
+        return Ok("已暂停当前 session 的 supervisor workflow。".to_string());
+    }
+    if rest == "clear" {
+        bot.clear_workflow(session_id).await?;
+        return Ok("已清除当前 session 的 supervisor workflow。".to_string());
+    }
+    let set_args = rest
+        .strip_prefix("set")
+        .or_else(|| rest.strip_prefix("start"))
+        .map(str::trim);
+    let Some(set_args) = set_args else {
+        return Ok("用法：/workflow set <id> [--max-rounds N|unlimited] [--context {JSON}]，/workflow pause，/workflow clear，/workflow status".to_string());
+    };
+    let mut split = set_args.splitn(2, char::is_whitespace);
+    let workflow_id = split.next().unwrap_or("").trim();
+    let mut options = split.next().unwrap_or("").trim();
+    if workflow_id.is_empty() {
+        return Ok("用法：/workflow set <id> ...".to_string());
+    }
+    let mut max_rounds = GoalMaxRounds::default();
+    let mut context = serde_json::json!({});
+    while !options.is_empty() {
+        if let Some(rest) = options.strip_prefix("--max-rounds") {
+            let rest = rest.trim_start();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            max_rounds = parse_goal_max_rounds(parts.next().unwrap_or(""))?;
+            options = parts.next().unwrap_or("").trim();
+            continue;
+        }
+        if let Some(rest) = options.strip_prefix("--context") {
+            let raw = rest.trim_start();
+            context = serde_json::from_str(raw).context("invalid workflow context JSON")?;
+            options = "";
+            continue;
+        }
+        anyhow::bail!("unknown workflow option: {options}");
+    }
+    let instance = bot
+        .start_workflow_by_id(session_id, workflow_id, context, max_rounds)
+        .await?;
+    Ok(format!(
+        "已设置 supervisor workflow。\n\n{}",
+        format_workflow_status(&instance)
+    ))
+}
+
+fn format_workflow_status(instance: &bot_core::WorkflowInstance) -> String {
+    let max_rounds = match &instance.max_rounds {
+        bot_core::WorkflowMaxRounds::Limited(value) => value.to_string(),
+        bot_core::WorkflowMaxRounds::Unlimited => "unlimited".to_string(),
+    };
+    let mut text = format!(
+        "workflow: {}\nstatus: {:?}\nnode: {}\nmax_rounds: {}\ncontext: {}",
+        instance.definition.id,
+        instance.status,
+        instance.current_node,
+        max_rounds,
+        serde_json::to_string(&instance.context).unwrap_or_else(|_| "{}".into())
+    );
+    if let Some(report) = &instance.last_report {
+        if let Some(edge) = &report.edge {
+            text.push_str(&format!(
+                "\nlast_transition: {} -> {} via {}\nlast_reason: {}",
+                report.from_node, report.to_node, edge, report.reason
+            ));
+        } else {
+            text.push_str(&format!(
+                "\nlast_state: {:?} at {}\nlast_reason: {}",
+                report.status, report.to_node, report.reason
+            ));
+        }
+        if let Some(message) = &report.agent_message {
+            text.push_str(&format!("\nlast_agent_message: {message}"));
+        }
+        if let Some(message) = &report.next_node_message {
+            text.push_str(&format!("\nnext_node_message: {message}"));
+        }
+    }
+    text
 }
 
 async fn handle_goal_command(
@@ -2370,10 +3474,13 @@ async fn handle_goal_command(
         bot.clear_goal(session_id).await?;
         return Ok("已清除当前 session 的 goal。".to_string());
     }
+    if rest == "pause" {
+        bot.pause_workflow(session_id).await?;
+        return Ok("已暂停当前 session 的 goal。".to_string());
+    }
     let Some(mut goal_text) = rest.strip_prefix("set").map(str::trim) else {
         return Ok(
-            "用法：/goal set [--max-rounds N|unlimited] <目标>，/goal status，/goal clear"
-                .to_string(),
+            "用法：/goal set [--max-rounds N|unlimited] <目标>，/goal pause，/goal clear，/goal status".to_string(),
         );
     };
     let mut max_rounds = GoalMaxRounds::default();
@@ -2395,6 +3502,15 @@ async fn handle_goal_command(
     Ok(format!("已设置 goal。\n\n{}", format_goal_status(&goal)))
 }
 
+fn is_goal_set_command(command: &str) -> bool {
+    command
+        .trim()
+        .strip_prefix("/goal")
+        .map(str::trim)
+        .and_then(|rest| rest.strip_prefix("set"))
+        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
+
 fn parse_goal_max_rounds(raw: &str) -> anyhow::Result<GoalMaxRounds> {
     if raw.eq_ignore_ascii_case("unlimited") || raw == "无限" {
         return Ok(GoalMaxRounds::Unlimited);
@@ -2411,6 +3527,7 @@ fn parse_goal_max_rounds(raw: &str) -> anyhow::Result<GoalMaxRounds> {
 fn format_goal_status(goal: &bot_core::GoalState) -> String {
     let status = match &goal.status {
         bot_core::GoalStatus::Active => "active",
+        bot_core::GoalStatus::Paused => "paused",
         bot_core::GoalStatus::Completed => "completed",
     };
     let max_rounds = match &goal.max_rounds {
@@ -2442,10 +3559,14 @@ fn feishu_session_channel_id(msg: &FeishuMessage) -> String {
         .filter(|value| !value.is_empty());
     if msg.chat_type == "group" {
         if let Some(thread_id) = thread_id {
-            return format!("{}:thread:{thread_id}", msg.chat_id);
+            return feishu_topic_channel_id(&msg.chat_id, thread_id);
         }
     }
     msg.chat_id.clone()
+}
+
+fn feishu_topic_channel_id(chat_id: &str, thread_id: &str) -> String {
+    format!("{}:thread:{}", chat_id.trim(), thread_id.trim())
 }
 
 fn should_ignore_unaddressed_topic_start(msg: &FeishuMessage, session_exists: bool) -> bool {
@@ -2458,20 +3579,209 @@ fn should_ignore_unaddressed_topic_start(msg: &FeishuMessage, session_exists: bo
         && !msg.at_bot
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeishuReplyKind {
+    Text,
+    Thinking,
+    ToolCall,
+    ToolResult,
+    SubSession,
+    Supervisor,
+    Stats,
+    Error,
+}
+
+impl FeishuReplyKind {
+    fn is_standalone(self) -> bool {
+        matches!(self, Self::SubSession | Self::Stats | Self::Error)
+    }
+
+    fn starts_new_message(self, active: Option<Self>) -> bool {
+        match (self, active) {
+            (Self::ToolResult, Some(Self::ToolCall)) => false,
+            (Self::ToolCall, Some(Self::ToolCall)) => true,
+            _ => active != Some(self) || self.is_standalone(),
+        }
+    }
+
+    fn finishes_message(self) -> bool {
+        matches!(
+            self,
+            Self::ToolResult | Self::SubSession | Self::Stats | Self::Error
+        )
+    }
+}
+
+struct FeishuReplyStream {
+    gateway: FeishuGateway,
+    parent_message_id: String,
+    active_kind: Option<FeishuReplyKind>,
+    active_card: Option<StreamingCard>,
+    tool_cards: HashMap<String, StreamingCard>,
+}
+
+impl FeishuReplyStream {
+    fn new(gateway: FeishuGateway, parent_message_id: String) -> Self {
+        Self {
+            gateway,
+            parent_message_id,
+            active_kind: None,
+            active_card: None,
+            tool_cards: HashMap::new(),
+        }
+    }
+
+    async fn push(&mut self, kind: FeishuReplyKind, chunk: &str) {
+        if kind.starts_new_message(self.active_kind) {
+            self.finish_active().await;
+            self.active_card = Some(self.gateway.begin_streaming_reply(&self.parent_message_id));
+            self.active_kind = Some(kind);
+        }
+
+        if let Some(card) = self.active_card.as_mut() {
+            card.push(chunk).await.ok();
+        }
+
+        if kind.finishes_message() {
+            self.finish_active().await;
+        }
+    }
+
+    async fn finish(&mut self) {
+        self.finish_active().await;
+        for (_, mut card) in self.tool_cards.drain() {
+            card.finish().await.ok();
+        }
+    }
+
+    async fn finish_active(&mut self) {
+        if let Some(mut card) = self.active_card.take() {
+            card.finish().await.ok();
+        }
+        self.active_kind = None;
+    }
+
+    async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) {
+        self.finish_active().await;
+        let gateway = self.gateway.clone();
+        let parent_message_id = self.parent_message_id.clone();
+        let card = self
+            .tool_cards
+            .entry(call_id.to_string())
+            .or_insert_with(|| gateway.begin_streaming_reply(&parent_message_id));
+        if done {
+            card.replace_final(line).await.ok();
+            self.tool_cards.remove(call_id);
+        } else {
+            card.replace(line).await.ok();
+        }
+    }
+}
+
 async fn append_reply_chunk(
     output: &mut String,
-    card: &mut Option<&mut StreamingCard>,
+    replies: &mut Option<&mut FeishuReplyStream>,
+    kind: FeishuReplyKind,
     chunk: &str,
 ) {
     output.push_str(chunk);
-    if let Some(card) = card.as_deref_mut() {
-        card.push(chunk).await.ok();
+    if let Some(replies) = replies.as_deref_mut() {
+        replies.push(kind, chunk).await;
     }
 }
 
 fn fenced_block(lang: &str, content: &str) -> String {
     let sanitized = content.replace("```", "'''");
     format!("```{lang}\n{}\n```", sanitized.trim())
+}
+
+async fn update_tool_reply(
+    output: &mut String,
+    replies: &mut Option<&mut FeishuReplyStream>,
+    call_id: &str,
+    line: &str,
+    done: bool,
+) {
+    if let Some(replies) = replies.as_deref_mut() {
+        replies.update_tool(call_id, line, done).await;
+        if done {
+            output.push_str(line);
+            output.push('\n');
+        }
+    } else {
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
+fn format_feishu_tool_line(pretty: &bot_core::PrettyToolCall) -> String {
+    let (icon, status) = match pretty.status {
+        bot_core::PrettyToolStatus::Running => ("⏳", "运行中"),
+        bot_core::PrettyToolStatus::Success => ("✅", "成功"),
+        bot_core::PrettyToolStatus::Error => ("❌", "失败"),
+    };
+    let elapsed = pretty
+        .elapsed_ms
+        .map(format_elapsed)
+        .map(|value| format!(" · {value}"))
+        .unwrap_or_default();
+    truncate_tool_line(&format!(
+        "{icon} {status} **{}** — {}{elapsed}",
+        single_line(&pretty.title),
+        single_line(&pretty.summary)
+    ))
+}
+
+fn truncate_tool_line(line: &str) -> String {
+    const MAX_CHARS: usize = 140;
+    if line.chars().count() <= MAX_CHARS {
+        return line.to_string();
+    }
+    let mut truncated = line.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+fn format_supervisor_progress(event: &bot_core::SupervisorTraceEvent) -> String {
+    match event {
+        bot_core::SupervisorTraceEvent::Thinking { content } => {
+            format!("\n**Thinking**\n{}\n", fenced_block("text", content))
+        }
+        bot_core::SupervisorTraceEvent::ToolCall { name, args } => {
+            let json = serde_json::to_string_pretty(args).unwrap_or_default();
+            format!("\n**Tool `{name}`**\n{}\n", fenced_block("json", &json))
+        }
+        bot_core::SupervisorTraceEvent::ToolResult { name, result } => format!(
+            "\n**Tool result `{name}`**\n{}\n",
+            fenced_block("text", result)
+        ),
+        bot_core::SupervisorTraceEvent::OutputDelta { content } => content.clone(),
+        bot_core::SupervisorTraceEvent::Output { content } => {
+            format!("\n**Output**\n{}\n", fenced_block("json", content))
+        }
+    }
+}
+
+fn supervisor_reply_kind(event: &bot_core::SupervisorTraceEvent) -> FeishuReplyKind {
+    match event {
+        bot_core::SupervisorTraceEvent::Thinking { .. } => FeishuReplyKind::Thinking,
+        bot_core::SupervisorTraceEvent::ToolCall { .. } => FeishuReplyKind::ToolCall,
+        bot_core::SupervisorTraceEvent::ToolResult { .. } => FeishuReplyKind::ToolResult,
+        bot_core::SupervisorTraceEvent::OutputDelta { .. }
+        | bot_core::SupervisorTraceEvent::Output { .. } => FeishuReplyKind::Supervisor,
+    }
 }
 
 fn env_var_present(key: &str) -> bool {
@@ -2541,6 +3851,7 @@ async fn record_sub_session_event(
             title: event.title.clone(),
             platform: platform.to_string(),
             parent_channel_id: msg.chat_id.clone(),
+            parent_thread_id: None,
             actor_user_id: Some(msg.sender_user_id.clone()),
         })
         .await;
@@ -2629,11 +3940,14 @@ fn next_arg(args: &[String], index: usize) -> anyhow::Result<String> {
 mod cli_tests {
     use super::{
         extract_first_url, extract_lark_cli_config_from_json, feishu_doctor_message,
-        feishu_session_channel_id, parse_command, parse_goal_max_rounds, run_streaming_command,
+        feishu_session_channel_id, feishu_topic_channel_id, first_available_port,
+        format_feishu_tool_line, is_goal_set_command, parse_command, parse_global_args,
+        parse_goal_max_rounds, prefix_short_config_entry, run_streaming_command,
         run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start, AppCommand,
-        CliConfig, FeishuCommand, FeishuDoctorStatus,
+        CliConfig, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, ProfileCommand,
     };
-    use bot_core::GoalMaxRounds;
+    use crate::profile_command::{ProfileAgentCommand, ProfileWorkflowCommand};
+    use bot_core::{GoalMaxRounds, PrettyToolCall};
     use im_feishu::FeishuMessage;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2661,8 +3975,136 @@ mod cli_tests {
     fn setup_command_is_recognized() {
         assert!(matches!(
             parse_command(&args(&["setup"])).unwrap(),
-            AppCommand::Setup
+            AppCommand::Setup(entries) if entries.is_empty()
         ));
+    }
+
+    #[test]
+    fn global_profile_is_removed_before_command_parsing() {
+        let parsed = parse_global_args(&args(&["--profile", "dev", "doctor"])).unwrap();
+        assert_eq!(parsed.profile.as_deref(), Some("dev"));
+        assert_eq!(parsed.command_args, args(&["doctor"]));
+
+        let parsed = parse_global_args(&args(&["doctor", "--profile=prod-2"])).unwrap();
+        assert_eq!(parsed.profile.as_deref(), Some("prod-2"));
+        assert_eq!(parsed.command_args, args(&["doctor"]));
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_global_profiles() {
+        assert!(parse_global_args(&args(&["--profile", "../dev", "doctor"])).is_err());
+        assert!(
+            parse_global_args(&args(&["--profile", "dev", "--profile", "prod", "doctor",]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_management_commands_are_recognized() {
+        assert!(matches!(
+            parse_command(&args(&["profile", "list"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::List)
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "delete", "dev", "--force"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Delete { name, force })
+                if name == "dev" && force
+        ));
+        assert!(parse_command(&args(&["profile", "delete", "default", "--force"])).is_err());
+        assert!(matches!(
+            parse_command(&args(&["profile", "create", "dev", "admin.port=8790"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Create { name, entries })
+                if name == "dev" && entries == args(&["admin.port=8790"])
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "start", "default"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Start(name)) if name == "default"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "stop", "dev", "--force"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Stop { name, force }) if name == "dev" && force
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "restart", "dev"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Restart { name, force }) if name == "dev" && !force
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "status", "--all"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::StatusAll)
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "status", "default"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Status(name)) if name == "default"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "agent", "list", "dev"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Agent(ProfileAgentCommand::List { profile }))
+                if profile == "dev"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "agent", "upsert", "dev", "/tmp/a.md"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Agent(ProfileAgentCommand::Upsert { profile, path }))
+                if profile == "dev" && path == "/tmp/a.md"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "agent", "set-default", "dev", "coder"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Agent(ProfileAgentCommand::SetDefault { profile, agent_id }))
+                if profile == "dev" && agent_id == "coder"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "workflow", "list", "dev"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::List { profile }))
+                if profile == "dev"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "workflow", "show", "dev", "verify"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::Show { profile, workflow_id }))
+                if profile == "dev" && workflow_id == "verify"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "workflow", "delete", "dev", "verify"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::Delete { profile, workflow_id }))
+                if profile == "dev" && workflow_id == "verify"
+        ));
+        assert!(parse_command(&args(&["profile", "workflow", "delete", "dev", "goal"])).is_err());
+        assert!(matches!(
+            parse_command(&args(&["config", "set", "admin.port=8790"])).unwrap(),
+            AppCommand::ConfigSet(entries) if entries == args(&["admin.port=8790"])
+        ));
+        assert!(matches!(
+            parse_command(&args(&["config", "set", "shell.mode=local"])).unwrap(),
+            AppCommand::ConfigSet(entries) if entries == args(&["shell.mode=local"])
+        ));
+        assert!(matches!(
+            parse_command(&args(&["sandbox", "set", "kind=no_sandbox"])).unwrap(),
+            AppCommand::SandboxSet(entries) if entries == args(&["kind=no_sandbox"])
+        ));
+    }
+
+    #[test]
+    fn sandbox_short_entries_are_prefixed_by_key_only() {
+        assert_eq!(
+            prefix_short_config_entry("sandbox", "host_dir=.remi-cat/profiles/dev"),
+            "sandbox.host_dir=.remi-cat/profiles/dev"
+        );
+        assert_eq!(
+            prefix_short_config_entry("sandbox", "sandbox.kind=docker"),
+            "sandbox.kind=docker"
+        );
+    }
+
+    #[test]
+    fn occupied_setup_port_moves_upward() {
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+            return;
+        };
+        let occupied = listener.local_addr().unwrap().port();
+        if occupied < u16::MAX {
+            let selected =
+                first_available_port("127.0.0.1", occupied, &std::collections::HashSet::new())
+                    .unwrap();
+            assert!(selected > occupied);
+        }
     }
 
     #[test]
@@ -2676,6 +4118,14 @@ mod cli_tests {
             GoalMaxRounds::Unlimited
         );
         assert!(parse_goal_max_rounds("0").is_err());
+    }
+
+    #[test]
+    fn recognizes_goal_set_command_without_matching_status() {
+        assert!(is_goal_set_command("/goal set 分析深圳房价"));
+        assert!(is_goal_set_command(" /goal set --max-rounds 3 test "));
+        assert!(!is_goal_set_command("/goal status"));
+        assert!(!is_goal_set_command("/goal setting"));
     }
 
     #[test]
@@ -2700,6 +4150,55 @@ mod cli_tests {
             parse_command(&args(&["feishu", "doctor"])).unwrap(),
             AppCommand::Feishu(FeishuCommand::Doctor)
         ));
+    }
+
+    #[test]
+    fn feishu_reply_events_pair_tool_request_and_response() {
+        assert!(!FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Text)));
+        assert!(FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Text)));
+        assert!(FeishuReplyKind::ToolCall.starts_new_message(Some(FeishuReplyKind::ToolCall)));
+        assert!(!FeishuReplyKind::ToolResult.starts_new_message(Some(FeishuReplyKind::ToolCall)));
+        assert!(FeishuReplyKind::ToolResult.starts_new_message(None));
+        assert!(FeishuReplyKind::ToolResult.finishes_message());
+        assert!(FeishuReplyKind::Text.starts_new_message(None));
+    }
+
+    #[test]
+    fn feishu_tool_pretty_line_is_compact() {
+        let pretty = PrettyToolCall::completed(
+            "call-1",
+            "search",
+            &serde_json::json!({"query": "exa"}),
+            "found result\nwith details",
+            true,
+            1234,
+        );
+
+        let line = format_feishu_tool_line(&pretty);
+
+        assert!(line.starts_with("✅ 成功 "));
+        assert!(line.contains(" · 1.2s"));
+        assert!(!line.contains("<details>"));
+        assert!(!line.contains("完整 request"));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn feishu_tool_pretty_line_truncates_long_summary() {
+        let pretty = PrettyToolCall::completed(
+            "call-1",
+            "manage_yourself",
+            &serde_json::json!({"command": "profile agent list default"}),
+            "default\tRemi\tdefault\tsearch, skill__get, skill__read_resource, todo__add, todo__list, todo__complete, todo__update, todo__remove, trigger__upsert, trigger__list, trigger__delete, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, acp__chat, manage_yourself",
+            true,
+            511,
+        );
+
+        let line = format_feishu_tool_line(&pretty);
+
+        assert!(line.chars().count() <= 141);
+        assert!(line.contains("default"));
+        assert!(!line.contains("skill__read_resource"));
     }
 
     #[test]
@@ -2783,6 +4282,14 @@ mod cli_tests {
             mentions: Vec::new(),
         };
         assert_eq!(feishu_session_channel_id(&msg), "oc_chat:thread:omt_topic");
+    }
+
+    #[test]
+    fn feishu_topic_channel_id_matches_session_channel_format() {
+        assert_eq!(
+            feishu_topic_channel_id("oc_chat", "omt_fork"),
+            "oc_chat:thread:omt_fork"
+        );
     }
 
     #[test]

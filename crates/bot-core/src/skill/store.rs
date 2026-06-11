@@ -37,16 +37,16 @@ pub struct SkillResource {
 pub struct BuiltinSkill {
     pub name: &'static str,
     pub description: &'static str,
-    pub content: &'static str,
+    pub content: String,
 }
 
 impl BuiltinSkill {
     fn document(&self) -> Result<SkillDocument, AgentError> {
-        let parsed = parse_skill_markdown(self.name, self.content)?;
+        let parsed = parse_skill_markdown(self.name, &self.content)?;
         Ok(SkillDocument {
             name: parsed.name,
             description: parsed.description,
-            content: self.content.to_string(),
+            content: self.content.clone(),
             source: "builtin".to_string(),
             root: None,
         })
@@ -735,7 +735,7 @@ mod tests {
             [BuiltinSkill {
                 name: "trigger",
                 description: "Builtin trigger capability reference",
-                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nTrigger body",
+                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nTrigger body".to_string(),
             }],
         );
 

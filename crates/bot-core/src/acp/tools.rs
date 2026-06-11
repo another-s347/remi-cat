@@ -131,7 +131,7 @@ fn current_bound_channel(ctx: &ToolContext) -> Result<AcpBoundChannel, AgentErro
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AgentError::tool("acp__chat", "missing platform in tool context"))?;
+        .unwrap_or("cli");
     let channel_id = ctx
         .thread_id
         .as_ref()
@@ -144,4 +144,40 @@ fn current_bound_channel(ctx: &ToolContext) -> Result<AcpBoundChannel, AgentErro
         platform: platform.to_string(),
         channel_id: channel_id.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_bound_channel;
+    use remi_agentloop::prelude::{AgentConfig, ToolContext};
+    use std::sync::{Arc, RwLock};
+
+    fn tool_context(metadata: Option<serde_json::Value>) -> ToolContext {
+        ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(serde_json::from_value(serde_json::json!("thread-1")).unwrap()),
+            run_id: serde_json::from_value(serde_json::json!("run-1")).unwrap(),
+            metadata,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        }
+    }
+
+    #[test]
+    fn bound_channel_uses_metadata_platform() {
+        let channel = current_bound_channel(&tool_context(Some(serde_json::json!({
+            "platform": "feishu"
+        }))))
+        .unwrap();
+
+        assert_eq!(channel.platform, "feishu");
+        assert_eq!(channel.channel_id, "thread-1");
+    }
+
+    #[test]
+    fn bound_channel_defaults_to_cli_without_metadata_platform() {
+        let channel = current_bound_channel(&tool_context(None)).unwrap();
+
+        assert_eq!(channel.platform, "cli");
+        assert_eq!(channel.channel_id, "thread-1");
+    }
 }

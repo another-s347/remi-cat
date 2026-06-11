@@ -594,6 +594,7 @@ async fn handle_trigger_run(
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: true,
+        skill_injections: Vec::new(),
         im_attachments: Vec::new(),
         im_documents: Vec::new(),
         cancel: Some(cancel),
@@ -681,7 +682,7 @@ fn trigger_command_help_text() -> String {
   \"condition\": []\n\
 }\n\
 ```"
-        .to_string()
+    .to_string()
 }
 
 fn trigger_command_stream_options(ev: &remi_proto::ImMessageEvent) -> StreamOptions {
@@ -694,6 +695,7 @@ fn trigger_command_stream_options(ev: &remi_proto::ImMessageEvent) -> StreamOpti
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: false,
+        skill_injections: Vec::new(),
         im_attachments: Vec::new(),
         im_documents: Vec::new(),
         cancel: None,
@@ -713,6 +715,7 @@ fn stream_options_from_im_message(
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: false,
+        skill_injections: Vec::new(),
         im_attachments: ev
             .attachments
             .iter()
@@ -789,11 +792,7 @@ fn fallback_message_text(
     }
 }
 
-async fn send_command_reply(
-    tx: &mpsc::Sender<AgentMessage>,
-    reply_to: &str,
-    text: String,
-) {
+async fn send_command_reply(tx: &mpsc::Sender<AgentMessage>, reply_to: &str, text: String) {
     let _ = tx
         .send(AgentMessage {
             reply_to_message_id: reply_to.to_string(),
@@ -831,14 +830,19 @@ async fn forward_stream(
                         Some(AgentPayload::TextDelta(AgentTextDelta { text: t })),
                     CatEvent::Thinking(c) =>
                         Some(AgentPayload::Thinking(AgentThinking { content: c })),
-                    CatEvent::ToolCall { name, args } =>
+                    CatEvent::ToolCall { name, args, .. } =>
                         Some(AgentPayload::ToolCall(AgentToolCall {
                             name,
                             args_json: serde_json::to_string(&args).unwrap_or_default(),
                         })),
-                    CatEvent::ToolCallResult { name, result } =>
+                    CatEvent::ToolCallResult { name, result, .. } =>
                         Some(AgentPayload::ToolResult(AgentToolResult { name, result })),
-                    CatEvent::Stats { prompt_tokens, completion_tokens, elapsed_ms } =>
+                    CatEvent::Stats {
+                        prompt_tokens,
+                        completion_tokens,
+                        elapsed_ms,
+                        ..
+                    } =>
                         Some(AgentPayload::Stats(AgentStats {
                             prompt_tokens,
                             completion_tokens,
@@ -911,8 +915,7 @@ mod tests {
     #[test]
     fn parses_trigger_delete_command() {
         assert_eq!(
-            parse_trigger_slash_command("/trigger delete 7")
-                .expect("delete command should parse"),
+            parse_trigger_slash_command("/trigger delete 7").expect("delete command should parse"),
             TriggerSlashCommand::Delete { id: 7 }
         );
     }

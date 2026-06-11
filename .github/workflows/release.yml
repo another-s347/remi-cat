@@ -28,6 +28,19 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Build embedded Web Chat UI
+        working-directory: web-ui
+        run: |
+          npm ci
+          npm run build
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq

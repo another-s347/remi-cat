@@ -4,6 +4,8 @@
 !.remi-cat/agents/*.md
 !.remi-cat/models/
 !.remi-cat/models/*.yaml
+!.remi-cat/workflows/
+!.remi-cat/workflows/*.json
 
 # ── Secrets and credentials (never commit these) ────────────────────────────
 .env
@@ -13,3 +15,14 @@ mgmt_identity.json
 owner.json
 *.key
 .setup-state
+
+# ── Local runtime state ─────────────────────────────────────────────────────
+.codex
+.codex-tmp/
+memory/
+sessions.json
+*.db
+__pycache__/
+
+# Web UI dependencies are restored from web-ui/package-lock.json.
+web-ui/node_modules/

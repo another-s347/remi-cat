@@ -1,7 +1,7 @@
 use remi_agentloop::prelude::{AgentError, Message};
 use remi_agentloop::types::SubSessionEvent;
 
-use crate::goal::SupervisorReport;
+use crate::supervisor_workflow::{SupervisorTraceEvent, WorkflowReport};
 
 // ── Skill events ─────────────────────────────────────────────────────────────
 
@@ -52,25 +52,40 @@ pub enum CatEvent {
     Trigger(TriggerEvent),
     /// A nested ACP or sub-agent session emitted observable progress.
     SubSession(SubSessionEvent),
-    /// Supervisor evaluated an active goal after a main-agent round.
-    Supervisor(SupervisorReport),
+    /// Supervisor evaluated the active workflow after a main-agent round.
+    Supervisor(WorkflowReport),
+    /// Live progress emitted while the supervisor evaluates a workflow node.
+    SupervisorProgress(SupervisorTraceEvent),
     /// Run completed normally.
     Done,
     /// An error occurred (run aborted).
     Error(AgentError),
     /// Model thinking/reasoning content (from extended thinking).
     Thinking(String),
+    /// A tool call has started streaming from the model.
+    ToolCallStart { id: String, name: String },
+    /// Streaming JSON argument text for a tool call.
+    ToolCallArgumentsDelta { id: String, delta: String },
     /// A tool is being called (name + JSON arguments).
     ToolCall {
+        id: String,
         name: String,
         args: serde_json::Value,
     },
     /// A tool returned its result.
-    ToolCallResult { name: String, result: String },
+    ToolCallResult {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+        result: String,
+        success: bool,
+        elapsed_ms: u64,
+    },
     /// Token usage + elapsed time stats for the completed run.
     Stats {
         prompt_tokens: u32,
         completion_tokens: u32,
+        max_prompt_tokens: u32,
         elapsed_ms: u64,
     },
     /// Intermediate state snapshot — user_state after each tool round.

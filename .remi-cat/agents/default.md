@@ -27,9 +27,9 @@ tools:
   - fs_mkdir
   - fs_remove
   - fs_ls
+  - fetch
   - acp__chat
-  - agent__list
-  - agent__upsert
+  - manage_yourself
 delegates: []
 max_turns: null
 ---

@@ -28,6 +28,8 @@ use chrono::{DateTime, Utc};
 use remi_agentloop::prelude::{AgentError, Message, Role};
 use uuid::Uuid;
 
+use crate::tool_pretty::{tool_success, PrettyToolCall};
+
 use super::compress::LlmCompressor;
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
 
@@ -42,6 +44,19 @@ pub struct MemoryContext {
     pub short_term: Vec<Message>,
     /// Persisted tool-managed state (todos, etc.) restored from disk.
     pub user_state: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadHistoryMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub timestamp: Option<String>,
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pretty: Option<PrettyToolCall>,
 }
 
 // ── MemoryStore ───────────────────────────────────────────────────────────────
@@ -451,6 +466,92 @@ impl MemoryStore {
         })
     }
 
+    pub async fn thread_history(&self, thread_id: &str) -> Vec<ThreadHistoryMessage> {
+        let mut tool_calls =
+            std::collections::HashMap::<String, (String, serde_json::Value)>::new();
+        Self::read_short_term(&self.short_term_path(thread_id))
+            .await
+            .into_iter()
+            .filter(|message| !matches!(message.role, Role::System))
+            .map(|message| {
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        let args = serde_json::from_str(&call.function.arguments)
+                            .unwrap_or(serde_json::Value::String(call.function.arguments.clone()));
+                        tool_calls.insert(call.id.clone(), (call.function.name.clone(), args));
+                    }
+                }
+                let text = message.content.text_content();
+                let pretty = match (&message.role, message.tool_call_id.as_deref()) {
+                    (Role::Tool, Some(call_id)) => tool_calls.get(call_id).map(|(name, args)| {
+                        let elapsed_ms = tool_elapsed_ms(&message);
+                        let mut pretty = PrettyToolCall::completed(
+                            call_id,
+                            name,
+                            args,
+                            &text,
+                            tool_success(&text),
+                            elapsed_ms.unwrap_or(0),
+                        );
+                        if elapsed_ms.is_none() {
+                            pretty.elapsed_ms = None;
+                        }
+                        pretty
+                    }),
+                    _ => None,
+                };
+                ThreadHistoryMessage {
+                    id: message.id.0,
+                    role: match message.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    }
+                    .to_string(),
+                    text,
+                    timestamp: message
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("timestamp"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    tool_call_id: message.tool_call_id,
+                    tool_calls: message
+                        .tool_calls
+                        .and_then(|calls| serde_json::to_value(calls).ok()),
+                    pretty,
+                }
+            })
+            .collect()
+    }
+
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<(), AgentError> {
+        match tokio::fs::remove_dir_all(self.thread_dir(thread_id)).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AgentError::Io(err.to_string())),
+        }
+    }
+
+    pub async fn fork_thread(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+    ) -> Result<(), AgentError> {
+        let source = self.thread_dir(source_thread_id);
+        let target = self.thread_dir(target_thread_id);
+        if tokio::fs::metadata(&source).await.is_err() {
+            return Ok(());
+        }
+        match tokio::fs::remove_dir_all(&target).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AgentError::Io(err.to_string())),
+        }
+        copy_dir_all(source, target).await
+    }
+
     /// Append new messages from a turn to short-term storage.
     ///
     /// If the total token estimate exceeds `short_term_tokens`, the oldest
@@ -522,7 +623,7 @@ impl MemoryStore {
             .map_err(|e| AgentError::Io(e.to_string()))
     }
 
-    async fn load_user_state(&self, thread_id: &str) -> serde_json::Value {
+    pub async fn load_user_state(&self, thread_id: &str) -> serde_json::Value {
         let path = self.user_state_path(thread_id);
         match tokio::fs::read_to_string(&path).await {
             Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
@@ -827,6 +928,10 @@ impl MemoryStore {
         }
         Ok(())
     }
+}
+
+fn tool_elapsed_ms(message: &Message) -> Option<u64> {
+    message.metadata.as_ref()?.get("tool_elapsed_ms")?.as_u64()
 }
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
@@ -1150,6 +1255,37 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn supervisor_workflow_state_round_trips_with_thread_user_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let instance = crate::supervisor_workflow::WorkflowInstance {
+            definition: crate::supervisor_workflow::embedded_goal_definition(),
+            context: json!({"goal": "finish the release"}),
+            current_node: "review".to_string(),
+            incoming_edge: None,
+            node_message: None,
+            status: crate::supervisor_workflow::WorkflowStatus::Paused,
+            max_rounds: crate::supervisor_workflow::WorkflowMaxRounds::Limited(20),
+            last_report: None,
+            updated_at: Utc::now(),
+        };
+        let mut user_state = json!({"__todos": []});
+        crate::supervisor_workflow::set_instance_in_user_state(&mut user_state, &instance).unwrap();
+        store
+            .save_user_state("session-1", &user_state)
+            .await
+            .unwrap();
+
+        let restored_state = test_store(tmp.path().to_path_buf())
+            .load_user_state("session-1")
+            .await;
+        let restored =
+            crate::supervisor_workflow::instance_from_user_state(&restored_state).unwrap();
+        assert_eq!(restored, instance);
+        assert_eq!(restored_state["__todos"], json!([]));
     }
 
     #[test]

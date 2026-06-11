@@ -56,6 +56,26 @@ impl HybridTodoBackend {
             .await
     }
 
+    pub async fn delete_thread(&self, thread_id: &str, user_id: Option<&str>) -> Result<()> {
+        self.sdk_runtime_for_user(user_id)
+            .await?
+            .delete_thread(thread_id)
+            .await
+    }
+
+    pub async fn fork_thread_user_state(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        user_id: Option<&str>,
+        target_user_state: &mut Value,
+    ) -> Result<()> {
+        self.sdk_runtime_for_user(user_id)
+            .await?
+            .fork_thread_user_state(source_thread_id, target_thread_id, target_user_state)
+            .await
+    }
+
     pub(crate) async fn add_batch(
         &self,
         ctx: &ToolContext,
@@ -392,6 +412,66 @@ impl SdkTodoRuntime {
         Ok(())
     }
 
+    async fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        let todos = self.thread_todos_from_snapshot_locked(thread_id)?;
+        let collections: HashSet<String> = todos
+            .iter()
+            .filter_map(|todo| todo.collection_uuid.clone())
+            .collect();
+        for todo in todos {
+            let (Some(collection_uuid), Some(thing_uuid)) =
+                (todo.collection_uuid.as_deref(), todo.thing_uuid.as_deref())
+            else {
+                continue;
+            };
+            let _ = self.sdk.things_delete_thing(
+                &self.config.device_id,
+                collection_uuid,
+                thing_uuid,
+            )?;
+        }
+        for collection_uuid in collections {
+            let _ = self
+                .sdk
+                .things_delete_collection(&self.config.device_id, &collection_uuid)?;
+        }
+        Ok(())
+    }
+
+    async fn fork_thread_user_state(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        target_user_state: &mut Value,
+    ) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        let source_todos = self.thread_todos_from_snapshot_locked(source_thread_id)?;
+        let mut copied = Vec::with_capacity(source_todos.len());
+        let mut by_batch: HashMap<u64, Vec<TodoItem>> = HashMap::new();
+        for mut todo in source_todos {
+            let batch_id = todo.batch_id.unwrap_or(todo.id);
+            todo.storage_kind = TodoStorageKind::RemiSdk;
+            todo.collection_uuid = Some(collection_uuid_for(target_thread_id, batch_id));
+            todo.thing_uuid = Some(thing_uuid_for(target_thread_id, todo.id));
+            by_batch.entry(batch_id).or_default().push(todo.clone());
+            copied.push(todo);
+        }
+        for (_, mut todos) in by_batch {
+            todos.sort_by_key(|todo| todo.batch_index.unwrap_or(todo.id));
+            let batch_title = todos
+                .first()
+                .and_then(|todo| todo.batch_title.as_deref())
+                .unwrap_or("Forked todos");
+            self.create_batch_locked(target_thread_id, batch_title, &todos)?;
+            for todo in todos.iter().filter(|todo| todo.done) {
+                let _ = self.complete_todo_locked(todo)?;
+            }
+        }
+        merge_sdk_todos(target_user_state, copied);
+        Ok(())
+    }
+
     async fn create_batch(
         &self,
         thread_id: &str,
@@ -399,6 +479,15 @@ impl SdkTodoRuntime {
         todos: &[TodoItem],
     ) -> Result<()> {
         let _guard = self.lock.lock().await;
+        self.create_batch_locked(thread_id, batch_title, todos)
+    }
+
+    fn create_batch_locked(
+        &self,
+        thread_id: &str,
+        batch_title: &str,
+        todos: &[TodoItem],
+    ) -> Result<()> {
         let Some(first) = todos.first() else {
             return Ok(());
         };
@@ -446,6 +535,10 @@ impl SdkTodoRuntime {
 
     async fn complete_todo(&self, todo: &TodoItem) -> Result<bool> {
         let _guard = self.lock.lock().await;
+        self.complete_todo_locked(todo)
+    }
+
+    fn complete_todo_locked(&self, todo: &TodoItem) -> Result<bool> {
         let thing_uuid = todo
             .thing_uuid
             .as_deref()

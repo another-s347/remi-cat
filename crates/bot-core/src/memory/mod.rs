@@ -37,7 +37,9 @@ pub mod tier;
 pub mod tool;
 
 pub use compress::LlmCompressor;
-pub use store::{MemoryContext, MemoryRecallResult, MemoryStore, NamedMemoryWrite};
+pub use store::{
+    MemoryContext, MemoryRecallResult, MemoryStore, NamedMemoryWrite, ThreadHistoryMessage,
+};
 pub use tier::{build_tier_msg, make_preview, MemoryEntry, MemoryIndex};
 pub use tool::{MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
 

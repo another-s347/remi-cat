@@ -60,6 +60,26 @@ impl TriggerBackend {
             .await
     }
 
+    pub async fn delete_thread(&self, thread_id: &str, user_id: Option<&str>) -> Result<()> {
+        self.sdk_runtime_for_user(user_id)
+            .await?
+            .delete_thread(thread_id)
+            .await
+    }
+
+    pub async fn fork_thread_user_state(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        user_id: Option<&str>,
+        target_user_state: &mut Value,
+    ) -> Result<()> {
+        self.sdk_runtime_for_user(user_id)
+            .await?
+            .fork_thread_user_state(source_thread_id, target_thread_id, target_user_state)
+            .await
+    }
+
     pub(crate) async fn upsert(
         &self,
         ctx: &ToolContext,
@@ -354,6 +374,73 @@ impl SdkTriggerRuntime {
         Ok(())
     }
 
+    async fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        let triggers = self.thread_triggers_from_snapshot_locked(thread_id)?;
+        let collections: std::collections::HashSet<String> = triggers
+            .iter()
+            .map(|trigger| trigger.collection_uuid.clone())
+            .collect();
+        for trigger in triggers {
+            let _ = self
+                .sdk
+                .delete_trigger_and_bindings(&self.config.device_id, &trigger.trigger_uuid)?;
+            let _ = self.sdk.things_delete_thing(
+                &self.config.device_id,
+                &trigger.collection_uuid,
+                &trigger.thing_uuid,
+            )?;
+        }
+        for collection_uuid in collections {
+            let _ = self
+                .sdk
+                .things_delete_collection(&self.config.device_id, &collection_uuid)?;
+        }
+        self.sync_best_effort_locked().await;
+        Ok(())
+    }
+
+    async fn fork_thread_user_state(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        target_user_state: &mut Value,
+    ) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        if let Err(err) = self.reconcile_local_trigger_state_locked() {
+            warn!(
+                device_id = %self.config.device_id,
+                error = %err,
+                "local trigger reconciliation failed before fork"
+            );
+        }
+        let source = self.thread_trigger_fork_drafts_locked(source_thread_id, target_thread_id)?;
+        let mut copied = Vec::with_capacity(source.len());
+        for draft in source {
+            self.ensure_collection_locked(&draft.collection_uuid)?;
+            self.upsert_request_thing_locked(&draft)?;
+            self.register_trigger_locked(&draft)?;
+            self.sdk.things_set_thing_trigger_uuid(
+                &self.config.device_id,
+                &draft.thing_uuid,
+                Some(&draft.trigger_uuid),
+            )?;
+            self.sdk
+                .upsert_trigger_binding(&draft.trigger_uuid, "thing", &draft.thing_uuid)?;
+            self.sdk
+                .set_trigger_paused(&draft.trigger_uuid, !draft.enabled)?;
+            let info = self
+                .fetch_trigger_info_locked(&draft.trigger_uuid)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("trigger missing after fork: {}", draft.trigger_uuid)
+                })?;
+            copied.push(trigger_item_from_parts(&draft, &info));
+        }
+        self.sync_best_effort_locked().await;
+        write_triggers_to_user_state(target_user_state, &copied);
+        Ok(())
+    }
+
     async fn upsert_trigger(&self, draft: TriggerDraft) -> Result<TriggerItem> {
         let _guard = self.lock.lock().await;
 
@@ -497,6 +584,56 @@ impl SdkTriggerRuntime {
         }
         triggers.sort_by_key(|item| item.id);
         Ok(triggers)
+    }
+
+    fn thread_trigger_fork_drafts_locked(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+    ) -> Result<Vec<TriggerDraft>> {
+        let snapshot = self.snapshot_locked()?;
+        let trigger_map = self.list_trigger_info_map_locked()?;
+        let collection_uuid = collection_uuid_for(target_thread_id);
+        let mut drafts = Vec::new();
+        for thing in &snapshot.things {
+            let Some(attrs) = stored_attrs_from_thing(thing) else {
+                continue;
+            };
+            if attrs.source != SDK_ATTRS_SOURCE || attrs.thread_id != source_thread_id {
+                continue;
+            }
+            let Some(source_trigger_uuid) = thing.trigger_uuid.as_deref() else {
+                continue;
+            };
+            let Some(info) = trigger_map.get(source_trigger_uuid) else {
+                continue;
+            };
+            let trigger_uuid = trigger_uuid_for(target_thread_id, attrs.local_id);
+            let thing_uuid = trigger_thing_uuid_for(target_thread_id, attrs.local_id);
+            drafts.push(TriggerDraft {
+                id: attrs.local_id,
+                trigger_uuid,
+                thing_uuid,
+                collection_uuid: collection_uuid.clone(),
+                thread_id: target_thread_id.to_string(),
+                name: if attrs.name.trim().is_empty() {
+                    info.name.clone()
+                } else {
+                    attrs.name.clone()
+                },
+                request: attrs.request.clone(),
+                precondition: info.precondition.clone(),
+                condition: info.condition.clone(),
+                enabled: attrs.enabled && !info.is_paused,
+                owner_user_id: attrs.owner_user_id.clone(),
+                owner_username: attrs.owner_username.clone(),
+                reply_to_message_id: attrs.reply_to_message_id.clone(),
+                chat_type: attrs.chat_type.clone(),
+                platform: attrs.platform.clone(),
+            });
+        }
+        drafts.sort_by_key(|draft| draft.id);
+        Ok(drafts)
     }
 
     fn list_trigger_info_map_locked(&self) -> Result<HashMap<String, LocalTriggerInfo>> {
@@ -798,6 +935,22 @@ fn collection_uuid_for(thread_id: &str) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!("remi-cat-trigger-collection:{thread_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn trigger_uuid_for(thread_id: &str, local_id: u64) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("remi-cat-trigger:{thread_id}:{local_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn trigger_thing_uuid_for(thread_id: &str, local_id: u64) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("remi-cat-trigger-thing:{thread_id}:{local_id}").as_bytes(),
     )
     .to_string()
 }

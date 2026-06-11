@@ -87,6 +87,48 @@ impl StreamingCard {
         Ok(())
     }
 
+    /// Replace the full visible card text and flush immediately.
+    ///
+    /// This is used for status-style streaming where the same message should
+    /// update from "running" to "completed" instead of appending another line.
+    pub async fn replace(&mut self, text: &str) -> anyhow::Result<()> {
+        self.buffer.clear();
+        self.buffer.push_str(text);
+        let content = format!("{}▋", self.buffer);
+        self.flush_text(&content).await
+    }
+
+    /// Replace the full card text without a cursor and mark it complete.
+    pub async fn replace_final(&mut self, text: &str) -> anyhow::Result<()> {
+        self.buffer.clear();
+        self.buffer.push_str(text);
+        self.done = true;
+        let content = if self.buffer.is_empty() {
+            "（无响应）".to_string()
+        } else {
+            self.buffer.clone()
+        };
+        self.flush_text(&content).await
+    }
+
+    async fn flush_text(&mut self, text: &str) -> anyhow::Result<()> {
+        if self.message_id.is_none() {
+            self.ensure_card(text).await?;
+        } else {
+            let id = self.message_id.clone().unwrap();
+            match self.client.update_card(&id, text).await {
+                Ok(()) => {
+                    self.last_update = Instant::now();
+                    debug!(chars = self.buffer.len(), "streaming card flushed");
+                }
+                Err(e) => {
+                    warn!("card update failed: {e:#}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Flush the final buffer (no cursor) and mark the stream as done.
     ///
     /// Safe to call multiple times; subsequent calls are no-ops.

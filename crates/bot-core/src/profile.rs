@@ -2,13 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use async_stream::stream;
-use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult};
-use remi_agentloop::tool::registry::DefaultToolRegistry;
-use remi_agentloop::types::ResumePayload;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 const EMBEDDED_AGENT_PROFILES: &[(&str, &str)] = &[(
     "default.md",
@@ -54,140 +48,6 @@ pub struct AgentProfile {
     pub max_turns: Option<usize>,
     #[serde(skip)]
     pub system_prompt: String,
-}
-
-pub fn register_agent_tools(registry: &mut DefaultToolRegistry, agents_dir: PathBuf) {
-    registry.register(AgentListTool {
-        agents_dir: agents_dir.clone(),
-    });
-    registry.register(AgentUpsertTool { agents_dir });
-}
-
-pub struct AgentListTool {
-    agents_dir: PathBuf,
-}
-
-impl Tool for AgentListTool {
-    fn name(&self) -> &str {
-        "agent__list"
-    }
-
-    fn description(&self) -> &str {
-        "List configured markdown agent profiles."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    fn execute(
-        &self,
-        _arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
-        let agents_dir = self.agents_dir.clone();
-        async move {
-            let registry = AgentRegistry::load(agents_dir)
-                .map_err(|err| AgentError::tool("agent__list", err.to_string()))?;
-            let mut profiles: Vec<_> = registry.profiles().cloned().collect();
-            profiles.sort_by(|a, b| a.id.cmp(&b.id));
-            let text = if profiles.is_empty() {
-                "(no agent profiles configured)".to_string()
-            } else {
-                profiles
-                    .into_iter()
-                    .map(|profile| {
-                        format!(
-                            "- `{}`: {} — tools: {}; delegates: {}",
-                            profile.id,
-                            profile.description,
-                            profile.tools.join(", "),
-                            profile.delegates.join(", ")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(ToolResult::Output(stream! {
-                yield ToolOutput::text(text);
-            }))
-        }
-    }
-}
-
-pub struct AgentUpsertTool {
-    agents_dir: PathBuf,
-}
-
-impl Tool for AgentUpsertTool {
-    fn name(&self) -> &str {
-        "agent__upsert"
-    }
-
-    fn description(&self) -> &str {
-        "Create or replace one markdown agent profile. The markdown must include YAML frontmatter and a system prompt body."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "file_name": {
-                    "type": "string",
-                    "description": "Markdown file name, for example coder.md."
-                },
-                "markdown": {
-                    "type": "string",
-                    "description": "Complete profile markdown with YAML frontmatter."
-                }
-            },
-            "required": ["file_name", "markdown"]
-        })
-    }
-
-    fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
-        let agents_dir = self.agents_dir.clone();
-        async move {
-            let file_name = arguments
-                .get("file_name")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| AgentError::tool("agent__upsert", "missing file_name"))?;
-            if file_name.contains('/') || file_name.contains('\\') || !file_name.ends_with(".md") {
-                return Err(AgentError::tool(
-                    "agent__upsert",
-                    "file_name must be a simple .md file name",
-                ));
-            }
-            let markdown = arguments
-                .get("markdown")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| AgentError::tool("agent__upsert", "missing markdown"))?;
-            let mut registry = AgentRegistry::load(agents_dir)
-                .map_err(|err| AgentError::tool("agent__upsert", err.to_string()))?;
-            let profile = registry
-                .upsert_markdown(file_name, markdown)
-                .map_err(|err| AgentError::tool("agent__upsert", err.to_string()))?;
-            let text = format!(
-                "saved agent `{}` ({}) to {}",
-                profile.id,
-                profile.name,
-                registry.dir().join(file_name).display()
-            );
-            Ok(ToolResult::Output(stream! {
-                yield ToolOutput::text(text);
-            }))
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +219,7 @@ You are Remi.
         assert!(path.exists());
         let profile = AgentProfile::from_markdown_file(&path).unwrap();
         assert_eq!(profile.id, "default");
+        assert!(profile.allows_tool("fetch"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -92,6 +92,7 @@ pub struct SubSessionBindingUpsertRequest {
     pub title: Option<String>,
     pub platform: String,
     pub parent_channel_id: String,
+    pub parent_thread_id: Option<String>,
     pub actor_user_id: Option<String>,
 }
 

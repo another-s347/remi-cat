@@ -867,6 +867,10 @@ impl FeishuGateway {
         self.client.send_text(chat_id, text).await
     }
 
+    pub async fn send_topic_text(&self, chat_id: &str, text: &str) -> Result<(String, String)> {
+        self.client.send_topic_text(chat_id, text).await
+    }
+
     pub async fn create_sub_session_chat(
         &self,
         name: &str,

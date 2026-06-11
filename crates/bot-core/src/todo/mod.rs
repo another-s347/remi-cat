@@ -3,8 +3,8 @@ pub mod tools;
 
 pub use backend::HybridTodoBackend;
 pub use tools::{
-    current_todo_card_markdown, latest_unfinished_batch_system_prompt, TodoAddTool,
-    TodoCompleteTool, TodoListTool, TodoRemoveTool, TodoUpdateTool,
+    current_todo_card_markdown, latest_unfinished_batch_system_prompt, todos_from_user_state,
+    TodoAddTool, TodoCompleteTool, TodoItem, TodoListTool, TodoRemoveTool, TodoUpdateTool,
 };
 
 use remi_agentloop::prelude::ParsedToolCall;

@@ -30,6 +30,59 @@ use crate::trigger;
 
 const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
     &["trigger__upsert", "trigger__list", "trigger__delete"];
+const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
+
+fn log_tool_call_started(kind: &str, thread_id: &str, run_id: &str, tc: &ParsedToolCall) {
+    tracing::info!(
+        thread_id,
+        run_id,
+        tool_kind = kind,
+        tool_call_id = %tc.id,
+        tool_name = %tc.name,
+        args_len = tc.arguments.to_string().len(),
+        "tool_call.start"
+    );
+}
+
+fn log_tool_call_finished(
+    kind: &str,
+    thread_id: &str,
+    run_id: &str,
+    tc: &ParsedToolCall,
+    collected: &CollectedToolResult,
+    success: bool,
+    elapsed_ms: u64,
+) {
+    if success {
+        tracing::info!(
+            thread_id,
+            run_id,
+            tool_kind = kind,
+            tool_call_id = %tc.id,
+            tool_name = %tc.name,
+            success,
+            elapsed_ms,
+            preview_len = collected.preview.len(),
+            multimodal = collected.content.is_multimodal(),
+            side_events = collected.side_events.len(),
+            "tool_call.completed"
+        );
+    } else {
+        tracing::warn!(
+            thread_id,
+            run_id,
+            tool_kind = kind,
+            tool_call_id = %tc.id,
+            tool_name = %tc.name,
+            success,
+            elapsed_ms,
+            preview_len = collected.preview.len(),
+            multimodal = collected.content.is_multimodal(),
+            side_events = collected.side_events.len(),
+            "tool_call.failed"
+        );
+    }
+}
 
 // ── CatAgent ─────────────────────────────────────────────────────────────────
 
@@ -66,11 +119,24 @@ where
         let overflow_bytes = self.overflow_bytes;
         let tool_allowlist = self.tool_allowlist.clone();
         let tool_def_ctx = build_tool_definition_ctx(&input);
+        let supervisor_run =
+            crate::metadata_flag_enabled(tool_def_ctx.metadata.as_ref(), "supervisor_run");
+        let log_thread_id = tool_def_ctx
+            .thread_id
+            .as_ref()
+            .map(|value| value.0.clone())
+            .unwrap_or_default();
+        let log_run_id = tool_def_ctx
+            .run_id
+            .as_ref()
+            .map(|value| value.0.clone())
+            .unwrap_or_default();
         let dynamic_tools = build_dynamic_tools(
             tool_def_ctx.metadata.clone(),
             data_dir.clone(),
             self.im_bridge.clone(),
         );
+        let dynamic_tool_count = dynamic_tools.definitions_with_context(&tool_def_ctx).len();
         let extra_defs = merge_runtime_tool_definitions(
             &self.local_tools,
             &dynamic_tools,
@@ -81,8 +147,17 @@ where
 
         stream! {
             let run_start = Instant::now();
+            tracing::info!(
+                thread_id = %log_thread_id,
+                run_id = %log_run_id,
+                supervisor_run,
+                dynamic_tools = dynamic_tool_count,
+                "agent_run.start"
+            );
             let mut total_prompt_tokens: u32 = 0;
             let mut total_completion_tokens: u32 = 0;
+            let mut max_prompt_tokens: u32 = 0;
+            let mut tool_rounds: usize = 0;
 
             let mut current = inject_extra_tools(input, extra_defs);
             let mut last_messages: Vec<Message> = vec![];
@@ -92,6 +167,14 @@ where
                 let inner_stream = match self.inner.chat(current).await {
                     Ok(s) => s,
                     Err(e) => {
+                        tracing::warn!(
+                            thread_id = %log_thread_id,
+                            run_id = %log_run_id,
+                            supervisor_run,
+                            elapsed_ms = run_start.elapsed().as_millis() as u64,
+                            error = %e,
+                            "agent_run.failed"
+                        );
                         yield CatEvent::Error(e);
                         return;
                     }
@@ -105,18 +188,32 @@ where
                         AgentEvent::ThinkingEnd { content } => {
                             yield CatEvent::Thinking(content);
                         }
+                        AgentEvent::ToolCallStart { id, name } => {
+                            yield CatEvent::ToolCallStart { id, name };
+                        }
+                        AgentEvent::ToolCallArgumentsDelta { id, delta } => {
+                            yield CatEvent::ToolCallArgumentsDelta { id, delta };
+                        }
                         AgentEvent::Usage {
                             prompt_tokens,
                             completion_tokens,
                         } => {
                             total_prompt_tokens += prompt_tokens;
                             total_completion_tokens += completion_tokens;
+                            max_prompt_tokens = max_prompt_tokens.max(prompt_tokens);
                         }
                         AgentEvent::NeedToolExecution {
                             mut state,
                             tool_calls,
                             completed_results,
                         } => {
+                            tool_rounds = tool_rounds.saturating_add(1);
+                            if supervisor_run && tool_rounds > SUPERVISOR_MAX_TOOL_ROUNDS {
+                                yield CatEvent::Error(AgentError::other(format!(
+                                    "supervisor exceeded the maximum of {SUPERVISOR_MAX_TOOL_ROUNDS} tool rounds"
+                                )));
+                                return;
+                            }
                             let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
                                 .iter()
                                 .cloned()
@@ -138,8 +235,19 @@ where
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
 
                             if !local.is_empty() {
+                                let started_at: HashMap<String, Instant> = local
+                                    .iter()
+                                    .map(|tc| (tc.id.clone(), Instant::now()))
+                                    .collect();
                                 for tc in &local {
+                                    log_tool_call_started(
+                                        "local",
+                                        &state.thread_id.0,
+                                        &state.run_id.0,
+                                        tc,
+                                    );
                                     yield CatEvent::ToolCall {
+                                        id: tc.id.clone(),
                                         name: tc.name.clone(),
                                         args: tc.arguments.clone(),
                                     };
@@ -160,16 +268,28 @@ where
 
                                 for (call_id, collected) in collected_results {
                                     let tc = local.iter().find(|t| t.id == call_id).unwrap();
-                                    debug!(
-                                        tool = %tc.name,
-                                        preview_len = collected.preview.len(),
-                                        multimodal = collected.content.is_multimodal(),
-                                        "agent: tool done"
+                                    let elapsed_ms = started_at
+                                        .get(&call_id)
+                                        .map(|instant| instant.elapsed().as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let success = crate::tool_pretty::tool_success(&collected.preview);
+                                    log_tool_call_finished(
+                                        "local",
+                                        &state.thread_id.0,
+                                        &state.run_id.0,
+                                        tc,
+                                        &collected,
+                                        success,
+                                        elapsed_ms,
                                     );
 
                                     yield CatEvent::ToolCallResult {
+                                        id: call_id.clone(),
                                         name: tc.name.clone(),
+                                        args: tc.arguments.clone(),
                                         result: collected.preview.clone(),
+                                        success,
+                                        elapsed_ms,
                                     };
 
                                     for side_ev in make_side_events(tc, &collected.preview) {
@@ -190,8 +310,19 @@ where
                             }
 
                             if !dynamic.is_empty() {
+                                let started_at: HashMap<String, Instant> = dynamic
+                                    .iter()
+                                    .map(|tc| (tc.id.clone(), Instant::now()))
+                                    .collect();
                                 for tc in &dynamic {
+                                    log_tool_call_started(
+                                        "dynamic",
+                                        &state.thread_id.0,
+                                        &state.run_id.0,
+                                        tc,
+                                    );
                                     yield CatEvent::ToolCall {
+                                        id: tc.id.clone(),
                                         name: tc.name.clone(),
                                         args: tc.arguments.clone(),
                                     };
@@ -211,16 +342,28 @@ where
 
                                 for (call_id, collected) in collected_results {
                                     let tc = dynamic.iter().find(|t| t.id == call_id).unwrap();
-                                    debug!(
-                                        tool = %tc.name,
-                                        preview_len = collected.preview.len(),
-                                        multimodal = collected.content.is_multimodal(),
-                                        "agent: dynamic tool done"
+                                    let elapsed_ms = started_at
+                                        .get(&call_id)
+                                        .map(|instant| instant.elapsed().as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let success = crate::tool_pretty::tool_success(&collected.preview);
+                                    log_tool_call_finished(
+                                        "dynamic",
+                                        &state.thread_id.0,
+                                        &state.run_id.0,
+                                        tc,
+                                        &collected,
+                                        success,
+                                        elapsed_ms,
                                     );
 
                                     yield CatEvent::ToolCallResult {
+                                        id: call_id.clone(),
                                         name: tc.name.clone(),
+                                        args: tc.arguments.clone(),
                                         result: collected.preview.clone(),
+                                        success,
+                                        elapsed_ms,
                                     };
                                     for side_ev in collected.side_events.clone() {
                                         yield side_ev;
@@ -235,16 +378,21 @@ where
                             }
 
                             if !external.is_empty() {
+                                let names = external
+                                    .iter()
+                                    .map(|t| t.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                tracing::warn!(
+                                    thread_id = %state.thread_id.0,
+                                    run_id = %state.run_id.0,
+                                    tool_names = %names,
+                                    tool_count = external.len(),
+                                    "tool_call.failed"
+                                );
                                 yield CatEvent::Error(AgentError::tool(
                                     "external",
-                                    format!(
-                                        "unhandled external tools: {}",
-                                        external
-                                            .iter()
-                                            .map(|t| t.name.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    ),
+                                    format!("unhandled external tools: {names}"),
                                 ));
                                 return;
                             }
@@ -268,9 +416,21 @@ where
                         }
                         AgentEvent::Done => {
                             let elapsed_ms = run_start.elapsed().as_millis() as u64;
+                            tracing::info!(
+                                thread_id = %log_thread_id,
+                                run_id = %log_run_id,
+                                supervisor_run,
+                                tool_rounds,
+                                prompt_tokens = total_prompt_tokens,
+                                completion_tokens = total_completion_tokens,
+                                max_prompt_tokens,
+                                elapsed_ms,
+                                "agent_run.completed"
+                            );
                             yield CatEvent::Stats {
                                 prompt_tokens: total_prompt_tokens,
                                 completion_tokens: total_completion_tokens,
+                                max_prompt_tokens,
                                 elapsed_ms,
                             };
                             yield CatEvent::History(last_messages.clone(), last_user_state.clone());
@@ -278,10 +438,30 @@ where
                             return;
                         }
                         AgentEvent::Error(e) => {
+                            tracing::warn!(
+                                thread_id = %log_thread_id,
+                                run_id = %log_run_id,
+                                supervisor_run,
+                                tool_rounds,
+                                prompt_tokens = total_prompt_tokens,
+                                completion_tokens = total_completion_tokens,
+                                max_prompt_tokens,
+                                elapsed_ms = run_start.elapsed().as_millis() as u64,
+                                error = %e,
+                                "agent_run.failed"
+                            );
                             yield CatEvent::Error(e);
                             return;
                         }
                         AgentEvent::Cancelled => {
+                            tracing::info!(
+                                thread_id = %log_thread_id,
+                                run_id = %log_run_id,
+                                supervisor_run,
+                                tool_rounds,
+                                elapsed_ms = run_start.elapsed().as_millis() as u64,
+                                "agent_run.cancelled"
+                            );
                             yield CatEvent::Done;
                             return;
                         }
@@ -837,6 +1017,66 @@ mod tests {
         }
     }
 
+    struct EndlessToolInnerAgent;
+
+    impl Agent for EndlessToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            let state = match req {
+                LoopInput::Start { metadata, .. } => {
+                    let mut state = AgentState::new(StepConfig::new("test-model"));
+                    state.config.metadata = metadata;
+                    state
+                }
+                LoopInput::Resume { state, .. } | LoopInput::Cancel { state } => state,
+            };
+            Ok(stream::iter(vec![
+                remi_agentloop::types::AgentEvent::NeedToolExecution {
+                    state,
+                    tool_calls: vec![ParsedToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: "instant".to_string(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    completed_results: vec![],
+                },
+            ]))
+        }
+    }
+
+    struct InstantTool;
+
+    impl Tool for InstantTool {
+        fn name(&self) -> &str {
+            "instant"
+        }
+
+        fn description(&self) -> &str {
+            "Returns immediately."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _resume: Option<remi_agentloop::types::ResumePayload>,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
+                "ok",
+            )])))
+        }
+    }
+
     #[tokio::test]
     async fn cat_agent_collects_parallel_tool_streams_end_to_end() {
         let mut local_tools = DefaultToolRegistry::new();
@@ -860,5 +1100,38 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
+    }
+
+    #[tokio::test]
+    async fn supervisor_run_stops_after_bounded_tool_rounds() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(InstantTool);
+        let agent = CatAgent {
+            inner: EndlessToolInnerAgent,
+            local_tools,
+            data_dir: test_root(),
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+        };
+
+        let events = agent
+            .stream_with_input(
+                LoopInput::start("keep calling tools")
+                    .metadata(serde_json::json!({"supervisor_run": "true"})),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, CatEvent::ToolCall { .. }))
+                .count(),
+            8
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, CatEvent::Error(error) if error.to_string().contains("maximum of 8 tool rounds"))
+        }));
     }
 }

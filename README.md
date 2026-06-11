@@ -46,6 +46,77 @@ After `feishu init` imports `FEISHU_*`, start the gateway with:
 cargo run --release
 ```
 
+## Runtime Profiles
+
+Named profiles are independent runtime instances stored under
+`.remi-cat/profiles/<name>`. Each profile has its own runtime config, agents,
+models, sessions, memory, sandbox, and listening ports:
+
+```bash
+cargo run -- --profile dev setup
+cargo run -- --profile prod setup
+
+cargo run -- --profile dev
+cargo run -- --profile prod
+```
+
+`REMI_PROFILE=dev` is equivalent to `--profile dev`. An explicitly exported
+`REMI_DATA_DIR` takes precedence for compatibility with custom data paths.
+The existing `.remi-cat/runtime.yaml` remains the un-named default profile.
+
+Manage named profiles with:
+
+```bash
+cargo run -- profile list
+cargo run -- profile create dev admin.port=8789 sandbox.kind=no_sandbox
+cargo run -- profile show dev
+cargo run -- profile start dev
+cargo run -- profile status dev
+cargo run -- profile restart dev
+cargo run -- profile stop dev
+cargo run -- profile delete dev --force
+```
+
+Configure a profile's agents and supervisor workflows from the CLI:
+
+```bash
+cargo run -- profile agent list dev
+cargo run -- profile agent upsert dev ./agents/coder.md
+cargo run -- profile agent set-default dev coder
+
+cargo run -- profile workflow list dev
+cargo run -- profile workflow upsert dev ./workflows/verify.json
+cargo run -- profile workflow show dev verify
+cargo run -- profile workflow delete dev verify
+```
+
+`agent upsert` accepts markdown agent profiles with YAML frontmatter.
+`workflow upsert` accepts supervisor workflow JSON and validates it before
+writing `<profile-data-dir>/workflows/<id>.json`.
+
+Runtime config can also be updated non-interactively, which is useful for
+scripts and local automation:
+
+```bash
+cargo run -- --profile dev setup --non-interactive admin.port=8789 sandbox.kind=no_sandbox
+cargo run -- --profile dev config set admin.port=8790 feishu.transport=event_hook feishu.hook.port=8791
+cargo run -- --profile dev sandbox set kind=docker host_dir=.remi-cat/profiles/dev container_name=remi-cat-sandbox-dev
+```
+
+These CLI updates write `runtime.yaml` directly and do not run the setup smoke
+chat. Use interactive `setup` when you want credential prompting and model
+verification.
+
+During setup, an occupied Admin or Event Hook port is automatically advanced
+to the next available port and the selected value is saved in `runtime.yaml`.
+Normal startup never changes a saved port. Docker profiles also receive a
+profile-specific container name, with a numeric suffix added on conflicts.
+
+Background profile processes write metadata to
+`<profile-data-dir>/run/remi-cat.pid.json` and append logs to
+`<profile-data-dir>/logs/remi-cat.log`. `profile stop` sends SIGTERM and waits;
+use `--force` to send SIGKILL when a process does not exit.
+
 By default Feishu inbound events use the Feishu WebSocket long connection. To
 use Feishu Event Hook callbacks instead, run `cargo run -- setup` and choose
 `event_hook` for `Feishu inbound transport`, then expose the configured local
@@ -62,11 +133,32 @@ subscription settings.
 | `.remi-cat/sessions.json` | Channel-to-session bindings and session metadata. |
 | `.remi-cat/agents/*.md` | Markdown agent profiles with YAML frontmatter. |
 | `.remi-cat/models/*.yaml` | File-backed model profiles for provider/model/capability settings. |
+| `.remi-cat/workflows/*.json` | Supervisor workflow graph definitions. |
 | `.remi-cat/runtime.yaml` | Primary runtime config written by `remi-cat setup`. |
 
 The old daemon/agent split and Docker agent sandbox are no longer the default
 runtime architecture. Shell execution is host-local only when explicitly enabled
 with `REMI_SHELL_MODE=local` and the active agent profile allowlists `bash`.
+
+## Web Chat
+
+Normal `remi-cat` startup serves the embedded Web Chat UI at
+`http://127.0.0.1:8787`. With Feishu credentials configured, Web Chat and
+Feishu run together; without them Remi starts in Web-only mode. Override the
+bind address with `REMI_ADMIN_HOST` and `REMI_ADMIN_PORT`.
+
+Web sessions support creation, history restore, automatic titles, rename,
+cancel, and deletion. The UI uses assistant-ui primitives through a Remi-owned
+external-store adapter, while the versioned NDJSON API remains framework
+independent.
+
+The release binary embeds `web-ui/dist`. Rebuild it after frontend changes:
+
+```bash
+cd web-ui
+npm ci
+npm run build
+```
 
 ## Agent Profiles
 
@@ -89,8 +181,7 @@ tools:
   - todo__list
   - memory__get_detail
   - acp__chat
-  - agent__list
-  - agent__upsert
+  - manage_yourself
 delegates: []
 max_turns: null
 ---
@@ -110,8 +201,52 @@ and distinctive keywords from the question before giving the final answer.
 `tools` is an explicit allowlist. Tools not listed are not advertised and cannot
 be executed by that agent. `models.primary` selects that agent's main model
 profile, while `helper` and `vision` are reserved for future tool/model routing.
-Profiles can be created or replaced with `agent__upsert`, or edited directly
-under `.remi-cat/agents`.
+Profiles can be created or replaced with `manage_yourself` using
+`profile agent upsert`, or edited directly under `.remi-cat/agents`.
+`manage_yourself` accepts only a top-level `command` string, for example:
+`{"command":"profile list"}`.
+
+## Supervisor Workflows
+
+Place workflow definitions in `.remi-cat/workflows/<id>.json`, then start one
+for the current IM session with:
+
+```text
+/workflow start <id> [--max-rounds N|unlimited] [--context {"key":"value"}]
+/workflow status
+/workflow stop
+```
+
+A definition is a versioned directed graph. Every non-terminal node and edge
+has a prompt. After each main-agent round, a fresh supervisor session receives
+the incoming edge prompt, current node prompt, optional previous-node message,
+workflow context, allowed outgoing edges, and the complete main-agent history.
+It selects an edge and may send instructions back to the main agent.
+
+```json
+{
+  "version": 1,
+  "id": "verify",
+  "name": "Verification workflow",
+  "description": "Implement, verify, then stop.",
+  "prompt": "Require evidence before completion.",
+  "start_prompt": "Review the requested work.",
+  "initial_node": "review",
+  "terminal_node": "stop",
+  "nodes": [
+    { "id": "review", "prompt": "Find remaining implementation work." },
+    { "id": "verify", "prompt": "Check tests and evidence." },
+    { "id": "stop", "prompt": "The workflow is complete." }
+  ],
+  "edges": [
+    { "id": "implement", "from": "review", "to": "verify", "prompt": "Request the missing implementation." },
+    { "id": "revise", "from": "verify", "to": "review", "prompt": "Return when verification finds a defect." },
+    { "id": "complete", "from": "verify", "to": "stop", "prompt": "Choose only with sufficient evidence." }
+  ]
+}
+```
+
+`/goal set ...` remains available and uses the built-in two-node goal workflow.
 
 ## Model Profiles
 
@@ -152,6 +287,9 @@ Feishu, a `SubSession(Start)` event automatically creates a private group chat
 for that sub-session and stores the returned Feishu `chat_id` as the
 sub-session channel binding. Parent agent context receives the final tool
 result; intermediate child output stays observable as sub-session progress.
+By default, local ACP uses the installed Codex CLI (`codex exec`) when
+`acp.client` is `codex`; set `REMI_ACP_CODEX_BIN` to override the binary path,
+or set `acp.client: remi` to use the in-process Remi runner/stub.
 
 ## Admin API
 

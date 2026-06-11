@@ -62,6 +62,7 @@ struct MessageResponse {
 #[derive(Debug, Deserialize)]
 struct MessageData {
     message_id: String,
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,6 +384,68 @@ impl FeishuClient {
             return self.send_text_once(chat_id, text).await;
         }
         res
+    }
+
+    /// Send a plain-text message intended to start a new topic in a topic-enabled group.
+    /// Returns `(message_id, thread_id)`.
+    pub async fn send_topic_text(&self, chat_id: &str, text: &str) -> Result<(String, String)> {
+        let res = self.send_topic_text_once(chat_id, text).await;
+        if res
+            .as_ref()
+            .err()
+            .map(is_token_expired_err)
+            .unwrap_or(false)
+        {
+            warn!("send_topic_text: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.send_topic_text_once(chat_id, text).await;
+        }
+        res
+    }
+
+    async fn send_topic_text_once(&self, chat_id: &str, text: &str) -> Result<(String, String)> {
+        let content = serde_json::json!({ "text": text }).to_string();
+        let token = self.token().await;
+
+        let resp: MessageResponse = self
+            .http
+            .post(format!(
+                "{FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": content,
+            }))
+            .send()
+            .await
+            .context("send_topic_text")?
+            .json()
+            .await
+            .context("parse send_topic_text response")?;
+
+        ensure_ok(resp.code, &resp.msg, "send_topic_text")?;
+        let data = resp
+            .data
+            .ok_or_else(|| anyhow!("send_topic_text response missing data"))?;
+        let message_id = data.message_id;
+        let thread_id = match data.thread_id {
+            Some(thread_id) if !thread_id.trim().is_empty() => Some(thread_id),
+            _ => self.get_message_thread_id(&message_id).await?,
+        }
+        .or_else(|| {
+            if message_id.starts_with("omt_") {
+                Some(message_id.clone())
+            } else {
+                None
+            }
+        });
+        let thread_id = thread_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("send_topic_text response missing thread_id"))?;
+        debug!("Sent topic text to chat {chat_id}, thread {thread_id}");
+        Ok((message_id, thread_id))
     }
 
     async fn send_text_once(&self, chat_id: &str, text: &str) -> Result<String> {
@@ -1487,6 +1550,58 @@ impl FeishuClient {
         res
     }
 
+    async fn get_message_thread_id(&self, message_id: &str) -> Result<Option<String>> {
+        let res = self.get_message_thread_id_once(message_id).await;
+        if res
+            .as_ref()
+            .err()
+            .map(is_token_expired_err)
+            .unwrap_or(false)
+        {
+            warn!("get_message_thread_id: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            return self.get_message_thread_id_once(message_id).await;
+        }
+        res
+    }
+
+    async fn get_message_thread_id_once(&self, message_id: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct GetResp {
+            code: i64,
+            msg: String,
+            data: Option<GetData>,
+        }
+        #[derive(Deserialize)]
+        struct GetData {
+            items: Vec<GetItem>,
+        }
+        #[derive(Deserialize)]
+        struct GetItem {
+            thread_id: Option<String>,
+        }
+
+        let token = self.token().await;
+        let resp: GetResp = self
+            .http
+            .get(format!("{FEISHU_BASE}/im/v1/messages/{message_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("get_message_thread_id")?
+            .json()
+            .await
+            .context("parse get_message_thread_id response")?;
+
+        ensure_ok(resp.code, &resp.msg, "get_message_thread_id")?;
+        Ok(resp
+            .data
+            .and_then(|data| data.items.into_iter().next())
+            .and_then(|item| item.thread_id)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
     async fn get_message_raw_once(&self, message_id: &str) -> Result<Option<(String, String)>> {
         #[derive(Deserialize)]
         struct GetResp {
@@ -1899,8 +2014,25 @@ mod tests {
 
     use super::{
         log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
-        ContactUserIdType,
+        ContactUserIdType, MessageResponse,
     };
+
+    #[test]
+    fn message_response_parses_thread_id_when_present() {
+        let parsed: MessageResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "data": {
+                "message_id": "om_msg",
+                "thread_id": "omt_topic"
+            }
+        }))
+        .unwrap();
+
+        let data = parsed.data.unwrap();
+        assert_eq!(data.message_id, "om_msg");
+        assert_eq!(data.thread_id.as_deref(), Some("omt_topic"));
+    }
 
     #[test]
     fn log_text_preview_flattens_and_truncates_multiline_text() {

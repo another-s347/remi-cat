@@ -331,7 +331,7 @@ mod tests {
             [BuiltinSkill {
                 name: "trigger",
                 description: "Builtin trigger capability reference",
-                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nSecret body",
+                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nSecret body".to_string(),
             }],
         ));
         let tool = SkillGetTool { store };
@@ -363,7 +363,7 @@ mod tests {
             [BuiltinSkill {
                 name: "researcher",
                 description: "Research workflow",
-                content: "---\nname: researcher\ndescription: Research workflow\n---\n\nUse primary sources.",
+                content: "---\nname: researcher\ndescription: Research workflow\n---\n\nUse primary sources.".to_string(),
             }],
         ));
         let tool = SkillGetTool { store };

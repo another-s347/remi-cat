@@ -268,7 +268,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             mode: AcpMode::LocalStub,
-            client: AcpClient::Remi,
+            client: AcpClient::Codex,
         }
     }
 }
@@ -496,8 +496,8 @@ mod tests {
     }
 
     #[test]
-    fn default_acp_client_is_remi() {
+    fn default_acp_client_is_codex() {
         let cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
-        assert_eq!(cfg.acp.client, AcpClient::Remi);
+        assert_eq!(cfg.acp.client, AcpClient::Codex);
     }
 }

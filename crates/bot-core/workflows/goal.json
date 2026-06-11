@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "id": "goal",
+  "name": "Goal Supervisor",
+  "description": "Supervise the main agent until the requested goal is complete.",
+  "prompt": "Evaluate progress toward context.goal. Do not declare completion until the goal is genuinely achieved and verified. When more work is required, give the main agent a concrete autonomous action instruction that advances context.goal. Treat the goal as the user's controlling intent: do not tell the main agent to ask the user which unrelated task they meant, and do not defer merely because the latest user message is short or ambiguous. Request user input only when execution is objectively blocked by missing credentials, permissions, or information unavailable through the agent's tools and history.",
+  "start_prompt": "Begin by reviewing the goal against the complete main-agent history.",
+  "initial_node": "review",
+  "terminal_node": "stop",
+  "nodes": [
+    { "id": "review", "prompt": "Review the complete main-agent history and determine whether context.goal is complete. Ignore unrelated abandoned tasks when deciding the next action." },
+    { "id": "stop", "prompt": "The goal is complete. Stop the workflow." }
+  ],
+  "edges": [
+    { "id": "continue", "from": "review", "to": "review", "prompt": "Choose when more main-agent work is required. agent_message must tell the main agent exactly what to execute next without asking the user to choose between unrelated tasks." },
+    { "id": "complete", "from": "review", "to": "stop", "prompt": "Choose only when context.goal is genuinely complete." }
+  ]
+}

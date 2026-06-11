@@ -9,8 +9,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::Context;
@@ -24,6 +25,17 @@ use remi_agentloop::prelude::{
 use crate::sandbox::Sandbox;
 
 // ── helper ────────────────────────────────────────────────────────────────────
+
+fn log_preview(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out.replace('\n', "\\n")
+}
 
 fn detect_inline_image_media_type(path: &str, bytes: &[u8]) -> Option<&'static str> {
     detect_inline_image_media_type_from_magic(bytes)
@@ -218,18 +230,75 @@ impl Tool for WorkspaceBashTool {
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
-                tracing::debug!(cmd = %command, timeout_ms, sandbox = %sandbox.kind(), "bash: running");
+                let started = Instant::now();
+                let cmd_preview = log_preview(&command, 160);
+                tracing::info!(
+                    command = %cmd_preview,
+                    command_len = command.len(),
+                    named_session = named.as_deref().unwrap_or(""),
+                    timeout_ms,
+                    sandbox_kind = %sandbox.kind(),
+                    "bash.start"
+                );
                 match sandbox.bash(&command, named.as_deref(), timeout_ms).await {
                     Ok(output) if output.timed_out => {
-                        tracing::warn!(cmd = %command, timeout_ms, "bash: timed out");
+                        tracing::warn!(
+                            command = %cmd_preview,
+                            command_len = command.len(),
+                            named_session = named.as_deref().unwrap_or(""),
+                            timeout_ms,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "bash.failed"
+                        );
                         yield ToolOutput::text(format!("[timed out after {timeout_ms}ms]"));
                     }
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Err(e) => {
+                        tracing::warn!(
+                            command = %cmd_preview,
+                            command_len = command.len(),
+                            named_session = named.as_deref().unwrap_or(""),
+                            timeout_ms,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "bash.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                     Ok(output) => {
                         let stdout = output.stdout;
                         let stderr = output.stderr;
                         let code   = output.exit_code;
-                        tracing::debug!(cmd = %command, code, "bash: done");
+                        let stdout_bytes = stdout.len();
+                        let stderr_bytes = stderr.len();
+                        if code == 0 {
+                            tracing::info!(
+                                command = %cmd_preview,
+                                command_len = command.len(),
+                                named_session = named.as_deref().unwrap_or(""),
+                                timeout_ms,
+                                sandbox_kind = %sandbox.kind(),
+                                exit_code = code,
+                                stdout_bytes,
+                                stderr_bytes,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "bash.completed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                command = %cmd_preview,
+                                command_len = command.len(),
+                                named_session = named.as_deref().unwrap_or(""),
+                                timeout_ms,
+                                sandbox_kind = %sandbox.kind(),
+                                exit_code = code,
+                                stdout_bytes,
+                                stderr_bytes,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "bash.failed"
+                            );
+                        }
                         let mut r = stdout;
                         if !stderr.is_empty() {
                             if !r.is_empty() { r.push('\n'); }
@@ -243,6 +312,170 @@ impl Tool for WorkspaceBashTool {
             }))
         }
     }
+}
+
+// ── ManageYourselfTool ────────────────────────────────────────────────────────
+
+pub struct ManageYourselfTool;
+
+impl Tool for ManageYourselfTool {
+    fn name(&self) -> &str {
+        "manage_yourself"
+    }
+
+    fn description(&self) -> &str {
+        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. The command is parsed as shell-like arguments but is not executed through a shell."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "remi-cat arguments without the binary name, for example: profile list"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    {
+        async move {
+            let command = arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AgentError::tool(
+                        "manage_yourself",
+                        "missing 'command'; use exactly {\"command\":\"profile list\"}",
+                    )
+                })?
+                .to_string();
+            let args = parse_manage_yourself_command(&command)?;
+            Ok(ToolResult::Output(stream! {
+                yield ToolOutput::Delta(format!("remi-cat {}", args.join(" ")));
+                tracing::info!(
+                    command = %log_preview(&command, 160),
+                    command_len = command.len(),
+                    argc = args.len(),
+                    "manage_yourself.start"
+                );
+                match run_manage_yourself_command(&args).await {
+                    Ok(output) => yield ToolOutput::text(output),
+                    Err(error) => {
+                        tracing::warn!(
+                            command = %log_preview(&command, 160),
+                            command_len = command.len(),
+                            argc = args.len(),
+                            error = %error,
+                            "manage_yourself.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {error:#}"));
+                    }
+                }
+            }))
+        }
+    }
+}
+
+fn parse_manage_yourself_command(command: &str) -> Result<Vec<String>, AgentError> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(AgentError::tool(
+            "manage_yourself",
+            "command must not be empty",
+        ));
+    }
+    let args = shlex::split(trimmed).ok_or_else(|| {
+        AgentError::tool(
+            "manage_yourself",
+            "failed to parse command; check shell quoting",
+        )
+    })?;
+    if args.is_empty() {
+        return Err(AgentError::tool(
+            "manage_yourself",
+            "command must not be empty",
+        ));
+    }
+    Ok(args)
+}
+
+async fn run_manage_yourself_command(args: &[String]) -> anyhow::Result<String> {
+    let exe = std::env::current_exe().context("resolving current remi-cat executable")?;
+    let started = Instant::now();
+    tracing::debug!(
+        exe = %exe.display(),
+        argc = args.len(),
+        "manage_yourself.process.start"
+    );
+    let output = tokio::task::spawn_blocking({
+        let args = args.to_vec();
+        move || Command::new(&exe).args(args).output()
+    })
+    .await
+    .context("joining manage_yourself command task")?
+    .context("running remi-cat command")?;
+    let stdout_bytes = output.stdout.len();
+    let stderr_bytes = output.stderr.len();
+    let exit_code = output.status.code();
+    if output.status.success() {
+        tracing::info!(
+            exit_code = exit_code.unwrap_or(-1),
+            stdout_bytes,
+            stderr_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "manage_yourself.completed"
+        );
+    } else {
+        tracing::warn!(
+            exit_code = exit_code.unwrap_or(-1),
+            stdout_bytes,
+            stderr_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "manage_yourself.failed"
+        );
+    }
+    Ok(format_command_output(output))
+}
+
+fn format_command_output(output: std::process::Output) -> String {
+    let mut text = String::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        text.push_str(stdout.trim_end());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr] ");
+        text.push_str(stderr.trim_end());
+    }
+    if let Some(code) = output.status.code() {
+        if code != 0 {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[exit {code}]"));
+        }
+    } else {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[terminated by signal]");
+    }
+    text
 }
 
 // ── RootedFsReadTool ──────────────────────────────────────────────────────────
@@ -290,14 +523,43 @@ impl Tool for RootedFsReadTool {
             let offset = arguments["offset"].as_u64().unwrap_or(0) as usize;
             let length = arguments["length"].as_u64().unwrap_or(8192) as usize;
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    path = %path_str,
+                    offset,
+                    length,
+                    sandbox_kind = %sandbox.kind(),
+                    "fs_read.start"
+                );
                 match sandbox.read(&path_str).await {
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            offset,
+                            length,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "fs_read.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                     Ok(bytes) => {
+                        let total = bytes.len();
                         if let Some(mime_type) = detect_inline_image_media_type(&path_str, &bytes) {
+                            tracing::info!(
+                                path = %path_str,
+                                total_bytes = total,
+                                mime_type,
+                                inline_image = true,
+                                sandbox_kind = %sandbox.kind(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "fs_read.completed"
+                            );
                             let summary = redactor
                                 .read()
                                 .unwrap()
-                                .redact(&inline_image_summary(&path_str, mime_type, bytes.len()));
+                                .redact(&inline_image_summary(&path_str, mime_type, total));
                             let data_url = format!(
                                 "data:{mime_type};base64,{}",
                                 base64::engine::general_purpose::STANDARD.encode(&bytes)
@@ -309,11 +571,21 @@ impl Tool for RootedFsReadTool {
                             return;
                         }
 
-                        let total = bytes.len();
                         let start = offset.min(total);
                         let end   = (start + length).min(total);
                         let text  = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                         let remaining = total.saturating_sub(end);
+                        tracing::info!(
+                            path = %path_str,
+                            start,
+                            returned_bytes = end.saturating_sub(start),
+                            total_bytes = total,
+                            remaining,
+                            inline_image = false,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "fs_read.completed"
+                        );
                         let text = redactor.read().unwrap().redact(&text);
                         let mut r = text;
                         r.push_str(&format!("\n[offset={start} length={} total_bytes={total} remaining={remaining}]", end - start));
@@ -373,9 +645,35 @@ impl Tool for RootedFsWriteTool {
                 .to_string();
             let bytes = content.len();
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    path = %path_str,
+                    bytes,
+                    sandbox_kind = %sandbox.kind(),
+                    "fs_write.start"
+                );
                 match sandbox.write(&path_str, content.as_bytes()).await {
-                    Ok(()) => yield ToolOutput::text(format!("wrote {bytes} bytes to {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %path_str,
+                            bytes,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "fs_write.completed"
+                        );
+                        yield ToolOutput::text(format!("wrote {bytes} bytes to {path_str}"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            bytes,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "fs_write.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                 }
             }))
         }
@@ -396,8 +694,8 @@ impl Tool for RootedFsApplyPatchTool {
         "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
          existing files. The patch must be a standard unified diff, such as output \
          from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
-         hunks. `diff --git` headers are accepted. Each old hunk must match \
-         exactly once."
+         hunks. Every context line, including a blank one, starts with a space. \
+         `diff --git` headers are accepted. Each old hunk must match exactly once."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -405,7 +703,7 @@ impl Tool for RootedFsApplyPatchTool {
             "properties": {
                 "patch": {
                     "type": "string",
-                    "description": "Standard unified diff text, such as output from git diff or diff -u"
+                    "description": "Standard unified diff text, such as output from git diff or diff -u. Prefix blank context lines with a space."
                 },
                 "workdir": {
                     "type": "string",
@@ -430,9 +728,38 @@ impl Tool for RootedFsApplyPatchTool {
                 .to_string();
             let workdir = arguments["workdir"].as_str().map(str::to_string);
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    patch_bytes = patch.len(),
+                    workdir = workdir.as_deref().unwrap_or(""),
+                    sandbox_kind = %sandbox.kind(),
+                    "apply_patch.start"
+                );
                 match apply_patch_to_sandbox(sandbox.as_ref(), &patch, workdir.as_deref()).await {
-                    Ok(summary) => yield ToolOutput::text(summary.to_string()),
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(summary) => {
+                        tracing::info!(
+                            patch_bytes = patch.len(),
+                            workdir = workdir.as_deref().unwrap_or(""),
+                            added = summary.added.len(),
+                            updated = summary.updated.len(),
+                            deleted = summary.deleted.len(),
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "apply_patch.completed"
+                        );
+                        yield ToolOutput::text(summary.to_string());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            patch_bytes = patch.len(),
+                            workdir = workdir.as_deref().unwrap_or(""),
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "apply_patch.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                 }
             }))
         }
@@ -703,9 +1030,21 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<ParsedPatchOp>, String> {
                     new.push_str(rest);
                 } else if next == r"\ No newline at end of file" {
                     // Informational marker emitted by unified diff.
+                } else if next.is_empty()
+                    && lines.get(index + 1).is_some_and(|following| {
+                        following.starts_with([' ', '-', '+'])
+                            || trim_line(following) == r"\ No newline at end of file"
+                    })
+                {
+                    // Be tolerant of a common generated-diff mistake: a blank context
+                    // line written as "\n" instead of the required " \n".
+                    old.push_str(line);
+                    new.push_str(line);
                 } else {
                     return Err(format!(
-                        "file {path} hunk lines must start with space, '-' or '+'"
+                        "file {path} patch line {} is invalid inside a hunk: {next:?}; \
+                         hunk lines must start with space, '-' or '+'",
+                        index + 1
                     ));
                 }
                 saw_line = true;
@@ -809,9 +1148,35 @@ impl Tool for RootedFsCreateTool {
                 .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    path = %path_str,
+                    recursive,
+                    sandbox_kind = %sandbox.kind(),
+                    "fs_mkdir.start"
+                );
                 match sandbox.mkdir(&path_str, recursive).await {
-                    Ok(()) => yield ToolOutput::text(format!("created {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %path_str,
+                            recursive,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "fs_mkdir.completed"
+                        );
+                        yield ToolOutput::text(format!("created {path_str}"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            recursive,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "fs_mkdir.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                 }
             }))
         }
@@ -856,9 +1221,35 @@ impl Tool for RootedFsRemoveTool {
                 .to_string();
             let recursive = arguments["recursive"].as_bool().unwrap_or(false);
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    path = %path_str,
+                    recursive,
+                    sandbox_kind = %sandbox.kind(),
+                    "fs_remove.start"
+                );
                 match sandbox.remove(&path_str, recursive).await {
-                    Ok(()) => yield ToolOutput::text(format!("removed {path_str}")),
-                    Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %path_str,
+                            recursive,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "fs_remove.completed"
+                        );
+                        yield ToolOutput::text(format!("removed {path_str}"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            recursive,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "fs_remove.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                 }
             }))
         }
@@ -899,9 +1290,31 @@ impl Tool for RootedFsLsTool {
         async move {
             let path_str = arguments["path"].as_str().unwrap_or(".").to_string();
             Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                tracing::info!(
+                    path = %path_str,
+                    sandbox_kind = %sandbox.kind(),
+                    "fs_ls.start"
+                );
                 match sandbox.list(&path_str).await {
-                        Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "fs_ls.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {e:#}"));
+                    }
                     Ok(entries) => {
+                        tracing::info!(
+                            path = %path_str,
+                            entries = entries.len(),
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "fs_ls.completed"
+                        );
                         let listing = entries.join("\n");
                         let listing = redactor.read().unwrap().redact(&listing);
                         yield ToolOutput::text(listing);
@@ -971,7 +1384,13 @@ impl Tool for ExaSearchTool {
                 .unwrap_or(default_n);
 
             Ok(ToolResult::Output(stream! {
-                tracing::debug!(query = %query, "web_search: querying");
+                let started = Instant::now();
+                tracing::info!(
+                    query = %log_preview(&query, 160),
+                    query_len = query.len(),
+                    num_results = num,
+                    "web_search.start"
+                );
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -989,22 +1408,55 @@ impl Tool for ExaSearchTool {
                     .await
                 {
                     Err(e) => {
-                        tracing::warn!("web_search failed: {e}");
+                        tracing::warn!(
+                            query = %log_preview(&query, 160),
+                            query_len = query.len(),
+                            num_results = num,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "web_search.failed"
+                        );
                         yield ToolOutput::text(format!("search request failed: {e}"));
                     }
                     Ok(resp) => {
                         match resp.json::<serde_json::Value>().await {
-                            Err(e) => { yield ToolOutput::text(format!("parse error: {e}")); }
+                            Err(e) => {
+                                tracing::warn!(
+                                    query = %log_preview(&query, 160),
+                                    query_len = query.len(),
+                                    num_results = num,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    error = %e,
+                                    "web_search.failed"
+                                );
+                                yield ToolOutput::text(format!("parse error: {e}"));
+                            }
                             Ok(data) => {
                                 let mut out = String::new();
                                 if let Some(results) = data["results"].as_array() {
-                                    tracing::debug!(query = %query, n = results.len(), "web_search: done");
+                                    tracing::info!(
+                                        query = %log_preview(&query, 160),
+                                        query_len = query.len(),
+                                        num_results = num,
+                                        results = results.len(),
+                                        elapsed_ms = started.elapsed().as_millis() as u64,
+                                        "web_search.completed"
+                                    );
                                     for (i, r) in results.iter().enumerate() {
                                         let title = r["title"].as_str().unwrap_or("(no title)");
                                         let url   = r["url"].as_str().unwrap_or("");
                                         let text  = r["text"].as_str().unwrap_or("");
                                         out.push_str(&format!("{}. **{}**\n   {}\n   {}\n\n", i+1, title, url, text.trim()));
                                     }
+                                } else {
+                                    tracing::info!(
+                                        query = %log_preview(&query, 160),
+                                        query_len = query.len(),
+                                        num_results = num,
+                                        results = 0,
+                                        elapsed_ms = started.elapsed().as_millis() as u64,
+                                        "web_search.completed"
+                                    );
                                 }
                                 if out.is_empty() { out = "No results found.".into(); }
                                 yield ToolOutput::text(out.trim().to_string());
@@ -1137,7 +1589,10 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor};
+    use super::{
+        format_command_output, parse_apply_patch, parse_manage_yourself_command, ParsedPatchOp,
+        PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor,
+    };
     use crate::sandbox::NoSandbox;
     use futures::StreamExt;
     use remi_agentloop::prelude::{
@@ -1171,6 +1626,47 @@ mod tests {
             metadata: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
+    }
+
+    #[test]
+    fn manage_yourself_parses_shell_like_command_without_shell() {
+        let args =
+            parse_manage_yourself_command("profile agent upsert dev './agents/coder profile.md'")
+                .expect("quoted command should parse");
+
+        assert_eq!(
+            args,
+            vec![
+                "profile",
+                "agent",
+                "upsert",
+                "dev",
+                "./agents/coder profile.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn manage_yourself_rejects_empty_or_unclosed_quotes() {
+        assert!(parse_manage_yourself_command("   ").is_err());
+        assert!(parse_manage_yourself_command("profile 'unterminated").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manage_yourself_formats_nonzero_exit_output() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: b"stdout\n".to_vec(),
+            stderr: b"stderr\n".to_vec(),
+        };
+
+        assert_eq!(
+            format_command_output(output),
+            "stdout\n[stderr] stderr\n[exit 2]"
+        );
     }
 
     async fn collect_tool_content(
@@ -1361,6 +1857,46 @@ deleted file mode 100644
         );
         assert!(!root.join("b.txt").exists());
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn apply_patch_accepts_unprefixed_blank_context_lines() {
+        let patch = r#"--- a/note.txt
++++ b/note.txt
+@@ -1,3 +1,3 @@
+-alpha
++ALPHA
+
+ omega
+"#;
+
+        let ops = parse_apply_patch(patch).expect("blank context line should be tolerated");
+
+        assert_eq!(
+            ops,
+            vec![ParsedPatchOp::Update {
+                path: "note.txt".to_string(),
+                hunks: vec![PatchHunk {
+                    old: "alpha\n\nomega\n".to_string(),
+                    new: "ALPHA\n\nomega\n".to_string(),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_patch_reports_invalid_hunk_line_number_and_content() {
+        let patch = r#"--- a/note.txt
++++ b/note.txt
+@@ -1 +1 @@
+ alpha
+invalid
+"#;
+
+        let error = parse_apply_patch(patch).expect_err("invalid hunk line should fail");
+
+        assert!(error.contains("patch line 5"), "{error}");
+        assert!(error.contains("\"invalid\""), "{error}");
     }
 
     #[tokio::test]

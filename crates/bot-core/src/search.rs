@@ -220,28 +220,76 @@ async fn search_web(query: &str, limit: usize) -> Result<Vec<serde_json::Value>,
         .send()
         .await
         .map_err(|err| format!("web search request failed: {err}"))?;
-    let data = response
-        .json::<serde_json::Value>()
+    let status = response.status().as_u16();
+    let body = response
+        .text()
         .await
-        .map_err(|err| format!("web search response parse failed: {err}"))?;
+        .map_err(|err| format!("web search response read failed: {err}"))?;
+    parse_exa_search_response(status, &body, limit)
+}
 
+fn parse_exa_search_response(
+    status: u16,
+    body: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    let data: serde_json::Value = serde_json::from_str(body).map_err(|err| {
+        format!(
+            "web search response parse failed: {err}; body={}",
+            preview(body)
+        )
+    })?;
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "web search HTTP {status}: {}",
+            exa_error_message(&data).unwrap_or_else(|| preview(body))
+        ));
+    }
     let mut results = Vec::new();
-    if let Some(items) = data["results"].as_array() {
-        for item in items.iter().take(limit) {
-            results.push(json!({
-                "scope": "web",
-                "title": item["title"].as_str().unwrap_or("(no title)"),
-                "url": item["url"].as_str().unwrap_or(""),
-                "text": item["text"].as_str().unwrap_or(""),
-            }));
-        }
+    let items = data["results"].as_array().ok_or_else(|| {
+        let keys = data
+            .as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_else(|| data.to_string());
+        format!("web search response missing results array; response keys: {keys}")
+    })?;
+    for item in items.iter().take(limit) {
+        results.push(json!({
+            "scope": "web",
+            "title": item["title"].as_str().unwrap_or("(no title)"),
+            "url": item["url"].as_str().unwrap_or(""),
+            "text": item["text"].as_str().unwrap_or(""),
+        }));
     }
     Ok(results)
 }
 
+fn exa_error_message(data: &serde_json::Value) -> Option<String> {
+    for key in ["message", "error", "detail"] {
+        let Some(value) = data.get(key) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            return Some(text.to_string());
+        }
+        if !value.is_null() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn preview(text: &str) -> String {
+    const MAX: usize = 500;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    format!("{}...", &text[..MAX])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SearchTool;
+    use super::{parse_exa_search_response, SearchTool};
     use crate::memory::{LlmCompressor, MemoryStore};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};
     use futures::StreamExt;
@@ -303,7 +351,8 @@ mod tests {
             [BuiltinSkill {
                 name: "aurora-skill",
                 description: "Teal aurora workflow",
-                content: "---\nname: aurora-skill\ndescription: Teal aurora workflow\n---\n\nBody",
+                content: "---\nname: aurora-skill\ndescription: Teal aurora workflow\n---\n\nBody"
+                    .to_string(),
             }],
         ))
     }
@@ -406,6 +455,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("EXA_API_KEY is not set"));
+    }
+
+    #[test]
+    fn exa_http_error_is_reported_instead_of_empty_results() {
+        let error = parse_exa_search_response(401, r#"{"message":"Invalid API key"}"#, 5)
+            .expect_err("non-2xx Exa responses should fail");
+
+        assert!(error.contains("HTTP 401"), "{error}");
+        assert!(error.contains("Invalid API key"), "{error}");
+    }
+
+    #[test]
+    fn exa_missing_results_array_is_reported() {
+        let error = parse_exa_search_response(200, r#"{"requestId":"req_1","error":"quota"}"#, 5)
+            .expect_err("missing results should fail clearly");
+
+        assert!(error.contains("missing results array"), "{error}");
+        assert!(error.contains("requestId"), "{error}");
+    }
+
+    #[test]
+    fn exa_results_are_parsed() {
+        let results = parse_exa_search_response(
+            200,
+            r#"{"results":[{"title":"Example","url":"https://example.com","text":"Body"}]}"#,
+            5,
+        )
+        .expect("valid Exa response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["scope"], "web");
+        assert_eq!(results[0]["title"], "Example");
     }
 
     #[tokio::test]

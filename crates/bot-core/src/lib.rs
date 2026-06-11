@@ -22,33 +22,45 @@ pub mod goal;
 pub mod im_tools;
 pub mod memory;
 pub mod model_profile;
+pub mod model_usage;
 pub mod profile;
+pub mod remi_skill;
 pub mod sandbox;
 pub mod search;
 pub mod skill;
+pub mod supervisor_workflow;
 pub mod todo;
+pub mod tool_pretty;
 pub mod tools;
 pub mod trigger;
 
 pub use agent::CatAgent;
 pub use events::{CatEvent, SkillEvent, TodoEvent, TriggerEvent};
-pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision, SupervisorReport};
+pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
-pub use memory::MemoryStore;
+pub use memory::{MemoryStore, ThreadHistoryMessage};
 pub use model_profile::{
     install_embedded_model_profiles, resolve_model_profile_from_env, ModelProfileConfig,
     ModelProfileRegistry, ModelProfileSource, ThinkingMode,
 };
+pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{
     install_embedded_agent_profiles, AgentModelBindings, AgentProfile, AgentRegistry,
 };
 pub use remi_agentloop::prelude::{Content, ContentPart, Message};
 pub use skill::store::{BuiltinSkillStore, FileSkillStore};
+pub use skill::store::{SkillDocument, SkillSummary};
+pub use supervisor_workflow::{
+    SupervisorTraceEvent, WorkflowDecision, WorkflowDefinition, WorkflowEdge, WorkflowInstance,
+    WorkflowMaxRounds, WorkflowNode, WorkflowReport, WorkflowStatus,
+};
+pub use tool_pretty::{tool_success, PrettyToolCall, PrettyToolStatus};
 pub use tools::SharedRedactor;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
@@ -62,6 +74,7 @@ use remi_agentloop_deepagent::{SubAgentEventStream, SubAgentToolAdapter};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::im_tools::register_fetch_tool;
+use crate::skill::store::SkillStore;
 use memory::{
     build_injected_history, LlmCompressor, MemoryGetDetailTool, MemoryRecallTool,
     MemoryUpsertNamedTool,
@@ -69,12 +82,13 @@ use memory::{
 use sandbox::SandboxConfig;
 use search::SearchTool;
 use tools::{
-    BashMode, ExaSearchTool, NowTool, RootedFsApplyPatchTool, RootedFsCreateTool, RootedFsLsTool,
-    RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool, SecretRedactor, SleepTool,
-    WorkspaceBashTool,
+    BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RootedFsApplyPatchTool,
+    RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
+    SecretRedactor, SleepTool, WorkspaceBashTool,
 };
 
 const DEFAULT_AGENT_ID: &str = "default";
+const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(180);
 pub(crate) const TRIGGER_RUN_META_KEY: &str = "trigger_run";
 
 pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &str) -> bool {
@@ -100,6 +114,10 @@ pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) 
 /// Per-turn options for [`CatBot::stream_with_options`].
 #[derive(Debug, Default, Clone)]
 pub struct StreamOptions {
+    /// Optional session-persisted model profile override.
+    pub model_profile_id: Option<String>,
+    /// Skill documents explicitly loaded by slash-command preprocessing for this turn.
+    pub skill_injections: Vec<SkillDocument>,
     /// UUID of the sender (stored in metadata; injected as a
     /// system annotation in group chats so the LLM can distinguish speakers).
     pub sender_user_id: Option<String>,
@@ -202,6 +220,7 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
                 raw_history,
                 raw_user_state,
                 skip_count,
+                &HashMap::new(),
             )
             .await;
             let trimmed = text.trim();
@@ -218,17 +237,122 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
 /// Main bot handle.  Build with [`CatBotBuilder`] or [`CatBot::from_env`].
 pub struct CatBot {
     inner: CatAgent<InnerAgent>,
+    model_agents: HashMap<String, CatAgent<InnerAgent>>,
+    skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
     trigger_backend: Arc<trigger::TriggerBackend>,
     acp_backend: Arc<acp::AcpBackend>,
     run_locks: ThreadRunLocks,
     model_profile: ModelProfileConfig,
+    model_registry: Arc<ModelProfileRegistry>,
+    api_key: String,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
 }
 
+#[derive(Debug, Clone)]
+pub struct EffectiveModelProfile {
+    pub profile: ModelProfileConfig,
+    pub source: EffectiveModelSource,
+    pub invalid_session_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveModelSource {
+    Session,
+    Default,
+}
+
 impl CatBot {
+    pub fn model_context_tokens(&self) -> u32 {
+        self.model_profile.context_tokens
+    }
+
+    pub fn model_context_tokens_for(&self, session_model_profile_id: Option<&str>) -> u32 {
+        self.effective_model_profile(session_model_profile_id)
+            .profile
+            .context_tokens
+    }
+
+    pub fn model_profiles(&self) -> Vec<&ModelProfileConfig> {
+        self.model_registry.list()
+    }
+
+    pub fn skill_summaries(&self) -> Vec<SkillSummary> {
+        self.skill_store.featured_summaries()
+    }
+
+    pub async fn get_skill(&self, name: &str) -> Result<Option<SkillDocument>, AgentError> {
+        self.skill_store.get(name).await
+    }
+
+    pub async fn read_skill_names(&self, thread_id: &str) -> Vec<String> {
+        let user_state = self.memory.load_user_state(thread_id).await;
+        skill::tools::read_skill_names(&user_state)
+    }
+
+    pub fn default_model_profile(&self) -> &ModelProfileConfig {
+        &self.model_profile
+    }
+
+    pub fn get_model_profile(&self, id: &str) -> Option<&ModelProfileConfig> {
+        self.model_registry.get(id)
+    }
+
+    pub fn effective_model_profile(
+        &self,
+        session_model_profile_id: Option<&str>,
+    ) -> EffectiveModelProfile {
+        if let Some(id) = session_model_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(profile) = self.model_registry.get(id) {
+                return EffectiveModelProfile {
+                    profile: profile.clone(),
+                    source: EffectiveModelSource::Session,
+                    invalid_session_model: None,
+                };
+            }
+            return EffectiveModelProfile {
+                profile: self.model_profile.clone(),
+                source: EffectiveModelSource::Default,
+                invalid_session_model: Some(id.to_string()),
+            };
+        }
+        EffectiveModelProfile {
+            profile: self.model_profile.clone(),
+            source: EffectiveModelSource::Default,
+            invalid_session_model: None,
+        }
+    }
+
+    pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
+        model_usage::query_account_usage(&self.model_profile, &self.api_key).await
+    }
+
+    pub async fn account_usage_for(
+        &self,
+        session_model_profile_id: Option<&str>,
+    ) -> anyhow::Result<AccountUsage> {
+        let effective = self.effective_model_profile(session_model_profile_id);
+        model_usage::query_account_usage(&effective.profile, &self.api_key).await
+    }
+
+    fn agent_for_model_profile(&self, profile_id: &str) -> &CatAgent<InnerAgent> {
+        if profile_id == self.model_profile.id {
+            &self.inner
+        } else {
+            self.model_agents.get(profile_id).unwrap_or(&self.inner)
+        }
+    }
+
+    pub async fn thread_todos(&self, thread_id: &str) -> Result<Vec<todo::TodoItem>, AgentError> {
+        let context = self.memory.load_context(thread_id).await?;
+        Ok(todo::todos_from_user_state(&context.user_state))
+    }
+
     /// Convenience constructor — reads credentials from environment variables.
     ///
     /// | Variable                  | Description                                           |
@@ -265,40 +389,227 @@ impl CatBot {
         self.memory.clear_thread(thread_id).await
     }
 
+    pub async fn thread_history(&self, thread_id: &str) -> Vec<ThreadHistoryMessage> {
+        self.memory.thread_history(thread_id).await
+    }
+
+    pub async fn delete_thread_data(
+        &self,
+        thread_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<(), remi_agentloop::prelude::AgentError> {
+        let run_lock = self.thread_run_lock(thread_id).await;
+        let _run_guard = run_lock.lock().await;
+        self.todo_backend
+            .delete_thread(thread_id, user_id)
+            .await
+            .map_err(|err| AgentError::other(format!("delete thread todos: {err:#}")))?;
+        self.trigger_backend
+            .delete_thread(thread_id, user_id)
+            .await
+            .map_err(|err| AgentError::other(format!("delete thread triggers: {err:#}")))?;
+        self.memory.delete_thread(thread_id).await?;
+        let _ = supervisor_workflow::clear_instance(&self.memory.data_dir, thread_id).await;
+        Ok(())
+    }
+
+    pub async fn fork_thread_data(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<(), remi_agentloop::prelude::AgentError> {
+        if source_thread_id == target_thread_id {
+            return Err(AgentError::other("cannot fork a thread onto itself"));
+        }
+        let source_lock = self.thread_run_lock(source_thread_id).await;
+        let target_lock = self.thread_run_lock(target_thread_id).await;
+        if source_thread_id <= target_thread_id {
+            let _source_guard = source_lock.lock().await;
+            let _target_guard = target_lock.lock().await;
+            self.fork_thread_data_locked(source_thread_id, target_thread_id, user_id)
+                .await
+        } else {
+            let _target_guard = target_lock.lock().await;
+            let _source_guard = source_lock.lock().await;
+            self.fork_thread_data_locked(source_thread_id, target_thread_id, user_id)
+                .await
+        }
+    }
+
+    async fn fork_thread_data_locked(
+        &self,
+        source_thread_id: &str,
+        target_thread_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<(), remi_agentloop::prelude::AgentError> {
+        self.memory
+            .fork_thread(source_thread_id, target_thread_id)
+            .await?;
+        let mut user_state = self.memory.load_user_state(target_thread_id).await;
+        self.todo_backend
+            .fork_thread_user_state(source_thread_id, target_thread_id, user_id, &mut user_state)
+            .await
+            .map_err(|err| AgentError::other(format!("fork thread todos: {err:#}")))?;
+        self.trigger_backend
+            .fork_thread_user_state(source_thread_id, target_thread_id, user_id, &mut user_state)
+            .await
+            .map_err(|err| AgentError::other(format!("fork thread triggers: {err:#}")))?;
+        self.memory
+            .save_user_state(target_thread_id, &user_state)
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_goal(
         &self,
         thread_id: &str,
         goal_text: &str,
         max_rounds: GoalMaxRounds,
     ) -> Result<GoalState, remi_agentloop::prelude::AgentError> {
-        let goal = GoalState {
-            goal: goal_text.trim().to_string(),
-            status: GoalStatus::Active,
-            max_rounds,
-            last_evaluation: None,
-            updated_at: chrono::Utc::now(),
-        };
-        goal::save_goal(&self.memory.data_dir, thread_id, &goal)
-            .await
-            .map_err(|err| AgentError::Io(err.to_string()))?;
-        Ok(goal)
+        let instance = self
+            .start_workflow(
+                thread_id,
+                supervisor_workflow::embedded_goal_definition(),
+                serde_json::json!({"goal": goal_text.trim()}),
+                max_rounds,
+            )
+            .await?;
+        goal::from_instance(&instance)
+            .ok_or_else(|| AgentError::other("failed to create goal workflow"))
     }
 
     pub async fn goal_status(&self, thread_id: &str) -> Option<GoalState> {
-        goal::load_goal(&self.memory.data_dir, thread_id).await
+        let instance = self.workflow_status(thread_id).await?;
+        goal::from_instance(&instance)
     }
 
     pub async fn clear_goal(
         &self,
         thread_id: &str,
     ) -> Result<(), remi_agentloop::prelude::AgentError> {
-        goal::clear_goal(&self.memory.data_dir, thread_id)
+        self.clear_workflow(thread_id).await
+    }
+
+    pub async fn start_workflow(
+        &self,
+        thread_id: &str,
+        definition: WorkflowDefinition,
+        context: serde_json::Value,
+        max_rounds: WorkflowMaxRounds,
+    ) -> Result<WorkflowInstance, AgentError> {
+        definition.validate().map_err(AgentError::other)?;
+        if !context.is_object() {
+            return Err(AgentError::other("workflow context must be a JSON object"));
+        }
+        let instance = WorkflowInstance {
+            current_node: definition.initial_node.clone(),
+            definition,
+            context,
+            incoming_edge: None,
+            node_message: None,
+            status: WorkflowStatus::Active,
+            max_rounds,
+            last_report: None,
+            updated_at: chrono::Utc::now(),
+        };
+        self.save_workflow_instance(thread_id, &instance).await?;
+        Ok(instance)
+    }
+
+    pub async fn start_workflow_by_id(
+        &self,
+        thread_id: &str,
+        workflow_id: &str,
+        context: serde_json::Value,
+        max_rounds: WorkflowMaxRounds,
+    ) -> Result<WorkflowInstance, AgentError> {
+        let definition = supervisor_workflow::load_definition(&self.memory.data_dir, workflow_id)
+            .await
+            .map_err(AgentError::other)?;
+        self.start_workflow(thread_id, definition, context, max_rounds)
+            .await
+    }
+
+    pub async fn workflow_status(&self, thread_id: &str) -> Option<WorkflowInstance> {
+        let user_state = self.memory.load_user_state(thread_id).await;
+        if let Some(instance) = supervisor_workflow::instance_from_user_state(&user_state) {
+            return Some(instance);
+        }
+        let instance = goal::migrate_legacy_goal(&self.memory.data_dir, thread_id).await?;
+        if self
+            .save_workflow_instance(thread_id, &instance)
+            .await
+            .is_ok()
+        {
+            let _ = supervisor_workflow::clear_instance(&self.memory.data_dir, thread_id).await;
+        }
+        Some(instance)
+    }
+
+    pub async fn pause_workflow(&self, thread_id: &str) -> Result<(), AgentError> {
+        let Some(mut instance) = self.workflow_status(thread_id).await else {
+            return Ok(());
+        };
+        instance.status = WorkflowStatus::Paused;
+        instance.updated_at = chrono::Utc::now();
+        instance.last_report = Some(WorkflowReport {
+            workflow_id: instance.definition.id.clone(),
+            workflow_name: instance.definition.name.clone(),
+            from_node: instance.current_node.clone(),
+            edge: None,
+            to_node: instance.current_node.clone(),
+            status: WorkflowStatus::Paused,
+            reason: "paused by user".to_string(),
+            agent_message: None,
+            next_node_message: None,
+            supervisor_trace: Vec::new(),
+            round: instance
+                .last_report
+                .as_ref()
+                .map(|report| report.round)
+                .unwrap_or(0),
+            max_rounds: instance.max_rounds.clone(),
+            error: None,
+        });
+        self.save_workflow_instance(thread_id, &instance).await
+    }
+
+    pub async fn stop_workflow(&self, thread_id: &str) -> Result<(), AgentError> {
+        self.pause_workflow(thread_id).await
+    }
+
+    pub async fn clear_workflow(&self, thread_id: &str) -> Result<(), AgentError> {
+        let mut user_state = self.memory.load_user_state(thread_id).await;
+        supervisor_workflow::remove_instance_from_user_state(&mut user_state);
+        self.memory.save_user_state(thread_id, &user_state).await?;
+        supervisor_workflow::clear_instance(&self.memory.data_dir, thread_id)
+            .await
+            .map_err(|err| AgentError::Io(err.to_string()))?;
+        goal::clear_legacy_goal(&self.memory.data_dir, thread_id)
             .await
             .map_err(|err| AgentError::Io(err.to_string()))
     }
 
+    async fn save_workflow_instance(
+        &self,
+        thread_id: &str,
+        instance: &WorkflowInstance,
+    ) -> Result<(), AgentError> {
+        let mut user_state = self.memory.load_user_state(thread_id).await;
+        supervisor_workflow::set_instance_in_user_state(&mut user_state, instance)
+            .map_err(|err| AgentError::other(format!("serialize supervisor workflow: {err}")))?;
+        self.memory.save_user_state(thread_id, &user_state).await
+    }
+
     async fn thread_run_lock(&self, thread_id: &str) -> ThreadRunLock {
         thread_run_lock(&self.run_locks, thread_id).await
+    }
+
+    pub async fn is_thread_running(&self, thread_id: &str) -> bool {
+        let lock = self.thread_run_lock(thread_id).await;
+        let running = lock.try_lock().is_err();
+        running
     }
 
     /// List triggers for the current thread without invoking the LLM.
@@ -434,91 +745,165 @@ impl CatBot {
             .collect()
     }
 
-    async fn evaluate_goal_after_round(
+    async fn evaluate_workflow_after_round(
         &self,
         thread_id: &str,
         history: &[Message],
+        todo_prompt: Option<String>,
         completed_continuations: u32,
-    ) -> GoalRoundOutcome {
-        let Some(mut goal_state) = goal::load_goal(&self.memory.data_dir, thread_id).await else {
-            return GoalRoundOutcome::NoGoal;
+        model_profile_id: Option<&str>,
+        progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
+    ) -> WorkflowRoundOutcome {
+        let Some(mut instance) = self.workflow_status(thread_id).await else {
+            return WorkflowRoundOutcome::NoWorkflow;
         };
-
-        if goal_state.status == GoalStatus::Completed {
-            if let Some(decision) = goal_state.last_evaluation.clone() {
-                return GoalRoundOutcome::Report(SupervisorReport {
-                    goal: goal_state.goal,
-                    decision,
-                    round: completed_continuations,
-                    max_rounds: goal_state.max_rounds,
-                });
-            }
-            return GoalRoundOutcome::NoGoal;
+        if instance.status != WorkflowStatus::Active {
+            return WorkflowRoundOutcome::NoWorkflow;
         }
-
+        let from_node = instance.current_node.clone();
         let decision = match self
-            .run_supervisor_once(thread_id, &goal_state.goal, history)
+            .run_supervisor_node(
+                thread_id,
+                &instance,
+                history,
+                todo_prompt.as_deref(),
+                model_profile_id,
+                progress,
+            )
             .await
         {
             Ok(decision) => decision,
-            Err(err) => SupervisorDecision {
-                status: goal::SupervisorDecisionStatus::Continue,
-                message: None,
-                reason: format!("supervisor failed: {err}"),
-            },
+            Err(err) => {
+                return self
+                    .workflow_error(
+                        thread_id,
+                        instance,
+                        from_node,
+                        completed_continuations,
+                        err.to_string(),
+                    )
+                    .await
+            }
         };
-
-        if decision.status == goal::SupervisorDecisionStatus::Completed {
-            goal_state.status = GoalStatus::Completed;
-        }
-        goal_state.last_evaluation = Some(decision.clone());
-        goal_state.updated_at = chrono::Utc::now();
-        if let Err(err) = goal::save_goal(&self.memory.data_dir, thread_id, &goal_state).await {
-            tracing::warn!(thread_id, error = %err, "failed to save goal state");
-        }
-
-        let report = SupervisorReport {
-            goal: goal_state.goal.clone(),
-            decision: decision.clone(),
-            round: completed_continuations,
-            max_rounds: goal_state.max_rounds.clone(),
+        let (report, agent_message) = match supervisor_workflow::apply_decision(
+            &mut instance,
+            decision,
+            completed_continuations,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                return self
+                    .workflow_error(thread_id, instance, from_node, completed_continuations, err)
+                    .await;
+            }
         };
-
-        if decision.status != goal::SupervisorDecisionStatus::Continue {
-            return GoalRoundOutcome::Report(report);
+        if let Err(err) = self.save_workflow_instance(thread_id, &instance).await {
+            tracing::warn!(thread_id, error = %err, "failed to save supervisor workflow");
         }
-        if !goal_round_allows_continue(&goal_state.max_rounds, completed_continuations) {
-            return GoalRoundOutcome::Report(report);
+        let Some(message) = agent_message else {
+            return WorkflowRoundOutcome::Report(report);
+        };
+        if !workflow_round_allows_continue(&instance.max_rounds, completed_continuations) {
+            return WorkflowRoundOutcome::Report(report);
         }
-        match decision.message {
-            Some(message) => GoalRoundOutcome::Continue { report, message },
-            None => GoalRoundOutcome::Report(report),
-        }
+        WorkflowRoundOutcome::Continue { report, message }
     }
 
-    async fn run_supervisor_once(
+    async fn workflow_error(
         &self,
         thread_id: &str,
-        goal_text: &str,
+        mut instance: WorkflowInstance,
+        node: String,
+        round: u32,
+        error: String,
+    ) -> WorkflowRoundOutcome {
+        instance.status = WorkflowStatus::Error;
+        instance.updated_at = chrono::Utc::now();
+        let report = WorkflowReport {
+            workflow_id: instance.definition.id.clone(),
+            workflow_name: instance.definition.name.clone(),
+            from_node: node.clone(),
+            edge: None,
+            to_node: node,
+            status: WorkflowStatus::Error,
+            reason: error.clone(),
+            agent_message: None,
+            next_node_message: None,
+            supervisor_trace: Vec::new(),
+            round,
+            max_rounds: instance.max_rounds.clone(),
+            error: Some(error),
+        };
+        instance.last_report = Some(report.clone());
+        let _ = self.save_workflow_instance(thread_id, &instance).await;
+        WorkflowRoundOutcome::Report(report)
+    }
+
+    async fn run_supervisor_node(
+        &self,
+        thread_id: &str,
+        instance: &WorkflowInstance,
         history: &[Message],
-    ) -> Result<SupervisorDecision, AgentError> {
+        todo_prompt: Option<&str>,
+        model_profile_id: Option<&str>,
+        progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
+    ) -> Result<WorkflowDecision, AgentError> {
         let supervisor_thread_id = format!("supervisor:{thread_id}:{}", uuid::Uuid::new_v4());
-        let prompt = goal::supervisor_prompt(goal_text, history);
+        let prompt = supervisor_workflow::supervisor_prompt(instance, history, todo_prompt)
+            .map_err(AgentError::other)?;
         let input = LoopInput::start(prompt).metadata(serde_json::json!({
             "thread_id": supervisor_thread_id,
             "supervisor_run": "true",
         }));
-        let mut stream = std::pin::pin!(self.inner.stream_with_input(input));
-        let mut output = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                CatEvent::Text(delta) => output.push_str(&delta),
-                CatEvent::Error(err) => return Err(err),
-                CatEvent::Done => break,
-                _ => {}
+        let effective_model = self.effective_model_profile(model_profile_id);
+        let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
+        let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
+            let mut stream = std::pin::pin!(active_agent.stream_with_input(input));
+            let mut output = String::new();
+            let mut trace = Vec::new();
+            while let Some(event) = stream.next().await {
+                match event {
+                    CatEvent::Text(delta) => {
+                        output.push_str(&delta);
+                        let _ = progress.send(SupervisorTraceEvent::OutputDelta { content: delta });
+                    }
+                    CatEvent::Thinking(content) => {
+                        let event = SupervisorTraceEvent::Thinking { content };
+                        let _ = progress.send(event.clone());
+                        trace.push(event);
+                    }
+                    CatEvent::ToolCall { name, args, .. } => {
+                        let event = SupervisorTraceEvent::ToolCall { name, args };
+                        let _ = progress.send(event.clone());
+                        trace.push(event);
+                    }
+                    CatEvent::ToolCallResult { name, result, .. } => {
+                        let event = SupervisorTraceEvent::ToolResult { name, result };
+                        let _ = progress.send(event.clone());
+                        trace.push(event);
+                    }
+                    CatEvent::Error(err) => {
+                        return Err(AgentError::other(format!(
+                            "{err}\n\nsupervisor trace: {}",
+                            serde_json::to_string(&trace).unwrap_or_default()
+                        )));
+                    }
+                    CatEvent::Done => break,
+                    _ => {}
+                }
             }
-        }
-        goal::parse_supervisor_decision(&output).map_err(AgentError::other)
+            trace.push(SupervisorTraceEvent::Output {
+                content: output.clone(),
+            });
+            Ok((output, trace))
+        })
+        .await
+        .map_err(|_| AgentError::other("supervisor evaluation timed out after 180 seconds"))??;
+        let (output, trace) = output;
+        let mut decision =
+            supervisor_workflow::parse_decision(&output).map_err(AgentError::other)?;
+        decision.trace = trace;
+        Ok(decision)
     }
 
     /// Stream events for one conversation turn (text input).
@@ -556,15 +941,41 @@ impl CatBot {
         stream! {
             let run_lock = self.thread_run_lock(&thread_id_owned).await;
             let _run_guard = run_lock.lock().await;
+            let effective_model = self.effective_model_profile(opts.model_profile_id.as_deref());
+            let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
             let mut next_content = content;
             let mut supervisor_round: u32 = 0;
             let mut continuation_from_supervisor = false;
+            let turn_started = Instant::now();
+            tracing::info!(
+                thread_id = %thread_id_owned,
+                model_profile = %effective_model.profile.id,
+                model = %effective_model.profile.model,
+                model_source = ?effective_model.source,
+                platform = opts.platform.as_deref().unwrap_or(""),
+                chat_type = opts.chat_type.as_deref().unwrap_or(""),
+                message_id = opts.message_id.as_deref().unwrap_or(""),
+                sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
+                supervisor_run = opts.supervisor_run,
+                trigger_run = opts.trigger_run,
+                "agent_turn.start"
+            );
 
-            'goal_loop: loop {
+            'workflow_loop: loop {
             // 1. Load memory context (triggers mid->long-term promotion if needed).
             let mut ctx = match self.memory.load_context(&thread_id_owned).await {
                 Ok(c) => c,
-                Err(e) => { yield CatEvent::Error(e); return; }
+                Err(e) => {
+                    tracing::warn!(
+                        thread_id = %thread_id_owned,
+                        model_profile = %effective_model.profile.id,
+                        elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                        error = %e,
+                        "agent_turn.failed"
+                    );
+                    yield CatEvent::Error(e);
+                    return;
+                }
             };
 
             if let Err(err) = self
@@ -608,6 +1019,7 @@ impl CatBot {
                 round_opts.im_documents.clear();
             }
 
+            apply_skill_injections(&mut ctx.user_state, &round_opts.skill_injections);
             let requested_user_name = round_opts
                 .sender_username
                 .as_deref()
@@ -627,12 +1039,22 @@ impl CatBot {
             let mut history = build_injected_history(&ctx);
             let agent_header_count =
                 usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
+            insert_skill_injection_prompts(
+                &mut history,
+                agent_header_count,
+                &round_opts.skill_injections,
+            );
             insert_single_chat_sender_system_prompt(
                 &mut history,
                 agent_header_count,
                 single_chat_sender_prompt.clone(),
             );
-            append_thread_todo_system_prompt(&mut history, &ctx.user_state);
+            let active_supervisor = self
+                .workflow_status(&thread_id_owned)
+                .await
+                .is_some_and(|instance| instance.status == WorkflowStatus::Active);
+            let initial_supervisor_todo_prompt =
+                route_thread_todo_prompt(&mut history, &ctx.user_state, active_supervisor);
             let skip_count = history.len();
 
             // 3. Build request-level metadata (thread_id for tools);
@@ -706,11 +1128,20 @@ impl CatBot {
             let should_log_media_input = content.is_multimodal()
                 || !round_opts.im_attachments.is_empty()
                 || !round_opts.im_documents.is_empty();
-            if should_log_media_input && !self.model_profile.supports_images {
-                yield CatEvent::Error(AgentError::other(format!(
+            if should_log_media_input && !effective_model.profile.supports_images {
+                let err = AgentError::other(format!(
                     "current model profile `{}` does not support image/document inputs; switch REMI_MODEL_PROFILE to a multimodal model",
-                    self.model_profile.id
-                )));
+                    effective_model.profile.id
+                ));
+                tracing::warn!(
+                    thread_id = %thread_id_owned,
+                    model_profile = %effective_model.profile.id,
+                    model = %effective_model.profile.model,
+                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "agent_turn.failed"
+                );
+                yield CatEvent::Error(err);
                 return;
             }
             if should_log_media_input {
@@ -766,8 +1197,9 @@ impl CatBot {
             // 4. Drive inner agent, intercept History event to persist.
             let mut raw_history: Option<Vec<Message>> = None;
             let mut raw_user_state: Option<serde_json::Value> = None;
+            let mut tool_elapsed_ms = HashMap::<String, u64>::new();
             let cancel = round_opts.cancel.clone();
-            let inner_stream = self.inner.stream_with_input(input);
+            let inner_stream = active_agent.stream_with_input(input);
             let mut inner_stream = std::pin::pin!(inner_stream);
 
             loop {
@@ -791,11 +1223,13 @@ impl CatBot {
                     SelectOut::Cancelled => {
                         tracing::info!(
                             thread_id = %thread_id_owned,
-                            "stream_with_options: cooperative cancel — persisting partial content"
+                            model_profile = %effective_model.profile.id,
+                            elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                            "agent_turn.cancelled"
                         );
                         persist_turn(
                             &self.memory, &thread_id_owned,
-                            raw_history.take(), raw_user_state.take(), skip_count,
+                            raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
                         ).await;
                         yield CatEvent::Done;
                         return;
@@ -815,37 +1249,90 @@ impl CatBot {
                             )
                             .await;
                         }
+                        CatEvent::ToolCallResult {
+                            id,
+                            name,
+                            args,
+                            result,
+                            success,
+                            elapsed_ms,
+                        } => {
+                            tool_elapsed_ms.insert(id.clone(), elapsed_ms);
+                            yield CatEvent::ToolCallResult {
+                                id,
+                                name,
+                                args,
+                                result,
+                                success,
+                                elapsed_ms,
+                            };
+                        }
                         // Save memory BEFORE yielding Done/Error — the caller drops
                         // the stream immediately on these events, so any code after
                         // this loop would never execute.
                         CatEvent::Done => {
                             let supervisor_history = raw_history.clone();
+                            let supervisor_todo_prompt = if active_supervisor {
+                                raw_user_state
+                                    .as_ref()
+                                    .and_then(|state| {
+                                        todo::latest_unfinished_batch_system_prompt(state)
+                                    })
+                                    .or(initial_supervisor_todo_prompt.clone())
+                            } else {
+                                None
+                            };
                             persist_turn(
                                 &self.memory, &thread_id_owned,
-                                raw_history.take(), raw_user_state.take(), skip_count,
+                                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
                             ).await;
                             if !round_opts.supervisor_run {
-                                match self
-                                    .evaluate_goal_after_round(
-                                        &thread_id_owned,
-                                        supervisor_history.as_deref().unwrap_or(&[]),
-                                        supervisor_round,
-                                    )
-                                    .await
-                                {
-                                    GoalRoundOutcome::NoGoal => {}
-                                    GoalRoundOutcome::Report(report) => {
+                                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                                let evaluation = self.evaluate_workflow_after_round(
+                                    &thread_id_owned,
+                                    supervisor_history.as_deref().unwrap_or(&[]),
+                                    supervisor_todo_prompt,
+                                    supervisor_round,
+                                    round_opts.model_profile_id.as_deref(),
+                                    progress_tx,
+                                );
+                                tokio::pin!(evaluation);
+                                let outcome = loop {
+                                    tokio::select! {
+                                        outcome = &mut evaluation => break outcome,
+                                        progress = progress_rx.recv() => {
+                                            if let Some(progress) = progress {
+                                                yield CatEvent::SupervisorProgress(progress);
+                                            }
+                                        }
+                                    }
+                                };
+                                while let Ok(progress) = progress_rx.try_recv() {
+                                    yield CatEvent::SupervisorProgress(progress);
+                                }
+                                match outcome {
+                                    WorkflowRoundOutcome::NoWorkflow => {}
+                                    WorkflowRoundOutcome::Report(report) => {
                                         yield CatEvent::Supervisor(report);
                                     }
-                                    GoalRoundOutcome::Continue { report, message } => {
+                                    WorkflowRoundOutcome::Continue { report, message } => {
                                         yield CatEvent::Supervisor(report);
                                         supervisor_round = supervisor_round.saturating_add(1);
                                         next_content = Content::text(message);
                                         continuation_from_supervisor = true;
-                                        continue 'goal_loop;
+                                        continue 'workflow_loop;
                                     }
                                 }
                             }
+                            tracing::info!(
+                                thread_id = %thread_id_owned,
+                                model_profile = %effective_model.profile.id,
+                                model = %effective_model.profile.model,
+                                supervisor_round,
+                                tool_calls = tool_elapsed_ms.len(),
+                                elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                                "agent_turn.completed"
+                            );
                             yield CatEvent::Done;
                             return;
                         }
@@ -853,8 +1340,18 @@ impl CatBot {
                             // Best-effort save on error (partial history is better than nothing).
                             persist_turn(
                                 &self.memory, &thread_id_owned,
-                                raw_history.take(), raw_user_state.take(), skip_count,
+                                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
                             ).await;
+                            tracing::warn!(
+                                thread_id = %thread_id_owned,
+                                model_profile = %effective_model.profile.id,
+                                model = %effective_model.profile.model,
+                                supervisor_round,
+                                tool_calls = tool_elapsed_ms.len(),
+                                elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                                error = %e,
+                                "agent_turn.failed"
+                            );
                             yield CatEvent::Error(e);
                             return;
                         }
@@ -866,24 +1363,36 @@ impl CatBot {
             // Fallback: stream ended without Done (shouldn't normally happen).
             persist_turn(
                 &self.memory, &thread_id_owned,
-                raw_history.take(), raw_user_state.take(), skip_count,
+                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
             ).await;
-            break 'goal_loop;
+            tracing::warn!(
+                thread_id = %thread_id_owned,
+                model_profile = %effective_model.profile.id,
+                model = %effective_model.profile.model,
+                supervisor_round,
+                tool_calls = tool_elapsed_ms.len(),
+                elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                "agent_turn.failed"
+            );
+            break 'workflow_loop;
             }
         }
     }
 }
 
-enum GoalRoundOutcome {
-    NoGoal,
-    Report(SupervisorReport),
+enum WorkflowRoundOutcome {
+    NoWorkflow,
+    Report(WorkflowReport),
     Continue {
-        report: SupervisorReport,
+        report: WorkflowReport,
         message: String,
     },
 }
 
-fn goal_round_allows_continue(max_rounds: &GoalMaxRounds, completed_continuations: u32) -> bool {
+fn workflow_round_allows_continue(
+    max_rounds: &WorkflowMaxRounds,
+    completed_continuations: u32,
+) -> bool {
     match max_rounds {
         GoalMaxRounds::Limited(max) => completed_continuations < *max,
         GoalMaxRounds::Unlimited => true,
@@ -903,9 +1412,11 @@ async fn persist_turn(
     history: Option<Vec<Message>>,
     user_state: Option<serde_json::Value>,
     skip_count: usize,
+    tool_elapsed_ms: &HashMap<String, u64>,
 ) {
     if let Some(all_msgs) = history {
-        let new_msgs: Vec<Message> = all_msgs.into_iter().skip(skip_count).collect();
+        let mut new_msgs: Vec<Message> = all_msgs.into_iter().skip(skip_count).collect();
+        annotate_tool_elapsed_ms(&mut new_msgs, tool_elapsed_ms);
         tracing::debug!(
             thread_id,
             skip_count,
@@ -921,13 +1432,33 @@ async fn persist_turn(
         }
         if !new_msgs.is_empty() {
             if let Err(e) = memory.save_turn(thread_id, new_msgs).await {
-                tracing::warn!("memory save_turn failed: {e:#}");
+                tracing::warn!(thread_id, error = %e, "memory.persist.failed");
             }
         }
     }
     if let Some(us) = user_state {
         if let Err(e) = memory.save_user_state(thread_id, &us).await {
-            tracing::warn!("memory save_user_state failed: {e:#}");
+            tracing::warn!(thread_id, error = %e, "memory.user_state.persist.failed");
+        }
+    }
+}
+
+fn annotate_tool_elapsed_ms(messages: &mut [Message], tool_elapsed_ms: &HashMap<String, u64>) {
+    for message in messages {
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(elapsed_ms) = tool_elapsed_ms.get(call_id) else {
+            continue;
+        };
+        let metadata = message
+            .metadata
+            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(map) = metadata {
+            map.insert(
+                "tool_elapsed_ms".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(*elapsed_ms)),
+            );
         }
     }
 }
@@ -938,7 +1469,12 @@ async fn persist_intermediate_user_state(
     user_state: serde_json::Value,
 ) -> CatEvent {
     if let Err(e) = memory.save_user_state(thread_id, &user_state).await {
-        tracing::warn!("memory save_user_state (intermediate) failed: {e:#}");
+        tracing::warn!(
+            thread_id,
+            intermediate = true,
+            error = %e,
+            "memory.user_state.persist.failed"
+        );
     }
     CatEvent::StateUpdate(user_state)
 }
@@ -962,9 +1498,75 @@ fn insert_single_chat_sender_system_prompt(
     history.insert(insertion_index.min(history.len()), Message::system(prompt));
 }
 
+fn insert_skill_injection_prompts(
+    history: &mut Vec<Message>,
+    insertion_index: usize,
+    skills: &[SkillDocument],
+) {
+    if skills.is_empty() {
+        return;
+    }
+    let mut offset = 0;
+    for skill in skills {
+        let prompt = format!(
+            "Skill `{}` loaded for this turn from {}.\n\n{}",
+            skill.name,
+            skill.source,
+            skill.content.trim_end()
+        );
+        history.insert(
+            (insertion_index + offset).min(history.len()),
+            Message::system(prompt),
+        );
+        offset += 1;
+    }
+}
+
+fn apply_skill_injections(user_state: &mut serde_json::Value, skills: &[SkillDocument]) {
+    if skills.is_empty() {
+        return;
+    }
+    if !user_state.is_object() {
+        *user_state = serde_json::json!({});
+    }
+    let Some(map) = user_state.as_object_mut() else {
+        return;
+    };
+    let entry = map
+        .entry(skill::tools::READ_SKILLS_STATE_KEY.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !entry.is_array() {
+        *entry = serde_json::json!([]);
+    }
+    let Some(items) = entry.as_array_mut() else {
+        return;
+    };
+    for skill in skills {
+        if !items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|value| value == skill.name))
+        {
+            items.push(serde_json::Value::String(skill.name.clone()));
+        }
+    }
+}
+
 fn append_thread_todo_system_prompt(history: &mut Vec<Message>, user_state: &serde_json::Value) {
     if let Some(prompt) = todo::latest_unfinished_batch_system_prompt(user_state) {
         history.push(Message::system(prompt));
+    }
+}
+
+fn route_thread_todo_prompt(
+    history: &mut Vec<Message>,
+    user_state: &serde_json::Value,
+    supervisor_active: bool,
+) -> Option<String> {
+    if supervisor_active {
+        todo::latest_unfinished_batch_system_prompt(user_state)
+    } else {
+        append_thread_todo_system_prompt(history, user_state);
+        None
     }
 }
 
@@ -1135,6 +1737,123 @@ fn trigger_command_metadata(thread_id: &str, opts: &StreamOptions) -> serde_json
         meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
     }
     meta
+}
+
+struct LocalToolDeps {
+    skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
+    memory: Arc<MemoryStore>,
+    todo_backend: Arc<todo::HybridTodoBackend>,
+    trigger_backend: Arc<trigger::TriggerBackend>,
+    acp_backend: Arc<acp::AcpBackend>,
+    sandbox: Arc<dyn sandbox::Sandbox>,
+    bash_enabled: bool,
+    redactor: SharedRedactor,
+    data_dir: PathBuf,
+    agents_dir: PathBuf,
+    delegate_ids: Vec<String>,
+    api_key: String,
+    im_bridge: Option<Arc<dyn ImFileBridge>>,
+    active_agent_id: String,
+}
+
+impl LocalToolDeps {
+    fn build_tools(
+        &self,
+        profile: &ModelProfileConfig,
+        extra_options: serde_json::Map<String, serde_json::Value>,
+        include_acp: bool,
+    ) -> DefaultToolRegistry {
+        let mut local_tools = DefaultToolRegistry::new();
+        skill::register_skill_tools(&mut local_tools, Arc::clone(&self.skill_store));
+        todo::register_todo_tools(&mut local_tools, Arc::clone(&self.todo_backend));
+        trigger::register_trigger_tools(&mut local_tools, Arc::clone(&self.trigger_backend));
+        if include_acp {
+            acp::register_acp_tools(&mut local_tools, Arc::clone(&self.acp_backend));
+        }
+        register_delegate_agent_tools(
+            &mut local_tools,
+            &self.agents_dir,
+            &self.delegate_ids,
+            self.api_key.clone(),
+            profile.base_url.clone(),
+            profile.model.clone(),
+            extra_options,
+        );
+        local_tools.register(MemoryGetDetailTool {
+            store: Arc::clone(&self.memory),
+        });
+        local_tools.register(MemoryUpsertNamedTool {
+            store: Arc::clone(&self.memory),
+            agent_id: self.active_agent_id.clone(),
+        });
+        local_tools.register(MemoryRecallTool {
+            store: Arc::clone(&self.memory),
+            agent_id: self.active_agent_id.clone(),
+        });
+        local_tools.register(SearchTool {
+            skill_store: Arc::clone(&self.skill_store),
+            memory_store: Arc::clone(&self.memory),
+            agent_id: self.active_agent_id.clone(),
+        });
+        if self.bash_enabled {
+            local_tools.register(WorkspaceBashTool::new(
+                Arc::clone(&self.sandbox),
+                Arc::clone(&self.redactor),
+            ));
+        }
+        local_tools.register(RootedFsReadTool {
+            sandbox: Arc::clone(&self.sandbox),
+            redactor: Arc::clone(&self.redactor),
+        });
+        local_tools.register(RootedFsWriteTool {
+            sandbox: Arc::clone(&self.sandbox),
+        });
+        local_tools.register(RootedFsApplyPatchTool {
+            sandbox: Arc::clone(&self.sandbox),
+        });
+        local_tools.register(RootedFsCreateTool {
+            sandbox: Arc::clone(&self.sandbox),
+        });
+        local_tools.register(RootedFsRemoveTool {
+            sandbox: Arc::clone(&self.sandbox),
+        });
+        local_tools.register(RootedFsLsTool {
+            sandbox: Arc::clone(&self.sandbox),
+            redactor: Arc::clone(&self.redactor),
+        });
+        register_fetch_tool(
+            &mut local_tools,
+            self.data_dir.clone(),
+            self.im_bridge.clone(),
+        );
+        local_tools.register(ExaSearchTool::new());
+        local_tools.register(NowTool);
+        local_tools.register(SleepTool);
+        local_tools.register(ManageYourselfTool);
+        local_tools
+    }
+}
+
+fn build_inner_agent(
+    api_key: &str,
+    profile: &ModelProfileConfig,
+    system_prompt: String,
+    max_turns: Option<usize>,
+    extra_options: serde_json::Map<String, serde_json::Value>,
+) -> InnerAgent {
+    let mut model = OpenAIClient::new(api_key.to_string()).with_model(profile.model.clone());
+    if let Some(url) = profile.base_url.clone() {
+        model = model.with_base_url(url);
+    }
+    let mut builder = AgentBuilder::new()
+        .model(model)
+        .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
+        .system(system_prompt)
+        .max_turns(max_turns.unwrap_or(usize::MAX));
+    if !extra_options.is_empty() {
+        builder = builder.extra_options(extra_options);
+    }
+    builder.build_loop()
 }
 
 // -- CatBotBuilder ------------------------------------------------------------
@@ -1381,7 +2100,10 @@ impl CatBotBuilder {
 
         let skill_store = Arc::new(BuiltinSkillStore::new(
             FileSkillStore::new(self.skills_dir),
-            [trigger::builtin_trigger_skill()],
+            [
+                trigger::builtin_trigger_skill(),
+                remi_skill::builtin_remi_skill(),
+            ],
         ));
         let data_dir = memory.data_dir.clone();
         let sandbox = self.sandbox_config.build()?;
@@ -1401,7 +2123,7 @@ impl CatBotBuilder {
         let mut acp_local_builder = AgentBuilder::new()
             .model(acp_local_model)
             .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
-            .system(system_prompt)
+            .system(system_prompt.clone())
             .max_turns(self.max_turns.unwrap_or(usize::MAX));
         if !self.extra_options.is_empty() {
             acp_local_builder = acp_local_builder.extra_options(self.extra_options.clone());
@@ -1411,7 +2133,6 @@ impl CatBotBuilder {
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
         todo::register_todo_tools(&mut acp_local_tools, Arc::clone(&todo_backend));
         trigger::register_trigger_tools(&mut acp_local_tools, Arc::clone(&trigger_backend));
-        profile::register_agent_tools(&mut acp_local_tools, agents_dir.clone());
         register_delegate_agent_tools(
             &mut acp_local_tools,
             &agents_dir,
@@ -1437,17 +2158,16 @@ impl CatBotBuilder {
             memory_store: Arc::clone(&memory),
             agent_id: active_agent_id.clone(),
         });
-        let acp_local_redactor: SharedRedactor =
-            Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
+        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
         if self.sandbox_config.bash_enabled() {
             acp_local_tools.register(WorkspaceBashTool::new(
                 Arc::clone(&sandbox),
-                Arc::clone(&acp_local_redactor),
+                Arc::clone(&redactor),
             ));
         }
         acp_local_tools.register(RootedFsReadTool {
             sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&acp_local_redactor),
+            redactor: Arc::clone(&redactor),
         });
         acp_local_tools.register(RootedFsWriteTool {
             sandbox: Arc::clone(&sandbox),
@@ -1463,7 +2183,7 @@ impl CatBotBuilder {
         });
         acp_local_tools.register(RootedFsLsTool {
             sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&acp_local_redactor),
+            redactor: Arc::clone(&redactor),
         });
         register_fetch_tool(
             &mut acp_local_tools,
@@ -1473,6 +2193,7 @@ impl CatBotBuilder {
         acp_local_tools.register(ExaSearchTool::new());
         acp_local_tools.register(NowTool);
         acp_local_tools.register(SleepTool);
+        acp_local_tools.register(ManageYourselfTool);
         let run_locks: ThreadRunLocks = Arc::new(AsyncMutex::new(HashMap::new()));
         acp_backend.set_local_runner(Arc::new(LocalAcpAgentRunner {
             agent: CatAgent {
@@ -1486,73 +2207,49 @@ impl CatBotBuilder {
             memory: Arc::clone(&memory),
             run_locks: Arc::clone(&run_locks),
         }));
-        let mut local_tools = DefaultToolRegistry::new();
-        skill::register_skill_tools(&mut local_tools, Arc::clone(&skill_store));
-        todo::register_todo_tools(&mut local_tools, Arc::clone(&todo_backend));
-        trigger::register_trigger_tools(&mut local_tools, Arc::clone(&trigger_backend));
-        acp::register_acp_tools(&mut local_tools, Arc::clone(&acp_backend));
-        profile::register_agent_tools(&mut local_tools, agents_dir.clone());
-        register_delegate_agent_tools(
-            &mut local_tools,
-            &agents_dir,
-            &self.delegate_ids,
-            self.api_key.clone(),
-            resolved_base_url.clone(),
-            profile.model.clone(),
-            self.extra_options.clone(),
-        );
-        local_tools.register(MemoryGetDetailTool {
-            store: Arc::clone(&memory),
-        });
-        local_tools.register(MemoryUpsertNamedTool {
-            store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-        });
-        local_tools.register(MemoryRecallTool {
-            store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-        });
-        local_tools.register(SearchTool {
+        let tool_deps = LocalToolDeps {
             skill_store: Arc::clone(&skill_store),
-            memory_store: Arc::clone(&memory),
-            agent_id: active_agent_id,
-        });
-
-        // ── Workspace tools (bash + fs rooted at data_dir) ────────────────
-        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
-        if self.sandbox_config.bash_enabled() {
-            local_tools.register(WorkspaceBashTool::new(
-                Arc::clone(&sandbox),
-                Arc::clone(&redactor),
-            ));
+            memory: Arc::clone(&memory),
+            todo_backend: Arc::clone(&todo_backend),
+            trigger_backend: Arc::clone(&trigger_backend),
+            acp_backend: Arc::clone(&acp_backend),
+            sandbox: Arc::clone(&sandbox),
+            bash_enabled: self.sandbox_config.bash_enabled(),
+            redactor: Arc::clone(&redactor),
+            data_dir: data_dir.clone(),
+            agents_dir: agents_dir.clone(),
+            delegate_ids: self.delegate_ids.clone(),
+            api_key: self.api_key.clone(),
+            im_bridge: self.im_bridge.clone(),
+            active_agent_id: active_agent_id.clone(),
+        };
+        let local_tools = tool_deps.build_tools(&profile, self.extra_options.clone(), true);
+        let mut model_agents = HashMap::new();
+        for model_profile in self.model_registry.list() {
+            if model_profile.id == profile.id {
+                continue;
+            }
+            let model_extra_options = model_profile.merged_extra_options(None)?;
+            let model_inner = build_inner_agent(
+                &self.api_key,
+                model_profile,
+                system_prompt.clone(),
+                self.max_turns,
+                model_extra_options.clone(),
+            );
+            let model_tools = tool_deps.build_tools(model_profile, model_extra_options, true);
+            model_agents.insert(
+                model_profile.id.clone(),
+                CatAgent {
+                    inner: model_inner,
+                    local_tools: model_tools,
+                    data_dir: memory.data_dir.clone(),
+                    overflow_bytes: model_profile.overflow_bytes,
+                    im_bridge: self.im_bridge.clone(),
+                    tool_allowlist: self.tool_allowlist.clone(),
+                },
+            );
         }
-        local_tools.register(RootedFsReadTool {
-            sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&redactor),
-        });
-        local_tools.register(RootedFsWriteTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        local_tools.register(RootedFsApplyPatchTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        local_tools.register(RootedFsCreateTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        local_tools.register(RootedFsRemoveTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        local_tools.register(RootedFsLsTool {
-            sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&redactor),
-        });
-
-        register_fetch_tool(&mut local_tools, data_dir.clone(), self.im_bridge.clone());
-        local_tools.register(ExaSearchTool::new());
-
-        // ── Current time ──────────────────────────────────────────────────
-        local_tools.register(NowTool);
-        local_tools.register(SleepTool);
 
         Ok(CatBot {
             inner: CatAgent {
@@ -1563,12 +2260,16 @@ impl CatBotBuilder {
                 im_bridge: self.im_bridge,
                 tool_allowlist: self.tool_allowlist,
             },
+            model_agents,
+            skill_store,
             memory,
             todo_backend,
             trigger_backend,
             acp_backend,
             run_locks,
             model_profile: profile,
+            model_registry: Arc::clone(&self.model_registry),
+            api_key: self.api_key,
             redactor,
         })
     }
@@ -1680,18 +2381,23 @@ fn register_delegate_agent_tools(
 mod tests {
     use super::{
         append_thread_todo_system_prompt, default_system_prompt,
-        insert_single_chat_sender_system_prompt, local_acp_thread_id,
+        insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
+        local_acp_thread_id,
         memory::{build_injected_history, MemoryContext, MemoryIndex},
         model_profile::ModelProfileConfig,
-        prepend_group_sender_username, single_chat_sender_system_prompt, thread_run_lock,
-        AgentModelBindings, CatBotBuilder, Content, ContentPart, GoalMaxRounds, Message,
-        ModelProfileRegistry, SandboxConfig, ThreadRunLocks, DEFAULT_AGENT_ID,
+        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
+        thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
+        GoalMaxRounds, Message, ModelProfileRegistry, SandboxConfig, ThreadRunLocks,
+        DEFAULT_AGENT_ID,
     };
     use crate::todo::tools::TodoItem;
+    use futures::StreamExt as _;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
@@ -1727,20 +2433,20 @@ mod tests {
     }
 
     #[test]
-    fn goal_round_limit_allows_default_twenty_continuations() {
-        assert!(super::goal_round_allows_continue(
+    fn workflow_round_limit_allows_default_twenty_continuations() {
+        assert!(super::workflow_round_allows_continue(
             &GoalMaxRounds::Limited(20),
             0
         ));
-        assert!(super::goal_round_allows_continue(
+        assert!(super::workflow_round_allows_continue(
             &GoalMaxRounds::Limited(20),
             19
         ));
-        assert!(!super::goal_round_allows_continue(
+        assert!(!super::workflow_round_allows_continue(
             &GoalMaxRounds::Limited(20),
             20
         ));
-        assert!(super::goal_round_allows_continue(
+        assert!(super::workflow_round_allows_continue(
             &GoalMaxRounds::Unlimited,
             u32::MAX
         ));
@@ -2036,6 +2742,240 @@ You are Remi.
             contents[5],
             "[CURRENT TODO BATCH]\nThis thread still has unfinished work under \"Release launch\".\nKeep progress synchronized with todo__complete/update/remove.\nWhen this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.\n- #1 Draft changelog"
         );
+    }
+
+    #[test]
+    fn active_supervisor_receives_todo_instead_of_main_agent_history() {
+        let user_state = json!({
+            "__todos": [TodoItem {
+                id: 1,
+                content: "Run verification".to_string(),
+                description: None,
+                done: false,
+                batch_id: Some(1),
+                batch_title: Some("Release".to_string()),
+                batch_index: Some(0),
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
+            }]
+        });
+
+        let mut supervised_history = vec![Message::user("start")];
+        let supervisor_todo = route_thread_todo_prompt(&mut supervised_history, &user_state, true);
+        assert_eq!(supervised_history.len(), 1);
+        assert!(supervisor_todo
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("Run verification")));
+
+        let mut main_agent_history = vec![Message::user("start")];
+        let supervisor_todo = route_thread_todo_prompt(&mut main_agent_history, &user_state, false);
+        assert!(supervisor_todo.is_none());
+        assert_eq!(main_agent_history.len(), 2);
+        assert!(main_agent_history[1]
+            .content
+            .text_content()
+            .contains("Run verification"));
+    }
+
+    #[tokio::test]
+    async fn active_supervisor_routes_existing_todo_only_to_supervisor_end_to_end() {
+        let responses = vec![
+            sse_tool_call(
+                "call_add",
+                "todo__add",
+                json!({
+                    "title": "Supervisor routing",
+                    "items": [
+                        {"title": "检查主agent不直接接收todo"},
+                        {"title": "确认supervisor接收todo"}
+                    ]
+                }),
+            ),
+            sse_text("todo created"),
+            sse_text("main agent ran without direct todo injection"),
+            sse_text(
+                r#"{"edge":"complete","agent_message":null,"next_node_message":null,"reason":"todo routing verified"}"#,
+            ),
+        ];
+        let (base_url, requests) = start_openai_mock_server(responses).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            agents_dir,
+            max_turns: Some(8),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .build()
+        .unwrap();
+
+        let thread_id = "todo-supervisor-routing-e2e";
+        collect_stream(bot.stream(thread_id, "create todo")).await;
+        bot.set_goal(thread_id, "verify todo routing", GoalMaxRounds::Limited(1))
+            .await
+            .unwrap();
+        let events = collect_stream(bot.stream(thread_id, "continue")).await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Supervisor(report) if report.reason == "todo routing verified")));
+
+        let requests = requests.lock().expect("request lock poisoned");
+        assert_eq!(requests.len(), 4);
+        assert!(
+            !requests[2].contains("[CURRENT TODO BATCH]"),
+            "main-agent request unexpectedly contained todo injection: {}",
+            requests[2]
+        );
+        assert!(
+            requests[3].contains("[CURRENT TODO BATCH]"),
+            "supervisor request did not contain todo injection: {}",
+            requests[3]
+        );
+        assert!(requests[3].contains("确认supervisor接收todo"));
+    }
+
+    async fn collect_stream(stream: impl futures::Stream<Item = CatEvent>) -> Vec<CatEvent> {
+        let mut stream = std::pin::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let CatEvent::Error(err) = &event {
+                panic!("stream error: {err}");
+            }
+            let done = matches!(event, CatEvent::Done);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    async fn start_openai_mock_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let responses = Arc::new(StdMutex::new(VecDeque::from(responses)));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = Arc::clone(&captured_requests);
+                let responses = Arc::clone(&responses);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0_u8; 1024];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = find_header_end(&buffer) {
+                            break pos;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while buffer.len() < body_start + content_length {
+                        let mut chunk = vec![0_u8; body_start + content_length - buffer.len()];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                    }
+                    let body =
+                        String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
+                            .to_string();
+                    requests.lock().expect("request lock poisoned").push(body);
+                    let response_body = responses
+                        .lock()
+                        .expect("response lock poisoned")
+                        .pop_front()
+                        .expect("missing mock response");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn sse_text(content: &str) -> String {
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": null
+            }]
+        });
+        format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+    }
+
+    fn sse_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> String {
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        format!("data: {}\n\ndata: [DONE]\n\n", chunk)
     }
 
     #[tokio::test]

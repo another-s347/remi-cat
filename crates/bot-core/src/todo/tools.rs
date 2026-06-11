@@ -113,7 +113,7 @@ struct TodoBatchGroup {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-pub(crate) fn todos_from_user_state(user_state: &serde_json::Value) -> Vec<TodoItem> {
+pub fn todos_from_user_state(user_state: &serde_json::Value) -> Vec<TodoItem> {
     match user_state.get(TODOS_STATE_KEY) {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
         None => vec![],

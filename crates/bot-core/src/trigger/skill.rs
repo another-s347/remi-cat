@@ -71,6 +71,6 @@ pub fn builtin_trigger_skill() -> BuiltinSkill {
     BuiltinSkill {
         name: BUILTIN_TRIGGER_SKILL_NAME,
         description: BUILTIN_TRIGGER_SKILL_DESCRIPTION,
-        content: BUILTIN_TRIGGER_SKILL_CONTENT,
+        content: BUILTIN_TRIGGER_SKILL_CONTENT.to_string(),
     }
 }
