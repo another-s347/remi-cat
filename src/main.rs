@@ -28,16 +28,17 @@ use bot_core::{
 };
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuEventHookConfig, FeishuGateway, FeishuMessage, StreamingCard};
-use instance_profile::InstanceProfile;
+use instance_profile::{InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
 use profile_command::{
-    apply_runtime_config_entries, available_container_name, configured_ports, first_available_port,
-    parse_profile_command, prefix_short_config_entry, print_port_adjustment,
-    run_noninteractive_setup, run_profile_command, ProfileCommand,
+    apply_runtime_config_entries, available_container_name, configured_ports,
+    ensure_builtin_diagnostic_profile, first_available_port, parse_profile_command,
+    prefix_short_config_entry, print_port_adjustment, run_noninteractive_setup,
+    run_profile_command, ProfileCommand,
 };
 use remi_agentloop::types::{SubSessionEvent, SubSessionEventPayload};
 use runtime_config::{
     detect_setup_state, has_legacy_env_credentials, load_dotenv_pairs, upsert_dotenv_value,
-    write_runtime_config, FeishuTransport, RuntimeConfig, RuntimeSandboxKind, SetupState,
+    write_runtime_config, FeishuTransport, ImMode, RuntimeConfig, RuntimeSandboxKind, SetupState,
 };
 use secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use session::{ChannelBinding, SessionRuntime, SubSessionKind};
@@ -523,6 +524,9 @@ async fn main() -> anyhow::Result<()> {
     let global_args = parse_global_args(&raw_args)?;
     let command = parse_command(&global_args.command_args)?;
     let selected_profile = resolve_instance_profile(global_args.profile, explicit_data_dir)?;
+    if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
+        ensure_builtin_diagnostic_profile()?;
+    }
     let mut data_dir = selected_profile.data_dir.clone();
 
     if let AppCommand::Profile(profile_command) = &command {
@@ -627,7 +631,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let gateway = if cli.enabled || cli.once.is_some() {
+    let im_disabled = matches!(im_mode_from_env(), ImMode::Disabled);
+    let gateway = if im_disabled || cli.enabled || cli.once.is_some() {
         None
     } else {
         match (
@@ -938,6 +943,7 @@ async fn run_setup(
         "event_hook" | "event-hook" | "hook" => FeishuTransport::EventHook,
         _ => FeishuTransport::WebSocket,
     };
+    config.im.mode = ImMode::Feishu;
     if matches!(config.im.transport, FeishuTransport::EventHook) {
         config.im.event_hook.host =
             prompt_with_default("Feishu Event Hook listen host", &config.im.event_hook.host)?;
@@ -1031,6 +1037,7 @@ fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> 
             );
             println!("sandbox_container: {}", config.sandbox.container_name);
             println!("feishu_transport: {}", config.im.transport.as_env_value());
+            println!("im_mode: {}", config.im.mode.as_env_value());
             if matches!(config.im.transport, FeishuTransport::EventHook) {
                 println!(
                     "feishu_event_hook: http://{}:{}{}",
@@ -2348,6 +2355,17 @@ async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+fn im_mode_from_env() -> ImMode {
+    match std::env::var("REMI_IM_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("disabled" | "off" | "none") => ImMode::Disabled,
+        _ => ImMode::Feishu,
+    }
 }
 
 fn feishu_transport_from_env() -> FeishuTransport {
@@ -3946,7 +3964,9 @@ mod cli_tests {
         run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start, AppCommand,
         CliConfig, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, ProfileCommand,
     };
-    use crate::profile_command::{ProfileAgentCommand, ProfileWorkflowCommand};
+    use crate::profile_command::{
+        ProfileAgentCommand, ProfileWorkflowCommand, PROFILE_RUNTIME_ENV_KEYS,
+    };
     use bot_core::{GoalMaxRounds, PrettyToolCall};
     use im_feishu::FeishuMessage;
     use std::fs;
@@ -4016,6 +4036,10 @@ mod cli_tests {
             AppCommand::Profile(ProfileCommand::Create { name, entries })
                 if name == "dev" && entries == args(&["admin.port=8790"])
         ));
+        assert!(parse_command(&args(&["profile", "create", "remi_diagnostics"])).is_err());
+        assert!(
+            parse_command(&args(&["profile", "delete", "remi_diagnostics", "--force"])).is_err()
+        );
         assert!(matches!(
             parse_command(&args(&["profile", "start", "default"])).unwrap(),
             AppCommand::Profile(ProfileCommand::Start(name)) if name == "default"
@@ -4079,6 +4103,26 @@ mod cli_tests {
             parse_command(&args(&["sandbox", "set", "kind=no_sandbox"])).unwrap(),
             AppCommand::SandboxSet(entries) if entries == args(&["kind=no_sandbox"])
         ));
+    }
+
+    #[test]
+    fn profile_start_clears_runtime_override_env() {
+        for key in [
+            "REMI_AGENT_ID",
+            "REMI_MODEL_PROFILE",
+            "REMI_AGENTS_DIR",
+            "REMI_SANDBOX_KIND",
+            "REMI_SANDBOX_HOST_DIR",
+            "REMI_ADMIN_PORT",
+            "REMI_IM_MODE",
+            "REMI_SHELL_MODE",
+            "REMI_ACP_CLIENT",
+        ] {
+            assert!(
+                PROFILE_RUNTIME_ENV_KEYS.contains(&key),
+                "missing runtime env cleanup for {key}"
+            );
+        }
     }
 
     #[test]

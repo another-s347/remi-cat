@@ -923,7 +923,7 @@ async fn run_turn(
     .await;
 }
 
-fn is_web_fork_command(command: &str) -> bool {
+pub(crate) fn is_web_fork_command(command: &str) -> bool {
     command == "/fork" || command.starts_with("/fork ")
 }
 

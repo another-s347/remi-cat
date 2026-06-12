@@ -560,11 +560,13 @@ async fn start_web_run(
     }
     uuid::Uuid::parse_str(&request.run_id)
         .map_err(|_| AdminError::bad_request("run_id must be a UUID".into()))?;
-    state
-        .sessions
-        .lock()
-        .await
-        .set_title_if_empty(&id, &request.text)?;
+    if !crate::web_chat::is_web_fork_command(request.text.trim()) {
+        state
+            .sessions
+            .lock()
+            .await
+            .set_title_if_empty(&id, &request.text)?;
+    }
     let run = web_handle(&state)?
         .run(id, request.run_id, request.text)
         .await

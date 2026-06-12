@@ -77,6 +77,17 @@ cargo run -- profile stop dev
 cargo run -- profile delete dev --force
 ```
 
+`remi_diagnostics` is a built-in self-diagnostic profile and agent. It uses the
+current default model profile, starts with Feishu disabled, and runs with
+`sandbox.kind=no_sandbox`, `shell.mode=local`, and `sandbox.host_dir=.` so it
+can inspect Remi logs, session history, runtime config, profiles, agents, and
+source files:
+
+```bash
+cargo run -- profile show remi_diagnostics
+cargo run -- profile start remi_diagnostics
+```
+
 Configure a profile's agents and supervisor workflows from the CLI:
 
 ```bash

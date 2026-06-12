@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::runtime_config::{detect_setup_state, RuntimeConfig, SetupState};
 
 pub const DEFAULT_DATA_DIR: &str = ".remi-cat";
+pub const DIAGNOSTIC_PROFILE_NAME: &str = "remi_diagnostics";
 const PROFILES_DIR: &str = "profiles";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -15,11 +15,43 @@ use bot_core::{
 use crate::instance_profile::{
     configured_profiles_excluding, discover_profiles, read_run_metadata, remove_named_profile,
     remove_run_metadata, write_run_metadata, InstanceProfile, ProfileRunMetadata,
+    DIAGNOSTIC_PROFILE_NAME,
 };
 use crate::runtime_config::{
-    detect_setup_state, write_runtime_config, FeishuTransport, RuntimeConfig, RuntimeSandboxKind,
-    SetupState, ShellMode,
+    detect_setup_state, write_runtime_config, FeishuTransport, ImMode, RuntimeConfig,
+    RuntimeSandboxKind, SetupState, ShellMode,
 };
+
+pub(crate) const PROFILE_RUNTIME_ENV_KEYS: &[&str] = &[
+    "REMI_DATA_DIR",
+    "REMI_PROFILE",
+    "REMI_AGENT_ID",
+    "REMI_MODEL_PROFILE",
+    "REMI_AGENTS_DIR",
+    "AGENT_MD_PATH",
+    "REMI_SANDBOX_KIND",
+    "REMI_SANDBOX_HOST_DIR",
+    "REMI_SANDBOX_CONTAINER_DIR",
+    "REMI_SANDBOX_IMAGE",
+    "REMI_SANDBOX_CONTAINER_NAME",
+    "REMI_SANDBOX_USER",
+    "REMI_ADMIN_ENABLED",
+    "REMI_ADMIN_HOST",
+    "REMI_ADMIN_PORT",
+    "REMI_IM_MODE",
+    "REMI_FEISHU_TRANSPORT",
+    "REMI_FEISHU_HOOK_HOST",
+    "REMI_FEISHU_HOOK_PORT",
+    "REMI_FEISHU_HOOK_PATH",
+    "REMI_FEISHU_HOOK_VERIFICATION_TOKEN",
+    "REMI_SHELL_MODE",
+    "REMI_BASH_MODE",
+    "REMI_ACP_MODE",
+    "REMI_ACP_CLIENT",
+    "REMI_ACP_BASE_URL",
+    "REMI_ACP_AGENT_NAME",
+    "REMI_ACP_MODEL",
+];
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -78,6 +110,9 @@ pub fn parse_profile_command(args: &[String]) -> anyhow::Result<ProfileCommand> 
         }
         Some("create") => {
             let name = next_arg(args, 0)?;
+            if name == DIAGNOSTIC_PROFILE_NAME {
+                anyhow::bail!("profile `{DIAGNOSTIC_PROFILE_NAME}` is builtin and cannot be created manually");
+            }
             crate::instance_profile::validate_profile_name(&name)?;
             Ok(ProfileCommand::Create {
                 name,
@@ -88,6 +123,9 @@ pub fn parse_profile_command(args: &[String]) -> anyhow::Result<ProfileCommand> 
             let name = next_arg(args, 0)?;
             if name == "default" {
                 anyhow::bail!("the default profile cannot be deleted");
+            }
+            if name == DIAGNOSTIC_PROFILE_NAME {
+                anyhow::bail!("builtin profile `{DIAGNOSTIC_PROFILE_NAME}` cannot be deleted");
             }
             crate::instance_profile::validate_profile_name(&name)?;
             Ok(ProfileCommand::Delete {
@@ -226,6 +264,7 @@ pub fn run_noninteractive_setup(
 }
 
 pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
+    ensure_builtin_diagnostic_profile()?;
     match command {
         ProfileCommand::List => {
             println!("NAME\tSETUP\tRUNNING\tADMIN\tSANDBOX\tDATA DIR");
@@ -273,6 +312,7 @@ pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
                     println!("model_profile: {}", config.model_profile);
                     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
                     println!("sandbox_container: {}", config.sandbox.container_name);
+                    println!("im_mode: {}", config.im.mode.as_env_value());
                     println!("admin: {}", format_admin_addr(&config));
                     if matches!(config.im.transport, FeishuTransport::EventHook) {
                         println!(
@@ -517,7 +557,42 @@ fn profile_run_state(profile: &InstanceProfile) -> ProfileRunState {
 fn ensure_profile_assets(data_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     install_embedded_agent_profiles(data_dir.join("agents"))?;
+    install_embedded_model_profiles(data_dir.join("models"))?;
     std::fs::create_dir_all(data_dir.join("workflows"))?;
+    Ok(())
+}
+
+pub fn ensure_builtin_diagnostic_profile() -> anyhow::Result<()> {
+    let profile = InstanceProfile::named(DIAGNOSTIC_PROFILE_NAME)?;
+    ensure_profile_assets(&profile.data_dir)?;
+    match detect_setup_state(&profile.data_dir) {
+        SetupState::Initialized { .. } | SetupState::Invalid { .. } => return Ok(()),
+        SetupState::LegacyEnvCompatible { .. } | SetupState::Uninitialized { .. } => {}
+    }
+
+    let default_model_profile =
+        match detect_setup_state(Path::new(crate::instance_profile::DEFAULT_DATA_DIR)) {
+            SetupState::Initialized { config, .. } => config.model_profile,
+            _ => {
+                RuntimeConfig::default_for(Path::new(crate::instance_profile::DEFAULT_DATA_DIR))
+                    .model_profile
+            }
+        };
+
+    let mut config = RuntimeConfig::default_for(&profile.data_dir);
+    config.root_agent_id = DIAGNOSTIC_PROFILE_NAME.to_string();
+    config.model_profile = default_model_profile;
+    config.sandbox.kind = RuntimeSandboxKind::NoSandbox;
+    config.sandbox.host_dir = ".".to_string();
+    config.shell.mode = ShellMode::Local;
+    config.im.mode = ImMode::Disabled;
+    config.admin.enabled = true;
+    config.admin.port = first_available_port(
+        &config.admin.host,
+        config.admin.port,
+        &configured_ports(&profile.data_dir)?,
+    )?;
+    write_runtime_config(&profile.data_dir, &config)?;
     Ok(())
 }
 
@@ -663,6 +738,7 @@ fn print_profile_status(profile: &InstanceProfile) -> anyhow::Result<()> {
         SetupState::Initialized { config, .. } => {
             println!("setup: initialized");
             println!("admin: {}", format_admin_addr(&config));
+            println!("im_mode: {}", config.im.mode.as_env_value());
         }
         SetupState::Invalid { error, .. } => {
             println!("setup: invalid");
@@ -710,9 +786,10 @@ fn start_profile(profile: &InstanceProfile) -> anyhow::Result<()> {
         command_display.push("--profile".to_string());
         command_display.push(name.to_string());
     }
+    for key in PROFILE_RUNTIME_ENV_KEYS {
+        command.env_remove(key);
+    }
     command
-        .env_remove("REMI_DATA_DIR")
-        .env_remove("REMI_PROFILE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -898,6 +975,7 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
             config.sandbox.container_name = value.to_string()
         }
         "shell_mode" | "shell.mode" => config.shell.mode = parse_shell_mode(value)?,
+        "im_mode" | "im.mode" => config.im.mode = parse_im_mode(value)?,
         "feishu_transport" | "im_transport" | "im.transport" | "feishu.transport" => {
             config.im.transport = parse_feishu_transport(value)?
         }
@@ -950,7 +1028,9 @@ fn normalize_runtime_config(data_dir: &Path, config: &mut RuntimeConfig) -> anyh
         print_port_adjustment("Admin", requested, config.admin.port);
         reserved_ports.insert(config.admin.port);
     }
-    if matches!(config.im.transport, FeishuTransport::EventHook) {
+    if matches!(config.im.mode, ImMode::Feishu)
+        && matches!(config.im.transport, FeishuTransport::EventHook)
+    {
         let requested = config.im.event_hook.port;
         config.im.event_hook.port =
             first_available_port(&config.im.event_hook.host, requested, &reserved_ports)?;
@@ -988,6 +1068,14 @@ fn parse_shell_mode(value: &str) -> anyhow::Result<ShellMode> {
     }
 }
 
+fn parse_im_mode(value: &str) -> anyhow::Result<ImMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "feishu" => Ok(ImMode::Feishu),
+        "disabled" | "off" | "none" => Ok(ImMode::Disabled),
+        other => anyhow::bail!("unknown IM mode `{other}`"),
+    }
+}
+
 fn parse_feishu_transport(value: &str) -> anyhow::Result<FeishuTransport> {
     match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "websocket" | "ws" => Ok(FeishuTransport::WebSocket),
@@ -1010,7 +1098,9 @@ pub fn configured_ports(data_dir: &Path) -> anyhow::Result<HashSet<u16>> {
         if config.admin.enabled {
             ports.insert(config.admin.port);
         }
-        if matches!(config.im.transport, FeishuTransport::EventHook) {
+        if matches!(config.im.mode, ImMode::Feishu)
+            && matches!(config.im.transport, FeishuTransport::EventHook)
+        {
             ports.insert(config.im.event_hook.port);
         }
     }

@@ -55,6 +55,7 @@ impl RuntimeConfig {
         );
         set_env_if_absent("REMI_ADMIN_HOST", &self.admin.host);
         set_env_if_absent("REMI_ADMIN_PORT", &self.admin.port.to_string());
+        set_env_if_absent("REMI_IM_MODE", self.im.mode.as_env_value());
         set_env_if_absent("REMI_FEISHU_TRANSPORT", self.im.transport.as_env_value());
         set_env_if_absent("REMI_FEISHU_HOOK_HOST", &self.im.event_hook.host);
         set_env_if_absent(
@@ -168,6 +169,7 @@ impl Default for AdminConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImConfig {
+    #[serde(default)]
     pub mode: ImMode,
     #[serde(default)]
     pub transport: FeishuTransport,
@@ -185,10 +187,21 @@ impl Default for ImConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImMode {
+    #[default]
     Feishu,
+    Disabled,
+}
+
+impl ImMode {
+    pub fn as_env_value(&self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -443,7 +456,7 @@ fn set_env_if_absent(key: &str, value: &str) {
 mod tests {
     use super::{
         detect_setup_state, load_runtime_config, runtime_config_path, write_runtime_config,
-        AcpClient, AdminConfig, RuntimeConfig, SetupState,
+        AcpClient, AdminConfig, ImMode, RuntimeConfig, SetupState,
     };
 
     #[test]
@@ -499,5 +512,18 @@ mod tests {
     fn default_acp_client_is_codex() {
         let cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
         assert_eq!(cfg.acp.client, AcpClient::Codex);
+    }
+
+    #[test]
+    fn disabled_im_mode_round_trips() {
+        let dir =
+            std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
+        let mut cfg = RuntimeConfig::default_for(&dir);
+        cfg.im.mode = ImMode::Disabled;
+        write_runtime_config(&dir, &cfg).unwrap();
+        let loaded = load_runtime_config(&dir).unwrap().unwrap();
+        assert_eq!(loaded.im.mode, ImMode::Disabled);
+        assert_eq!(loaded.im.mode.as_env_value(), "disabled");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

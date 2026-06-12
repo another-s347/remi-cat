@@ -4,10 +4,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const EMBEDDED_AGENT_PROFILES: &[(&str, &str)] = &[(
-    "default.md",
-    include_str!("../../../.remi-cat/agents/default.md"),
-)];
+const EMBEDDED_AGENT_PROFILES: &[(&str, &str)] = &[
+    (
+        "default.md",
+        include_str!("../../../.remi-cat/agents/default.md"),
+    ),
+    (
+        "remi_diagnostics.md",
+        include_str!("../../../.remi-cat/agents/remi_diagnostics.md"),
+    ),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentModelBindings {
@@ -58,15 +64,6 @@ pub struct AgentRegistry {
 
 pub fn install_embedded_agent_profiles(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
-    let has_markdown = dir.exists()
-        && std::fs::read_dir(dir)
-            .with_context(|| format!("reading agent profile dir {}", dir.display()))?
-            .filter_map(|entry| entry.ok())
-            .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("md"));
-    if has_markdown {
-        return Ok(());
-    }
-
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating agent profile dir {}", dir.display()))?;
     for (name, contents) in EMBEDDED_AGENT_PROFILES {
@@ -220,6 +217,33 @@ You are Remi.
         let profile = AgentProfile::from_markdown_file(&path).unwrap();
         assert_eq!(profile.id, "default");
         assert!(profile.allows_tool("fetch"));
+        let diagnostics_path = dir.join("remi_diagnostics.md");
+        assert!(diagnostics_path.exists());
+        let diagnostics = AgentProfile::from_markdown_file(&diagnostics_path).unwrap();
+        assert_eq!(diagnostics.id, "remi_diagnostics");
+        assert!(diagnostics.allows_tool("bash"));
+        assert!(diagnostics.allows_tool("manage_yourself"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn embedded_agent_install_does_not_overwrite_existing_files() {
+        let dir = std::env::temp_dir().join(format!("remi-agent-seed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = r#"---
+id: default
+name: Custom
+description: Custom default
+---
+Custom prompt.
+"#;
+        std::fs::write(dir.join("default.md"), custom).unwrap();
+        install_embedded_agent_profiles(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("default.md")).unwrap(),
+            custom
+        );
+        assert!(dir.join("remi_diagnostics.md").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
