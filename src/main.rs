@@ -4,6 +4,7 @@ mod profile_command;
 mod runtime_config;
 mod secret_store;
 mod session;
+mod tui_app;
 mod web_chat;
 
 use anyhow::Context;
@@ -91,6 +92,7 @@ enum SecretCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliConfig {
     enabled: bool,
+    tui: bool,
     once: Option<String>,
     pure_prompt: bool,
     admin_only: bool,
@@ -104,6 +106,7 @@ impl CliConfig {
         let mut enabled = args
             .iter()
             .any(|arg| matches!(arg.as_str(), "--local" | "--cli-im" | "cli"));
+        let mut tui = args.iter().any(|arg| matches!(arg.as_str(), "tui"));
         let mut once = None;
         let mut pure_prompt = false;
         let mut admin_only = args
@@ -118,6 +121,10 @@ impl CliConfig {
             match args[i].as_str() {
                 "cli" => {
                     enabled = true;
+                }
+                "tui" => {
+                    enabled = true;
+                    tui = true;
                 }
                 "prompt" => {
                     enabled = true;
@@ -165,6 +172,7 @@ impl CliConfig {
 
         Ok(Self {
             enabled,
+            tui,
             once,
             pure_prompt,
             admin_only,
@@ -517,20 +525,25 @@ async fn main() -> anyhow::Result<()> {
     let secret_store = Arc::new(Mutex::new(SecretStore::from_env()));
     let startup_secrets = secret_store.lock().await.entries()?;
     apply_entries_to_env(&startup_secrets);
-    init_observability();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let global_args = parse_global_args(&raw_args)?;
     let command = parse_command(&global_args.command_args)?;
     let selected_profile = resolve_instance_profile(global_args.profile, explicit_data_dir)?;
     let mut data_dir = selected_profile.data_dir.clone();
+    std::fs::create_dir_all(&data_dir)?;
+    let _observability_guard = init_observability(
+        matches!(
+            &command,
+            AppCommand::Run(cli) if cli.tui
+        ),
+        &data_dir,
+    )?;
 
     if let AppCommand::Profile(profile_command) = &command {
         run_profile_command(profile_command)?;
         return Ok(());
     }
-
-    std::fs::create_dir_all(&data_dir)?;
 
     match command {
         AppCommand::Setup(entries) => {
@@ -627,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let gateway = if cli.enabled || cli.once.is_some() {
+    let gateway = if cli.enabled || cli.tui || cli.once.is_some() {
         None
     } else {
         match (
@@ -666,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
-    if !cli.pure_prompt {
+    if !cli.pure_prompt && !cli.tui {
         maybe_start_admin(host_admin::AdminState {
             agents_dir,
             skills_dir: data_dir.join("skills"),
@@ -684,6 +697,9 @@ async fn main() -> anyhow::Result<()> {
     local_set
         .run_until(async move {
             tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
+            if cli.tui {
+                return tui_app::run_tui(runtime, cli).await;
+            }
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
                     process_prompt_message(Rc::clone(&runtime), &cli, message).await?;
@@ -759,7 +775,10 @@ fn current_workspace_dir(data_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| data_dir.to_path_buf())
 }
 
-fn init_observability() {
+fn init_observability(
+    tui_enabled: bool,
+    data_dir: &Path,
+) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     let _sentry_guard = sentry::init((
         std::env::var("SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {
@@ -768,15 +787,31 @@ fn init_observability() {
         },
     ));
     use tracing_subscriber::prelude::*;
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer().with_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "remi_cat=info,bot_core=info,im_feishu=info".into()),
-            ),
-        )
-        .with(sentry::integrations::tracing::layer())
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "remi_cat=info,bot_core=info,im_feishu=info".into());
+
+    if tui_enabled {
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        let file_appender = tracing_appender::rolling::never(log_dir, "tui.log");
+        let (writer, guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .with_filter(filter),
+            )
+            .with(sentry::integrations::tracing::layer())
+            .init();
+        Ok(Some(guard))
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .with(sentry::integrations::tracing::layer())
+            .init();
+        Ok(None)
+    }
 }
 
 async fn run_setup(
@@ -3960,8 +3995,29 @@ mod cli_tests {
     fn cli_subcommand_starts_interactive_mode() {
         let config = CliConfig::from_args(&args(&["cli"])).unwrap();
         assert!(config.enabled);
+        assert!(!config.tui);
         assert_eq!(config.once, None);
         assert!(!config.pure_prompt);
+    }
+
+    #[test]
+    fn tui_subcommand_starts_terminal_ui_mode() {
+        let config = CliConfig::from_args(&args(&[
+            "tui",
+            "--session",
+            "desk",
+            "--user",
+            "u1",
+            "--name",
+            "Alice",
+        ]))
+        .unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert_eq!(config.channel_id, "desk");
+        assert_eq!(config.user_id, "u1");
+        assert_eq!(config.username, "Alice");
+        assert_eq!(config.once, None);
     }
 
     #[test]
