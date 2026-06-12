@@ -64,6 +64,22 @@ header { height: 62px; border-bottom: 1px solid #222722; display: flex; align-it
 .tool-image-preview { margin: 10px 0 2px; padding: 8px; border: 1px solid #2d352e; border-radius: 9px; background: #0d100d; }
 .tool-image-preview img { display: block; max-width: min(100%, 560px); max-height: 420px; border-radius: 7px; object-fit: contain; background: #080a08; }
 .tool-image-preview figcaption { margin-top: 6px; color: #899389; font: 11px ui-monospace, monospace; overflow-wrap: anywhere; }
+.patch-viewer { margin: 10px 0 2px; border: 1px solid #2d352e; border-radius: 9px; background: #0b0e0b; overflow: hidden; }
+.patch-summary { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-bottom: 1px solid #252c25; color: #aeb7ad; font-size: 12px; }
+.patch-summary span { margin-right: auto; color: #dce2da; }
+.patch-added { color: #86efac; }
+.patch-removed { color: #fca5a5; }
+.patch-file { border-top: 1px solid #202720; }
+.patch-file:first-of-type { border-top: 0; }
+.patch-file summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; color: #dce2da; }
+.patch-file summary code { color: #d8ff73; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.patch-file summary small { margin-left: auto; color: #899389; font-size: 11px; white-space: nowrap; }
+.patch-file pre { margin: 0; padding: 0; border: 0; border-radius: 0; max-height: 460px; overflow: auto; background: #080a08; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.patch-line { display: block; min-width: max-content; padding: 0 10px; white-space: pre; color: #b8c0b6; }
+.patch-line.add { background: rgba(34, 197, 94, .12); color: #bbf7d0; }
+.patch-line.remove { background: rgba(239, 68, 68, .13); color: #fecaca; }
+.patch-line.meta { background: #111711; color: #9ca3af; }
+.patch-line.context { color: #c8d0c6; }
 .supervisor, .debug { border: 1px solid #354036; border-radius: 10px; margin: 12px 0; background: #121612; color: #aeb7ad; }
 .supervisor summary, .debug summary { cursor: pointer; display: flex; align-items: center; gap: 7px; padding: 9px 11px; color: #d8ff73; }
 .supervisor summary small, .debug summary small { margin-left: auto; color: #7f8a7f; font-size: 11px; }

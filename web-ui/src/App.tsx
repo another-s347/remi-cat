@@ -84,9 +84,172 @@ function encodeWorkspacePath(path: string) {
     .join("/");
 }
 
+type PatchLine = {
+  kind: "add" | "remove" | "context" | "meta";
+  text: string;
+};
+
+type PatchFile = {
+  path: string;
+  oldPath?: string;
+  newPath?: string;
+  operation?: "add" | "delete" | "update";
+  lines: PatchLine[];
+  added: number;
+  removed: number;
+};
+
+function patchTextFromPretty(pretty: PrettyToolCall) {
+  const request = pretty.request as { patch?: unknown } | undefined;
+  return typeof request?.patch === "string" ? request.patch : undefined;
+}
+
+function normalizeDiffPath(path: string) {
+  const clean = path.trim().split(/\s+/)[0] ?? "";
+  if (clean === "/dev/null") return clean;
+  return clean.replace(/^([ab])\//, "");
+}
+
+function parsePatchFiles(patch: string): PatchFile[] {
+  return patch.includes("*** Begin Patch") || patch.includes("*** Update File:")
+    ? parseCodexPatchFiles(patch)
+    : parseUnifiedPatchFiles(patch);
+}
+
+function parseUnifiedPatchFiles(patch: string): PatchFile[] {
+  const files: PatchFile[] = [];
+  let current: PatchFile | undefined;
+  let pendingOldPath: string | undefined;
+  const ensureCurrent = (path: string, oldPath?: string, newPath?: string) => {
+    current = {
+      path,
+      oldPath,
+      newPath,
+      operation: oldPath === "/dev/null" ? "add" : newPath === "/dev/null" ? "delete" : "update",
+      lines: [],
+      added: 0,
+      removed: 0,
+    };
+    files.push(current);
+  };
+
+  for (const rawLine of patch.split(/\r?\n/)) {
+    if (rawLine.startsWith("diff --git ")) {
+      const parts = rawLine.trim().split(/\s+/);
+      pendingOldPath = normalizeDiffPath(parts[2] ?? "");
+      const newPath = normalizeDiffPath(parts[3] ?? pendingOldPath ?? "patch");
+      ensureCurrent(newPath, pendingOldPath, newPath);
+      current?.lines.push({ kind: "meta", text: rawLine });
+      continue;
+    }
+    if (rawLine.startsWith("--- ")) {
+      pendingOldPath = normalizeDiffPath(rawLine.slice(4));
+      if (current) current.oldPath = pendingOldPath;
+      continue;
+    }
+    if (rawLine.startsWith("+++ ")) {
+      const newPath = normalizeDiffPath(rawLine.slice(4));
+      if (!current || current.lines.some((line) => line.text.startsWith("@@"))) {
+        ensureCurrent(newPath === "/dev/null" ? pendingOldPath ?? newPath : newPath, pendingOldPath, newPath);
+      } else {
+        current.path = newPath === "/dev/null" ? pendingOldPath ?? newPath : newPath;
+        current.newPath = newPath;
+        current.operation = pendingOldPath === "/dev/null" ? "add" : newPath === "/dev/null" ? "delete" : "update";
+      }
+      continue;
+    }
+    if (!current) continue;
+    const line = classifyPatchLine(rawLine);
+    current.lines.push(line);
+    if (line.kind === "add") current.added += 1;
+    if (line.kind === "remove") current.removed += 1;
+  }
+  return files.filter((file) => file.lines.length > 0);
+}
+
+function parseCodexPatchFiles(patch: string): PatchFile[] {
+  const files: PatchFile[] = [];
+  let current: PatchFile | undefined;
+  for (const rawLine of patch.split(/\r?\n/)) {
+    const updatePath = rawLine.match(/^\*\*\* Update File:\s+(.+)$/)?.[1];
+    const addPath = rawLine.match(/^\*\*\* Add File:\s+(.+)$/)?.[1];
+    const deletePath = rawLine.match(/^\*\*\* Delete File:\s+(.+)$/)?.[1];
+    if (updatePath || addPath || deletePath) {
+      current = {
+        path: (updatePath ?? addPath ?? deletePath ?? "patch").trim(),
+        operation: addPath ? "add" : deletePath ? "delete" : "update",
+        lines: [],
+        added: 0,
+        removed: 0,
+      };
+      files.push(current);
+      continue;
+    }
+    if (!current || rawLine === "*** Begin Patch" || rawLine === "*** End Patch") continue;
+    const line = classifyPatchLine(rawLine);
+    current.lines.push(line);
+    if (line.kind === "add") current.added += 1;
+    if (line.kind === "remove") current.removed += 1;
+  }
+  return files.filter((file) => file.lines.length > 0);
+}
+
+function classifyPatchLine(rawLine: string): PatchLine {
+  if (rawLine.startsWith("+") && !rawLine.startsWith("+++")) {
+    return { kind: "add", text: rawLine };
+  }
+  if (rawLine.startsWith("-") && !rawLine.startsWith("---")) {
+    return { kind: "remove", text: rawLine };
+  }
+  if (rawLine.startsWith("@@") || rawLine.startsWith("***") || rawLine.startsWith("index ")) {
+    return { kind: "meta", text: rawLine };
+  }
+  return { kind: "context", text: rawLine };
+}
+
+function PatchDiffViewer({ patch }: { patch: string }) {
+  const files = parsePatchFiles(patch);
+  if (!files.length) {
+    return (
+      <details className="patch-viewer">
+        <summary>Patch</summary>
+        <pre>{patch}</pre>
+      </details>
+    );
+  }
+  const added = files.reduce((sum, file) => sum + file.added, 0);
+  const removed = files.reduce((sum, file) => sum + file.removed, 0);
+  return (
+    <div className="patch-viewer">
+      <div className="patch-summary">
+        <span>{files.length} file{files.length === 1 ? "" : "s"}</span>
+        <strong className="patch-added">+{added}</strong>
+        <strong className="patch-removed">-{removed}</strong>
+      </div>
+      {files.map((file, index) => (
+        <details className="patch-file" key={`${file.path}-${index}`} open>
+          <summary>
+            <code>{file.path}</code>
+            <small>{file.operation ?? "update"} · +{file.added} / -{file.removed}</small>
+          </summary>
+          <pre>
+            {file.lines.map((line, lineIndex) => (
+              <span className={`patch-line ${line.kind}`} key={lineIndex}>
+                {line.text || " "}
+                {"\n"}
+              </span>
+            ))}
+          </pre>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 function ToolPart({ toolName, args, argsText, result, status }: ToolCallMessagePartProps) {
   const pretty = prettyFromPart(args, result);
   if (pretty) {
+    const patchText = pretty.tool_name === "apply_patch" ? patchTextFromPretty(pretty) : undefined;
     const icon = pretty.status === "error" ? "❌" : pretty.status === "success" ? "✅" : "⏳";
     const liveElapsedMs =
       pretty.elapsed_ms ??
@@ -111,10 +274,15 @@ function ToolPart({ toolName, args, argsText, result, status }: ToolCallMessageP
             <figcaption>{imagePreview.path}</figcaption>
           </figure>
         )}
-        <details>
-          <summary>完整 request</summary>
-          <pre>{JSON.stringify(pretty.request, null, 2)}</pre>
-        </details>
+        {patchText && (
+          <PatchDiffViewer patch={patchText} />
+        )}
+        {pretty.tool_name !== "apply_patch" && (
+          <details>
+            <summary>完整 request</summary>
+            <pre>{JSON.stringify(pretty.request, null, 2)}</pre>
+          </details>
+        )}
         {pretty.response !== undefined && pretty.response !== null && (
           <details>
             <summary>完整 response</summary>
