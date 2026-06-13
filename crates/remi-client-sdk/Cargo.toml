@@ -34,8 +34,6 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 url = "2"
 urlencoding = "2.1"
 tonic = { version = "0.14", features = ["transport"] }
-tonic_conn = { git = "https://github.com/another-s347/decenet.git", rev = "d37d9a6cb9319f3cd8979555bc21498f1f914b40" }
-decentralized_network = { git = "https://github.com/another-s347/decenet.git", rev = "d37d9a6cb9319f3cd8979555bc21498f1f914b40" }
 tonic-prost = "0.14"
 tracing = "0.1"
 automerge = "0.7.2"
