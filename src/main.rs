@@ -56,6 +56,7 @@ const CLI_USER_ID: &str = "local-user";
 const CLI_USERNAME: &str = "local-user";
 const SESSION_DEBUG_METADATA_KEY: &str = "debug";
 const SESSION_MODEL_PROFILE_METADATA_KEY: &str = "model_profile_id";
+const SESSION_INPUT_HISTORY_METADATA_KEY: &str = "input_history";
 const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +95,8 @@ enum SecretCommand {
 struct CliConfig {
     enabled: bool,
     tui: bool,
+    resume: bool,
+    resume_session_id: Option<String>,
     once: Option<String>,
     pure_prompt: bool,
     admin_only: bool,
@@ -108,6 +111,8 @@ impl CliConfig {
             .iter()
             .any(|arg| matches!(arg.as_str(), "--local" | "--cli-im" | "cli"));
         let mut tui = args.iter().any(|arg| matches!(arg.as_str(), "tui"));
+        let mut resume = false;
+        let mut resume_session_id = None;
         let mut once = None;
         let mut pure_prompt = false;
         let mut admin_only = args
@@ -126,6 +131,13 @@ impl CliConfig {
                 "tui" => {
                     enabled = true;
                     tui = true;
+                }
+                "resume" if tui => {
+                    resume = true;
+                    if let Some(value) = optional_arg(args, i) {
+                        resume_session_id = Some(value);
+                        i += 1;
+                    }
                 }
                 "prompt" => {
                     enabled = true;
@@ -149,6 +161,15 @@ impl CliConfig {
                 "--cli-channel" | "--channel" | "--session" => {
                     channel_id = next_arg(args, i)?;
                     i += 1;
+                }
+                "--resume" => {
+                    enabled = true;
+                    tui = true;
+                    resume = true;
+                    if let Some(value) = optional_arg(args, i) {
+                        resume_session_id = Some(value);
+                        i += 1;
+                    }
                 }
                 "--cli-user" | "--user" => {
                     user_id = next_arg(args, i)?;
@@ -174,6 +195,8 @@ impl CliConfig {
         Ok(Self {
             enabled,
             tui,
+            resume,
+            resume_session_id,
             once,
             pure_prompt,
             admin_only,
@@ -3037,6 +3060,14 @@ pub(crate) async fn handle_runtime_command(
         let reply = handle_model_command(runtime, session_id, command).await?;
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
+    if command == "/permissions"
+        || command.starts_with("/permissions ")
+        || command == "/permission"
+        || command.starts_with("/permission ")
+    {
+        let reply = handle_permissions_command(runtime, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
     if command == "/compact" {
         let n = runtime.bot.compact_memory(session_id).await?;
         return Ok(Some(RuntimeCommandResult::Reply(format!(
@@ -3069,6 +3100,57 @@ pub(crate) async fn handle_runtime_command(
         ))));
     }
     Ok(None)
+}
+
+async fn handle_permissions_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    use bot_core::approval::ApprovalSessionPolicy;
+
+    let rest = command
+        .trim()
+        .trim_start_matches('/')
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
+    let manager = runtime.bot.approval_manager();
+
+    let policy = match rest {
+        "" | "status" => None,
+        "ask" | "default" | "prompt" | "reset" => Some(ApprovalSessionPolicy::Ask),
+        "auto" | "medium" | "model-auto" | "model_auto" => Some(ApprovalSessionPolicy::ModelAuto),
+        "allow" | "allow-session" | "allow_session" | "bypass" | "trusted" => {
+            Some(ApprovalSessionPolicy::AllowAll)
+        }
+        _ => {
+            return Ok(format!(
+                "用法：/permissions status | ask | auto | allow\n\n{}",
+                format_permissions_status(session_id, manager.session_policy(session_id).await)
+            ));
+        }
+    };
+
+    if let Some(policy) = policy {
+        manager.set_session_policy(session_id, policy).await;
+    }
+
+    Ok(format_permissions_status(
+        session_id,
+        manager.session_policy(session_id).await,
+    ))
+}
+
+fn format_permissions_status(
+    session_id: &str,
+    policy: bot_core::approval::ApprovalSessionPolicy,
+) -> String {
+    format!(
+        "**permissions**\n\nsession_id: `{session_id}`\nmode: `{}`\n{}\n\nmodes:\n- `ask`: low 自动通过；medium/high 请求审批\n- `auto` / `medium`: low/medium 自动通过；high 请求审批\n- `allow`: 本 session 所有 tool request 自动通过",
+        policy.label(),
+        policy.description()
+    )
 }
 
 async fn handle_model_command(
@@ -3989,6 +4071,13 @@ fn next_arg(args: &[String], index: usize) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} requires a value", args[index]))
 }
 
+fn optional_arg(args: &[String], index: usize) -> Option<String> {
+    args.get(index + 1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::{
@@ -4034,10 +4123,44 @@ mod cli_tests {
         .unwrap();
         assert!(config.enabled);
         assert!(config.tui);
+        assert!(!config.resume);
+        assert_eq!(config.resume_session_id, None);
         assert_eq!(config.channel_id, "desk");
         assert_eq!(config.user_id, "u1");
         assert_eq!(config.username, "Alice");
         assert_eq!(config.once, None);
+    }
+
+    #[test]
+    fn tui_subcommand_accepts_resume_selector() {
+        let config = CliConfig::from_args(&args(&["tui", "resume", "abc123"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.resume);
+        assert_eq!(config.resume_session_id.as_deref(), Some("abc123"));
+        assert_eq!(config.once, None);
+
+        let config = CliConfig::from_args(&args(&["--resume", "desk-session"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.resume);
+        assert_eq!(config.resume_session_id.as_deref(), Some("desk-session"));
+    }
+
+    #[test]
+    fn tui_resume_accepts_missing_selector_for_menu() {
+        let config = CliConfig::from_args(&args(&["tui", "resume"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.resume);
+        assert_eq!(config.resume_session_id, None);
+
+        let config = CliConfig::from_args(&args(&["--resume", "--user", "alice"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.resume);
+        assert_eq!(config.resume_session_id, None);
+        assert_eq!(config.user_id, "alice");
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod approval;
 pub mod events;
 pub mod goal;
 pub mod im_tools;
@@ -35,6 +36,10 @@ pub mod tools;
 pub mod trigger;
 
 pub use agent::CatAgent;
+pub use approval::{
+    ApprovalResolution, ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
+    ToolRiskLevel, ToolRiskReview,
+};
 pub use events::{CatEvent, SkillEvent, TodoEvent, TriggerEvent};
 pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
@@ -66,8 +71,8 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    Agent, AgentBuilder, AgentConfig, AgentError, AgentEvent, LoopInput, OpenAIClient,
-    ReqwestTransport, ToolContext,
+    AgentBuilder, AgentConfig, AgentError, AgentEvent, LoopInput, OpenAIClient, ReqwestTransport,
+    RunId, ThreadId, ToolContext,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use remi_agentloop_deepagent::{SubAgentEventStream, SubAgentToolAdapter};
@@ -243,6 +248,7 @@ pub struct CatBot {
     todo_backend: Arc<todo::HybridTodoBackend>,
     trigger_backend: Arc<trigger::TriggerBackend>,
     acp_backend: Arc<acp::AcpBackend>,
+    approval_manager: Arc<ToolApprovalManager>,
     run_locks: ThreadRunLocks,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
@@ -267,6 +273,10 @@ pub enum EffectiveModelSource {
 impl CatBot {
     pub fn model_context_tokens(&self) -> u32 {
         self.model_profile.context_tokens
+    }
+
+    pub fn approval_manager(&self) -> Arc<ToolApprovalManager> {
+        Arc::clone(&self.approval_manager)
     }
 
     pub fn model_context_tokens_for(&self, session_model_profile_id: Option<&str>) -> u32 {
@@ -1267,6 +1277,15 @@ impl CatBot {
                                 elapsed_ms,
                             };
                         }
+                        CatEvent::ToolApprovalRequested(request) => {
+                            yield CatEvent::ToolApprovalRequested(request);
+                        }
+                        CatEvent::ToolApprovalUpdated(request) => {
+                            yield CatEvent::ToolApprovalUpdated(request);
+                        }
+                        CatEvent::ToolApprovalResolved { request, decision } => {
+                            yield CatEvent::ToolApprovalResolved { request, decision };
+                        }
                         // Save memory BEFORE yielding Done/Error — the caller drops
                         // the stream immediately on these events, so any code after
                         // this loop would never execute.
@@ -1754,9 +1773,32 @@ struct LocalToolDeps {
     api_key: String,
     im_bridge: Option<Arc<dyn ImFileBridge>>,
     active_agent_id: String,
+    approval_manager: Arc<ToolApprovalManager>,
+    overflow_bytes: usize,
 }
 
 impl LocalToolDeps {
+    fn clone_for_subagent(&self) -> Self {
+        Self {
+            skill_store: Arc::clone(&self.skill_store),
+            memory: Arc::clone(&self.memory),
+            todo_backend: Arc::clone(&self.todo_backend),
+            trigger_backend: Arc::clone(&self.trigger_backend),
+            acp_backend: Arc::clone(&self.acp_backend),
+            sandbox: Arc::clone(&self.sandbox),
+            bash_enabled: self.bash_enabled,
+            redactor: Arc::clone(&self.redactor),
+            data_dir: self.data_dir.clone(),
+            agents_dir: self.agents_dir.clone(),
+            delegate_ids: self.delegate_ids.clone(),
+            api_key: self.api_key.clone(),
+            im_bridge: self.im_bridge.clone(),
+            active_agent_id: self.active_agent_id.clone(),
+            approval_manager: Arc::clone(&self.approval_manager),
+            overflow_bytes: self.overflow_bytes,
+        }
+    }
+
     fn build_tools(
         &self,
         profile: &ModelProfileConfig,
@@ -1772,12 +1814,13 @@ impl LocalToolDeps {
         }
         register_delegate_agent_tools(
             &mut local_tools,
-            &self.agents_dir,
+            self,
             &self.delegate_ids,
             self.api_key.clone(),
             profile.base_url.clone(),
             profile.model.clone(),
             extra_options,
+            self.overflow_bytes,
         );
         local_tools.register(MemoryGetDetailTool {
             store: Arc::clone(&self.memory),
@@ -2111,6 +2154,7 @@ impl CatBotBuilder {
         let active_agent_id = self.active_agent_id.clone();
         let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
         let trigger_backend = Arc::new(trigger::TriggerBackend::new(data_dir.clone()));
+        let approval_manager = ToolApprovalManager::new();
         let acp_backend = Arc::new(acp::AcpBackend::new(
             data_dir.clone(),
             self.im_bridge.clone(),
@@ -2129,18 +2173,38 @@ impl CatBotBuilder {
             acp_local_builder = acp_local_builder.extra_options(self.extra_options.clone());
         }
         let acp_local_inner: InnerAgent = acp_local_builder.build_loop();
+        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
+        let acp_tool_deps = LocalToolDeps {
+            skill_store: Arc::clone(&skill_store),
+            memory: Arc::clone(&memory),
+            todo_backend: Arc::clone(&todo_backend),
+            trigger_backend: Arc::clone(&trigger_backend),
+            acp_backend: Arc::clone(&acp_backend),
+            sandbox: Arc::clone(&sandbox),
+            bash_enabled: self.sandbox_config.bash_enabled(),
+            redactor: Arc::clone(&redactor),
+            data_dir: data_dir.clone(),
+            agents_dir: agents_dir.clone(),
+            delegate_ids: self.delegate_ids.clone(),
+            api_key: self.api_key.clone(),
+            im_bridge: self.im_bridge.clone(),
+            active_agent_id: active_agent_id.clone(),
+            approval_manager: Arc::clone(&approval_manager),
+            overflow_bytes,
+        };
         let mut acp_local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
         todo::register_todo_tools(&mut acp_local_tools, Arc::clone(&todo_backend));
         trigger::register_trigger_tools(&mut acp_local_tools, Arc::clone(&trigger_backend));
         register_delegate_agent_tools(
             &mut acp_local_tools,
-            &agents_dir,
+            &acp_tool_deps,
             &self.delegate_ids,
             self.api_key.clone(),
             resolved_base_url.clone(),
             profile.model.clone(),
             self.extra_options.clone(),
+            overflow_bytes,
         );
         acp_local_tools.register(MemoryGetDetailTool {
             store: Arc::clone(&memory),
@@ -2158,7 +2222,6 @@ impl CatBotBuilder {
             memory_store: Arc::clone(&memory),
             agent_id: active_agent_id.clone(),
         });
-        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
         if self.sandbox_config.bash_enabled() {
             acp_local_tools.register(WorkspaceBashTool::new(
                 Arc::clone(&sandbox),
@@ -2203,6 +2266,7 @@ impl CatBotBuilder {
                 overflow_bytes,
                 im_bridge: self.im_bridge.clone(),
                 tool_allowlist: self.tool_allowlist.clone(),
+                approval_manager: Arc::clone(&approval_manager),
             },
             memory: Arc::clone(&memory),
             run_locks: Arc::clone(&run_locks),
@@ -2222,6 +2286,8 @@ impl CatBotBuilder {
             api_key: self.api_key.clone(),
             im_bridge: self.im_bridge.clone(),
             active_agent_id: active_agent_id.clone(),
+            approval_manager: Arc::clone(&approval_manager),
+            overflow_bytes,
         };
         let local_tools = tool_deps.build_tools(&profile, self.extra_options.clone(), true);
         let mut model_agents = HashMap::new();
@@ -2247,6 +2313,7 @@ impl CatBotBuilder {
                     overflow_bytes: model_profile.overflow_bytes,
                     im_bridge: self.im_bridge.clone(),
                     tool_allowlist: self.tool_allowlist.clone(),
+                    approval_manager: Arc::clone(&approval_manager),
                 },
             );
         }
@@ -2259,6 +2326,7 @@ impl CatBotBuilder {
                 overflow_bytes,
                 im_bridge: self.im_bridge,
                 tool_allowlist: self.tool_allowlist,
+                approval_manager: Arc::clone(&approval_manager),
             },
             model_agents,
             skill_store,
@@ -2266,6 +2334,7 @@ impl CatBotBuilder {
             todo_backend,
             trigger_backend,
             acp_backend,
+            approval_manager,
             run_locks,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
@@ -2281,14 +2350,15 @@ fn delegate_tool_name(agent_id: &str) -> String {
 
 fn register_delegate_agent_tools(
     registry: &mut DefaultToolRegistry,
-    agents_dir: &std::path::Path,
+    deps: &LocalToolDeps,
     delegate_ids: &[String],
     api_key: String,
     base_url: Option<String>,
     default_model: String,
     extra_options: serde_json::Map<String, serde_json::Value>,
+    overflow_bytes: usize,
 ) {
-    let Ok(agent_registry) = AgentRegistry::load(agents_dir) else {
+    let Ok(agent_registry) = AgentRegistry::load(&deps.agents_dir) else {
         return;
     };
     for delegate_id in delegate_ids {
@@ -2311,6 +2381,17 @@ fn register_delegate_agent_tools(
         let max_turns = profile.max_turns.unwrap_or(12);
         let tool_api_key = api_key.clone();
         let tool_extra_options = extra_options.clone();
+        let mut tool_allowlist = profile.tools.clone();
+        for delegate in &profile.delegates {
+            let name = delegate_tool_name(delegate);
+            if !tool_allowlist.iter().any(|tool| tool == &name) {
+                tool_allowlist.push(name);
+            }
+        }
+        let subagent_data_dir = deps.data_dir.clone();
+        let subagent_approval_manager = Arc::clone(&deps.approval_manager);
+        let subagent_deps = deps.clone_for_subagent();
+        let subagent_profile = profile.clone();
         registry.register(SubAgentToolAdapter::new(
             tool_name,
             tool_description,
@@ -2342,6 +2423,11 @@ fn register_delegate_agent_tools(
                 let base_url = tool_base_url.clone();
                 let system_prompt = system_prompt.clone();
                 let extra_options = tool_extra_options.clone();
+                let data_dir = subagent_data_dir.clone();
+                let approval_manager = Arc::clone(&subagent_approval_manager);
+                let tool_allowlist = tool_allowlist.clone();
+                let deps = subagent_deps.clone_for_subagent();
+                let profile = subagent_profile.clone();
                 Box::pin(async move {
                     if task.trim().is_empty() {
                         return Err(AgentError::tool("sub-agent", "missing task"));
@@ -2357,23 +2443,111 @@ fn register_delegate_agent_tools(
                     if !extra_options.is_empty() {
                         builder = builder.extra_options(extra_options);
                     }
-                    let agent = builder.build_loop();
+                    let agent = CatAgent {
+                        inner: builder.build_loop(),
+                        local_tools: build_subagent_tools(&deps, &profile),
+                        data_dir,
+                        overflow_bytes,
+                        im_bridge: None,
+                        tool_allowlist: Some(tool_allowlist),
+                        approval_manager,
+                    };
+                    let sub_thread_id = ThreadId(format!("subagent:{}", uuid::Uuid::new_v4()));
+                    let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
                     Ok(Box::pin(stream! {
-                        match agent.chat(LoopInput::start(&task)).await {
-                            Ok(inner_stream) => {
-                                let mut inner_stream = std::pin::pin!(inner_stream);
-                                while let Some(event) = inner_stream.next().await {
-                                    yield event;
-                                }
-                            }
-                            Err(error) => {
-                                yield AgentEvent::Error(error);
+                        yield AgentEvent::RunStart {
+                            thread_id: sub_thread_id,
+                            run_id: sub_run_id,
+                            metadata: None,
+                        };
+                        let mut inner_stream = std::pin::pin!(agent.stream_with_input(LoopInput::start(&task)));
+                        while let Some(event) = inner_stream.next().await {
+                            match cat_event_to_agent_event(event) {
+                                Some(agent_event) => yield agent_event,
+                                None => {}
                             }
                         }
                     }) as SubAgentEventStream)
                 })
             },
         ));
+    }
+}
+
+fn build_subagent_tools(deps: &LocalToolDeps, profile: &AgentProfile) -> DefaultToolRegistry {
+    let mut local_tools = DefaultToolRegistry::new();
+    skill::register_skill_tools(&mut local_tools, Arc::clone(&deps.skill_store));
+    todo::register_todo_tools(&mut local_tools, Arc::clone(&deps.todo_backend));
+    trigger::register_trigger_tools(&mut local_tools, Arc::clone(&deps.trigger_backend));
+    local_tools.register(MemoryGetDetailTool {
+        store: Arc::clone(&deps.memory),
+    });
+    local_tools.register(MemoryUpsertNamedTool {
+        store: Arc::clone(&deps.memory),
+        agent_id: profile.id.clone(),
+    });
+    local_tools.register(MemoryRecallTool {
+        store: Arc::clone(&deps.memory),
+        agent_id: profile.id.clone(),
+    });
+    local_tools.register(SearchTool {
+        skill_store: Arc::clone(&deps.skill_store),
+        memory_store: Arc::clone(&deps.memory),
+        agent_id: profile.id.clone(),
+    });
+    if deps.bash_enabled {
+        local_tools.register(WorkspaceBashTool::new(
+            Arc::clone(&deps.sandbox),
+            Arc::clone(&deps.redactor),
+        ));
+    }
+    local_tools.register(RootedFsReadTool {
+        sandbox: Arc::clone(&deps.sandbox),
+        redactor: Arc::clone(&deps.redactor),
+    });
+    local_tools.register(RootedFsWriteTool {
+        sandbox: Arc::clone(&deps.sandbox),
+    });
+    local_tools.register(RootedFsApplyPatchTool {
+        sandbox: Arc::clone(&deps.sandbox),
+    });
+    local_tools.register(RootedFsCreateTool {
+        sandbox: Arc::clone(&deps.sandbox),
+    });
+    local_tools.register(RootedFsRemoveTool {
+        sandbox: Arc::clone(&deps.sandbox),
+    });
+    local_tools.register(RootedFsLsTool {
+        sandbox: Arc::clone(&deps.sandbox),
+        redactor: Arc::clone(&deps.redactor),
+    });
+    register_fetch_tool(
+        &mut local_tools,
+        deps.data_dir.clone(),
+        deps.im_bridge.clone(),
+    );
+    local_tools.register(ExaSearchTool::new());
+    local_tools.register(NowTool);
+    local_tools.register(SleepTool);
+    local_tools.register(ManageYourselfTool);
+    local_tools
+}
+
+fn cat_event_to_agent_event(event: CatEvent) -> Option<AgentEvent> {
+    match event {
+        CatEvent::Text(text) => Some(AgentEvent::TextDelta(text)),
+        CatEvent::Thinking(content) => Some(AgentEvent::ThinkingEnd { content }),
+        CatEvent::ToolCallStart { id, name } => Some(AgentEvent::ToolCallStart { id, name }),
+        CatEvent::ToolCallArgumentsDelta { id, delta } => {
+            Some(AgentEvent::ToolCallArgumentsDelta { id, delta })
+        }
+        CatEvent::ToolCall { id, name, .. } => Some(AgentEvent::ToolCallStart { id, name }),
+        CatEvent::ToolCallResult {
+            id, name, result, ..
+        } => Some(AgentEvent::ToolResult { id, name, result }),
+        CatEvent::Error(error) => Some(AgentEvent::Error(error)),
+        CatEvent::Done => Some(AgentEvent::Done),
+        _ => None,
     }
 }
 
@@ -2835,6 +3009,7 @@ You are Remi.
         .unwrap();
 
         let thread_id = "todo-supervisor-routing-e2e";
+        bot.approval_manager().grant_session(thread_id).await;
         collect_stream(bot.stream(thread_id, "create todo")).await;
         bot.set_goal(thread_id, "verify todo routing", GoalMaxRounds::Limited(1))
             .await

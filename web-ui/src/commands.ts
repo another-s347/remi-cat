@@ -101,6 +101,30 @@ export const CHAT_COMMANDS: ChatCommand[] = [
     keywords: ["model", "reset", "模型", "重置"],
   },
   {
+    value: "/permissions status",
+    label: "权限模式",
+    description: "查看当前 session 的工具审批策略",
+    keywords: ["permission", "permissions", "权限", "审批", "status"],
+  },
+  {
+    value: "/permissions auto",
+    label: "自动通过中低风险",
+    description: "本 session 中 low/medium 自动通过，high 仍请求审批",
+    keywords: ["permission", "permissions", "权限", "审批", "auto", "medium"],
+  },
+  {
+    value: "/permissions ask",
+    label: "恢复审批",
+    description: "恢复默认：low 自动通过，medium/high 请求审批",
+    keywords: ["permission", "permissions", "权限", "审批", "ask", "default"],
+  },
+  {
+    value: "/permissions allow",
+    label: "信任本会话",
+    description: "本 session 所有工具请求自动通过",
+    keywords: ["permission", "permissions", "权限", "审批", "allow", "trusted"],
+  },
+  {
     value: "/skill list",
     label: "Skill 列表",
     description: "列出可用 skills",

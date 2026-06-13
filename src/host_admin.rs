@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use bot_core::skill::store::SkillStore;
 use bot_core::{
     remi_skill, trigger, AgentProfile, AgentRegistry, BuiltinSkillStore, FileSkillStore,
+    ToolApprovalDecision,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -68,6 +69,10 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/chat/sessions/{id}/todos", get(web_session_todos))
         .route(
+            "/api/v1/chat/sessions/{id}/input-history",
+            get(web_session_input_history).post(append_web_session_input_history),
+        )
+        .route(
             "/api/v1/chat/sessions/{id}/runs",
             post(start_web_run).delete(cancel_web_session_run),
         )
@@ -76,6 +81,7 @@ pub fn router(state: AdminState) -> Router {
             get(active_web_session_run),
         )
         .route("/api/v1/chat/runs/{id}", delete(cancel_web_run))
+        .route("/api/v1/chat/approvals/{id}", post(decide_web_approval))
         .route(
             "/api/v1/chat/assets/workspace/{*path}",
             get(workspace_image_asset),
@@ -221,6 +227,30 @@ fn static_command_catalog() -> Vec<CommandCatalogEntry> {
             "/model reset",
             "重置模型",
             "清除当前 session 的模型 override",
+            false,
+        ),
+        (
+            "/permissions status",
+            "权限模式",
+            "查看当前 session 的工具审批策略",
+            false,
+        ),
+        (
+            "/permissions auto",
+            "自动通过中低风险",
+            "本 session 中 low/medium 自动通过，high 仍请求审批",
+            false,
+        ),
+        (
+            "/permissions ask",
+            "恢复审批",
+            "恢复默认：low 自动通过，medium/high 请求审批",
+            false,
+        ),
+        (
+            "/permissions allow",
+            "信任本会话",
+            "本 session 所有工具请求自动通过",
             false,
         ),
         ("/skill list", "Skill 列表", "列出可用 skills", false),
@@ -535,6 +565,51 @@ async fn web_session_todos(
     Ok(Json(web_handle(&state)?.todos(id).await?))
 }
 
+#[derive(Debug, serde::Serialize)]
+struct InputHistoryResponse {
+    items: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AppendInputHistoryRequest {
+    text: String,
+}
+
+async fn web_session_input_history(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<InputHistoryResponse>, AdminError> {
+    require_web_session(&state, &id).await?;
+    let items = session_input_history(&state, &id).await;
+    Ok(Json(InputHistoryResponse { items }))
+}
+
+async fn append_web_session_input_history(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<AppendInputHistoryRequest>,
+) -> Result<Json<InputHistoryResponse>, AdminError> {
+    require_web_session(&state, &id).await?;
+    let mut sessions = state.sessions.lock().await;
+    let existing = sessions
+        .metadata_value(&id, crate::SESSION_INPUT_HISTORY_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    let mut items = existing;
+    items.push(request.text);
+    let items = normalize_input_history(items);
+    sessions.set_metadata_value(
+        &id,
+        crate::SESSION_INPUT_HISTORY_METADATA_KEY,
+        serde_json::json!(items),
+    )?;
+    let items = sessions
+        .metadata_value(&id, crate::SESSION_INPUT_HISTORY_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    Ok(Json(InputHistoryResponse { items }))
+}
+
 async fn active_web_session_run(
     State(state): State<AdminState>,
     AxumPath(id): AxumPath<String>,
@@ -547,6 +622,11 @@ async fn active_web_session_run(
 struct StartRunRequest {
     run_id: String,
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalDecisionRequest {
+    decision: ToolApprovalDecision,
 }
 
 async fn start_web_run(
@@ -622,6 +702,18 @@ async fn cancel_web_run(
     }
 }
 
+async fn decide_web_approval(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> Result<Json<bot_core::ToolApprovalRequest>, AdminError> {
+    let approval = web_handle(&state)?
+        .decide_approval(id, request.decision)
+        .await?
+        .ok_or_else(|| AdminError::not_found("approval not found".into()))?;
+    Ok(Json(approval))
+}
+
 async fn workspace_image_asset(
     State(state): State<AdminState>,
     AxumPath(path): AxumPath<String>,
@@ -693,6 +785,33 @@ async fn require_web_session(state: &AdminState, id: &str) -> Result<Session, Ad
         return Err(AdminError::not_found(format!("session `{id}` not found")));
     }
     Ok(session)
+}
+
+async fn session_input_history(state: &AdminState, id: &str) -> Vec<String> {
+    state
+        .sessions
+        .lock()
+        .await
+        .metadata_value(id, crate::SESSION_INPUT_HISTORY_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .map(normalize_input_history)
+        .unwrap_or_default()
+}
+
+fn normalize_input_history(items: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for item in items {
+        let item = item.trim().to_string();
+        if item.is_empty() || normalized.last() == Some(&item) {
+            continue;
+        }
+        normalized.push(item);
+    }
+    if normalized.len() > 100 {
+        normalized.split_off(normalized.len() - 100)
+    } else {
+        normalized
+    }
 }
 
 fn web_handle(state: &AdminState) -> Result<&WebChatHandle, AdminError> {

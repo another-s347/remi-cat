@@ -1,20 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use remi_agentloop::prelude::{AgentError, ToolContext};
 use remi_client_sdk::auth::auth_set_app_key;
 use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingUpsert, ThingsSnapshotState};
 use remi_client_sdk::things_events::ThingsEvent;
-use remi_client_sdk::things_sync::sync_v3_documents_with_server;
+use remi_client_sdk::things_sync::{sync_v3_documents_with_server_mode, ThingsSyncMode};
 use remi_client_sdk::transport::configure_shared_transport;
 use remi_client_sdk::{TriggerClient, TriggerSdk};
 use remi_things_crdt::{apply_collection_op, CollectionOp, ThingDatatype, TriggerUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tracing::warn;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::{timeout, Duration, Instant};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::tools::{
@@ -29,6 +30,8 @@ const TODO_CREATE_VIA_SDK_META_KEY: &str = "todo_create_via_sdk";
 const SDK_ATTRS_ROOT_KEY: &str = "remi_cat_todo";
 const SDK_ATTRS_SOURCE: &str = "remi-cat-todo";
 const SDK_DB_FILE_NAME: &str = "todo-sdk.db";
+const SDK_LOCK_WARN_AFTER: Duration = Duration::from_millis(500);
+const SDK_SYNC_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub struct HybridTodoBackend {
     data_dir: PathBuf,
@@ -360,6 +363,7 @@ struct SdkTodoRuntime {
     config: SdkTodoConfig,
     sdk: Arc<TriggerSdk>,
     lock: Arc<Mutex<()>>,
+    lock_owner: Arc<StdMutex<Option<String>>>,
 }
 
 impl SdkTodoRuntime {
@@ -392,11 +396,17 @@ impl SdkTodoRuntime {
             )
         })?);
         let lock = Arc::new(Mutex::new(()));
+        let lock_owner = Arc::new(StdMutex::new(None));
         if config.remote.is_some() {
-            spawn_things_sync_task(Arc::clone(&sdk), config.clone(), Arc::clone(&lock));
+            spawn_things_sync_task(Arc::clone(&sdk), config.clone());
         }
 
-        Ok(Self { sdk, config, lock })
+        Ok(Self {
+            sdk,
+            config,
+            lock,
+            lock_owner,
+        })
     }
 
     async fn refresh_thread_user_state(
@@ -405,7 +415,7 @@ impl SdkTodoRuntime {
         user_state: &mut Value,
     ) -> Result<()> {
         let sdk_todos = {
-            let _guard = self.lock.lock().await;
+            let _guard = self.lock_for("refresh_thread_user_state").await;
             self.thread_todos_from_snapshot_locked(thread_id)?
         };
         merge_sdk_todos(user_state, sdk_todos);
@@ -413,7 +423,7 @@ impl SdkTodoRuntime {
     }
 
     async fn delete_thread(&self, thread_id: &str) -> Result<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("delete_thread").await;
         let todos = self.thread_todos_from_snapshot_locked(thread_id)?;
         let collections: HashSet<String> = todos
             .iter()
@@ -445,7 +455,7 @@ impl SdkTodoRuntime {
         target_thread_id: &str,
         target_user_state: &mut Value,
     ) -> Result<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("fork_thread_user_state").await;
         let source_todos = self.thread_todos_from_snapshot_locked(source_thread_id)?;
         let mut copied = Vec::with_capacity(source_todos.len());
         let mut by_batch: HashMap<u64, Vec<TodoItem>> = HashMap::new();
@@ -478,7 +488,7 @@ impl SdkTodoRuntime {
         batch_title: &str,
         todos: &[TodoItem],
     ) -> Result<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("create_batch").await;
         self.create_batch_locked(thread_id, batch_title, todos)
     }
 
@@ -534,7 +544,7 @@ impl SdkTodoRuntime {
     }
 
     async fn complete_todo(&self, todo: &TodoItem) -> Result<bool> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("complete_todo").await;
         self.complete_todo_locked(todo)
     }
 
@@ -550,7 +560,7 @@ impl SdkTodoRuntime {
     }
 
     async fn update_todo_title(&self, todo: &TodoItem, content: &str) -> Result<bool> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("update_todo_title").await;
         let thing_uuid = todo
             .thing_uuid
             .as_deref()
@@ -577,7 +587,7 @@ impl SdkTodoRuntime {
     }
 
     async fn remove_todo(&self, todo: &TodoItem) -> Result<bool> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock_for("remove_todo").await;
         let collection_uuid = todo
             .collection_uuid
             .as_deref()
@@ -603,6 +613,10 @@ impl SdkTodoRuntime {
             }
         }
         Ok(removed)
+    }
+
+    async fn lock_for(&self, operation: &'static str) -> SdkTodoLockGuard<'_> {
+        lock_sdk_todo_mutex(&self.lock, &self.lock_owner, operation).await
     }
 
     fn snapshot_locked(&self) -> Result<ThingsSnapshotState> {
@@ -654,7 +668,72 @@ impl SdkTodoRuntime {
     }
 }
 
-fn spawn_things_sync_task(sdk: Arc<TriggerSdk>, config: SdkTodoConfig, lock: Arc<Mutex<()>>) {
+struct SdkTodoLockGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+    owner: Arc<StdMutex<Option<String>>>,
+}
+
+impl Drop for SdkTodoLockGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = None;
+        }
+    }
+}
+
+async fn lock_sdk_todo_mutex<'a>(
+    lock: &'a Arc<Mutex<()>>,
+    owner: &Arc<StdMutex<Option<String>>>,
+    operation: &'static str,
+) -> SdkTodoLockGuard<'a> {
+    let owner_label = operation.to_string();
+    match lock.try_lock() {
+        Ok(guard) => {
+            if let Ok(mut owner) = owner.lock() {
+                *owner = Some(owner_label);
+            }
+            info!(operation, waited_ms = 0_u64, "sdk todo lock acquired");
+            return SdkTodoLockGuard {
+                _guard: guard,
+                owner: Arc::clone(owner),
+            };
+        }
+        Err(_) => {
+            let current_owner = owner
+                .lock()
+                .ok()
+                .and_then(|owner| owner.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            warn!(operation, current_owner, "sdk todo lock waiting");
+        }
+    }
+
+    let started = Instant::now();
+    let guard = lock.lock().await;
+    let waited = started.elapsed();
+    if let Ok(mut owner) = owner.lock() {
+        *owner = Some(owner_label);
+    }
+    if waited >= SDK_LOCK_WARN_AFTER {
+        warn!(
+            operation,
+            waited_ms = waited.as_millis() as u64,
+            "sdk todo lock waited"
+        );
+    } else {
+        info!(
+            operation,
+            waited_ms = waited.as_millis() as u64,
+            "sdk todo lock acquired"
+        );
+    }
+    SdkTodoLockGuard {
+        _guard: guard,
+        owner: Arc::clone(owner),
+    }
+}
+
+fn spawn_things_sync_task(sdk: Arc<TriggerSdk>, config: SdkTodoConfig) {
     tokio::spawn(async move {
         let mut rx = sdk.things_subscribe();
         loop {
@@ -681,13 +760,40 @@ fn spawn_things_sync_task(sdk: Arc<TriggerSdk>, config: SdkTodoConfig, lock: Arc
                 }
             }
 
-            let _guard = lock.lock().await;
-            if let Err(err) = sync_sdk_todos(&sdk, &config).await {
-                warn!(
-                    device_id = %config.device_id,
-                    error = %err,
-                    "sdk todo sync triggered by things event failed"
-                );
+            info!(
+                device_id = %config.device_id,
+                timeout_ms = SDK_SYNC_TIMEOUT.as_millis() as u64,
+                mode = ?ThingsSyncMode::Incremental,
+                "sdk todo background sync started"
+            );
+            match timeout(SDK_SYNC_TIMEOUT, sync_sdk_todos(&sdk, &config)).await {
+                Ok(Ok(output)) => {
+                    info!(
+                        device_id = %config.device_id,
+                        documents_synced = output.documents_synced,
+                        total_elapsed_ms = output.metrics.total_elapsed_ms,
+                        phase1_push_ms = output.metrics.phase1_push_ms,
+                        phase1_documents_synced = output.metrics.phase1_documents_synced,
+                        phase1_batch_calls = output.metrics.phase1_batch_calls,
+                        phase1_rpc_rounds = output.metrics.phase1_rpc_rounds,
+                        "sdk todo background sync completed"
+                    );
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        device_id = %config.device_id,
+                        error = %err,
+                        "sdk todo background sync triggered by things event failed"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        device_id = %config.device_id,
+                        timeout_ms = SDK_SYNC_TIMEOUT.as_millis() as u64,
+                        mode = ?ThingsSyncMode::Incremental,
+                        "sdk todo background sync triggered by things event timed out"
+                    );
+                }
             }
         }
     });
@@ -702,10 +808,18 @@ fn should_sync_on_things_event(event: &ThingsEvent) -> bool {
     )
 }
 
-async fn sync_sdk_todos(sdk: &TriggerSdk, config: &SdkTodoConfig) -> Result<()> {
+async fn sync_sdk_todos(
+    sdk: &TriggerSdk,
+    config: &SdkTodoConfig,
+) -> Result<remi_client_sdk::things_sync::ThingsV3SyncOutput> {
     let mut client = TriggerClient::new_with_shared_transport(String::new()).await?;
-    let _ = sync_v3_documents_with_server(sdk, &mut client, &config.device_id).await?;
-    Ok(())
+    sync_v3_documents_with_server_mode(
+        sdk,
+        &mut client,
+        &config.device_id,
+        ThingsSyncMode::Incremental,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

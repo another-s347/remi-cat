@@ -78,6 +78,36 @@ export type PrettyToolCall = {
   response?: string | null;
 };
 
+export type ToolRiskLevel = "low" | "medium" | "high";
+
+export type ToolApprovalDecision =
+  | "deny"
+  | "allow_once"
+  | "allow_session"
+  | "allow_session_model_auto";
+
+export type ToolRiskReview = {
+  risk: ToolRiskLevel;
+  reason: string;
+  concerns: string[];
+};
+
+export type ToolApprovalRequest = {
+  id: string;
+  session_id: string;
+  run_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  risk: ToolRiskLevel;
+  args_summary: string;
+  platform?: string | null;
+  review?: ToolRiskReview | null;
+};
+
+export type InputHistory = {
+  items: string[];
+};
+
 export type SecretEntry = {
   key: string;
 };
@@ -134,10 +164,24 @@ export const api = {
     json<ActiveRun | null>(`/api/v1/chat/sessions/${id}/runs/active`),
   todos: (id: string) =>
     json<TodoItem[]>(`/api/v1/chat/sessions/${id}/todos`),
+  inputHistory: (id: string) =>
+    json<InputHistory>(`/api/v1/chat/sessions/${id}/input-history`),
+  appendInputHistory: (id: string, text: string) =>
+    json<InputHistory>(`/api/v1/chat/sessions/${id}/input-history`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
   cancelSessionRun: (sessionId: string) =>
     fetch(`/api/v1/chat/sessions/${sessionId}/runs`, { method: "DELETE" }),
   cancelRun: (runId: string) =>
     fetch(`/api/v1/chat/runs/${runId}`, { method: "DELETE" }),
+  decideApproval: (id: string, decision: ToolApprovalDecision) =>
+    json<ToolApprovalRequest>(`/api/v1/chat/approvals/${id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision }),
+    }),
   listSecrets: () => json<SecretList>("/api/v1/secrets"),
   setSecret: (key: string, value: string) =>
     json<SecretList>("/api/v1/secrets", {

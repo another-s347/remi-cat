@@ -5,10 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use bot_core::{todo::TodoItem, CatEvent, Content, StreamOptions, ThreadHistoryMessage};
+use bot_core::{
+    todo::TodoItem, CatEvent, Content, StreamOptions, ThreadHistoryMessage, ToolApprovalDecision,
+    ToolApprovalRequest,
+};
 use futures::StreamExt;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::task::JoinHandle;
 
 use crate::{
     process_runtime_commands, Runtime, RuntimeCommandPipelineResult,
@@ -79,6 +83,11 @@ pub(crate) enum WebChatCommand {
         entries: HashMap<String, String>,
         response: oneshot::Sender<()>,
     },
+    DecideApproval {
+        approval_id: String,
+        decision: ToolApprovalDecision,
+        response: oneshot::Sender<Option<ToolApprovalRequest>>,
+    },
 }
 
 struct ActiveRun {
@@ -86,6 +95,7 @@ struct ActiveRun {
     text: String,
     started_at: String,
     cancel: Arc<Notify>,
+    handle: JoinHandle<()>,
     log: Rc<RefCell<Vec<ChatEventV1>>>,
     broadcast: broadcast::Sender<ChatEventV1>,
 }
@@ -264,6 +274,24 @@ impl WebChatHandle {
             .map_err(|_| anyhow::anyhow!("web chat runtime dropped secret redactor response"))?;
         Ok(())
     }
+
+    pub async fn decide_approval(
+        &self,
+        approval_id: String,
+        decision: ToolApprovalDecision,
+    ) -> anyhow::Result<Option<ToolApprovalRequest>> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::DecideApproval {
+                approval_id,
+                decision,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped approval response"))
+    }
 }
 
 pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChatCommand>) {
@@ -296,34 +324,51 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 let log = Rc::new(RefCell::new(Vec::new()));
                 let (events_tx, events_rx) = mpsc::channel(128);
                 let (broadcast_tx, _) = broadcast::channel(512);
+                let started_at = chrono::Utc::now().to_rfc3339();
+                let _ = response.send(Ok(WebRun { events: events_rx }));
+
+                let runtime = Rc::clone(&runtime);
+                let active_for_task = Rc::clone(&active);
+                let session_id_for_task = session_id.clone();
+                let run_id_for_task = run_id.clone();
+                let text_for_task = text.clone();
+                let log_for_task = Rc::clone(&log);
+                let broadcast_for_task = broadcast_tx.clone();
+                let cancel_for_task = Arc::clone(&cancel);
+                let handle = tokio::task::spawn_local(async move {
+                    let sink = WebRunEventSink {
+                        direct: events_tx,
+                        log: log_for_task,
+                        broadcast: broadcast_for_task,
+                    };
+                    run_turn(
+                        runtime,
+                        &session_id_for_task,
+                        &run_id_for_task,
+                        text_for_task,
+                        cancel_for_task,
+                        sink,
+                    )
+                    .await;
+                    active_for_task.borrow_mut().remove(&run_id_for_task);
+                });
                 active.borrow_mut().insert(
                     run_id.clone(),
                     ActiveRun {
                         session_id: session_id.clone(),
                         text: text.clone(),
-                        started_at: chrono::Utc::now().to_rfc3339(),
+                        started_at,
                         cancel: Arc::clone(&cancel),
+                        handle,
                         log: Rc::clone(&log),
                         broadcast: broadcast_tx.clone(),
                     },
                 );
-                let _ = response.send(Ok(WebRun { events: events_rx }));
-
-                let runtime = Rc::clone(&runtime);
-                let active = Rc::clone(&active);
-                tokio::task::spawn_local(async move {
-                    let sink = WebRunEventSink {
-                        direct: events_tx,
-                        log,
-                        broadcast: broadcast_tx,
-                    };
-                    run_turn(runtime, &session_id, &run_id, text, cancel, sink).await;
-                    active.borrow_mut().remove(&run_id);
-                });
             }
             WebChatCommand::Cancel { run_id, response } => {
-                let cancelled = active.borrow().get(&run_id).map(|run| {
+                let cancelled = active.borrow_mut().remove(&run_id).map(|run| {
                     run.cancel.notify_one();
+                    run.handle.abort();
                     true
                 });
                 let _ = response.send(cancelled.unwrap_or(false));
@@ -333,14 +378,18 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 response,
             } => {
                 let mut cancelled = false;
-                for (_, cancel) in active
+                let run_ids = active
                     .borrow()
-                    .values()
-                    .map(|run| (&run.session_id, &run.cancel))
-                    .filter(|(active_session, _)| *active_session == &session_id)
-                {
-                    cancel.notify_one();
-                    cancelled = true;
+                    .iter()
+                    .filter(|(_, run)| run.session_id == session_id)
+                    .map(|(run_id, _)| run_id.clone())
+                    .collect::<Vec<_>>();
+                for run_id in run_ids {
+                    if let Some(run) = active.borrow_mut().remove(&run_id) {
+                        run.cancel.notify_one();
+                        run.handle.abort();
+                        cancelled = true;
+                    }
                 }
                 let _ = response.send(cancelled);
             }
@@ -398,12 +447,17 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 session_id,
                 response,
             } => {
-                for run in active
+                let run_ids = active
                     .borrow()
-                    .values()
-                    .filter(|run| run.session_id == session_id)
-                {
-                    run.cancel.notify_one();
+                    .iter()
+                    .filter(|(_, run)| run.session_id == session_id)
+                    .map(|(run_id, _)| run_id.clone())
+                    .collect::<Vec<_>>();
+                for run_id in run_ids {
+                    if let Some(run) = active.borrow_mut().remove(&run_id) {
+                        run.cancel.notify_one();
+                        run.handle.abort();
+                    }
                 }
                 let result = runtime
                     .bot
@@ -428,6 +482,27 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
             WebChatCommand::UpdateSecretRedactor { entries, response } => {
                 runtime.bot.update_secret_redactor(&entries);
                 let _ = response.send(());
+            }
+            WebChatCommand::DecideApproval {
+                approval_id,
+                decision,
+                response,
+            } => {
+                let request = runtime
+                    .bot
+                    .approval_manager()
+                    .decide(&approval_id, decision)
+                    .await;
+                tracing::info!(
+                    approval_id = %approval_id,
+                    decision = ?decision,
+                    source = "web_chat",
+                    decided = request.is_some(),
+                    tool_name = request.as_ref().map(|request| request.tool_name.as_str()).unwrap_or(""),
+                    session_id = request.as_ref().map(|request| request.session_id.as_str()).unwrap_or(""),
+                    "tool_approval.decision"
+                );
+                let _ = response.send(request);
             }
         }
     }
@@ -832,13 +907,35 @@ async fn run_turn(
                     }),
                 ))
             }
-            CatEvent::SubSession(event) => Some((
-                "sub_session",
+            CatEvent::ToolApprovalRequested(request) => Some((
+                "approval_requested",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            )),
+            CatEvent::ToolApprovalUpdated(request) => Some((
+                "approval_updated",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            )),
+            CatEvent::ToolApprovalResolved { request, decision } => Some((
+                "approval_resolved",
                 serde_json::json!({
-                    "agent_name": event.agent_name,
-                    "thread_id": event.sub_thread_id.0,
+                    "request": request,
+                    "decision": decision,
                 }),
             )),
+            CatEvent::SubSession(event) => Some(("sub_session", {
+                let mut value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(event.sub_thread_id.0.clone()),
+                    );
+                    map.insert(
+                        "run_id".to_string(),
+                        serde_json::Value::String(event.sub_run_id.0.clone()),
+                    );
+                }
+                value
+            })),
             CatEvent::SupervisorProgress(progress) => Some((
                 "supervisor_progress",
                 serde_json::to_value(progress).unwrap_or(serde_json::Value::Null),

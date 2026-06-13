@@ -12,6 +12,8 @@ use remi_agentloop::prelude::{
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -454,7 +456,7 @@ impl Tool for FetchTool {
                 },
                 "overwrite": {
                     "type": "boolean",
-                    "description": "Overwrite the destination if it already exists. Defaults to false."
+                    "description": "Deprecated. Fetch never overwrites existing files; passing true returns an error."
                 },
                 "raw": {
                     "type": "boolean",
@@ -519,6 +521,10 @@ impl Tool for FetchTool {
                 let explicit_file_type = string_arg(&arguments, "file_type");
                 let raw = arguments["raw"].as_bool().unwrap_or(false);
                 let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+                if overwrite {
+                    yield ToolOutput::text("error: fetch does not support overwriting existing files");
+                    return;
+                }
 
                 let source = match select_fetch_source(
                     requested_file_key,
@@ -798,7 +804,6 @@ async fn choose_fetch_target(
     root: &Path,
     requested_path: Option<&str>,
     suggested_name: &str,
-    overwrite: bool,
 ) -> anyhow::Result<PathBuf> {
     let desired = match requested_path {
         Some(path) if !path.trim().is_empty() => rooted_path(root, path),
@@ -808,7 +813,7 @@ async fn choose_fetch_target(
         ),
     };
 
-    if overwrite || tokio::fs::metadata(&desired).await.is_err() {
+    if tokio::fs::metadata(&desired).await.is_err() {
         return Ok(desired);
     }
 
@@ -927,7 +932,7 @@ async fn run_fetch_task(
     metadata: Option<serde_json::Value>,
     source: FetchSource,
     requested_path: Option<String>,
-    overwrite: bool,
+    _overwrite: bool,
     explicit_file_type: Option<String>,
     raw: bool,
     progress: FetchProgressReporter,
@@ -947,7 +952,6 @@ async fn run_fetch_task(
             &root,
             requested_path.as_deref(),
             &completion.fetched.file_name,
-            overwrite,
         )
         .await?;
 
@@ -956,7 +960,13 @@ async fn run_fetch_task(
                 .await
                 .context("create parent directory")?;
         }
-        tokio::fs::write(&target, &completion.fetched.content)
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+            .with_context(|| format!("create fetched file {}", target.display()))?;
+        file.write_all(&completion.fetched.content)
             .await
             .context("write fetched file")?;
 
@@ -1591,6 +1601,89 @@ mod tests {
             String::from_utf8(fetched.content).expect("raw HTML should decode"),
             body
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_overwrite_requests() {
+        let root = std::env::temp_dir().join(format!("remi-fetch-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        let tool = FetchTool {
+            root: root.clone(),
+            bridge: None,
+            tasks: FetchTaskRegistry::new(),
+        };
+        let url = serve_once("new", "text/plain", "/note.txt").await;
+        let output = collect_tool_output(
+            <FetchTool as remi_agentloop::prelude::Tool>::execute(
+                &tool,
+                serde_json::json!({
+                    "url": url,
+                    "path": "note.txt",
+                    "overwrite": true
+                }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fetch should return tool output"),
+        )
+        .await;
+
+        assert!(output.contains("does not support overwriting"), "{output}");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_never_overwrites_existing_target() {
+        let root = std::env::temp_dir().join(format!("remi-fetch-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "existing")
+            .await
+            .expect("existing fixture should be written");
+        let tool = FetchTool {
+            root: root.clone(),
+            bridge: None,
+            tasks: FetchTaskRegistry::new(),
+        };
+        let url = serve_once("new", "text/plain", "/note.txt").await;
+        let output = collect_tool_output(
+            <FetchTool as remi_agentloop::prelude::Tool>::execute(
+                &tool,
+                serde_json::json!({
+                    "url": url,
+                    "path": "note.txt"
+                }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fetch should return tool output"),
+        )
+        .await;
+        let completed: serde_json::Value =
+            serde_json::from_str(&output).expect("fetch output should be valid json");
+        let workspace_path = completed["workspace_path"]
+            .as_str()
+            .expect("workspace_path should be present");
+
+        assert_ne!(workspace_path, "note.txt");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("note.txt"))
+                .await
+                .unwrap(),
+            "existing"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(workspace_path))
+                .await
+                .unwrap(),
+            "new"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]

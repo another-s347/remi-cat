@@ -1,6 +1,7 @@
 use remi_agentloop::prelude::{AgentError, Message};
 use remi_agentloop::types::SubSessionEvent;
 
+use crate::approval::{ToolApprovalDecision, ToolApprovalRequest};
 use crate::supervisor_workflow::{SupervisorTraceEvent, WorkflowReport};
 
 // ── Skill events ─────────────────────────────────────────────────────────────
@@ -71,6 +72,15 @@ pub enum CatEvent {
         id: String,
         name: String,
         args: serde_json::Value,
+    },
+    /// A risky tool call is waiting for approval.
+    ToolApprovalRequested(ToolApprovalRequest),
+    /// A tool approval request was updated, for example after risk review.
+    ToolApprovalUpdated(ToolApprovalRequest),
+    /// A tool approval request was resolved by a user or policy.
+    ToolApprovalResolved {
+        request: ToolApprovalRequest,
+        decision: ToolApprovalDecision,
     },
     /// A tool returned its result.
     ToolCallResult {

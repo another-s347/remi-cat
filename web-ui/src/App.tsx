@@ -38,6 +38,8 @@ import {
   type PrettyToolCall,
   type SecretList,
   type Session,
+  type ToolApprovalDecision,
+  type ToolApprovalRequest,
   type TodoItem,
 } from "./api";
 import { CHAT_COMMANDS, commandSuggestions, type ChatCommand } from "./commands";
@@ -246,6 +248,65 @@ function PatchDiffViewer({ patch }: { patch: string }) {
   );
 }
 
+function ApprovalPart({ args, result }: ToolCallMessagePartProps) {
+  const payload = (result ?? args) as {
+    request?: ToolApprovalRequest;
+    decision?: ToolApprovalDecision;
+  };
+  const request = payload.request;
+  const [pending, setPending] = useState<ToolApprovalDecision | null>(null);
+  if (!request) return null;
+  const decision = payload.decision;
+  const disabled = Boolean(decision || pending);
+  const review = request.review;
+  const submit = async (next: ToolApprovalDecision) => {
+    setPending(next);
+    try {
+      await api.decideApproval(request.id, next);
+    } catch {
+      setPending(null);
+    }
+  };
+  return (
+    <section className={`approval-card risk-${review?.risk ?? request.risk}`}>
+      <header>
+        <Wrench size={15} />
+        <strong>Tool approval</strong>
+        <span>{request.tool_name}</span>
+        <small>{review?.risk ?? request.risk}</small>
+      </header>
+      <p>{review?.reason ?? "This tool needs approval before it can run."}</p>
+      {review?.concerns?.length ? (
+        <ul>
+          {review.concerns.map((concern) => <li key={concern}>{concern}</li>)}
+        </ul>
+      ) : null}
+      <details>
+        <summary>参数摘要</summary>
+        <pre>{request.args_summary}</pre>
+      </details>
+      {decision ? (
+        <div className="approval-status">Decision: {decision.replaceAll("_", " ")}</div>
+      ) : (
+        <div className="approval-actions">
+          <button type="button" disabled={disabled} onClick={() => submit("allow_once")}>
+            Allow once
+          </button>
+          <button type="button" disabled={disabled} onClick={() => submit("allow_session")}>
+            Allow session
+          </button>
+          <button type="button" disabled={disabled} onClick={() => submit("allow_session_model_auto")}>
+            Model auto
+          </button>
+          <button type="button" disabled={disabled} className="danger" onClick={() => submit("deny")}>
+            Deny
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ToolPart({ toolName, args, argsText, result, status }: ToolCallMessagePartProps) {
   const pretty = prettyFromPart(args, result);
   if (pretty) {
@@ -319,6 +380,28 @@ type SupervisorReport = {
   round?: number;
 };
 
+type SubSessionEvent = {
+  sub_type?: string;
+  agent_name?: string;
+  title?: string | null;
+  id?: string;
+  name?: string;
+  content?: string;
+  delta?: string;
+  result?: string;
+  final_output?: string | null;
+  message?: string;
+  turn?: number;
+};
+
+type SubSessionArgs = {
+  agentName?: string;
+  title?: string | null;
+  threadId?: string;
+  runId?: string;
+  events?: SubSessionEvent[];
+};
+
 function SupervisorPart({ args, result, status }: ToolCallMessagePartProps) {
   const events = ((args as { events?: SupervisorEvent[] }).events ?? []);
   const report = result as SupervisorReport | undefined;
@@ -349,6 +432,66 @@ function SupervisorPart({ args, result, status }: ToolCallMessagePartProps) {
             <p>{report.reason}</p>
           </div>
         )}
+      </div>
+    </details>
+  );
+}
+
+function subSessionLabel(event: SubSessionEvent) {
+  const type = event.sub_type ?? "event";
+  switch (type) {
+    case "start":
+      return "start";
+    case "delta":
+      return "output";
+    case "thinking_start":
+      return "thinking";
+    case "thinking_end":
+      return "thinking done";
+    case "tool_call_start":
+      return `tool ${event.name ?? ""}`.trim();
+    case "tool_call_arguments_delta":
+      return "tool args";
+    case "tool_delta":
+      return `tool ${event.name ?? ""}`.trim();
+    case "tool_result":
+      return `tool result ${event.name ?? ""}`.trim();
+    case "turn_start":
+      return `turn ${event.turn ?? ""}`.trim();
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    default:
+      return type.replaceAll("_", " ");
+  }
+}
+
+function SubSessionPart({ args, result, status }: ToolCallMessagePartProps) {
+  const payload = args as SubSessionArgs;
+  const events = payload.events ?? [];
+  const final = result as SubSessionEvent | undefined;
+  const title = payload.title || payload.agentName || "Sub-agent";
+  const state = final?.sub_type === "error" ? "failed" : final ? "done" : "running";
+  return (
+    <details className={`supervisor sub-session ${state}`} open={status.type === "running" || !final}>
+      <summary>
+        <Bot size={15} />
+        <span>{title}</span>
+        <small>{payload.threadId ? String(payload.threadId).slice(0, 8) : state}</small>
+      </summary>
+      <div className="supervisor-body">
+        {events.map((event, index) => (
+          <div className={`supervisor-event ${event.sub_type ?? "event"}`} key={index}>
+            <strong>{subSessionLabel(event)}</strong>
+            {event.id && <code>{event.id}</code>}
+            {event.content && <pre>{event.content}</pre>}
+            {event.delta && <pre>{event.delta}</pre>}
+            {event.result !== undefined && <pre>{event.result}</pre>}
+            {event.final_output && <pre>{event.final_output}</pre>}
+            {event.message && <pre>{event.message}</pre>}
+          </div>
+        ))}
       </div>
     </details>
   );
@@ -392,6 +535,8 @@ const partComponents = {
   tools: {
     by_name: {
       __remi_supervisor: SupervisorPart,
+      __remi_sub_session: SubSessionPart,
+      __remi_approval: ApprovalPart,
     },
     Fallback: ToolPart,
   },
@@ -425,13 +570,16 @@ function AssistantMessage() {
   );
 }
 
-function CommandComposer() {
+function CommandComposer({ sessionId }: { sessionId: string }) {
   const composer = useComposerRuntime();
   const text = useComposer((state) => state.text);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const draftBeforeHistoryRef = useRef("");
   const [commandCatalog, setCommandCatalog] = useState<ChatCommand[]>(CHAT_COMMANDS);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [dismissedText, setDismissedText] = useState<string>();
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const suggestions = useMemo(
     () => (dismissedText === text ? [] : commandSuggestions(text, commandCatalog).slice(0, 8)),
     [commandCatalog, dismissedText, text],
@@ -453,46 +601,95 @@ function CommandComposer() {
     setSelectedIndex(0);
   }, [text]);
 
+  useEffect(() => {
+    let cancelled = false;
+    api.inputHistory(sessionId)
+      .then((history) => {
+        if (!cancelled) setInputHistory(history.items);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
   const complete = useCallback(
     (index: number) => {
       const command = suggestions[index];
       if (!command) return;
       composer.setText(command.value);
+      setHistoryIndex(null);
       setDismissedText(undefined);
       requestAnimationFrame(() => inputRef.current?.focus());
     },
     [composer, suggestions],
   );
 
+  const rememberInput = useCallback((value: string) => {
+    const normalized = value.trim();
+    if (!normalized) return;
+    setInputHistory((history) => {
+      const updated = history.at(-1) === normalized ? history : [...history, normalized];
+      return updated.slice(-100);
+    });
+    setHistoryIndex(null);
+    draftBeforeHistoryRef.current = "";
+    void api.appendInputHistory(sessionId, normalized)
+      .then((history) => setInputHistory(history.items))
+      .catch(() => undefined);
+  }, [sessionId]);
+
+  const recallInputHistory = useCallback(
+    (direction: -1 | 1) => {
+      if (inputHistory.length === 0) return;
+      const current = historyIndex ?? inputHistory.length;
+      if (historyIndex === null) {
+        draftBeforeHistoryRef.current = text;
+      }
+      const next = direction < 0
+        ? Math.max(0, current - 1)
+        : Math.min(inputHistory.length, current + 1);
+      setHistoryIndex(next < inputHistory.length ? next : null);
+      composer.setText(next < inputHistory.length ? inputHistory[next] : draftBeforeHistoryRef.current);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [composer, historyIndex, inputHistory, text],
+  );
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (!suggestions.length) return;
-    if (event.key === "ArrowDown") {
+    if (event.altKey && event.key === "ArrowUp") {
       event.preventDefault();
-      setSelectedIndex((index) => (index + 1) % suggestions.length);
+      recallInputHistory(-1);
       return;
     }
-    if (event.key === "ArrowUp") {
+    if (event.altKey && event.key === "ArrowDown") {
       event.preventDefault();
-      setSelectedIndex((index) => (index - 1 + suggestions.length) % suggestions.length);
+      recallInputHistory(1);
       return;
     }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      setDismissedText(text);
-      return;
-    }
-    if (event.key === "Tab") {
-      event.preventDefault();
-      complete(selectedIndex);
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey) {
-      const selected = suggestions[selectedIndex];
-      if (selected && (selected.acceptsArguments || text.trim() !== selected.value.trim())) {
+    if (suggestions.length > 0) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setDismissedText(text);
+        return;
+      }
+      if (event.key === "Tab") {
         event.preventDefault();
         complete(selectedIndex);
+        return;
       }
+      if (event.key === "Enter" && !event.shiftKey) {
+        const selected = suggestions[selectedIndex];
+        if (selected && (selected.acceptsArguments || text.trim() !== selected.value.trim())) {
+          event.preventDefault();
+          complete(selectedIndex);
+          return;
+        }
+      }
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      rememberInput(text);
     }
   };
 
@@ -526,14 +723,18 @@ function CommandComposer() {
           rows={1}
           onKeyDown={handleKeyDown}
         />
-        <ComposerPrimitive.Send className="icon-button primary" aria-label="发送"><Send size={18} /></ComposerPrimitive.Send>
+        <ComposerPrimitive.Send
+          className="icon-button primary"
+          aria-label="发送"
+          onMouseDown={() => rememberInput(text)}
+        ><Send size={18} /></ComposerPrimitive.Send>
         <ComposerPrimitive.Cancel className="icon-button danger" aria-label="停止"><Square size={16} /></ComposerPrimitive.Cancel>
       </ComposerPrimitive.Root>
     </div>
   );
 }
 
-function ChatThread({ todos, stats }: { todos: TodoItem[]; stats?: DebugStats }) {
+function ChatThread({ sessionId, todos, stats }: { sessionId: string; todos: TodoItem[]; stats?: DebugStats }) {
   return (
     <ThreadPrimitive.Root className="thread">
       <ThreadPrimitive.Viewport className="viewport">
@@ -546,7 +747,7 @@ function ChatThread({ todos, stats }: { todos: TodoItem[]; stats?: DebugStats })
             <ActiveTodoPanel items={todos} />
             <DebugPanel stats={stats} />
           </div>
-          <CommandComposer />
+          <CommandComposer sessionId={sessionId} />
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
@@ -836,7 +1037,7 @@ export default function App() {
               void refreshTodos();
             }}
           >
-            <ChatThread todos={todos} stats={stats} />
+            <ChatThread sessionId={activeId} todos={todos} stats={stats} />
           </RemiRuntimeProvider>
         )}
       </main>

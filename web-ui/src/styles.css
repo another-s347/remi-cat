@@ -80,6 +80,23 @@ header { height: 62px; border-bottom: 1px solid #222722; display: flex; align-it
 .patch-line.remove { background: rgba(239, 68, 68, .13); color: #fecaca; }
 .patch-line.meta { background: #111711; color: #9ca3af; }
 .patch-line.context { color: #c8d0c6; }
+.approval-card { border: 1px solid #4a4030; border-radius: 9px; margin: 10px 0; padding: 10px; background: #151411; color: #d9dfd7; }
+.approval-card.risk-high { border-color: #6a3330; }
+.approval-card.risk-medium { border-color: #5b4a2b; }
+.approval-card header { display: flex; align-items: center; gap: 8px; height: auto; padding: 0; color: #f5d38a; }
+.approval-card header span { color: #e8ebe6; font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.approval-card header small { margin-left: auto; color: #a99873; text-transform: uppercase; }
+.approval-card p { margin: 8px 0; color: #d9dfd7; }
+.approval-card ul { margin: 6px 0 8px; padding-left: 20px; color: #bfc7bd; }
+.approval-card details { margin-top: 8px; }
+.approval-card summary { cursor: pointer; color: #a99873; font-size: 12px; }
+.approval-card pre { max-height: 260px; white-space: pre-wrap; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.approval-actions button { border: 1px solid #4d584d; border-radius: 8px; padding: 7px 10px; background: #202620; color: #edf0eb; cursor: pointer; }
+.approval-actions button:hover:not(:disabled) { border-color: #d8ff73; }
+.approval-actions button.danger { border-color: #663836; color: #ffb4ae; }
+.approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
+.approval-status { margin-top: 10px; color: #aeb7ad; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .supervisor, .debug { border: 1px solid #354036; border-radius: 10px; margin: 12px 0; background: #121612; color: #aeb7ad; }
 .supervisor summary, .debug summary { cursor: pointer; display: flex; align-items: center; gap: 7px; padding: 9px 11px; color: #d8ff73; }
 .supervisor summary small, .debug summary small { margin-left: auto; color: #7f8a7f; font-size: 11px; }

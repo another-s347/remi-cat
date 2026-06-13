@@ -138,6 +138,14 @@ impl SessionRuntime {
             .map(ToOwned::to_owned)
     }
 
+    pub fn metadata_value(&self, session_id: &str, key: &str) -> Option<serde_json::Value> {
+        self.store
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.metadata.get(key))
+            .cloned()
+    }
+
     pub fn set_metadata_bool(&mut self, session_id: &str, key: &str, value: bool) -> Result<bool> {
         let Some(session) = self.store.sessions.get_mut(session_id) else {
             return Ok(false);
@@ -163,6 +171,21 @@ impl SessionRuntime {
             key.to_string(),
             serde_json::Value::String(value.to_string()),
         );
+        session.updated_at = Utc::now().to_rfc3339();
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn set_metadata_value(
+        &mut self,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<bool> {
+        let Some(session) = self.store.sessions.get_mut(session_id) else {
+            return Ok(false);
+        };
+        session.metadata.insert(key.to_string(), value);
         session.updated_at = Utc::now().to_rfc3339();
         self.save()?;
         Ok(true)
@@ -681,6 +704,32 @@ mod tests {
         assert_eq!(
             runtime.metadata_string(&session_id, "model_profile_id"),
             None
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stores_json_metadata() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let session_id = runtime
+            .resolve_channel("web", "local-dev", "default")
+            .unwrap();
+
+        let value = serde_json::json!(["first", "second"]);
+        assert!(runtime
+            .set_metadata_value(&session_id, "input_history", value.clone())
+            .unwrap());
+        assert_eq!(
+            runtime.metadata_value(&session_id, "input_history"),
+            Some(value)
+        );
+
+        let runtime = SessionRuntime::load(&dir).unwrap();
+        assert_eq!(
+            runtime.metadata_value(&session_id, "input_history"),
+            Some(serde_json::json!(["first", "second"]))
         );
 
         let _ = std::fs::remove_dir_all(dir);

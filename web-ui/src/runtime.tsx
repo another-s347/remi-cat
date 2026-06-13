@@ -14,6 +14,8 @@ import {
   type HistoryMessage,
   type PrettyToolCall,
   type Session,
+  type ToolApprovalDecision,
+  type ToolApprovalRequest,
   type TodoItem,
 } from "./api";
 
@@ -106,6 +108,42 @@ function parseToolArguments(value: string) {
   }
 }
 
+function approvalToolCallId(request: ToolApprovalRequest) {
+  return `approval-${request.id}`;
+}
+
+function upsertApprovalPart(
+  parts: ThreadAssistantMessagePart[],
+  indexes: Map<string, number>,
+  request: ToolApprovalRequest,
+  decision?: ToolApprovalDecision,
+) {
+  const toolCallId = approvalToolCallId(request);
+  const payload = { request, decision };
+  const index = indexes.get(toolCallId);
+  if (index !== undefined) {
+    const part = parts[index];
+    if (part?.type === "tool-call") {
+      parts[index] = {
+        ...part,
+        args: payload as never,
+        argsText: "",
+        result: decision ? payload : undefined,
+      };
+    }
+    return;
+  }
+  indexes.set(toolCallId, parts.length);
+  parts.push({
+    type: "tool-call",
+    toolCallId,
+    toolName: "__remi_approval",
+    args: payload as never,
+    argsText: "",
+    result: decision ? payload : undefined,
+  });
+}
+
 type ProviderProps = PropsWithChildren<{
   sessionId: string;
   history: HistoryMessage[];
@@ -189,6 +227,79 @@ function applySupervisorReport(
   return index;
 }
 
+function subSessionKey(data: Record<string, unknown>, fallback: string) {
+  const threadId = String(data.sub_thread_id ?? data.thread_id ?? "");
+  const runId = String(data.sub_run_id ?? data.run_id ?? "");
+  return threadId || runId ? `${threadId}:${runId}` : fallback;
+}
+
+function appendSubSessionEvent(
+  parts: ThreadAssistantMessagePart[],
+  indexes: Map<string, number>,
+  runId: string,
+  sequence: number,
+  data: Record<string, unknown>,
+) {
+  const key = subSessionKey(data, `${runId}-sub-session-${sequence}`);
+  const toolCallId = `${runId}-sub-session-${key}`;
+  let index = indexes.get(toolCallId);
+  if (index === undefined) {
+    index = parts.length;
+    indexes.set(toolCallId, index);
+    parts.push({
+      type: "tool-call",
+      toolCallId,
+      toolName: "__remi_sub_session",
+      args: {
+        agentName: data.agent_name,
+        title: data.title,
+        threadId: data.sub_thread_id ?? data.thread_id,
+        runId: data.sub_run_id ?? data.run_id,
+        events: [],
+      } as never,
+      argsText: "",
+    });
+  }
+
+  const part = parts[index];
+  if (part?.type !== "tool-call") return;
+  const args = part.args as {
+    agentName?: unknown;
+    title?: unknown;
+    threadId?: unknown;
+    runId?: unknown;
+    events?: Record<string, unknown>[];
+  };
+  const events = [...(args.events ?? [])];
+  const subType = String(data.sub_type ?? "");
+  if (subType === "delta") {
+    const text = String(data.content ?? "");
+    const last = events.at(-1);
+    if (last && String(last.sub_type ?? "") === "delta") {
+      events[events.length - 1] = {
+        ...last,
+        content: String(last.content ?? "") + text,
+      };
+    } else {
+      events.push({ ...data, content: text });
+    }
+  } else {
+    events.push(data);
+  }
+
+  parts[index] = {
+    ...part,
+    args: {
+      agentName: data.agent_name ?? args.agentName,
+      title: data.title ?? args.title,
+      threadId: data.sub_thread_id ?? data.thread_id ?? args.threadId,
+      runId: data.sub_run_id ?? data.run_id ?? args.runId,
+      events,
+    } as never,
+    result: subType === "done" || subType === "error" ? data : part.result,
+  };
+}
+
 export function RemiRuntimeProvider({
   sessionId,
   history,
@@ -251,6 +362,7 @@ export function RemiRuntimeProvider({
     const runningToolIds = new Set<string>();
     let ticker: number | undefined;
     let supervisorIndex: number | undefined;
+    const subSessionIndexes = new Map<string, number>();
     const updateAssistant = (status: ThreadMessageLike["status"]) => {
       setMessages((current) =>
         current.map((item) =>
@@ -362,12 +474,34 @@ export function RemiRuntimeProvider({
               }
               break;
             }
+            case "approval_requested":
+            case "approval_updated": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data as unknown as ToolApprovalRequest,
+              );
+              break;
+            }
+            case "approval_resolved": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data.request as ToolApprovalRequest,
+                data.decision as ToolApprovalDecision,
+              );
+              break;
+            }
             case "supervisor_progress": {
               supervisorIndex = appendSupervisorProgress(parts, supervisorIndex, runId, data);
               break;
             }
             case "supervisor_report": {
               supervisorIndex = applySupervisorReport(parts, supervisorIndex, runId, data);
+              break;
+            }
+            case "sub_session": {
+              appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
               break;
             }
             case "stats":
@@ -440,6 +574,7 @@ export function RemiRuntimeProvider({
       const runningToolIds = new Set<string>();
       let ticker: number | undefined;
       let supervisorIndex: number | undefined;
+      const subSessionIndexes = new Map<string, number>();
       const updateAssistant = (status: ThreadMessageLike["status"]) => {
         setMessages((current) =>
           current.map((item) =>
@@ -467,6 +602,7 @@ export function RemiRuntimeProvider({
       };
 
       try {
+        void api.appendInputHistory(sessionId, contentText(message.content)).catch(() => undefined);
         for await (const event of streamRun(
           sessionId,
           runId,
@@ -555,12 +691,34 @@ export function RemiRuntimeProvider({
               }
               break;
             }
+            case "approval_requested":
+            case "approval_updated": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data as unknown as ToolApprovalRequest,
+              );
+              break;
+            }
+            case "approval_resolved": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data.request as ToolApprovalRequest,
+                data.decision as ToolApprovalDecision,
+              );
+              break;
+            }
             case "supervisor_progress": {
               supervisorIndex = appendSupervisorProgress(parts, supervisorIndex, runId, data);
               break;
             }
             case "supervisor_report": {
               supervisorIndex = applySupervisorReport(parts, supervisorIndex, runId, data);
+              break;
+            }
+            case "sub_session": {
+              appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
               break;
             }
             case "stats": {
