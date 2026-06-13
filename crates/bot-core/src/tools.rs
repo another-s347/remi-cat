@@ -21,10 +21,14 @@ use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentError, Content, ContentPart, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::sandbox::{Sandbox, SandboxBashOutput, SandboxBashStatus};
 
 pub const DEFAULT_FS_READ_LENGTH: usize = 32 * 1024;
+
+const FS_READ_LAST_STATE_KEY: &str = "__fs_read_last";
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
@@ -578,6 +582,61 @@ fn format_command_output(output: std::process::Output) -> String {
 
 // ── RootedFsReadTool ──────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FsReadLastRecord {
+    path: String,
+    start: usize,
+    end: usize,
+    requested_length: usize,
+    total_bytes: usize,
+    metadata_len: u64,
+    modified_ms: Option<u64>,
+}
+
+fn fs_read_duplicate_warning(
+    user_state: &Arc<RwLock<Value>>,
+    record: FsReadLastRecord,
+) -> Option<String> {
+    let mut state = user_state.write().unwrap();
+    if !state.is_object() {
+        *state = serde_json::json!({});
+    }
+
+    let previous = state
+        .get(FS_READ_LAST_STATE_KEY)
+        .and_then(|value| serde_json::from_value::<FsReadLastRecord>(value.clone()).ok());
+
+    let warning = previous.and_then(|previous| {
+        let same_file_version = previous.path == record.path
+            && previous.total_bytes == record.total_bytes
+            && previous.metadata_len == record.metadata_len
+            && previous.modified_ms == record.modified_ms;
+        let same_range = previous.start == record.start && previous.end == record.end;
+        if !same_file_version || !same_range {
+            return None;
+        }
+
+        let mut warning = format!(
+            "warning: this fs_read request repeats a range already read in this session, and the file appears unchanged (path={}, offset={}, length={}).",
+            record.path,
+            record.start,
+            record.end.saturating_sub(record.start)
+        );
+        if record.end < record.total_bytes {
+            warning.push_str(&format!(" Continue with offset={} to read the next unread chunk.", record.end));
+        }
+        Some(warning)
+    });
+
+    if let Some(object) = state.as_object_mut() {
+        if let Ok(value) = serde_json::to_value(record) {
+            object.insert(FS_READ_LAST_STATE_KEY.to_string(), value);
+        }
+    }
+
+    warning
+}
+
 pub struct RootedFsReadTool {
     pub sandbox: Arc<dyn Sandbox>,
     pub redactor: SharedRedactor,
@@ -611,11 +670,12 @@ impl Tool for RootedFsReadTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
+        let user_state = Arc::clone(&ctx.user_state);
         async move {
             let path_str = arguments["path"]
                 .as_str()
@@ -649,6 +709,18 @@ impl Tool for RootedFsReadTool {
                     }
                     Ok(bytes) => {
                         let total = bytes.len();
+                        let metadata = match sandbox.metadata(&path_str).await {
+                            Ok(metadata) => Some(metadata),
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path_str,
+                                    sandbox_kind = %sandbox.kind(),
+                                    error = %e,
+                                    "fs_read.metadata.failed"
+                                );
+                                None
+                            }
+                        };
                         if let Some(mime_type) = detect_inline_image_media_type(&path_str, &bytes) {
                             tracing::info!(
                                 path = %path_str,
@@ -676,6 +748,20 @@ impl Tool for RootedFsReadTool {
 
                         let start = offset.min(total);
                         let end   = (start + length).min(total);
+                        let duplicate_warning = metadata.as_ref().and_then(|metadata| {
+                            fs_read_duplicate_warning(
+                                &user_state,
+                                FsReadLastRecord {
+                                    path: path_str.clone(),
+                                    start,
+                                    end,
+                                    requested_length: length,
+                                    total_bytes: total,
+                                    metadata_len: metadata.len,
+                                    modified_ms: metadata.modified_ms,
+                                },
+                            )
+                        });
                         let text  = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                         let remaining = total.saturating_sub(end);
                         tracing::info!(
@@ -691,6 +777,9 @@ impl Tool for RootedFsReadTool {
                         );
                         let text = redactor.read().unwrap().redact(&text);
                         let mut r = text;
+                        if let Some(warning) = duplicate_warning {
+                            r = format!("{warning}\n\n{r}");
+                        }
                         r.push_str(&format!("\n[offset={start} length={} total_bytes={total} remaining={remaining}]", end - start));
                         if remaining > 0 {
                             r.push_str(&format!("\n[{remaining} bytes remaining — call fs_read again with offset={end}]"));
@@ -1985,6 +2074,163 @@ mod tests {
         let text = content.text_content();
         assert!(text.contains("world"));
         assert!(text.contains("[offset=6 length=5 total_bytes=11 remaining=0]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_warns_when_repeating_same_range_unchanged() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "hello world")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let first = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 0, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("first fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(!first.contains("repeats a range"));
+
+        let second = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 0, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("second fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(second.contains("repeats a range already read"));
+        assert!(second.contains("Continue with offset=5"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn fs_read_different_range_clears_previous_duplicate_marker() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "hello world")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let _ = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 0, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("first fs_read should succeed"),
+        )
+        .await;
+
+        let next = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 6, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("next fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(!next.contains("repeats a range"));
+        assert!(next.contains("world"));
+
+        let repeated_next = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 6, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("repeated fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(repeated_next.contains("repeats a range already read"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn fs_read_same_range_after_mtime_change_does_not_warn() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        let path = root.join("note.txt");
+        tokio::fs::write(&path, "hello world")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let _ = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 0, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("first fs_read should succeed"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::write(&path, "HELLO world")
+            .await
+            .expect("text fixture should be rewritten");
+
+        let after_change = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "offset": 0, "length": 5 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("second fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(!after_change.contains("repeats a range"));
+        assert!(after_change.contains("HELLO"));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]

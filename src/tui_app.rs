@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +35,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::session::Session;
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
+use crate::workspace_files::{
+    default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
+};
 use crate::{
     process_runtime_commands, CliConfig, Runtime, RuntimeCommandPipelineResult,
     SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
@@ -49,6 +55,8 @@ const HISTORY_GUTTER_WIDTH: u16 = 4;
 const MAX_TOOL_BODY_CHARS: usize = 240;
 const MAX_HISTORY_BODY_LINES: usize = 220;
 const QUIT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
+const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
+const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -340,15 +348,588 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputSegment {
+    Text(String),
+    Paste { text: String, label: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ComposerCursor {
+    segment: usize,
+    offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMentionToken {
+    start: usize,
+    end: usize,
+    query: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComposerInput {
+    segments: Vec<InputSegment>,
+    cursor: ComposerCursor,
+}
+
+impl ComposerInput {
+    fn is_empty(&self) -> bool {
+        self.segments.iter().all(|segment| match segment {
+            InputSegment::Text(text) => text.is_empty(),
+            InputSegment::Paste { .. } => false,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.segments.clear();
+        self.cursor = ComposerCursor::default();
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.segments = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![InputSegment::Text(text)]
+        };
+        self.cursor = self.end_cursor();
+    }
+
+    fn to_text(&self) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            match segment {
+                InputSegment::Text(value) => text.push_str(value),
+                InputSegment::Paste { text: value, .. } => text.push_str(value),
+            }
+        }
+        text
+    }
+
+    fn command_text(&self) -> Option<&str> {
+        if self.segments.len() != 1 {
+            return None;
+        }
+        match &self.segments[0] {
+            InputSegment::Text(text) => Some(text),
+            InputSegment::Paste { .. } => None,
+        }
+    }
+
+    fn active_file_mention_token(&self) -> Option<FileMentionToken> {
+        let text = self.to_text();
+        let cursor = self.text_byte_for_cursor(self.cursor).min(text.len());
+        active_file_mention_token(&text, cursor)
+    }
+
+    fn replace_text_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let start_cursor = self.cursor_from_text_byte(start.min(self.to_text().len()));
+        let end_cursor = self.cursor_from_text_byte(end.min(self.to_text().len()));
+        self.delete_range(start_cursor, end_cursor);
+        self.cursor = start_cursor;
+        self.insert_text(replacement);
+    }
+
+    fn display_text(&self) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            match segment {
+                InputSegment::Text(value) => text.push_str(value),
+                InputSegment::Paste { label, .. } => text.push_str(label),
+            }
+        }
+        text
+    }
+
+    fn display_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+        for segment in &self.segments {
+            match segment {
+                InputSegment::Text(text) => {
+                    for (index, part) in text.split('\n').enumerate() {
+                        if index > 0 {
+                            lines.push(Vec::new());
+                        }
+                        if !part.is_empty() {
+                            lines
+                                .last_mut()
+                                .expect("composer line exists")
+                                .push(Span::styled(
+                                    part.to_string(),
+                                    Style::default().fg(Color::White),
+                                ));
+                        }
+                    }
+                }
+                InputSegment::Paste { label, .. } => {
+                    lines
+                        .last_mut()
+                        .expect("composer line exists")
+                        .push(Span::styled(
+                            label.clone(),
+                            Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD),
+                        ));
+                }
+            }
+        }
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, spans)| {
+                let prefix = if index == 0 { "›  " } else { "   " };
+                let mut line_spans = Vec::with_capacity(spans.len() + 1);
+                line_spans.push(Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(if index == 0 { CODEX_CYAN } else { CODEX_DIM })
+                        .add_modifier(if index == 0 {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ));
+                line_spans.extend(spans);
+                Line::from(line_spans)
+            })
+            .collect()
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let mut text = String::new();
+        text.push(ch);
+        self.insert_text(&text);
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.insert_segment(InputSegment::Text(text.to_string()));
+    }
+
+    fn insert_paste(&mut self, text: String) {
+        if should_collapse_paste(&text) {
+            self.insert_segment(InputSegment::Paste {
+                label: paste_chunk_label(&text),
+                text,
+            });
+        } else {
+            self.insert_text(&text);
+        }
+    }
+
+    fn insert_segment(&mut self, segment: InputSegment) {
+        let after = self.split_after_cursor();
+        let insert_index = self.segments.len();
+        self.segments.push(segment);
+        self.cursor = self.cursor_after_segment(insert_index);
+        self.segments.extend(after);
+        self.merge_text_segments_around_cursor();
+    }
+
+    fn backspace(&mut self) {
+        let previous = self.previous_cursor(self.cursor);
+        if previous == self.cursor {
+            return;
+        }
+        self.delete_range(previous, self.cursor);
+        self.cursor = previous;
+        self.merge_text_segments_around_cursor();
+    }
+
+    fn delete(&mut self) {
+        let next = self.next_cursor(self.cursor);
+        if next == self.cursor {
+            return;
+        }
+        let current = self.cursor;
+        self.delete_range(current, next);
+        self.cursor = current;
+        self.merge_text_segments_around_cursor();
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.previous_cursor(self.cursor);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = self.next_cursor(self.cursor);
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = ComposerCursor::default();
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.end_cursor();
+    }
+
+    fn move_vertical(&mut self, direction: isize) {
+        let display = self.display_text();
+        let line_ranges = input_line_ranges(&display);
+        if line_ranges.len() <= 1 {
+            return;
+        }
+        let cursor_byte = self.cursor_display_byte();
+        let current_line = line_ranges
+            .iter()
+            .position(|(start, end)| cursor_byte >= *start && cursor_byte <= *end)
+            .unwrap_or_else(|| line_ranges.len().saturating_sub(1));
+        let target_line = if direction < 0 {
+            current_line.saturating_sub(1)
+        } else {
+            (current_line + 1).min(line_ranges.len().saturating_sub(1))
+        };
+        if target_line == current_line {
+            return;
+        }
+        let (current_start, current_end) = line_ranges[current_line];
+        let (target_start, target_end) = line_ranges[target_line];
+        let desired_chars = display[current_start..cursor_byte.min(current_end)]
+            .chars()
+            .count();
+        let target = byte_index_for_char_offset(&display, target_start, target_end, desired_chars);
+        self.cursor = self.cursor_from_display_byte(target);
+    }
+
+    fn cursor_display_byte(&self) -> usize {
+        let mut display_byte = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index == self.cursor.segment {
+                return match segment {
+                    InputSegment::Text(_) => display_byte + self.cursor.offset,
+                    InputSegment::Paste { label, .. } => {
+                        display_byte
+                            + if self.cursor.offset == 0 {
+                                0
+                            } else {
+                                label.len()
+                            }
+                    }
+                };
+            }
+            display_byte += segment.display_len();
+        }
+        display_byte
+    }
+
+    fn cursor_from_display_byte(&self, target: usize) -> ComposerCursor {
+        let mut display_byte = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let next = display_byte + segment.display_len();
+            if target <= next {
+                return match segment {
+                    InputSegment::Text(text) => ComposerCursor {
+                        segment: index,
+                        offset: target.saturating_sub(display_byte).min(text.len()),
+                    },
+                    InputSegment::Paste { label, .. } => ComposerCursor {
+                        segment: index,
+                        offset: usize::from(target.saturating_sub(display_byte) > label.len() / 2),
+                    },
+                };
+            }
+            display_byte = next;
+        }
+        self.end_cursor()
+    }
+
+    fn split_after_cursor(&mut self) -> Vec<InputSegment> {
+        if self.cursor.segment >= self.segments.len() {
+            return Vec::new();
+        }
+        match &mut self.segments[self.cursor.segment] {
+            InputSegment::Text(text) => {
+                let right = text.split_off(self.cursor.offset.min(text.len()));
+                let mut after = self.segments.split_off(self.cursor.segment + 1);
+                if !right.is_empty() {
+                    after.insert(0, InputSegment::Text(right));
+                }
+                self.remove_empty_text_segments();
+                self.cursor = self.end_cursor();
+                after
+            }
+            InputSegment::Paste { .. } if self.cursor.offset == 0 => {
+                let after = self.segments.split_off(self.cursor.segment);
+                self.cursor = self.end_cursor();
+                after
+            }
+            InputSegment::Paste { .. } => {
+                let after = self.segments.split_off(self.cursor.segment + 1);
+                self.cursor = self.end_cursor();
+                after
+            }
+        }
+    }
+
+    fn delete_range(&mut self, start: ComposerCursor, end: ComposerCursor) {
+        let (mut before, _) = split_segments_at(&self.segments, start);
+        let (_, after) = split_segments_at(&self.segments, end);
+        before.extend(after);
+        self.segments = before;
+        self.cursor = start;
+    }
+
+    fn text_byte_for_cursor(&self, cursor: ComposerCursor) -> usize {
+        let mut byte = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index == cursor.segment {
+                return match segment {
+                    InputSegment::Text(_) => byte + cursor.offset,
+                    InputSegment::Paste { text, .. } => {
+                        byte + if cursor.offset == 0 { 0 } else { text.len() }
+                    }
+                };
+            }
+            byte += segment.text_len();
+        }
+        byte
+    }
+
+    fn cursor_from_text_byte(&self, target: usize) -> ComposerCursor {
+        let mut byte = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let next = byte + segment.text_len();
+            if target <= next {
+                return match segment {
+                    InputSegment::Text(text) => ComposerCursor {
+                        segment: index,
+                        offset: target.saturating_sub(byte).min(text.len()),
+                    },
+                    InputSegment::Paste { text, .. } => ComposerCursor {
+                        segment: index,
+                        offset: usize::from(target.saturating_sub(byte) > text.len() / 2),
+                    },
+                };
+            }
+            byte = next;
+        }
+        self.end_cursor()
+    }
+
+    fn previous_cursor(&self, cursor: ComposerCursor) -> ComposerCursor {
+        if self.segments.is_empty() {
+            return cursor;
+        }
+        if cursor.segment >= self.segments.len() {
+            return self.cursor_one_left_from_segment_end(self.segments.len() - 1);
+        }
+        match &self.segments[cursor.segment] {
+            InputSegment::Text(text) if cursor.offset > 0 => ComposerCursor {
+                segment: cursor.segment,
+                offset: previous_char_boundary(text, cursor.offset.min(text.len())),
+            },
+            InputSegment::Paste { .. } if cursor.offset > 0 => ComposerCursor {
+                segment: cursor.segment,
+                offset: 0,
+            },
+            _ if cursor.segment > 0 => self.cursor_one_left_from_segment_end(cursor.segment - 1),
+            _ => cursor,
+        }
+    }
+
+    fn next_cursor(&self, cursor: ComposerCursor) -> ComposerCursor {
+        if cursor.segment >= self.segments.len() {
+            return cursor;
+        }
+        match &self.segments[cursor.segment] {
+            InputSegment::Text(text) if cursor.offset < text.len() => ComposerCursor {
+                segment: cursor.segment,
+                offset: next_char_boundary(text, cursor.offset),
+            },
+            InputSegment::Paste { .. } if cursor.offset == 0 => ComposerCursor {
+                segment: cursor.segment,
+                offset: 1,
+            },
+            _ if cursor.segment + 1 < self.segments.len() => {
+                self.cursor_one_right_from_segment_start(cursor.segment + 1)
+            }
+            _ => self.end_cursor(),
+        }
+    }
+
+    fn cursor_one_right_from_segment_start(&self, segment: usize) -> ComposerCursor {
+        match &self.segments[segment] {
+            InputSegment::Text(text) => ComposerCursor {
+                segment,
+                offset: next_char_boundary(text, 0),
+            },
+            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 1 },
+        }
+    }
+
+    fn cursor_one_left_from_segment_end(&self, segment: usize) -> ComposerCursor {
+        match &self.segments[segment] {
+            InputSegment::Text(text) => ComposerCursor {
+                segment,
+                offset: previous_char_boundary(text, text.len()),
+            },
+            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 0 },
+        }
+    }
+
+    fn cursor_after_segment(&self, segment: usize) -> ComposerCursor {
+        match &self.segments[segment] {
+            InputSegment::Text(text) => ComposerCursor {
+                segment,
+                offset: text.len(),
+            },
+            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 1 },
+        }
+    }
+
+    fn end_cursor(&self) -> ComposerCursor {
+        ComposerCursor {
+            segment: self.segments.len(),
+            offset: 0,
+        }
+    }
+
+    fn remove_empty_text_segments(&mut self) {
+        self.segments
+            .retain(|segment| !matches!(segment, InputSegment::Text(text) if text.is_empty()));
+    }
+
+    fn merge_text_segments_around_cursor(&mut self) {
+        self.remove_empty_text_segments();
+        let text_byte = self.text_byte_for_cursor(self.cursor);
+        let mut merged = Vec::new();
+        for segment in std::mem::take(&mut self.segments) {
+            match (merged.last_mut(), segment) {
+                (Some(InputSegment::Text(left)), InputSegment::Text(right)) => {
+                    left.push_str(&right);
+                }
+                (_, segment) => merged.push(segment),
+            }
+        }
+        self.segments = merged;
+        self.cursor = self.cursor_from_text_byte(text_byte);
+    }
+}
+
+impl InputSegment {
+    fn display_len(&self) -> usize {
+        match self {
+            InputSegment::Text(text) => text.len(),
+            InputSegment::Paste { label, .. } => label.len(),
+        }
+    }
+
+    fn text_len(&self) -> usize {
+        match self {
+            InputSegment::Text(text) => text.len(),
+            InputSegment::Paste { text, .. } => text.len(),
+        }
+    }
+}
+
+fn split_segments_at(
+    segments: &[InputSegment],
+    cursor: ComposerCursor,
+) -> (Vec<InputSegment>, Vec<InputSegment>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for (index, segment) in segments.iter().cloned().enumerate() {
+        if index < cursor.segment {
+            before.push(segment);
+            continue;
+        }
+        if index > cursor.segment {
+            after.push(segment);
+            continue;
+        }
+        match segment {
+            InputSegment::Text(text) => {
+                let split = cursor.offset.min(text.len());
+                let (left, right) = text.split_at(split);
+                if !left.is_empty() {
+                    before.push(InputSegment::Text(left.to_string()));
+                }
+                if !right.is_empty() {
+                    after.push(InputSegment::Text(right.to_string()));
+                }
+            }
+            InputSegment::Paste { text, label } if cursor.offset == 0 => {
+                after.push(InputSegment::Paste { text, label });
+            }
+            InputSegment::Paste { text, label } => {
+                before.push(InputSegment::Paste { text, label });
+            }
+        }
+    }
+    (before, after)
+}
+
+fn should_collapse_paste(text: &str) -> bool {
+    text.lines().count() > PASTE_CHUNK_LINE_THRESHOLD
+        || text.chars().count() > PASTE_CHUNK_CHAR_THRESHOLD
+}
+
+fn paste_chunk_label(text: &str) -> String {
+    let lines = text.lines().count().max(1);
+    let bytes = text.len();
+    let size = if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    };
+    format!("[pasted {lines} lines, {size}]")
+}
+
+fn active_file_mention_token(input: &str, cursor: usize) -> Option<FileMentionToken> {
+    let cursor = cursor.min(input.len());
+    let before = &input[..cursor];
+    let at = before.rfind('@')?;
+    if at > 0 {
+        let previous = before[..at].chars().next_back()?;
+        if !previous.is_whitespace() {
+            return None;
+        }
+    }
+    let query = &before[at + 1..];
+    if query.contains('@') || query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(FileMentionToken {
+        start: at,
+        end: cursor,
+        query: query.to_string(),
+    })
+}
+
+fn current_workspace_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("REMI_SANDBOX_HOST_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
+fn current_workspace_root_label(workspace_dir: &std::path::Path) -> String {
+    let kind = std::env::var("REMI_SANDBOX_KIND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(kind.as_deref(), Some("docker")) {
+        std::env::var("REMI_SANDBOX_CONTAINER_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/workspace".to_string())
+    } else {
+        workspace_dir.display().to_string()
+    }
+}
+
 struct TuiApp {
     runtime: Rc<Runtime>,
     cli: CliConfig,
     session_id: String,
     cells: Vec<HistoryCell>,
-    input: String,
-    cursor: usize,
+    composer: ComposerInput,
     scroll: u16,
     command_catalog: Vec<CommandEntry>,
+    workspace_dir: std::path::PathBuf,
+    workspace_root_label: String,
+    file_query: Option<String>,
+    file_matches: Vec<WorkspaceFileMatch>,
     popup_selected: usize,
     show_shortcuts: bool,
     quit_hint_until: Option<Instant>,
@@ -360,6 +941,9 @@ struct TuiApp {
     input_history: Vec<String>,
     history_index: Option<usize>,
     status: StatusLine,
+    last_stats_snapshot: TokenStatsSnapshot,
+    pending_token_delta: TokenDelta,
+    last_token_cell_index: Option<usize>,
     active_tool_args: std::collections::HashMap<String, String>,
     active_tool_names: std::collections::HashMap<String, String>,
     active_tool_started_at: std::collections::HashMap<String, Instant>,
@@ -379,15 +963,20 @@ struct TuiApp {
 impl TuiApp {
     async fn new(runtime: Rc<Runtime>, cli: CliConfig, session_id: String) -> Self {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
+        let workspace_dir = current_workspace_dir(&runtime.data_dir);
+        let workspace_root_label = current_workspace_root_label(&workspace_dir);
         let mut app = Self {
             runtime,
             cli,
             session_id,
             cells: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            composer: ComposerInput::default(),
             scroll: 0,
             command_catalog: Vec::new(),
+            workspace_dir,
+            workspace_root_label,
+            file_query: None,
+            file_matches: Vec::new(),
             popup_selected: 0,
             show_shortcuts: false,
             quit_hint_until: None,
@@ -399,6 +988,9 @@ impl TuiApp {
             input_history: Vec::new(),
             history_index: None,
             status: StatusLine::default(),
+            last_stats_snapshot: TokenStatsSnapshot::default(),
+            pending_token_delta: TokenDelta::default(),
+            last_token_cell_index: None,
             active_tool_args: std::collections::HashMap::new(),
             active_tool_names: std::collections::HashMap::new(),
             active_tool_started_at: std::collections::HashMap::new(),
@@ -449,7 +1041,7 @@ impl TuiApp {
                     }
                 }
                 Some(event) = self.bot_rx.next() => {
-                    self.handle_bot_event(event);
+                    self.handle_bot_event(event).await;
                 }
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
@@ -463,11 +1055,11 @@ impl TuiApp {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key).await,
             Event::Paste(text) => {
-                if self.input.is_empty() && text == "?" {
+                if self.composer.is_empty() && text == "?" {
                     self.show_shortcuts = !self.show_shortcuts;
                     return Ok(false);
                 }
-                self.insert_text(&text);
+                self.insert_paste(text);
                 Ok(false)
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -578,21 +1170,25 @@ impl TuiApp {
                 Ok(false)
             }
             KeyCode::Esc => {
-                if self.popup_visible() {
-                    self.input.clear();
-                    self.cursor = 0;
+                match self.active_popup() {
+                    Some(PopupKind::Command) => self.composer.clear(),
+                    Some(PopupKind::File) => {
+                        self.file_query = None;
+                        self.file_matches.clear();
+                    }
+                    None => {}
                 }
                 self.show_shortcuts = false;
                 self.quit_hint_until = None;
                 self.popup_selected = 0;
                 Ok(false)
             }
-            KeyCode::Char('?') if self.input.is_empty() => {
+            KeyCode::Char('?') if self.composer.is_empty() => {
                 self.show_shortcuts = !self.show_shortcuts;
                 Ok(false)
             }
             KeyCode::Char('/')
-                if self.input.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                if self.composer.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.show_shortcuts = !self.show_shortcuts;
                 Ok(false)
@@ -606,19 +1202,39 @@ impl TuiApp {
                 Ok(false)
             }
             KeyCode::Up => {
-                self.move_input_cursor_vertical(-1);
+                if self.popup_visible() {
+                    self.move_popup_selection(-1);
+                } else {
+                    self.move_input_cursor_vertical(-1);
+                }
                 Ok(false)
             }
             KeyCode::Down => {
-                self.move_input_cursor_vertical(1);
+                if self.popup_visible() {
+                    self.move_popup_selection(1);
+                } else {
+                    self.move_input_cursor_vertical(1);
+                }
                 Ok(false)
             }
             KeyCode::Tab if self.popup_visible() => {
-                self.complete_selected_command();
+                match self.active_popup() {
+                    Some(PopupKind::Command) => self.complete_selected_command(),
+                    Some(PopupKind::File) => self.complete_selected_file(),
+                    None => {}
+                }
                 Ok(false)
             }
-            KeyCode::Enter if self.popup_visible() && self.selected_command_accepts_arguments() => {
-                self.complete_selected_command();
+            KeyCode::Enter if self.popup_visible() => {
+                match self.active_popup() {
+                    Some(PopupKind::Command) if self.selected_command_accepts_arguments() => {
+                        self.complete_selected_command();
+                    }
+                    Some(PopupKind::File) => self.complete_selected_file(),
+                    _ => {
+                        self.submit().await?;
+                    }
+                }
                 Ok(false)
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -638,19 +1254,23 @@ impl TuiApp {
                 Ok(false)
             }
             KeyCode::Left => {
-                self.cursor = previous_char_boundary(&self.input, self.cursor);
+                self.composer.move_left();
+                self.refresh_file_matches();
                 Ok(false)
             }
             KeyCode::Right => {
-                self.cursor = next_char_boundary(&self.input, self.cursor);
+                self.composer.move_right();
+                self.refresh_file_matches();
                 Ok(false)
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                self.composer.move_home();
+                self.refresh_file_matches();
                 Ok(false)
             }
             KeyCode::End => {
-                self.cursor = self.input.len();
+                self.composer.move_end();
+                self.refresh_file_matches();
                 Ok(false)
             }
             KeyCode::Char(ch) => {
@@ -662,24 +1282,103 @@ impl TuiApp {
     }
 
     async fn submit(&mut self) -> anyhow::Result<()> {
-        let text = self.input.trim().to_string();
+        let text = self.composer.to_text().trim().to_string();
         if text.is_empty() {
             return Ok(());
         }
-        self.input.clear();
-        self.cursor = 0;
+        self.composer.clear();
         self.history_index = None;
         self.scroll = 0;
         self.popup_selected = 0;
         self.show_shortcuts = false;
         self.quit_hint_until = None;
         self.record_input_history(text.clone()).await;
+        if is_tui_fork_command(&text) {
+            self.start_fork_command();
+            return Ok(());
+        }
+        if is_tui_new_command(&text) {
+            self.start_new_command();
+            return Ok(());
+        }
         if self.running {
             self.queued_inputs.push_back(text);
             return Ok(());
         }
         self.start_turn(text);
         Ok(())
+    }
+
+    fn start_fork_command(&mut self) {
+        self.cells.push(HistoryCell::user("/fork".to_string()));
+        if self.running {
+            self.cells.push(HistoryCell::system(
+                "当前 session 正在运行，结束或取消后再 fork。",
+            ));
+            return;
+        }
+        self.cells
+            .push(HistoryCell::system("fork: 准备复制当前 session..."));
+        let runtime = Rc::clone(&self.runtime);
+        let session_id = self.session_id.clone();
+        let cli = self.cli.clone();
+        let tx = self.bot_tx.clone();
+        tokio::task::spawn_local(async move {
+            run_tui_fork_command(runtime, session_id, cli, tx).await;
+        });
+    }
+
+    fn start_new_command(&mut self) {
+        self.cells.push(HistoryCell::user("/new".to_string()));
+        if self.running {
+            self.cells.push(HistoryCell::system(
+                "当前 session 正在运行，结束或取消后再创建新 session。",
+            ));
+            return;
+        }
+        self.cells
+            .push(HistoryCell::system("new: 正在创建空 session..."));
+        let runtime = Rc::clone(&self.runtime);
+        let cli = self.cli.clone();
+        let tx = self.bot_tx.clone();
+        tokio::task::spawn_local(async move {
+            run_tui_new_command(runtime, cli, tx).await;
+        });
+    }
+
+    async fn replace_current_session(&mut self, session_id: String, message: String) {
+        self.session_id = session_id;
+        self.cells.clear();
+        self.composer.clear();
+        self.scroll = 0;
+        self.popup_selected = 0;
+        self.file_query = None;
+        self.file_matches.clear();
+        self.show_shortcuts = false;
+        self.quit_hint_until = None;
+        self.queued_inputs.clear();
+        self.input_history.clear();
+        self.history_index = None;
+        self.status = StatusLine::default();
+        self.active_tool_args.clear();
+        self.active_tool_names.clear();
+        self.active_tool_started_at.clear();
+        self.sub_tool_args.clear();
+        self.sub_tool_names.clear();
+        self.sub_sessions.clear();
+        self.supervisors.clear();
+        self.pending_approval = None;
+        self.approval_selected = 0;
+        self.approval_state = "waiting";
+        self.active_supervisor_id = None;
+        self.last_todo_body = None;
+        self.load_input_history().await;
+        self.cells.push(HistoryCell::system(message));
+        self.cells.push(HistoryCell::system(format!(
+            "session id: {}",
+            self.session_id
+        )));
+        self.load_thread_history().await;
     }
 
     fn start_turn(&mut self, text: String) {
@@ -694,6 +1393,9 @@ impl TuiApp {
         self.run_started_at = Some(Instant::now());
         self.status.state = "running".to_string();
         self.status.last_error = None;
+        self.last_stats_snapshot = TokenStatsSnapshot::default();
+        self.pending_token_delta = TokenDelta::default();
+        self.last_token_cell_index = None;
         self.active_supervisor_id = Some(format!("supervisor-{}", uuid::Uuid::new_v4()));
 
         let runtime = Rc::clone(&self.runtime);
@@ -715,9 +1417,12 @@ impl TuiApp {
         }));
     }
 
-    fn handle_bot_event(&mut self, event: BotEvent) {
+    async fn handle_bot_event(&mut self, event: BotEvent) {
         match event {
-            BotEvent::Prefix(text) => self.cells.push(HistoryCell::assistant(text)),
+            BotEvent::Prefix(text) => {
+                self.cells.push(HistoryCell::assistant(text));
+                self.mark_token_cell(self.cells.len().saturating_sub(1));
+            }
             BotEvent::Text(delta) => self.push_assistant_delta(&delta),
             BotEvent::Thinking(delta) => self.push_thinking_delta(&delta),
             BotEvent::ToolStart { id, name } => {
@@ -728,7 +1433,7 @@ impl TuiApp {
                 let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
                 if name == "apply_patch" {
                     self.cells.push(HistoryCell::patch_diff(
-                        id,
+                        id.clone(),
                         "waiting for patch...".to_string(),
                         format_elapsed(0),
                         ToolVisualStatus::Running,
@@ -736,12 +1441,19 @@ impl TuiApp {
                 } else {
                     let body = tool_body(&pretty);
                     self.cells.push(HistoryCell::tool(
-                        id,
+                        id.clone(),
                         pretty.title,
                         body,
                         format_elapsed(0),
                         ToolVisualStatus::Running,
                     ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
                 }
             }
             BotEvent::ToolArgs { id, delta } => {
@@ -795,7 +1507,7 @@ impl TuiApp {
                         cell.body = body;
                     } else {
                         self.cells.push(HistoryCell::patch_diff(
-                            id,
+                            id.clone(),
                             body,
                             format_elapsed(0),
                             ToolVisualStatus::Running,
@@ -808,12 +1520,19 @@ impl TuiApp {
                 } else {
                     let body = tool_body(&pretty);
                     self.cells.push(HistoryCell::tool(
-                        id,
+                        id.clone(),
                         pretty.title,
                         body,
                         format_elapsed(0),
                         ToolVisualStatus::Running,
                     ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
                 }
             }
             BotEvent::ToolDone {
@@ -851,19 +1570,27 @@ impl TuiApp {
                         .rev()
                         .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
                     {
+                        let meta = preserve_token_meta(meta, &cell.meta);
                         *cell = HistoryCell::patch_diff(
-                            id,
+                            id.clone(),
                             patch,
                             meta,
                             ToolVisualStatus::from_success(success),
                         );
                     } else {
                         self.cells.push(HistoryCell::patch_diff(
-                            id,
+                            id.clone(),
                             patch,
                             meta,
                             ToolVisualStatus::from_success(success),
                         ));
+                    }
+                    if let Some(index) = self
+                        .cells
+                        .iter()
+                        .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                    {
+                        self.mark_token_cell(index);
                     }
                     return;
                 }
@@ -876,14 +1603,27 @@ impl TuiApp {
                     .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
                 {
                     let body = tool_body(&pretty);
+                    let meta = preserve_token_meta(meta, &cell.meta);
                     cell.title = pretty.title;
                     cell.body = body;
                     cell.meta = meta;
                     cell.status = status;
                 } else {
                     let body = tool_body(&pretty);
-                    self.cells
-                        .push(HistoryCell::tool(id, pretty.title, body, meta, status));
+                    self.cells.push(HistoryCell::tool(
+                        id.clone(),
+                        pretty.title,
+                        body,
+                        meta,
+                        status,
+                    ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
                 }
             }
             BotEvent::SupervisorProgress(progress) => self.upsert_supervisor_progress(progress),
@@ -959,6 +1699,23 @@ impl TuiApp {
                 self.status.completion_tokens = completion_tokens;
                 self.status.max_prompt_tokens = max_prompt_tokens;
                 self.status.model_elapsed_ms = elapsed_ms;
+                self.update_cell_tokens_from_stats(prompt_tokens, completion_tokens);
+            }
+            BotEvent::ForkProgress(message) => {
+                self.cells.push(HistoryCell::system(message));
+            }
+            BotEvent::SwitchToSession {
+                session_id,
+                message,
+            } => {
+                self.replace_current_session(session_id, message).await;
+            }
+            BotEvent::SessionCleared => {
+                self.cells.retain(|cell| {
+                    !matches!(cell.kind, CellKind::TodoState | CellKind::Supervisor { .. })
+                });
+                self.supervisors.clear();
+                self.last_todo_body = None;
             }
             BotEvent::Error(message) => {
                 self.status.last_error = Some(message.clone());
@@ -1011,8 +1768,11 @@ impl TuiApp {
         self.render_activity(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
         self.render_composer(frame, chunks[4]);
-        if self.popup_visible() {
-            self.render_command_popup(frame, chunks[4]);
+        self.refresh_file_matches();
+        match self.active_popup() {
+            Some(PopupKind::Command) => self.render_command_popup(frame, chunks[4]),
+            Some(PopupKind::File) => self.render_file_popup(frame, chunks[4]),
+            None => {}
         }
     }
 
@@ -1141,9 +1901,7 @@ impl TuiApp {
             let lines = vec![
                 Line::from(Span::styled(
                     format!("{FOOTER_INDENT}shortcuts"),
-                    Style::default()
-                        .fg(CODEX_CYAN)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     format!(
@@ -1236,7 +1994,7 @@ impl TuiApp {
             area.width,
             area.height.saturating_sub(1),
         );
-        let lines = if self.input.is_empty() {
+        let lines = if self.composer.is_empty() {
             vec![Line::from(vec![
                 Span::styled(
                     "›",
@@ -1249,26 +2007,7 @@ impl TuiApp {
                 ),
             ])]
         } else {
-            self.input
-                .split('\n')
-                .enumerate()
-                .map(|(index, line)| {
-                    let prefix = if index == 0 { "›  " } else { "   " };
-                    Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default()
-                                .fg(if index == 0 { CODEX_CYAN } else { CODEX_DIM })
-                                .add_modifier(if index == 0 {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                }),
-                        ),
-                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
-                    ])
-                })
-                .collect()
+            self.composer.display_lines()
         };
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, input_area);
@@ -1321,82 +2060,119 @@ impl TuiApp {
         frame.render_widget(list, area);
     }
 
+    fn render_file_popup(&self, frame: &mut Frame<'_>, composer_area: Rect) {
+        if self.file_matches.is_empty() {
+            return;
+        }
+        let width = composer_area.width.min(88).max(44);
+        let height = (self.file_matches.len() as u16 + 2).min(10);
+        let x = composer_area.x + composer_area.width.saturating_sub(width);
+        let y = composer_area.y.saturating_sub(height);
+        let area = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, area);
+        let rows = self
+            .file_matches
+            .iter()
+            .take(height.saturating_sub(2) as usize)
+            .enumerate()
+            .map(|(index, file)| {
+                let selected = index == self.popup_selected;
+                let path_style = if selected {
+                    Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(CODEX_CYAN)
+                };
+                let marker = if selected { "›" } else { " " };
+                let display = truncate_for_width(&format!("@{}", file.mention_path), 44);
+                let relative = truncate_for_width(&file.display_path, 30);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{marker} {:<44}", display), path_style),
+                    Span::styled(relative, Style::default().fg(CODEX_DIM)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" files ")
+                .border_style(Style::default().fg(CODEX_BORDER))
+                .style(Style::default()),
+        );
+        frame.render_widget(list, area);
+    }
+
     fn insert_char(&mut self, ch: char) {
-        self.input.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.composer.insert_char(ch);
         self.popup_selected = 0;
         self.history_index = None;
         self.quit_hint_until = None;
+        self.refresh_file_matches();
     }
 
     fn insert_text(&mut self, text: &str) {
-        self.input.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        self.composer.insert_text(text);
         self.popup_selected = 0;
         self.history_index = None;
         self.quit_hint_until = None;
+        self.refresh_file_matches();
+    }
+
+    fn insert_paste(&mut self, text: String) {
+        self.composer.insert_paste(text);
+        self.popup_selected = 0;
+        self.history_index = None;
+        self.quit_hint_until = None;
+        self.refresh_file_matches();
     }
 
     fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let previous = previous_char_boundary(&self.input, self.cursor);
-        self.input.replace_range(previous..self.cursor, "");
-        self.cursor = previous;
+        self.composer.backspace();
         self.popup_selected = 0;
         self.history_index = None;
+        self.refresh_file_matches();
     }
 
     fn delete(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let next = next_char_boundary(&self.input, self.cursor);
-        self.input.replace_range(self.cursor..next, "");
+        self.composer.delete();
         self.popup_selected = 0;
         self.history_index = None;
+        self.refresh_file_matches();
     }
 
     fn move_input_cursor_vertical(&mut self, direction: isize) {
-        let line_ranges = input_line_ranges(&self.input);
-        if line_ranges.len() <= 1 {
-            return;
-        }
-        let current_line = line_ranges
-            .iter()
-            .position(|(start, end)| self.cursor >= *start && self.cursor <= *end)
-            .unwrap_or_else(|| line_ranges.len().saturating_sub(1));
-        let target_line = if direction < 0 {
-            current_line.saturating_sub(1)
-        } else {
-            (current_line + 1).min(line_ranges.len().saturating_sub(1))
-        };
-        if target_line == current_line {
-            return;
-        }
-        let (current_start, current_end) = line_ranges[current_line];
-        let (target_start, target_end) = line_ranges[target_line];
-        let desired_chars = self.input[current_start..self.cursor.min(current_end)]
-            .chars()
-            .count();
-        self.cursor =
-            byte_index_for_char_offset(&self.input, target_start, target_end, desired_chars);
+        self.composer.move_vertical(direction);
         self.popup_selected = 0;
         self.history_index = None;
+        self.refresh_file_matches();
     }
 
     fn popup_visible(&self) -> bool {
-        let first_line = self.input.lines().next().unwrap_or("");
-        first_line.trim_start().starts_with('/') && !first_line.contains('\n')
+        matches!(
+            self.active_popup(),
+            Some(PopupKind::Command | PopupKind::File)
+        )
+    }
+
+    fn active_popup(&self) -> Option<PopupKind> {
+        if self.composer.active_file_mention_token().is_some() && !self.file_matches.is_empty() {
+            return Some(PopupKind::File);
+        }
+        let Some(input) = self.composer.command_text() else {
+            return None;
+        };
+        let first_line = input.lines().next().unwrap_or("");
+        if first_line.trim_start().starts_with('/') && !first_line.contains('\n') {
+            Some(PopupKind::Command)
+        } else {
+            None
+        }
     }
 
     fn filtered_commands(&self) -> Vec<&CommandEntry> {
-        let normalized = self
-            .input
-            .trim_start()
-            .trim_start_matches('/')
-            .to_lowercase();
+        let Some(input) = self.composer.command_text() else {
+            return Vec::new();
+        };
+        let normalized = input.trim_start().trim_start_matches('/').to_lowercase();
         let terms = normalized.split_whitespace().collect::<Vec<_>>();
         self.command_catalog
             .iter()
@@ -1407,13 +2183,34 @@ impl TuiApp {
             .collect()
     }
 
+    fn refresh_file_matches(&mut self) {
+        let Some(token) = self.composer.active_file_mention_token() else {
+            self.file_query = None;
+            self.file_matches.clear();
+            return;
+        };
+        if self.file_query.as_deref() == Some(token.query.as_str()) {
+            return;
+        }
+        self.file_query = Some(token.query.clone());
+        self.file_matches = search_workspace_files(
+            &self.workspace_dir,
+            &self.workspace_root_label,
+            &token.query,
+            default_file_search_limit(Some(8)),
+        )
+        .unwrap_or_default();
+        self.popup_selected = self
+            .popup_selected
+            .min(self.file_matches.len().saturating_sub(1));
+    }
+
     fn complete_selected_command(&mut self) {
         let commands = self.filtered_commands();
         let Some(command) = commands.get(self.popup_selected).copied() else {
             return;
         };
-        self.input = command.value.clone();
-        self.cursor = self.input.len();
+        self.composer.set_text(command.value.clone());
     }
 
     fn selected_command_accepts_arguments(&self) -> bool {
@@ -1423,10 +2220,39 @@ impl TuiApp {
             .is_some_and(|command| command.accepts_arguments)
     }
 
+    fn complete_selected_file(&mut self) {
+        let Some(token) = self.composer.active_file_mention_token() else {
+            return;
+        };
+        let Some(file) = self.file_matches.get(self.popup_selected) else {
+            return;
+        };
+        let replacement = format!("@{} ", file.mention_path);
+        self.composer
+            .replace_text_range(token.start, token.end, &replacement);
+        self.file_query = None;
+        self.file_matches.clear();
+        self.popup_selected = 0;
+    }
+
+    fn move_popup_selection(&mut self, direction: isize) {
+        let len = match self.active_popup() {
+            Some(PopupKind::Command) => self.filtered_commands().len(),
+            Some(PopupKind::File) => self.file_matches.len(),
+            None => 0,
+        };
+        if len == 0 {
+            self.popup_selected = 0;
+        } else if direction < 0 {
+            self.popup_selected = self.popup_selected.saturating_sub(1);
+        } else {
+            self.popup_selected = (self.popup_selected + 1).min(len - 1);
+        }
+    }
+
     fn handle_cancel_or_quit(&mut self) -> bool {
         if self.popup_visible() {
-            self.input.clear();
-            self.cursor = 0;
+            self.composer.clear();
             self.popup_selected = 0;
             return false;
         }
@@ -1508,11 +2334,11 @@ impl TuiApp {
             (current + 1).min(self.input_history.len())
         };
         self.history_index = (next < self.input_history.len()).then_some(next);
-        self.input = self
+        let input = self
             .history_index
             .and_then(|index| self.input_history.get(index).cloned())
             .unwrap_or_default();
-        self.cursor = self.input.len();
+        self.composer.set_text(input);
     }
 
     fn refresh_command_catalog(&mut self) {
@@ -1535,8 +2361,10 @@ impl TuiApp {
             .filter(|cell| matches!(cell.kind, CellKind::Assistant))
         {
             cell.append(delta);
+            self.mark_token_cell(self.cells.len().saturating_sub(1));
         } else {
             self.cells.push(HistoryCell::assistant(delta.to_string()));
+            self.mark_token_cell(self.cells.len().saturating_sub(1));
         }
     }
 
@@ -1547,9 +2375,57 @@ impl TuiApp {
             .filter(|cell| matches!(cell.kind, CellKind::Thinking))
         {
             cell.append(delta);
+            self.mark_token_cell(self.cells.len().saturating_sub(1));
         } else {
             self.cells.push(HistoryCell::thinking(delta.to_string()));
+            self.mark_token_cell(self.cells.len().saturating_sub(1));
         }
+    }
+
+    fn mark_token_cell(&mut self, index: usize) {
+        self.last_token_cell_index = Some(index);
+        if !self.pending_token_delta.is_empty() {
+            let delta = std::mem::take(&mut self.pending_token_delta);
+            if let Some(cell) = self.cells.get_mut(index) {
+                append_token_meta(cell, delta);
+            }
+        }
+    }
+
+    fn apply_token_delta(&mut self, delta: TokenDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(index) = self
+            .last_token_cell_index
+            .filter(|index| *index < self.cells.len())
+        {
+            if let Some(cell) = self.cells.get_mut(index) {
+                append_token_meta(cell, delta);
+                return;
+            }
+        }
+        self.pending_token_delta.prompt_tokens = self
+            .pending_token_delta
+            .prompt_tokens
+            .saturating_add(delta.prompt_tokens);
+        self.pending_token_delta.completion_tokens = self
+            .pending_token_delta
+            .completion_tokens
+            .saturating_add(delta.completion_tokens);
+    }
+
+    fn update_cell_tokens_from_stats(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        let delta = TokenDelta {
+            prompt_tokens: prompt_tokens.saturating_sub(self.last_stats_snapshot.prompt_tokens),
+            completion_tokens: completion_tokens
+                .saturating_sub(self.last_stats_snapshot.completion_tokens),
+        };
+        self.last_stats_snapshot = TokenStatsSnapshot {
+            prompt_tokens,
+            completion_tokens,
+        };
+        self.apply_token_delta(delta);
     }
 
     fn flush_status_elapsed(&mut self) {
@@ -1800,7 +2676,7 @@ impl TuiApp {
     }
 
     fn composer_height(&self, width: u16) -> u16 {
-        let rows = wrap_line_count(&self.input, width.saturating_sub(3)).max(1);
+        let rows = wrap_line_count(&self.composer.display_text(), width.saturating_sub(3)).max(1);
         rows.clamp(1, 6).saturating_add(1)
     }
 
@@ -1819,7 +2695,9 @@ impl TuiApp {
     }
 
     fn cursor_position(&self, area: Rect) -> (u16, u16) {
-        let before = &self.input[..self.cursor.min(self.input.len())];
+        let display = self.composer.display_text();
+        let cursor = self.composer.cursor_display_byte().min(display.len());
+        let before = &display[..cursor];
         let inner_width = area.width.saturating_sub(3).max(1);
         let mut row = 0_u16;
         let mut col = 0_u16;
@@ -1850,6 +2728,9 @@ async fn run_bot_turn(
 ) {
     match process_runtime_commands(&runtime, &session_id, text.trim()).await {
         Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+            if text.trim() == "/clear" {
+                let _ = tx.send(BotEvent::SessionCleared);
+            }
             let _ = tx.send(BotEvent::Prefix(reply));
             let _ = tx.send(BotEvent::Done);
             return;
@@ -1977,6 +2858,152 @@ async fn run_bot_turn(
     }
 }
 
+async fn run_tui_fork_command(
+    runtime: Rc<Runtime>,
+    source_session_id: String,
+    cli: CliConfig,
+    tx: mpsc::UnboundedSender<BotEvent>,
+) {
+    let send_progress = |message: String| {
+        let _ = tx.send(BotEvent::ForkProgress(message));
+    };
+
+    if runtime.bot.is_thread_running(&source_session_id).await {
+        send_progress("当前 session 正在运行，结束或取消后再 fork。".to_string());
+        return;
+    }
+
+    let channel_id = format!("fork:{}", uuid::Uuid::new_v4());
+    send_progress("fork: 正在创建新 session...".to_string());
+    let fork = match runtime.sessions.lock().await.fork_session(
+        &source_session_id,
+        TUI_CHANNEL,
+        &channel_id,
+        None,
+    ) {
+        Ok(Some(fork)) => fork,
+        Ok(None) => {
+            send_progress(format!(
+                "fork 失败: source session `{source_session_id}` not found"
+            ));
+            return;
+        }
+        Err(error) => {
+            send_progress(format!("fork 失败: {error:#}"));
+            return;
+        }
+    };
+
+    let fork_title = fork.title.as_deref().unwrap_or("新对话").to_string();
+    send_progress(format!(
+        "fork: 已创建新 session。\n新 session: {}\n标题: {}\n正在复制上下文...",
+        fork.id, fork_title
+    ));
+    if let Err(error) = runtime
+        .bot
+        .fork_thread_data(&source_session_id, &fork.id, Some(&cli.user_id))
+        .await
+    {
+        let _ = runtime.sessions.lock().await.delete(&fork.id);
+        send_progress(format!("fork 失败，已清理新 session。\n错误: {error:#}"));
+        return;
+    }
+
+    send_progress("fork: 上下文复制完成，正在打开新 pane...".to_string());
+    let fork_id = fork.id.clone();
+    match open_fork_in_new_pane(&fork_id, &cli) {
+        Ok(Some(kind)) => {
+            send_progress(format!(
+                "已 fork 当前 session，并在新的 {kind} pane 中打开。\n新 session: {}\n标题: {}",
+                fork_id, fork_title
+            ));
+        }
+        Ok(None) => {
+            let _ = tx.send(BotEvent::SwitchToSession {
+                session_id: fork_id.clone(),
+                message: format!(
+                    "已 fork 当前 session，并在当前 pane 切换到新 session。\n新 session: {}\n标题: {}",
+                    fork_id, fork_title
+                ),
+            });
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = tx.send(BotEvent::SwitchToSession {
+                session_id: fork_id.clone(),
+                message: format!(
+                    "自动打开新 pane 失败，已在当前 pane 切换到 fork session。\n新 session: {}\n标题: {}\n错误: {message}",
+                    fork_id, fork_title
+                ),
+            });
+            send_progress(format!(
+                "自动打开新 pane 失败，已在当前 pane 切换到 fork session。\n错误: {message}"
+            ));
+        }
+    }
+}
+
+async fn run_tui_new_command(
+    runtime: Rc<Runtime>,
+    cli: CliConfig,
+    tx: mpsc::UnboundedSender<BotEvent>,
+) {
+    let send_progress = |message: String| {
+        let _ = tx.send(BotEvent::ForkProgress(message));
+    };
+
+    let channel_id = format!("new:{}", uuid::Uuid::new_v4());
+    let title = "新对话".to_string();
+    let session = match runtime.sessions.lock().await.create_channel(
+        TUI_CHANNEL,
+        &channel_id,
+        &runtime.root_agent_id,
+        Some(title.clone()),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            send_progress(format!("new 失败: {error:#}"));
+            return;
+        }
+    };
+    let shown_title = session.title.as_deref().unwrap_or(&title).to_string();
+    send_progress(format!(
+        "new: 已创建空 session。\n新 session: {}\n标题: {}\n正在打开新 pane...",
+        session.id, shown_title
+    ));
+    let session_id = session.id.clone();
+    match open_fork_in_new_pane(&session_id, &cli) {
+        Ok(Some(kind)) => {
+            send_progress(format!(
+                "已创建空 session，并在新的 {kind} pane 中打开。\n新 session: {}\n标题: {}",
+                session_id, shown_title
+            ));
+        }
+        Ok(None) => {
+            let _ = tx.send(BotEvent::SwitchToSession {
+                session_id: session_id.clone(),
+                message: format!(
+                    "已创建空 session，并在当前 pane 切换过去。\n新 session: {}\n标题: {}",
+                    session_id, shown_title
+                ),
+            });
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = tx.send(BotEvent::SwitchToSession {
+                session_id: session_id.clone(),
+                message: format!(
+                    "自动打开新 pane 失败，已在当前 pane 切换到新 session。\n新 session: {}\n标题: {}\n错误: {message}",
+                    session_id, shown_title
+                ),
+            });
+            send_progress(format!(
+                "自动打开新 pane 失败，已在当前 pane 切换到新 session。\n错误: {message}"
+            ));
+        }
+    }
+}
+
 #[derive(Debug)]
 enum BotEvent {
     Prefix(String),
@@ -2020,6 +3047,12 @@ enum BotEvent {
         max_prompt_tokens: u32,
         elapsed_ms: u64,
     },
+    ForkProgress(String),
+    SwitchToSession {
+        session_id: String,
+        message: String,
+    },
+    SessionCleared,
     Error(String),
     Done,
 }
@@ -2032,6 +3065,24 @@ struct StatusLine {
     model_elapsed_ms: u64,
     elapsed_ms: u64,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TokenStatsSnapshot {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TokenDelta {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+impl TokenDelta {
+    fn is_empty(self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0
+    }
 }
 
 impl Default for StatusLine {
@@ -2295,8 +3346,16 @@ struct CommandEntry {
     searchable: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupKind {
+    Command,
+    File,
+}
+
 fn static_commands() -> Vec<CommandEntry> {
     [
+        ("/fork", "fork 当前 session 到新 pane", false),
+        ("/new", "创建空 session 到新 pane", false),
         ("/tools", "显示当前 Agent 可用的工具", false),
         ("/goal status", "查看当前会话目标", false),
         ("/goal set ", "设置目标；可嵌套 /skill:<name>", true),
@@ -2323,6 +3382,218 @@ fn static_commands() -> Vec<CommandEntry> {
         searchable: format!("{value} {description}"),
     })
     .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneLaunchCommand {
+    kind: &'static str,
+    program: &'static str,
+    args: Vec<OsString>,
+}
+
+fn open_fork_in_new_pane(
+    session_id: &str,
+    cli: &CliConfig,
+) -> anyhow::Result<Option<&'static str>> {
+    let tmux = std::env::var_os("TMUX").is_some();
+    let zellij = std::env::var_os("ZELLIJ").is_some();
+    let warp = std::env::var_os("WARP_TERMINAL_SESSION_UUID").is_some()
+        || std::env::var_os("WARP_FOCUS_URL").is_some()
+        || std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "WarpTerminal");
+    let exe = std::env::current_exe()?;
+
+    if !tmux && !zellij && warp {
+        let config_name = warp_tab_config_name(session_id);
+        let config_dir = warp_tab_config_dir()?;
+        std::fs::create_dir_all(&config_dir)
+            .with_context(|| format!("creating {}", config_dir.display()))?;
+        let config_path = config_dir.join(format!("{config_name}.toml"));
+        std::fs::write(
+            &config_path,
+            warp_tab_config_toml(&config_name, &exe, session_id, cli),
+        )
+        .with_context(|| format!("writing {}", config_path.display()))?;
+
+        let command = build_warp_open_command(&config_name);
+        let status = Command::new(command.program)
+            .args(&command.args)
+            .status()
+            .with_context(|| format!("opening Warp tab config {config_name}"))?;
+        if status.success() {
+            return Ok(Some(command.kind));
+        }
+        anyhow::bail!("{} exited with status {}", command.program, status);
+    }
+
+    let Some(command) = build_pane_launch_command(tmux, zellij, &exe, session_id, cli) else {
+        return Ok(None);
+    };
+    let status = Command::new(command.program)
+        .args(&command.args)
+        .status()
+        .with_context(|| format!("launching {} pane", command.kind))?;
+    if status.success() {
+        Ok(Some(command.kind))
+    } else {
+        anyhow::bail!("{} exited with status {}", command.program, status);
+    }
+}
+
+fn build_pane_launch_command(
+    tmux: bool,
+    zellij: bool,
+    exe: &Path,
+    session_id: &str,
+    cli: &CliConfig,
+) -> Option<PaneLaunchCommand> {
+    if tmux {
+        let mut args = vec![OsString::from("split-window"), OsString::from("-h")];
+        args.extend(tui_resume_command_args(exe, session_id, cli));
+        return Some(PaneLaunchCommand {
+            kind: "tmux",
+            program: "tmux",
+            args,
+        });
+    }
+    if zellij {
+        let mut args = vec![
+            OsString::from("action"),
+            OsString::from("new-pane"),
+            OsString::from("--direction"),
+            OsString::from("right"),
+            OsString::from("--"),
+        ];
+        args.extend(tui_resume_command_args(exe, session_id, cli));
+        return Some(PaneLaunchCommand {
+            kind: "Zellij",
+            program: "zellij",
+            args,
+        });
+    }
+    None
+}
+
+fn build_warp_open_command(config_name: &str) -> PaneLaunchCommand {
+    let uri = format!("warp://tab_config/{config_name}");
+    if cfg!(target_os = "macos") {
+        PaneLaunchCommand {
+            kind: "Warp",
+            program: "open",
+            args: vec![OsString::from(uri)],
+        }
+    } else if cfg!(target_os = "windows") {
+        PaneLaunchCommand {
+            kind: "Warp",
+            program: "cmd",
+            args: vec![
+                OsString::from("/C"),
+                OsString::from("start"),
+                OsString::from(""),
+                OsString::from(uri),
+            ],
+        }
+    } else {
+        PaneLaunchCommand {
+            kind: "Warp",
+            program: "xdg-open",
+            args: vec![OsString::from(uri)],
+        }
+    }
+}
+
+fn tui_resume_command_args(exe: &Path, session_id: &str, cli: &CliConfig) -> Vec<OsString> {
+    vec![
+        exe.as_os_str().to_os_string(),
+        OsString::from("tui"),
+        OsString::from("resume"),
+        OsString::from(session_id),
+        OsString::from("--user"),
+        OsString::from(cli.user_id.clone()),
+        OsString::from("--name"),
+        OsString::from(cli.username.clone()),
+    ]
+}
+
+fn warp_tab_config_dir() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(".warp").join("tab_configs"));
+    }
+    if cfg!(target_os = "windows") {
+        let appdata = std::env::var_os("APPDATA").context("APPDATA is not set")?;
+        return Ok(PathBuf::from(appdata)
+            .join("warp")
+            .join("Warp")
+            .join("data")
+            .join("tab_configs"));
+    }
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("XDG_DATA_HOME and HOME are not set")?;
+    Ok(data_home.join("warp-terminal").join("tab_configs"))
+}
+
+fn warp_tab_config_name(session_id: &str) -> String {
+    let suffix = session_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>();
+    if suffix.is_empty() {
+        "remi_cat_fork".to_string()
+    } else {
+        format!("remi_cat_fork_{suffix}")
+    }
+}
+
+fn warp_tab_config_toml(
+    config_name: &str,
+    exe: &Path,
+    session_id: &str,
+    cli: &CliConfig,
+) -> String {
+    let command = shell_join_command(&tui_resume_command_args(exe, session_id, cli));
+    format!(
+        "name = {}\ntitle = {}\n\n[[panes]]\nid = \"main\"\ntype = \"terminal\"\ncommands = [{}]\nis_focused = true\n",
+        toml_string(&format!("Remi fork {config_name}")),
+        toml_string("Remi fork"),
+        toml_string(&command)
+    )
+}
+
+fn shell_join_command(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
+fn is_tui_fork_command(command: &str) -> bool {
+    command == "/fork"
+}
+
+fn is_tui_new_command(command: &str) -> bool {
+    command == "/new"
 }
 
 #[derive(Clone)]
@@ -2829,6 +4100,35 @@ fn tool_meta(pretty: &PrettyToolCall) -> String {
         .unwrap_or_else(|| format_elapsed(0))
 }
 
+fn append_token_meta(cell: &mut HistoryCell, delta: TokenDelta) {
+    if delta.is_empty() {
+        return;
+    }
+    let token_meta = format!(
+        "tokens +{}p/+{}c",
+        delta.prompt_tokens, delta.completion_tokens
+    );
+    if cell.meta.is_empty() {
+        cell.meta = token_meta;
+    } else {
+        cell.meta.push_str(" · ");
+        cell.meta.push_str(&token_meta);
+    }
+}
+
+fn preserve_token_meta(mut meta: String, existing_meta: &str) -> String {
+    for part in existing_meta
+        .split(" · ")
+        .filter(|part| part.starts_with("tokens +"))
+    {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(part);
+    }
+    meta
+}
+
 fn patch_tool_meta(pretty: &PrettyToolCall) -> String {
     let elapsed = tool_meta(pretty);
     if pretty.summary.trim().is_empty() {
@@ -2842,7 +4142,11 @@ fn patch_tool_meta(pretty: &PrettyToolCall) -> String {
 }
 
 fn tool_body(pretty: &PrettyToolCall) -> String {
-    let summary = single_line(&pretty.summary);
+    let summary = if matches!(pretty.tool_name.as_str(), "bash" | "workspace_bash") {
+        pretty.summary.trim().to_string()
+    } else {
+        single_line(&pretty.summary)
+    };
     if summary.trim().is_empty() {
         return match pretty.status {
             PrettyToolStatus::Running => "running".to_string(),
@@ -3401,12 +4705,112 @@ mod tests {
     #[test]
     fn static_commands_include_skill_commands() {
         let commands = static_commands();
+        assert!(commands.iter().any(|command| command.value == "/fork"));
+        assert!(commands.iter().any(|command| command.value == "/new"));
         assert!(commands
             .iter()
             .any(|command| command.value == "/skill list"));
         assert!(commands
             .iter()
             .any(|command| command.value == "/model status"));
+    }
+
+    #[test]
+    fn parses_tui_fork_command() {
+        assert!(is_tui_fork_command("/fork"));
+        assert!(!is_tui_fork_command("/fork now"));
+        assert!(!is_tui_fork_command("/new"));
+    }
+
+    #[test]
+    fn parses_tui_new_command() {
+        assert!(is_tui_new_command("/new"));
+        assert!(!is_tui_new_command("/new now"));
+        assert!(!is_tui_new_command("/fork"));
+    }
+
+    #[test]
+    fn tmux_pane_launch_command_resumes_session() {
+        let cli = test_cli_config();
+        let command =
+            build_pane_launch_command(true, true, Path::new("/tmp/remi-cat"), "session-1", &cli)
+                .expect("tmux should be preferred");
+
+        assert_eq!(command.kind, "tmux");
+        assert_eq!(command.program, "tmux");
+        assert_eq!(
+            os_args_to_strings(&command.args),
+            vec![
+                "split-window",
+                "-h",
+                "/tmp/remi-cat",
+                "tui",
+                "resume",
+                "session-1",
+                "--user",
+                "u1",
+                "--name",
+                "Alice",
+            ]
+        );
+    }
+
+    #[test]
+    fn zellij_pane_launch_command_resumes_session() {
+        let cli = test_cli_config();
+        let command =
+            build_pane_launch_command(false, true, Path::new("/tmp/remi-cat"), "session-1", &cli)
+                .expect("zellij should be supported");
+
+        assert_eq!(command.kind, "Zellij");
+        assert_eq!(command.program, "zellij");
+        assert_eq!(
+            os_args_to_strings(&command.args),
+            vec![
+                "action",
+                "new-pane",
+                "--direction",
+                "right",
+                "--",
+                "/tmp/remi-cat",
+                "tui",
+                "resume",
+                "session-1",
+                "--user",
+                "u1",
+                "--name",
+                "Alice",
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_launch_command_is_absent_without_supported_multiplexer() {
+        let cli = test_cli_config();
+        assert!(build_pane_launch_command(
+            false,
+            false,
+            Path::new("/tmp/remi-cat"),
+            "session-1",
+            &cli
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn warp_tab_config_runs_resume_command() {
+        let cli = test_cli_config();
+        let toml = warp_tab_config_toml(
+            "remi_cat_fork_session1",
+            Path::new("/tmp/remi cat"),
+            "session-1",
+            &cli,
+        );
+
+        assert!(toml.contains("name = \"Remi fork remi_cat_fork_session1\""));
+        assert!(toml.contains("type = \"terminal\""));
+        assert!(toml.contains("is_focused = true"));
+        assert!(toml.contains("'/tmp/remi cat' tui resume session-1 --user u1 --name Alice"));
     }
 
     #[test]
@@ -3434,6 +4838,91 @@ mod tests {
             byte_index_for_char_offset(text, ranges[1].0, ranges[1].1, 99),
             8
         );
+    }
+
+    #[test]
+    fn composer_collapses_large_paste_but_submits_full_text() {
+        let paste = (0..10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut input = ComposerInput::default();
+        input.insert_text("before ");
+        input.insert_paste(paste.clone());
+        input.insert_text(" after");
+
+        assert_eq!(input.to_text(), format!("before {paste} after"));
+        assert!(input.display_text().contains("[pasted 10 lines,"));
+        assert!(!input.display_text().contains("line 9"));
+    }
+
+    #[test]
+    fn composer_keeps_short_paste_editable() {
+        let mut input = ComposerInput::default();
+        input.insert_paste("a\nb".to_string());
+
+        assert_eq!(input.to_text(), "a\nb");
+        assert_eq!(input.display_text(), "a\nb");
+    }
+
+    #[test]
+    fn composer_collapses_more_than_three_pasted_lines() {
+        let mut input = ComposerInput::default();
+        input.insert_paste("a\nb\nc\nd".to_string());
+
+        assert_eq!(input.to_text(), "a\nb\nc\nd");
+        assert!(input.display_text().starts_with("[pasted 4 lines,"));
+    }
+
+    #[test]
+    fn composer_moves_across_paste_as_atomic_chunk() {
+        let paste = "x".repeat(PASTE_CHUNK_CHAR_THRESHOLD + 1);
+        let mut input = ComposerInput::default();
+        input.insert_text("a");
+        input.insert_paste(paste);
+        input.insert_text("b");
+
+        input.move_home();
+        input.move_right();
+        let before_chunk = input.cursor;
+        input.move_right();
+        let after_chunk = input.cursor;
+        input.move_right();
+
+        assert_ne!(before_chunk, after_chunk);
+        assert_eq!(input.cursor_display_byte(), input.display_text().len());
+    }
+
+    #[test]
+    fn composer_deletes_paste_as_atomic_chunk() {
+        let paste = "x".repeat(PASTE_CHUNK_CHAR_THRESHOLD + 1);
+        let mut input = ComposerInput::default();
+        input.insert_text("a");
+        input.insert_paste(paste);
+        input.insert_text("b");
+
+        input.move_home();
+        input.move_right();
+        input.delete();
+
+        assert_eq!(input.to_text(), "ab");
+        assert_eq!(input.display_text(), "ab");
+    }
+
+    #[test]
+    fn composer_backspace_deletes_paste_as_atomic_chunk() {
+        let paste = "x".repeat(PASTE_CHUNK_CHAR_THRESHOLD + 1);
+        let mut input = ComposerInput::default();
+        input.insert_text("a");
+        input.insert_paste(paste);
+        input.insert_text("b");
+
+        input.move_end();
+        input.move_left();
+        input.backspace();
+
+        assert_eq!(input.to_text(), "ab");
+        assert_eq!(input.display_text(), "ab");
     }
 
     #[test]
@@ -3486,10 +4975,11 @@ mod tests {
             ToolVisualStatus::Success,
         );
         let lines = cell.lines(80);
-        assert!(lines.iter().any(|line| line
-            .spans
-            .iter()
-            .any(|span| span.content.as_ref() == "-old" && span.style.fg == Some(Color::Red))));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "-old" && span.style.fg == Some(Color::Red))
+        }));
         assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
             span.content.as_ref() == "+new" && span.style.fg == Some(CODEX_GREEN)
         })));
@@ -3602,9 +5092,10 @@ mod tests {
         let lines = resolved.lines(100);
         assert!(resolved.body.is_empty());
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].spans.iter().any(|span| span
-            .content
-            .contains("approval · resolved · fs_remove · AllowOnce")));
+        assert!(lines[0].spans.iter().any(|span| {
+            span.content
+                .contains("approval · resolved · fs_remove · AllowOnce")
+        }));
     }
 
     #[test]
@@ -3689,6 +5180,22 @@ mod tests {
         assert!(body.chars().count() <= MAX_TOOL_BODY_CHARS);
         assert!(body.ends_with('…'));
         assert_ne!(body, result);
+    }
+
+    #[test]
+    fn tool_body_preserves_bash_summary_lines() {
+        let pretty = PrettyToolCall::completed(
+            "call-1",
+            "bash",
+            &serde_json::json!({"command":"cargo test"}),
+            "one\ntwo\nthree\nfour\n",
+            true,
+            10,
+        );
+        let body = tool_body(&pretty);
+
+        assert!(body.contains("$ cargo test\n输出 4 行:\none\ntwo\nthree"));
+        assert!(!body.contains("four"));
     }
 
     #[test]
@@ -3853,9 +5360,50 @@ mod tests {
     }
 
     #[test]
+    fn appends_token_meta_to_history_cell() {
+        let mut cell = HistoryCell::assistant("hello");
+        append_token_meta(
+            &mut cell,
+            TokenDelta {
+                prompt_tokens: 12,
+                completion_tokens: 3,
+            },
+        );
+
+        assert_eq!(cell.meta, "tokens +12p/+3c");
+    }
+
+    #[test]
+    fn preserves_token_meta_when_replacing_tool_meta() {
+        let meta = preserve_token_meta("120ms".to_string(), "tokens +12p/+3c");
+        assert_eq!(meta, "120ms · tokens +12p/+3c");
+    }
+
+    #[test]
     fn preprocessing_depth_constant_remains_available() {
         assert!(crate::MAX_COMMAND_PREPROCESS_DEPTH >= 1);
         assert_eq!(crate::CLI_CHANNEL, "cli");
         assert_eq!(crate::CLI_USERNAME, "local-user");
+    }
+
+    fn test_cli_config() -> CliConfig {
+        CliConfig {
+            enabled: true,
+            tui: true,
+            resume: false,
+            resume_session_id: None,
+            once: None,
+            pure_prompt: false,
+            admin_only: false,
+            channel_id: "desk".to_string(),
+            user_id: "u1".to_string(),
+            username: "Alice".to_string(),
+        }
+    }
+
+    fn os_args_to_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 }

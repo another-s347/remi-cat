@@ -157,9 +157,23 @@ pub struct FileSkillStore {
 
 impl FileSkillStore {
     pub fn new(primary_dir: impl Into<PathBuf>) -> Self {
+        let primary_dir = primary_dir.into();
+        let workspace_root = infer_workspace_root_from_primary_dir(&primary_dir);
+        Self::new_in_workspace(primary_dir, workspace_root)
+    }
+
+    pub fn new_in_workspace(
+        primary_dir: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+    ) -> Self {
+        let primary_dir = primary_dir.into();
+        let workspace_root = workspace_root.into();
         Self::with_roots([
-            (primary_dir.into(), PRIMARY_SOURCE.to_string()),
-            (PathBuf::from(COMPAT_SOURCE), COMPAT_SOURCE.to_string()),
+            (primary_dir, PRIMARY_SOURCE.to_string()),
+            (
+                workspace_root.join(COMPAT_SOURCE),
+                COMPAT_SOURCE.to_string(),
+            ),
         ])
     }
 
@@ -176,6 +190,26 @@ impl FileSkillStore {
         let entries = scan_skill_roots(&self.roots);
         *self.entries.write().unwrap() = entries;
     }
+}
+
+fn infer_workspace_root_from_primary_dir(primary_dir: &Path) -> PathBuf {
+    let is_skills_dir = primary_dir.file_name().and_then(|value| value.to_str()) == Some("skills");
+    if !is_skills_dir {
+        return PathBuf::from(".");
+    }
+    let Some(data_dir) = primary_dir.parent() else {
+        return PathBuf::from(".");
+    };
+    if data_dir.file_name().and_then(|value| value.to_str()) == Some(".remi-cat") {
+        let Some(workspace_root) = data_dir.parent() else {
+            return PathBuf::from(".");
+        };
+        if workspace_root.as_os_str().is_empty() {
+            return PathBuf::from(".");
+        }
+        return workspace_root.to_path_buf();
+    }
+    PathBuf::from(".")
 }
 
 impl SkillStore for FileSkillStore {
@@ -343,7 +377,7 @@ fn scan_skill_roots(roots: &[(PathBuf, String)]) -> BTreeMap<String, SkillEntry>
     entries
 }
 
-fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, AgentError> {
+fn parse_skill_markdown(_dir_name: &str, content: &str) -> Result<ParsedSkill, AgentError> {
     let (frontmatter, body) = split_frontmatter(content).ok_or_else(|| {
         AgentError::other("skill SKILL.md must start with YAML frontmatter delimited by ---")
     })?;
@@ -376,11 +410,6 @@ fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, Ag
     let _ = (&meta.license, &meta.metadata, &meta.allowed_tools);
     if body.trim().is_empty() {
         return Err(AgentError::other("skill body must not be empty"));
-    }
-    if !dir_name.is_empty() && dir_name != name {
-        return Err(AgentError::other(format!(
-            "skill directory '{dir_name}' must match frontmatter name '{name}'"
-        )));
     }
     Ok(ParsedSkill { name, description })
 }
@@ -561,6 +590,53 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(primary);
         let _ = std::fs::remove_dir_all(compat);
+    }
+
+    #[tokio::test]
+    async fn new_in_workspace_loads_primary_and_compat_directories_from_same_workspace() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat").join("skills");
+        let compat = workspace.join(".agents").join("skills");
+        write_skill(
+            &primary,
+            "primary-skill",
+            "primary-skill",
+            "Primary workflow",
+            "Use the primary skill.",
+        );
+        write_skill(
+            &compat,
+            "compat-skill",
+            "compat-skill",
+            "Compat workflow",
+            "Use the compat skill.",
+        );
+
+        let store = FileSkillStore::new_in_workspace(&primary, &workspace);
+        let primary_doc = store.get("primary-skill").await.unwrap().unwrap();
+        let compat_doc = store.get("compat-skill").await.unwrap().unwrap();
+
+        assert_eq!(primary_doc.source, ".remi-cat/skills");
+        assert_eq!(compat_doc.source, ".agents/skills");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn new_in_workspace_prefers_primary_directory_duplicates() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat").join("skills");
+        let compat = workspace.join(".agents").join("skills");
+        write_skill(&primary, "dup", "dup", "Primary version", "Primary body.");
+        write_skill(&compat, "dup", "dup", "Compat version", "Compat body.");
+
+        let store = FileSkillStore::new_in_workspace(&primary, &workspace);
+        let doc = store.get("dup").await.unwrap().unwrap();
+
+        assert_eq!(doc.description, "Primary version");
+        assert_eq!(doc.source, ".remi-cat/skills");
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

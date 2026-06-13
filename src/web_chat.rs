@@ -779,6 +779,9 @@ async fn run_turn(
         .lock()
         .await
         .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+    let context_tokens = runtime
+        .bot
+        .model_context_tokens_for(model_profile_id.as_deref());
     let opts = StreamOptions {
         model_profile_id,
         skill_injections,
@@ -960,11 +963,29 @@ async fn run_turn(
                 max_prompt_tokens: round_max_prompt_tokens,
                 elapsed_ms,
             } => {
-                total_prompt_tokens = total_prompt_tokens.saturating_add(prompt_tokens);
-                total_completion_tokens = total_completion_tokens.saturating_add(completion_tokens);
-                max_prompt_tokens = max_prompt_tokens.max(round_max_prompt_tokens);
-                model_elapsed_ms = model_elapsed_ms.saturating_add(elapsed_ms);
-                None
+                total_prompt_tokens = prompt_tokens;
+                total_completion_tokens = completion_tokens;
+                max_prompt_tokens = round_max_prompt_tokens;
+                model_elapsed_ms = elapsed_ms;
+                let context_usage = if context_tokens == 0 {
+                    0.0
+                } else {
+                    max_prompt_tokens as f64 / context_tokens as f64
+                };
+                Some((
+                    "stats",
+                    serde_json::json!({
+                        "ttft_ms": first_response_at.map(|elapsed| elapsed.as_millis() as u64),
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": total_completion_tokens,
+                        "total_tokens": total_prompt_tokens.saturating_add(total_completion_tokens),
+                        "max_prompt_tokens": max_prompt_tokens,
+                        "context_tokens": context_tokens,
+                        "context_usage": context_usage,
+                        "model_elapsed_ms": model_elapsed_ms,
+                        "elapsed_ms": run_started_at.elapsed().as_millis() as u64,
+                    }),
+                ))
             }
             CatEvent::Error(error) => {
                 Some(("error", serde_json::json!({"message": error.to_string()})))
@@ -982,14 +1003,6 @@ async fn run_turn(
         }
     }
 
-    let model_profile_id = runtime
-        .sessions
-        .lock()
-        .await
-        .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
-    let context_tokens = runtime
-        .bot
-        .model_context_tokens_for(model_profile_id.as_deref());
     let context_usage = if context_tokens == 0 {
         0.0
     } else {

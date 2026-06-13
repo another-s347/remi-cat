@@ -135,6 +135,15 @@ export type CommandCatalogEntry = {
   accepts_arguments?: boolean;
 };
 
+export type WorkspaceFileMatch = {
+  relative_path: string;
+  mention_path: string;
+  display_path: string;
+  kind: "file" | "directory";
+  size?: number;
+  modified?: string;
+};
+
 async function json<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   if (!response.ok) {
@@ -204,6 +213,10 @@ export const api = {
       method: "DELETE",
     }),
   commands: () => json<CommandCatalogEntry[]>("/api/v1/chat/commands"),
+  fileMatches: (query: string, limit = 8) =>
+    json<{ items: WorkspaceFileMatch[] }>(
+      `/api/v1/chat/files?q=${encodeURIComponent(query)}&limit=${limit}`,
+    ),
 };
 
 export async function* streamRun(

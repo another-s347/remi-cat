@@ -7,6 +7,7 @@ mod session;
 mod tui_app;
 mod tui_markdown;
 mod web_chat;
+mod workspace_files;
 
 use anyhow::Context;
 use std::collections::HashMap;
@@ -1255,11 +1256,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| data_dir.join("agents"));
 
     if cli.admin_only {
+        let workspace_dir = current_workspace_dir(&data_dir);
         let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
         maybe_start_admin(host_admin::AdminState {
             agents_dir,
             skills_dir: data_dir.join("skills"),
-            workspace_dir: current_workspace_dir(&data_dir),
+            workspace_root_label: current_workspace_root_label(&workspace_dir),
+            workspace_dir,
             secret_store: Arc::clone(&secret_store),
             sessions,
             root_agent_id,
@@ -1312,10 +1315,12 @@ async fn main() -> anyhow::Result<()> {
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
     if !cli.pure_prompt && !cli.tui {
+        let workspace_dir = current_workspace_dir(&data_dir);
         maybe_start_admin(host_admin::AdminState {
             agents_dir,
             skills_dir: data_dir.join("skills"),
-            workspace_dir: current_workspace_dir(&data_dir),
+            workspace_root_label: current_workspace_root_label(&workspace_dir),
+            workspace_dir,
             secret_store: Arc::clone(&runtime.secret_store),
             sessions: Arc::clone(&runtime.sessions),
             root_agent_id: runtime.root_agent_id.clone(),
@@ -1405,6 +1410,20 @@ fn current_workspace_dir(data_dir: &Path) -> PathBuf {
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
+fn current_workspace_root_label(workspace_dir: &Path) -> String {
+    let kind = std::env::var("REMI_SANDBOX_KIND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(kind.as_deref(), Some("docker")) {
+        std::env::var("REMI_SANDBOX_CONTAINER_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/workspace".to_string())
+    } else {
+        workspace_dir.display().to_string()
+    }
 }
 
 fn init_observability(
@@ -1932,10 +1951,10 @@ fn format_command_status(present: &[String], missing: &[String]) -> String {
     }
 }
 
-const REQUIRED_SANDBOX_COMMANDS: &[&str] = &["bash", "sleep", "cat"];
+const REQUIRED_SANDBOX_COMMANDS: &[&str] = &["bash", "sleep", "cat", "rg"];
 const RECOMMENDED_SANDBOX_COMMANDS: &[&str] = &[
-    "git", "curl", "wget", "rg", "python3", "pip3", "jq", "gcc", "make", "tar", "gzip", "unzip",
-    "zip", "sed", "grep", "awk", "find", "xargs", "wc", "head", "tail", "sort",
+    "git", "curl", "wget", "python3", "pip3", "jq", "gcc", "make", "tar", "gzip", "unzip", "zip",
+    "sed", "grep", "awk", "find", "xargs", "wc", "head", "tail", "sort",
 ];
 
 fn check_sandbox(config: &RuntimeConfig) -> anyhow::Result<SandboxDoctorCheck> {

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -19,6 +19,9 @@ use crate::runtime_config::SetupState;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::{Session, SessionRuntime};
 use crate::web_chat::{WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
+use crate::workspace_files::{
+    default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
+};
 
 const WEB_INDEX: &str = include_str!("../web-ui/dist/index.html");
 const WEB_APP_JS: &str = include_str!("../web-ui/dist/app.js");
@@ -29,6 +32,7 @@ pub struct AdminState {
     pub agents_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub workspace_dir: PathBuf,
+    pub workspace_root_label: String,
     pub secret_store: Arc<Mutex<SecretStore>>,
     pub sessions: Arc<Mutex<SessionRuntime>>,
     pub root_agent_id: String,
@@ -52,6 +56,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/secrets", get(list_secrets).post(set_secret))
         .route("/api/v1/secrets/{key}", delete(delete_secret))
         .route("/api/v1/chat/commands", get(command_catalog))
+        .route("/api/v1/chat/files", get(search_workspace_file_matches))
         .route(
             "/api/v1/chat/sessions",
             get(list_web_sessions).post(create_web_session),
@@ -132,6 +137,17 @@ struct CommandCatalogEntry {
     accepts_arguments: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileSearchQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileSearchResponse {
+    items: Vec<WorkspaceFileMatch>,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -162,8 +178,28 @@ async fn command_catalog(State(state): State<AdminState>) -> Json<Vec<CommandCat
     Json(entries)
 }
 
+async fn search_workspace_file_matches(
+    State(state): State<AdminState>,
+    Query(query): Query<FileSearchQuery>,
+) -> Result<Json<FileSearchResponse>, AdminError> {
+    let raw_query = query.q.unwrap_or_default();
+    let items = search_workspace_files(
+        &state.workspace_dir,
+        &state.workspace_root_label,
+        &raw_query,
+        default_file_search_limit(query.limit),
+    )?;
+    Ok(Json(FileSearchResponse { items }))
+}
+
 fn static_command_catalog() -> Vec<CommandCatalogEntry> {
     [
+        (
+            "/fork",
+            "Fork Session",
+            "复制当前会话并打开新的 Web session",
+            false,
+        ),
         ("/tools", "列出工具", "显示当前 Agent 可用的工具", false),
         (
             "/goal status",

@@ -37,6 +37,20 @@ const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
     &["trigger__upsert", "trigger__list", "trigger__delete"];
 const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
 
+fn stats_event(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    max_prompt_tokens: u32,
+    run_start: Instant,
+) -> CatEvent {
+    CatEvent::Stats {
+        prompt_tokens,
+        completion_tokens,
+        max_prompt_tokens,
+        elapsed_ms: run_start.elapsed().as_millis() as u64,
+    }
+}
+
 fn log_tool_call_started(kind: &str, thread_id: &str, run_id: &str, tc: &ParsedToolCall) {
     tracing::info!(
         thread_id,
@@ -208,6 +222,12 @@ where
                             total_prompt_tokens += prompt_tokens;
                             total_completion_tokens += completion_tokens;
                             max_prompt_tokens = max_prompt_tokens.max(prompt_tokens);
+                            yield stats_event(
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                                max_prompt_tokens,
+                                run_start,
+                            );
                         }
                         AgentEvent::NeedToolExecution {
                             mut state,
@@ -346,6 +366,12 @@ where
                                             success: false,
                                             elapsed_ms: 0,
                                         };
+                                        yield stats_event(
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                            max_prompt_tokens,
+                                            run_start,
+                                        );
                                         all_outcomes.push(ToolCallOutcome::Error {
                                             tool_call_id: tc.id.clone(),
                                             tool_name: tc.name.clone(),
@@ -425,6 +451,12 @@ where
                                         success,
                                         elapsed_ms,
                                     };
+                                    yield stats_event(
+                                        total_prompt_tokens,
+                                        total_completion_tokens,
+                                        max_prompt_tokens,
+                                        run_start,
+                                    );
 
                                     for side_ev in make_side_events(tc, &collected.preview) {
                                         yield side_ev;
@@ -548,6 +580,12 @@ where
                                             success: false,
                                             elapsed_ms: 0,
                                         };
+                                        yield stats_event(
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                            max_prompt_tokens,
+                                            run_start,
+                                        );
                                         all_outcomes.push(ToolCallOutcome::Error {
                                             tool_call_id: tc.id.clone(),
                                             tool_name: tc.name.clone(),
@@ -626,6 +664,12 @@ where
                                         success,
                                         elapsed_ms,
                                     };
+                                    yield stats_event(
+                                        total_prompt_tokens,
+                                        total_completion_tokens,
+                                        max_prompt_tokens,
+                                        run_start,
+                                    );
                                     for side_ev in collected.side_events.clone() {
                                         yield side_ev;
                                     }
@@ -1467,6 +1511,65 @@ mod tests {
                 "ok",
             )])))
         }
+    }
+
+    struct UsageThenDoneInnerAgent;
+
+    impl Agent for UsageThenDoneInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            _req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            Ok(stream::iter(vec![
+                remi_agentloop::types::AgentEvent::Usage {
+                    prompt_tokens: 12,
+                    completion_tokens: 3,
+                },
+                remi_agentloop::types::AgentEvent::TextDelta("ok".to_string()),
+                remi_agentloop::types::AgentEvent::Done,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_events_emit_stats_before_done() {
+        let agent = CatAgent {
+            inner: UsageThenDoneInnerAgent,
+            local_tools: DefaultToolRegistry::new(),
+            data_dir: test_root(),
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("usage"))
+            .collect::<Vec<_>>()
+            .await;
+        let stats_index = events
+            .iter()
+            .position(|event| matches!(event, CatEvent::Stats { .. }))
+            .expect("stats event should be emitted");
+        let done_index = events
+            .iter()
+            .position(|event| matches!(event, CatEvent::Done))
+            .expect("done event should be emitted");
+
+        assert!(stats_index < done_index);
+        assert!(matches!(
+            &events[stats_index],
+            CatEvent::Stats {
+                prompt_tokens: 12,
+                completion_tokens: 3,
+                max_prompt_tokens: 12,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

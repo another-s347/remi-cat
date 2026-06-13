@@ -97,6 +97,7 @@ use tools::{
 
 const DEFAULT_AGENT_ID: &str = "default";
 const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(180);
+const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 pub(crate) const TRIGGER_RUN_META_KEY: &str = "trigger_run";
 
 pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &str) -> bool {
@@ -374,6 +375,8 @@ impl CatBot {
     /// | `REMI_MODEL_PROFILE`      | Selected model profile id (default: `default`)        |
     /// | `REMI_KIMI_THINKING`      | Optional thinking override for supported Kimi profiles |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
+    /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers auto compression (default: 80) |
+    /// | `REMI_SHORT_TERM_TOKENS`  | Absolute auto-compression token threshold override    |
     /// | `LANGSMITH_API_KEY`       | Enable LangSmith tracing (optional)                   |
     /// | `LANGSMITH_PROJECT`       | LangSmith project name (default: `remi-cat`)          |
     pub fn from_env() -> anyhow::Result<Self> {
@@ -1785,6 +1788,7 @@ struct LocalToolDeps {
     bash_enabled: bool,
     redactor: SharedRedactor,
     data_dir: PathBuf,
+    workspace_root: PathBuf,
     agents_dir: PathBuf,
     delegate_ids: Vec<String>,
     api_key: String,
@@ -1806,6 +1810,7 @@ impl LocalToolDeps {
             bash_enabled: self.bash_enabled,
             redactor: Arc::clone(&self.redactor),
             data_dir: self.data_dir.clone(),
+            workspace_root: self.workspace_root.clone(),
             agents_dir: self.agents_dir.clone(),
             delegate_ids: self.delegate_ids.clone(),
             api_key: self.api_key.clone(),
@@ -1883,7 +1888,7 @@ impl LocalToolDeps {
         });
         register_fetch_tool(
             &mut local_tools,
-            self.data_dir.clone(),
+            self.workspace_root.clone(),
             self.im_bridge.clone(),
         );
         local_tools.register(ExaSearchTool::new());
@@ -1914,6 +1919,28 @@ fn build_inner_agent(
         builder = builder.extra_options(extra_options);
     }
     builder.build_loop()
+}
+
+fn auto_compress_context_percent() -> anyhow::Result<usize> {
+    let Some(raw) = std::env::var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT);
+    };
+    let percent = raw.parse::<usize>().map_err(|err| {
+        anyhow::anyhow!("invalid REMI_AUTO_COMPRESS_CONTEXT_PERCENT `{raw}`: {err}")
+    })?;
+    if !(1..=100).contains(&percent) {
+        anyhow::bail!("REMI_AUTO_COMPRESS_CONTEXT_PERCENT must be between 1 and 100");
+    }
+    Ok(percent)
+}
+
+fn context_percent_tokens(profile: &ModelProfileConfig, percent: usize) -> usize {
+    let context_tokens = profile.context_tokens as usize;
+    context_tokens.saturating_mul(percent).div_ceil(100).max(1)
 }
 
 // -- CatBotBuilder ------------------------------------------------------------
@@ -1954,6 +1981,9 @@ impl CatBotBuilder {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(7_u64);
+        let short_term_tokens = std::env::var("REMI_SHORT_TERM_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok());
         let bash_mode = match std::env::var("REMI_SHELL_MODE")
             .or_else(|_| std::env::var("REMI_BASH_MODE"))
             .as_deref()
@@ -1982,7 +2012,7 @@ impl CatBotBuilder {
             skills_dir,
             data_dir: data_dir.clone(),
             agent_md_path,
-            short_term_tokens: None,
+            short_term_tokens,
             overflow_bytes: None,
             memory_days,
             sandbox_config,
@@ -2025,7 +2055,8 @@ impl CatBotBuilder {
     }
 
     /// Override the short-term memory token budget.
-    /// By default this is derived from the model profile.
+    /// By default this is derived from the model profile context window and
+    /// `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` (80% when unset).
     pub fn short_term_tokens(mut self, n: usize) -> Self {
         self.short_term_tokens = Some(n);
         self
@@ -2084,7 +2115,10 @@ impl CatBotBuilder {
 
     pub fn build(self) -> anyhow::Result<CatBot> {
         let profile = self.model_profile.clone();
-        let short_term_tokens = self.short_term_tokens.unwrap_or(profile.short_term_tokens);
+        let auto_compress_context_percent = auto_compress_context_percent()?;
+        let short_term_tokens = self
+            .short_term_tokens
+            .unwrap_or_else(|| context_percent_tokens(&profile, auto_compress_context_percent));
         let overflow_bytes = self.overflow_bytes.unwrap_or(profile.overflow_bytes);
         let resolved_base_url = profile.base_url.clone();
 
@@ -2096,6 +2130,7 @@ impl CatBotBuilder {
             context_tokens = profile.context_tokens,
             max_output_tokens = profile.max_output_tokens,
             short_term_tokens,
+            auto_compress_context_percent,
             overflow_bytes,
             base_url = ?resolved_base_url,
             "model profile resolved"
@@ -2158,8 +2193,9 @@ impl CatBotBuilder {
             memory_days: self.memory_days,
         });
 
+        let workspace_root = self.sandbox_config.host_dir().to_path_buf();
         let skill_store = Arc::new(BuiltinSkillStore::new(
-            FileSkillStore::new(self.skills_dir),
+            FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone()),
             [
                 trigger::builtin_trigger_skill(),
                 remi_skill::builtin_remi_skill(),
@@ -2201,6 +2237,7 @@ impl CatBotBuilder {
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
             data_dir: data_dir.clone(),
+            workspace_root: workspace_root.clone(),
             agents_dir: agents_dir.clone(),
             delegate_ids: self.delegate_ids.clone(),
             api_key: self.api_key.clone(),
@@ -2267,7 +2304,7 @@ impl CatBotBuilder {
         });
         register_fetch_tool(
             &mut acp_local_tools,
-            data_dir.clone(),
+            workspace_root.clone(),
             self.im_bridge.clone(),
         );
         acp_local_tools.register(ExaSearchTool::new());
@@ -2298,6 +2335,7 @@ impl CatBotBuilder {
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
             data_dir: data_dir.clone(),
+            workspace_root: workspace_root.clone(),
             agents_dir: agents_dir.clone(),
             delegate_ids: self.delegate_ids.clone(),
             api_key: self.api_key.clone(),
@@ -2540,7 +2578,7 @@ fn build_subagent_tools(deps: &LocalToolDeps, profile: &AgentProfile) -> Default
     });
     register_fetch_tool(
         &mut local_tools,
-        deps.data_dir.clone(),
+        deps.workspace_root.clone(),
         deps.im_bridge.clone(),
     );
     local_tools.register(ExaSearchTool::new());
@@ -2571,7 +2609,7 @@ fn cat_event_to_agent_event(event: CatEvent) -> Option<AgentEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_thread_todo_system_prompt, default_system_prompt,
+        append_thread_todo_system_prompt, context_percent_tokens, default_system_prompt,
         insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
         local_acp_thread_id,
         memory::{build_injected_history, MemoryContext, MemoryIndex},
@@ -2579,7 +2617,7 @@ mod tests {
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
         GoalMaxRounds, Message, ModelProfileRegistry, SandboxConfig, ThreadRunLocks,
-        DEFAULT_AGENT_ID,
+        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::todo::tools::TodoItem;
     use futures::StreamExt as _;
@@ -2609,6 +2647,22 @@ mod tests {
             auto_compress: true,
             extra_options: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn context_percent_tokens_defaults_to_eighty_percent_of_context() {
+        let profile = test_model_profile();
+        assert_eq!(
+            context_percent_tokens(&profile, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
+            102_400
+        );
+    }
+
+    #[test]
+    fn context_percent_tokens_rounds_up_and_never_returns_zero() {
+        let mut profile = test_model_profile();
+        profile.context_tokens = 1;
+        assert_eq!(context_percent_tokens(&profile, 80), 1);
     }
 
     #[tokio::test]

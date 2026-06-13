@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   Circle,
   Command,
+  FileText,
   GitBranch,
   KeyRound,
   ListTodo,
@@ -42,8 +43,16 @@ import {
   type ToolApprovalDecision,
   type ToolApprovalRequest,
   type TodoItem,
+  type WorkspaceFileMatch,
 } from "./api";
-import { CHAT_COMMANDS, commandSuggestions, type ChatCommand } from "./commands";
+import {
+  activeFileMentionToken,
+  CHAT_COMMANDS,
+  commandSuggestions,
+  replaceFileMentionToken,
+  type ChatCommand,
+  type FileMentionToken,
+} from "./commands";
 import { RemiRuntimeProvider } from "./runtime";
 
 function TextPart({ text }: TextMessagePartProps) {
@@ -85,6 +94,13 @@ function encodeWorkspacePath(path: string) {
     .filter((part) => part.length > 0)
     .map(encodeURIComponent)
     .join("/");
+}
+
+function formatFileSize(size?: number) {
+  if (size === undefined) return "文件";
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${size} B`;
 }
 
 type PatchLine = {
@@ -605,9 +621,12 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
   const [dismissedText, setDismissedText] = useState<string>();
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
+  const [fileToken, setFileToken] = useState<FileMentionToken>();
+  const [fileSuggestions, setFileSuggestions] = useState<WorkspaceFileMatch[]>([]);
+  const [fileSelectedIndex, setFileSelectedIndex] = useState(0);
   const suggestions = useMemo(
-    () => (dismissedText === text ? [] : commandSuggestions(text, commandCatalog).slice(0, 8)),
-    [commandCatalog, dismissedText, text],
+    () => (fileToken || dismissedText === text ? [] : commandSuggestions(text, commandCatalog).slice(0, 8)),
+    [commandCatalog, dismissedText, fileToken, text],
   );
 
   useEffect(() => {
@@ -624,7 +643,31 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     setSelectedIndex(0);
+    setFileSelectedIndex(0);
   }, [text]);
+
+  useEffect(() => {
+    const token = activeFileMentionToken(text, inputRef.current?.selectionStart ?? text.length);
+    setFileToken(token);
+  }, [text]);
+
+  useEffect(() => {
+    if (!fileToken) {
+      setFileSuggestions([]);
+      return;
+    }
+    let cancelled = false;
+    api.fileMatches(fileToken.query, 8)
+      .then((response) => {
+        if (!cancelled) setFileSuggestions(response.items);
+      })
+      .catch(() => {
+        if (!cancelled) setFileSuggestions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fileToken?.query, fileToken?.start, fileToken?.end]);
 
   useEffect(() => {
     let cancelled = false;
@@ -638,6 +681,11 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId]);
 
+  const refreshFileToken = useCallback(() => {
+    const token = activeFileMentionToken(text, inputRef.current?.selectionStart ?? text.length);
+    setFileToken(token);
+  }, [text]);
+
   const complete = useCallback(
     (index: number) => {
       const command = suggestions[index];
@@ -648,6 +696,20 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
       requestAnimationFrame(() => inputRef.current?.focus());
     },
     [composer, suggestions],
+  );
+
+  const completeFile = useCallback(
+    (index: number) => {
+      const token = fileToken;
+      const file = fileSuggestions[index];
+      if (!token || !file) return;
+      composer.setText(replaceFileMentionToken(text, token, file.mention_path));
+      setFileToken(undefined);
+      setFileSuggestions([]);
+      setHistoryIndex(null);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [composer, fileSuggestions, fileToken, text],
   );
 
   const rememberInput = useCallback((value: string) => {
@@ -682,6 +744,10 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
   );
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    const token = activeFileMentionToken(text, event.currentTarget.selectionStart ?? text.length);
+    if (token?.start !== fileToken?.start || token?.end !== fileToken?.end || token?.query !== fileToken?.query) {
+      setFileToken(token);
+    }
     if (event.altKey && event.key === "ArrowUp") {
       event.preventDefault();
       recallInputHistory(-1);
@@ -691,6 +757,30 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
       event.preventDefault();
       recallInputHistory(1);
       return;
+    }
+    if (fileToken && fileSuggestions.length > 0) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setFileToken(undefined);
+        setFileSuggestions([]);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setFileSelectedIndex((index) => Math.max(0, index - 1));
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setFileSelectedIndex((index) => Math.min(fileSuggestions.length - 1, index + 1));
+        return;
+      }
+      if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+        event.preventDefault();
+        completeFile(fileSelectedIndex);
+        return;
+      }
     }
     if (suggestions.length > 0) {
       if (event.key === "Escape") {
@@ -741,12 +831,35 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
           <div className="command-menu-footer"><kbd>↑</kbd><kbd>↓</kbd> 选择 <kbd>Tab</kbd> 补全 <kbd>Esc</kbd> 关闭</div>
         </div>
       )}
+      {fileToken && fileSuggestions.length > 0 && (
+        <div className="command-menu" role="listbox" aria-label="文件建议">
+          <div className="command-menu-header"><FileText size={14} /> 文件</div>
+          {fileSuggestions.map((file, index) => (
+            <button
+              className={index === fileSelectedIndex ? "command-item selected" : "command-item"}
+              key={file.relative_path}
+              role="option"
+              aria-selected={index === fileSelectedIndex}
+              onMouseEnter={() => setFileSelectedIndex(index)}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => completeFile(index)}
+              type="button"
+            >
+              <code>@{file.mention_path}</code>
+              <span><strong>{file.display_path}</strong><small>{file.kind === "directory" ? "目录" : formatFileSize(file.size)}</small></span>
+            </button>
+          ))}
+          <div className="command-menu-footer"><kbd>↑</kbd><kbd>↓</kbd> 选择 <kbd>Tab</kbd> 补全 <kbd>Esc</kbd> 关闭</div>
+        </div>
+      )}
       <ComposerPrimitive.Root className="composer">
         <ComposerPrimitive.Input
           ref={inputRef}
           placeholder="输入消息，或输入 / 查看命令..."
           rows={1}
           onKeyDown={handleKeyDown}
+          onKeyUp={refreshFileToken}
+          onClick={refreshFileToken}
         />
         <ComposerPrimitive.Send
           className="icon-button primary"

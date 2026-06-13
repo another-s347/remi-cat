@@ -1322,19 +1322,31 @@ fn copy_dir_all(
 
 /// Find a safe split point for compressing short-term messages.
 ///
-/// Starting at `desired`, walks backwards until `msgs[split]` is a `User` or
-/// `System` message.  This guarantees the "remaining" half always starts at a
-/// clean exchange boundary and never begins with an orphaned `Tool` result
-/// (which would cause the API to reject the history with "tool_call_id not found").
+/// Starting near `desired`, prefers the next `User` or `System` message after
+/// the midpoint, then falls back to an earlier boundary.  This guarantees the
+/// "remaining" half always starts at a clean exchange boundary and never begins
+/// with an orphaned `Tool` result (which would cause the API to reject the
+/// history with "tool_call_id not found").
 fn safe_split_point(msgs: &[Message], desired: usize) -> usize {
-    let mut i = desired.min(msgs.len().saturating_sub(1));
-    while i > 0 {
-        if matches!(msgs[i].role, Role::User | Role::System) {
-            break;
-        }
-        i -= 1;
+    if msgs.len() <= 1 {
+        return msgs.len();
     }
-    i.max(1)
+    let desired = desired.clamp(1, msgs.len().saturating_sub(1));
+
+    for i in desired..msgs.len() {
+        if matches!(msgs[i].role, Role::User | Role::System) {
+            return i;
+        }
+    }
+    for i in (1..desired).rev() {
+        if matches!(msgs[i].role, Role::User | Role::System) {
+            return i;
+        }
+    }
+
+    // No safe boundary exists. Compact everything instead of repeatedly
+    // compacting one message and emitting a stream of tiny compaction events.
+    msgs.len()
 }
 
 #[cfg(test)]
@@ -1391,8 +1403,8 @@ mod tests {
         assert_eq!(events[1].status, ContextCompactionStatus::Completed);
         assert_eq!(events[0].id, events[1].id);
         assert_eq!(events[0].thread_id, "thread-1");
-        assert_eq!(events[0].compacted_messages, 1);
-        assert_eq!(events[1].remaining_messages, 1);
+        assert_eq!(events[0].compacted_messages, 2);
+        assert_eq!(events[1].remaining_messages, 0);
         assert!(events[1].error.is_none());
     }
 
@@ -1431,6 +1443,35 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Not a directory"));
+    }
+
+    #[test]
+    fn safe_split_prefers_later_boundary_to_avoid_tiny_compactions() {
+        let msgs = vec![
+            Message::user("start"),
+            Message::assistant("a1"),
+            Message::tool_result("call-1", "t1"),
+            Message::assistant("a2"),
+            Message::tool_result("call-2", "t2"),
+            Message::assistant("a3"),
+            Message::tool_result("call-3", "t3"),
+            Message::user("next clean turn"),
+            Message::assistant("a4"),
+        ];
+
+        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), 7);
+    }
+
+    #[test]
+    fn safe_split_compacts_all_when_no_clean_remaining_boundary_exists() {
+        let msgs = vec![
+            Message::assistant("a1"),
+            Message::tool_result("call-1", "t1"),
+            Message::assistant("a2"),
+            Message::tool_result("call-2", "t2"),
+        ];
+
+        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), msgs.len());
     }
 
     #[tokio::test]

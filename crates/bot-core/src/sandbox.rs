@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -124,6 +124,15 @@ impl SandboxConfig {
         }
     }
 
+    pub fn workspace_root_label(&self) -> String {
+        match self {
+            Self::Disabled { host_dir } | Self::NoSandbox { host_dir } => {
+                host_dir.display().to_string()
+            }
+            Self::Docker(config) => config.container_dir.clone(),
+        }
+    }
+
     pub fn build(&self) -> Result<std::sync::Arc<dyn Sandbox>> {
         match self {
             Self::Disabled { host_dir } | Self::NoSandbox { host_dir } => {
@@ -165,6 +174,7 @@ pub trait Sandbox: Send + Sync {
     fn kind(&self) -> &'static str;
     fn workspace_root_label(&self) -> String;
     fn read<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, Vec<u8>>;
+    fn metadata<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, SandboxMetadata>;
     fn write<'a>(&'a self, path: &'a str, content: &'a [u8]) -> SandboxFuture<'a, ()>;
     fn replace<'a>(
         &'a self,
@@ -183,6 +193,24 @@ pub trait Sandbox: Send + Sync {
     ) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMetadata {
+    pub len: u64,
+    pub modified_ms: Option<u64>,
+}
+
+fn sandbox_metadata_from_std(metadata: std::fs::Metadata) -> SandboxMetadata {
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64);
+    SandboxMetadata {
+        len: metadata.len(),
+        modified_ms,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,17 +278,27 @@ impl Sandbox for NoSandbox {
 
     fn read<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.root, path).await?;
-            tokio::fs::read(full).await.context("reading sandbox file")
+            let full = resolve_local_existing_path(&self.root, path).await?;
+            tokio::fs::read(full).await.context("reading local file")
+        })
+    }
+
+    fn metadata<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, SandboxMetadata> {
+        Box::pin(async move {
+            let full = resolve_local_existing_path(&self.root, path).await?;
+            let metadata = tokio::fs::metadata(full)
+                .await
+                .context("reading local file metadata")?;
+            Ok(sandbox_metadata_from_std(metadata))
         })
     }
 
     fn write<'a>(&'a self, path: &'a str, content: &'a [u8]) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let full = resolve_writable_file_path(&self.root, path).await?;
+            let full = resolve_local_path(&self.root, path).await?;
             tokio::fs::write(full, content)
                 .await
-                .context("writing sandbox file")
+                .context("writing local file")
         })
     }
 
@@ -271,10 +309,10 @@ impl Sandbox for NoSandbox {
         new: &'a str,
     ) -> SandboxFuture<'a, ReplaceResult> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.root, path).await?;
+            let full = resolve_local_existing_path(&self.root, path).await?;
             let content = tokio::fs::read_to_string(&full)
                 .await
-                .context("reading sandbox file")?;
+                .context("reading local file")?;
             let count = content.matches(old).count();
             if count == 0 {
                 return Ok(ReplaceResult::NotFound);
@@ -285,26 +323,26 @@ impl Sandbox for NoSandbox {
             let replaced = content.replacen(old, new, 1);
             tokio::fs::write(full, replaced.as_bytes())
                 .await
-                .context("writing sandbox file")?;
+                .context("writing local file")?;
             Ok(ReplaceResult::Replaced)
         })
     }
 
     fn mkdir<'a>(&'a self, path: &'a str, recursive: bool) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let full = resolve_creatable_dir_path(&self.root, path).await?;
+            let full = resolve_local_path(&self.root, path).await?;
             if recursive {
                 tokio::fs::create_dir_all(full).await
             } else {
                 tokio::fs::create_dir(full).await
             }
-            .context("creating sandbox directory")
+            .context("creating local directory")
         })
     }
 
     fn remove<'a>(&'a self, path: &'a str, recursive: bool) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.root, path).await?;
+            let full = resolve_local_existing_path(&self.root, path).await?;
             if recursive {
                 tokio::fs::remove_dir_all(full).await
             } else if tokio::fs::metadata(&full)
@@ -316,16 +354,16 @@ impl Sandbox for NoSandbox {
             } else {
                 tokio::fs::remove_file(full).await
             }
-            .context("removing sandbox path")
+            .context("removing local path")
         })
     }
 
     fn list<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, Vec<String>> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.root, path).await?;
+            let full = resolve_local_existing_path(&self.root, path).await?;
             let mut rd = tokio::fs::read_dir(full)
                 .await
-                .context("listing sandbox directory")?;
+                .context("listing local directory")?;
             let mut entries = Vec::new();
             while let Some(entry) = rd.next_entry().await.context("reading sandbox directory")? {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -486,6 +524,16 @@ impl Sandbox for DockerSandbox {
         Box::pin(async move {
             let full = resolve_existing_path(&self.config.host_dir, path).await?;
             tokio::fs::read(full).await.context("reading sandbox file")
+        })
+    }
+
+    fn metadata<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, SandboxMetadata> {
+        Box::pin(async move {
+            let full = resolve_existing_path(&self.config.host_dir, path).await?;
+            let metadata = tokio::fs::metadata(full)
+                .await
+                .context("reading sandbox file metadata")?;
+            Ok(sandbox_metadata_from_std(metadata))
         })
     }
 
@@ -1099,6 +1147,25 @@ fn clean_relative_path(path: &str) -> Result<PathBuf> {
     }
 }
 
+async fn resolve_local_path(root: &Path, path: &str) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(root)
+        .await
+        .with_context(|| format!("creating local root {}", root.display()))?;
+    let input = Path::new(path);
+    if input.is_absolute() {
+        Ok(input.to_path_buf())
+    } else {
+        Ok(root.join(input))
+    }
+}
+
+async fn resolve_local_existing_path(root: &Path, path: &str) -> Result<PathBuf> {
+    let full = resolve_local_path(root, path).await?;
+    tokio::fs::canonicalize(&full)
+        .await
+        .with_context(|| format!("canonicalizing local path {}", path))
+}
+
 async fn canonical_root(root: &Path) -> Result<PathBuf> {
     tokio::fs::create_dir_all(root)
         .await
@@ -1169,34 +1236,6 @@ async fn resolve_writable_file_path(root: &Path, path: &str) -> Result<PathBuf> 
     Ok(full)
 }
 
-async fn resolve_creatable_dir_path(root: &Path, path: &str) -> Result<PathBuf> {
-    let root = canonical_root(root).await?;
-    let relative = clean_relative_path(path)?;
-    let full = root.join(relative);
-    if tokio::fs::symlink_metadata(&full).await.is_ok() {
-        let canonical = tokio::fs::canonicalize(&full)
-            .await
-            .with_context(|| format!("canonicalizing sandbox path {}", path))?;
-        if !canonical.starts_with(&root) {
-            return Err(anyhow!("path escapes sandbox root"));
-        }
-        return Ok(canonical);
-    }
-    let mut probe = full.as_path();
-    while !probe.exists() {
-        probe = probe
-            .parent()
-            .ok_or_else(|| anyhow!("path has no existing parent"))?;
-    }
-    let canonical = tokio::fs::canonicalize(probe)
-        .await
-        .with_context(|| format!("canonicalizing sandbox path {}", path))?;
-    if !canonical.starts_with(&root) {
-        return Err(anyhow!("path escapes sandbox root"));
-    }
-    Ok(full)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1224,6 +1263,24 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, 0);
         assert_eq!(sandbox.read("b.txt").await.unwrap(), b"world");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn no_sandbox_accepts_local_absolute_paths() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let file = root.join("absolute.txt");
+
+        sandbox
+            .write(file.to_str().unwrap(), b"absolute")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sandbox.read(file.to_str().unwrap()).await.unwrap(),
+            b"absolute"
+        );
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -1393,12 +1450,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_parent_dir_escape() {
-        let root = test_root();
+    async fn no_sandbox_parent_dir_paths_follow_local_shell_semantics() {
+        let parent = test_root();
+        let root = parent.join("workspace");
         let sandbox = NoSandbox::new(root.clone());
-        let err = sandbox.write("../outside.txt", b"nope").await.unwrap_err();
-        assert!(err.to_string().contains(".."));
-        let _ = tokio::fs::remove_dir_all(root).await;
+
+        sandbox.write("../sibling.txt", b"ok").await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(parent.join("sibling.txt")).await.unwrap(),
+            b"ok"
+        );
+        let _ = tokio::fs::remove_dir_all(parent).await;
     }
 
     #[tokio::test]

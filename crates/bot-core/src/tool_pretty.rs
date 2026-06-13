@@ -2,6 +2,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+const PRETTY_COMMAND_MAX_CHARS: usize = 120;
+const PRETTY_OUTPUT_LINE_MAX_CHARS: usize = 80;
+const PRETTY_OUTPUT_PREVIEW_LINES: usize = 3;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrettyToolStatus {
@@ -122,10 +126,7 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             let query = string_arg(args, "query").unwrap_or("内容");
             (format!("搜索 {query}"), "查询外部或本地资料".to_string())
         }
-        "workspace_bash" => {
-            let command = string_arg(args, "command").unwrap_or("命令");
-            (format!("执行命令 {command}"), "运行 shell 命令".to_string())
-        }
+        "workspace_bash" | "bash" => ("执行 bash".to_string(), bash_command_preview(args)),
         "sleep" => ("等待".to_string(), "暂停一段时间".to_string()),
         "now" => ("读取当前时间".to_string(), "获取系统时间".to_string()),
         "manage_yourself" => {
@@ -152,6 +153,10 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
 fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> (String, String) {
     let (title, started) = describe_started(name, args);
     if !success {
+        if is_bash_tool(name) {
+            let detail = bash_output_preview(result).unwrap_or_else(|| "工具执行失败".to_string());
+            return (title, format!("{}\n{detail}", bash_command_preview(args)));
+        }
         return (
             title,
             first_line(result).unwrap_or("工具执行失败").to_string(),
@@ -170,7 +175,7 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
             format!("列出 {count} 项")
         }
         "fetch" => fetch_summary(result).unwrap_or(started),
-        "workspace_bash" => bash_summary(result),
+        "workspace_bash" | "bash" => bash_summary(args, result),
         "manage_yourself" => remi_command_summary(args, result),
         "acp__chat" => acp_chat_summary(result).unwrap_or_else(|| "子会话已完成".to_string()),
         value if value.starts_with("agent__") => "子会话已完成".to_string(),
@@ -322,12 +327,61 @@ fn apply_patch_summary(args: &Value, result: &str) -> Option<String> {
 
 fn read_summary(args: &Value, result: &str) -> Option<String> {
     let path = string_arg(args, "path")?;
-    let bytes = result.len();
-    let truncated = result.contains("bytes remaining");
-    Some(if truncated {
-        format!("已读取 {path} 的前 {bytes} 字节，仍有剩余内容")
+    let duplicate = result.contains("repeats a range already read");
+    let meta = parse_fs_read_metadata(result);
+    let mut summary = if let Some(meta) = meta {
+        if meta.remaining > 0 {
+            format!(
+                "已读取 {path} offset={} length={}，仍有 {} 字节剩余",
+                meta.offset, meta.length, meta.remaining
+            )
+        } else {
+            format!("已读取 {path}，{} 字节", meta.length)
+        }
     } else {
-        format!("已读取 {path}，{bytes} 字节")
+        let bytes = result.len();
+        let truncated = result.contains("bytes remaining");
+        if truncated {
+            format!("已读取 {path} 的前 {bytes} 字节，仍有剩余内容")
+        } else {
+            format!("已读取 {path}，{bytes} 字节")
+        }
+    };
+    if duplicate {
+        summary.push_str("；重复读取同一片段，文件未变化");
+    }
+    Some(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FsReadMetadata {
+    offset: usize,
+    length: usize,
+    remaining: usize,
+}
+
+fn parse_fs_read_metadata(result: &str) -> Option<FsReadMetadata> {
+    let line = result
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[offset=") && line.ends_with(']'))?;
+    let line = line.trim_start_matches('[').trim_end_matches(']');
+    let mut offset = None;
+    let mut length = None;
+    let mut remaining = None;
+    for part in line.split_whitespace() {
+        let (key, value) = part.split_once('=')?;
+        match key {
+            "offset" => offset = value.parse().ok(),
+            "length" => length = value.parse().ok(),
+            "remaining" => remaining = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(FsReadMetadata {
+        offset: offset?,
+        length: length?,
+        remaining: remaining?,
     })
 }
 
@@ -346,12 +400,45 @@ fn fetch_summary(result: &str) -> Option<String> {
     }
 }
 
-fn bash_summary(result: &str) -> String {
+fn is_bash_tool(name: &str) -> bool {
+    matches!(name, "workspace_bash" | "bash")
+}
+
+fn bash_command_preview(args: &Value) -> String {
+    if let Some(command) = string_arg(args, "command") {
+        return format!("$ {}", first_sentence(command, PRETTY_COMMAND_MAX_CHARS));
+    }
+    match (string_arg(args, "action"), string_arg(args, "pid")) {
+        (Some(action), Some(pid)) => format!("bash {action} pid={pid}"),
+        (None, Some(pid)) => format!("bash poll pid={pid}"),
+        _ => "bash".to_string(),
+    }
+}
+
+fn bash_summary(args: &Value, result: &str) -> String {
+    let command = bash_command_preview(args);
     let line_count = result.lines().count();
     if line_count == 0 {
-        "命令执行完成，无输出".to_string()
+        format!("{command}\n无输出")
+    } else if let Some(preview) = bash_output_preview(result) {
+        format!("{command}\n输出 {line_count} 行:\n{preview}")
     } else {
-        format!("命令执行完成，输出 {line_count} 行")
+        format!("{command}\n输出 {line_count} 行")
+    }
+}
+
+fn bash_output_preview(result: &str) -> Option<String> {
+    let lines = result
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(PRETTY_OUTPUT_PREVIEW_LINES)
+        .map(|line| first_sentence(line, PRETTY_OUTPUT_LINE_MAX_CHARS))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -376,6 +463,68 @@ mod tests {
         );
         assert_eq!(pretty.title, "查看 src/main.rs");
         assert!(pretty.summary.contains("已读取 src/main.rs"));
+    }
+
+    #[test]
+    fn formats_fs_read_with_chunk_metadata() {
+        let pretty = PrettyToolCall::completed(
+            "1",
+            "fs_read",
+            &json!({"path":"src/main.rs", "offset": 626, "length": 626}),
+            "content\n[offset=626 length=626 total_bytes=2048 remaining=796]\n[796 bytes remaining — call fs_read again with offset=1252]",
+            true,
+            42,
+        );
+
+        assert_eq!(
+            pretty.summary,
+            "已读取 src/main.rs offset=626 length=626，仍有 796 字节剩余"
+        );
+    }
+
+    #[test]
+    fn formats_fs_read_duplicate_warning() {
+        let pretty = PrettyToolCall::completed(
+            "1",
+            "fs_read",
+            &json!({"path":"src/main.rs", "offset": 0, "length": 626}),
+            "warning: this fs_read request repeats a range already read in this session, and the file appears unchanged (path=src/main.rs, offset=0, length=626). Continue with offset=626 to read the next unread chunk.\n\ncontent\n[offset=0 length=626 total_bytes=2048 remaining=1422]",
+            true,
+            42,
+        );
+
+        assert_eq!(
+            pretty.summary,
+            "已读取 src/main.rs offset=0 length=626，仍有 1422 字节剩余；重复读取同一片段，文件未变化"
+        );
+    }
+
+    #[test]
+    fn formats_bash_command_and_first_three_output_lines_on_separate_lines() {
+        let pretty = PrettyToolCall::completed(
+            "1",
+            "bash",
+            &json!({"command":"cargo test"}),
+            "one\ntwo\nthree\nfour\n",
+            true,
+            42,
+        );
+
+        assert_eq!(pretty.summary, "$ cargo test\n输出 4 行:\none\ntwo\nthree");
+        assert!(!pretty.summary.contains("four"));
+    }
+
+    #[test]
+    fn truncates_long_bash_command_preview() {
+        let command = format!("cargo test {}", "very-long-argument ".repeat(20));
+        let pretty = PrettyToolCall::started("1", "workspace_bash", &json!({"command": command}));
+
+        assert_eq!(pretty.title, "执行 bash");
+        assert!(pretty
+            .summary
+            .starts_with("$ cargo test very-long-argument"));
+        assert!(pretty.summary.ends_with('…'));
+        assert!(!pretty.summary.contains('\n'));
     }
 
     #[test]

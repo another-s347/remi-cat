@@ -8,6 +8,12 @@ export type ChatCommand = {
 
 export const CHAT_COMMANDS: ChatCommand[] = [
   {
+    value: "/fork",
+    label: "Fork Session",
+    description: "复制当前会话并打开新的 Web session",
+    keywords: ["fork", "session", "复制", "分支"],
+  },
+  {
     value: "/tools",
     label: "列出工具",
     description: "显示当前 Agent 可用的工具",
@@ -148,4 +154,27 @@ export function commandSuggestions(input: string, commands: ChatCommand[] = CHAT
       .toLocaleLowerCase();
     return terms.every((term) => searchable.includes(term));
   });
+}
+
+export type FileMentionToken = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+export function activeFileMentionToken(input: string, cursor = input.length): FileMentionToken | undefined {
+  const safeCursor = Math.max(0, Math.min(cursor, input.length));
+  const before = input.slice(0, safeCursor);
+  const match = before.match(/(^|\s)@([^\s@]*)$/u);
+  if (!match || match.index === undefined) return undefined;
+  const prefix = match[1] ?? "";
+  const query = match[2] ?? "";
+  const start = match.index + prefix.length;
+  return { start, end: safeCursor, query };
+}
+
+export function replaceFileMentionToken(input: string, token: FileMentionToken, mentionPath: string) {
+  const replacement = `@${mentionPath} `;
+  const suffix = input.slice(token.end).replace(/^ /, "");
+  return `${input.slice(0, token.start)}${replacement}${suffix}`;
 }
