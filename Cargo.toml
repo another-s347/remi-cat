@@ -23,6 +23,10 @@ members = [
 default-members = ["."]
 resolver = "2"
 
+[features]
+default = ["secure-storage"]
+secure-storage = ["dep:keyring"]
+
 [dependencies]
 bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
@@ -69,10 +73,10 @@ uuid = { version = "1", features = ["v4"] }
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service"] }
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"], optional = true }

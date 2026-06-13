@@ -695,11 +695,40 @@ where
                                     tool_count = external.len(),
                                     "tool_call.failed"
                                 );
-                                yield CatEvent::Error(AgentError::tool(
-                                    "external",
-                                    format!("unhandled external tools: {names}"),
-                                ));
-                                return;
+                                for tc in &external {
+                                    let result =
+                                        format!("error: unhandled external tool: {}", tc.name);
+                                    log_tool_call_started(
+                                        "external",
+                                        &state.thread_id.0,
+                                        &state.run_id.0,
+                                        tc,
+                                    );
+                                    yield CatEvent::ToolCall {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        args: tc.arguments.clone(),
+                                    };
+                                    yield CatEvent::ToolCallResult {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        args: tc.arguments.clone(),
+                                        result: result.clone(),
+                                        success: false,
+                                        elapsed_ms: 0,
+                                    };
+                                    yield stats_event(
+                                        total_prompt_tokens,
+                                        total_completion_tokens,
+                                        max_prompt_tokens,
+                                        run_start,
+                                    );
+                                    all_outcomes.push(ToolCallOutcome::Error {
+                                        tool_call_id: tc.id.clone(),
+                                        tool_name: tc.name.clone(),
+                                        error: result,
+                                    });
+                                }
                             }
 
                             refresh_runtime_tool_definitions(
@@ -1414,6 +1443,51 @@ mod tests {
         }
     }
 
+    struct UnhandledExternalToolInnerAgent;
+
+    impl Agent for UnhandledExternalToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::NeedToolExecution {
+                        state: AgentState::new(StepConfig::new("test-model")),
+                        tool_calls: vec![ParsedToolCall {
+                            id: "read-call".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({
+                                "path": "/home/skye/remi-cat/.remi-cat/agents/explorer.md"
+                            }),
+                        }],
+                        completed_results: vec![],
+                    },
+                ])),
+                LoopInput::Resume { results, .. } => {
+                    let error = results
+                        .iter()
+                        .find_map(|result| match result {
+                            ToolCallOutcome::Error { error, .. } => Some(error.clone()),
+                            ToolCallOutcome::Result { .. } => None,
+                        })
+                        .unwrap_or_default();
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::TextDelta(error),
+                        remi_agentloop::types::AgentEvent::Done,
+                    ]))
+                }
+                LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
+        }
+    }
+
     struct LazyWaitTool;
 
     impl Tool for LazyWaitTool {
@@ -1596,6 +1670,51 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
+    }
+
+    #[tokio::test]
+    async fn unhandled_external_tool_emits_failed_tool_result_and_resumes() {
+        let agent = CatAgent {
+            inner: UnhandledExternalToolInnerAgent,
+            local_tools: DefaultToolRegistry::new(),
+            data_dir: test_root(),
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("call read"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::ToolCall { id, name, .. } if id == "read-call" && name == "read"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::ToolCallResult { id, name, success, result, .. }
+                    if id == "read-call"
+                        && name == "read"
+                        && !success
+                        && result.contains("unhandled external tool: read")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::Text(text) if text.contains("unhandled external tool: read")
+            )
+        }));
+        assert!(events.iter().any(|event| matches!(event, CatEvent::Done)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Error(_))));
     }
 
     #[tokio::test]

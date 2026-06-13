@@ -940,6 +940,7 @@ struct TuiApp {
     queued_inputs: VecDeque<String>,
     input_history: Vec<String>,
     history_index: Option<usize>,
+    history_draft: Option<String>,
     status: StatusLine,
     last_stats_snapshot: TokenStatsSnapshot,
     pending_token_delta: TokenDelta,
@@ -987,6 +988,7 @@ impl TuiApp {
             queued_inputs: VecDeque::new(),
             input_history: Vec::new(),
             history_index: None,
+            history_draft: None,
             status: StatusLine::default(),
             last_stats_snapshot: TokenStatsSnapshot::default(),
             pending_token_delta: TokenDelta::default(),
@@ -1204,16 +1206,20 @@ impl TuiApp {
             KeyCode::Up => {
                 if self.popup_visible() {
                     self.move_popup_selection(-1);
-                } else {
+                } else if self.composer.display_text().contains('\n') {
                     self.move_input_cursor_vertical(-1);
+                } else {
+                    self.recall_history(-1);
                 }
                 Ok(false)
             }
             KeyCode::Down => {
                 if self.popup_visible() {
                     self.move_popup_selection(1);
-                } else {
+                } else if self.composer.display_text().contains('\n') {
                     self.move_input_cursor_vertical(1);
+                } else {
+                    self.recall_history(1);
                 }
                 Ok(false)
             }
@@ -1288,6 +1294,7 @@ impl TuiApp {
         }
         self.composer.clear();
         self.history_index = None;
+        self.history_draft = None;
         self.scroll = 0;
         self.popup_selected = 0;
         self.show_shortcuts = false;
@@ -1359,6 +1366,7 @@ impl TuiApp {
         self.queued_inputs.clear();
         self.input_history.clear();
         self.history_index = None;
+        self.history_draft = None;
         self.status = StatusLine::default();
         self.active_tool_args.clear();
         self.active_tool_names.clear();
@@ -2104,7 +2112,7 @@ impl TuiApp {
     fn insert_char(&mut self, ch: char) {
         self.composer.insert_char(ch);
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.quit_hint_until = None;
         self.refresh_file_matches();
     }
@@ -2112,7 +2120,7 @@ impl TuiApp {
     fn insert_text(&mut self, text: &str) {
         self.composer.insert_text(text);
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.quit_hint_until = None;
         self.refresh_file_matches();
     }
@@ -2120,7 +2128,7 @@ impl TuiApp {
     fn insert_paste(&mut self, text: String) {
         self.composer.insert_paste(text);
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.quit_hint_until = None;
         self.refresh_file_matches();
     }
@@ -2128,21 +2136,21 @@ impl TuiApp {
     fn backspace(&mut self) {
         self.composer.backspace();
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.refresh_file_matches();
     }
 
     fn delete(&mut self) {
         self.composer.delete();
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.refresh_file_matches();
     }
 
     fn move_input_cursor_vertical(&mut self, direction: isize) {
         self.composer.move_vertical(direction);
         self.popup_selected = 0;
-        self.history_index = None;
+        self.reset_history_navigation();
         self.refresh_file_matches();
     }
 
@@ -2254,6 +2262,7 @@ impl TuiApp {
         if self.popup_visible() {
             self.composer.clear();
             self.popup_selected = 0;
+            self.reset_history_navigation();
             return false;
         }
         if self.show_shortcuts {
@@ -2264,12 +2273,7 @@ impl TuiApp {
             if let Some(cancel) = &self.cancel {
                 cancel.notify_waiters();
             }
-            if let Some(handle) = self.run_handle.take() {
-                handle.abort();
-            }
-            self.cancel = None;
-            self.running = false;
-            self.status.state = "idle".to_string();
+            self.status.state = "cancelling".to_string();
             self.active_tool_args.clear();
             self.active_tool_names.clear();
             self.active_tool_started_at.clear();
@@ -2283,9 +2287,6 @@ impl TuiApp {
             self.active_supervisor_id = None;
             self.cells.push(HistoryCell::system("Interrupt requested."));
             self.refresh_command_catalog();
-            if let Some(next) = self.queued_inputs.pop_front() {
-                self.start_turn(next);
-            }
             return false;
         }
         if self.quit_hint_active() {
@@ -2324,21 +2325,23 @@ impl TuiApp {
     }
 
     fn recall_history(&mut self, direction: isize) {
-        if self.input_history.is_empty() {
-            return;
-        }
-        let current = self.history_index.unwrap_or(self.input_history.len());
-        let next = if direction < 0 {
-            current.saturating_sub(1)
-        } else {
-            (current + 1).min(self.input_history.len())
-        };
-        self.history_index = (next < self.input_history.len()).then_some(next);
-        let input = self
-            .history_index
-            .and_then(|index| self.input_history.get(index).cloned())
-            .unwrap_or_default();
+        let (history_index, history_draft, input) = recall_input_history(
+            &self.input_history,
+            self.history_index,
+            self.history_draft.take(),
+            &self.composer.to_text(),
+            direction,
+        );
+        self.history_index = history_index;
+        self.history_draft = history_draft;
         self.composer.set_text(input);
+        self.popup_selected = 0;
+        self.refresh_file_matches();
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_index = None;
+        self.history_draft = None;
     }
 
     fn refresh_command_catalog(&mut self) {
@@ -4693,6 +4696,39 @@ fn normalize_input_history(items: Vec<String>) -> Vec<String> {
     }
 }
 
+fn recall_input_history(
+    input_history: &[String],
+    history_index: Option<usize>,
+    history_draft: Option<String>,
+    current_input: &str,
+    direction: isize,
+) -> (Option<usize>, Option<String>, String) {
+    if input_history.is_empty() {
+        return (history_index, history_draft, current_input.to_string());
+    }
+
+    let draft = if direction < 0 && history_index.is_none() {
+        Some(current_input.to_string())
+    } else {
+        history_draft
+    };
+    let current = history_index.unwrap_or(input_history.len());
+    let next = if direction < 0 {
+        current.saturating_sub(1)
+    } else {
+        (current + 1).min(input_history.len())
+    };
+    if next < input_history.len() {
+        (
+            Some(next),
+            draft,
+            input_history.get(next).cloned().unwrap_or_default(),
+        )
+    } else {
+        (None, None, draft.unwrap_or_default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4811,6 +4847,44 @@ mod tests {
         assert!(toml.contains("type = \"terminal\""));
         assert!(toml.contains("is_focused = true"));
         assert!(toml.contains("'/tmp/remi cat' tui resume session-1 --user u1 --name Alice"));
+    }
+
+    #[test]
+    fn input_history_recall_preserves_current_draft() {
+        let history = vec![
+            "/model status".to_string(),
+            "plain message".to_string(),
+            "/skill list".to_string(),
+        ];
+        let (index, draft, input) = recall_input_history(&history, None, None, "draft", -1);
+        assert_eq!(index, Some(2));
+        assert_eq!(draft.as_deref(), Some("draft"));
+        assert_eq!(input, "/skill list");
+
+        let (index, draft, input) = recall_input_history(&history, index, draft, "", -1);
+        assert_eq!(index, Some(1));
+        assert_eq!(draft.as_deref(), Some("draft"));
+        assert_eq!(input, "plain message");
+
+        let (index, draft, input) = recall_input_history(&history, index, draft, "", 1);
+        assert_eq!(index, Some(2));
+        assert_eq!(draft.as_deref(), Some("draft"));
+        assert_eq!(input, "/skill list");
+
+        let (index, draft, input) = recall_input_history(&history, index, draft, "", 1);
+        assert_eq!(index, None);
+        assert_eq!(draft, None);
+        assert_eq!(input, "draft");
+    }
+
+    #[test]
+    fn normalizes_command_history_like_other_input() {
+        let history = normalize_input_history(vec![
+            " /model status ".to_string(),
+            "/model status".to_string(),
+            "/skill list".to_string(),
+        ]);
+        assert_eq!(history, vec!["/model status", "/skill list"]);
     }
 
     #[test]
