@@ -6,6 +6,15 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/another-s347/remi-cat"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ name }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ name }/{ bin }{ binary-ext }"
+
 [workspace]
 members = [
     ".",

@@ -4568,10 +4568,22 @@ fn single_line(text: &str) -> String {
 }
 
 fn format_elapsed(ms: u64) -> String {
-    if ms < 1000 {
+    if ms < 1_000 {
         format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else if ms < 3_600_000 {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1_000;
+        format!("{minutes}m{seconds:02}s")
+    } else if ms < 86_400_000 {
+        let hours = ms / 3_600_000;
+        let minutes = (ms % 3_600_000) / 60_000;
+        format!("{hours}h{minutes:02}m")
     } else {
-        format!("{:.1}s", ms as f64 / 1000.0)
+        let days = ms / 86_400_000;
+        let hours = (ms % 86_400_000) / 3_600_000;
+        format!("{days}d{hours:02}h")
     }
 }
 

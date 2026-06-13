@@ -23,17 +23,17 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary: remi-cat
-            artifact: remi-cat-linux-x86_64
+            artifact: remi-cat-x86_64-unknown-linux-musl
 
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: remi-cat
-            artifact: remi-cat-macos-arm64
+            artifact: remi-cat-aarch64-apple-darwin
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: remi-cat.exe
-            artifact: remi-cat-windows-x86_64.exe
+            artifact: remi-cat-x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -87,30 +87,31 @@ jobs:
         run: >
           cargo build --release --target ${{ matrix.target }} -p remi-cat --no-default-features
 
-      - name: Prepare artifact (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Package artifact (Linux / macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
         run: |
           cd target/${{ matrix.target }}/release
-          cp ${{ matrix.binary }} ${{ matrix.artifact }}
-          sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.binary }}
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - name: Prepare artifact (Windows)
+      - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Copy-Item ${{ matrix.binary }} ${{ matrix.artifact }}
-          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.artifact }}).Hash.ToLower()
-          "$hash  ${{ matrix.artifact }}" | Out-File -Encoding ASCII ${{ matrix.artifact }}.sha256
+          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath ${{ matrix.artifact }}.zip
+          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.artifact }}.zip).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ASCII ${{ matrix.artifact }}.zip.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            target/${{ matrix.target }}/release/${{ matrix.artifact }}
-            target/${{ matrix.target }}/release/${{ matrix.artifact }}.sha256
-
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.tar.gz
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.tar.gz.sha256
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.zip
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.zip.sha256
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest

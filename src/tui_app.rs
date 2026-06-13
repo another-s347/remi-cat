@@ -4394,10 +4394,22 @@ fn format_json_summary(value: &serde_json::Value) -> String {
 }
 
 fn format_elapsed(ms: u64) -> String {
-    if ms < 1000 {
+    if ms < 1_000 {
         format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else if ms < 3_600_000 {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1_000;
+        format!("{minutes}m{seconds:02}s")
+    } else if ms < 86_400_000 {
+        let hours = ms / 3_600_000;
+        let minutes = (ms % 3_600_000) / 60_000;
+        format!("{hours}h{minutes:02}m")
     } else {
-        format!("{:.1}s", ms as f64 / 1000.0)
+        let days = ms / 86_400_000;
+        let hours = (ms % 86_400_000) / 3_600_000;
+        format!("{days}d{hours:02}h")
     }
 }
 
@@ -5229,6 +5241,10 @@ mod tests {
     fn parses_and_formats_tool_metadata() {
         assert_eq!(format_elapsed(42), "42ms");
         assert_eq!(format_elapsed(1250), "1.2s");
+        assert_eq!(format_elapsed(90_000), "1m30s");
+        assert_eq!(format_elapsed(970_000), "16m10s");
+        assert_eq!(format_elapsed(5_400_000), "1h30m");
+        assert_eq!(format_elapsed(172_800_000), "2d00h");
         assert_eq!(parse_tool_args("").unwrap(), empty_tool_args());
         assert_eq!(
             parse_tool_args("{\"command\":\"cargo test\"}")
