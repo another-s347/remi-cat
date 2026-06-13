@@ -1,7 +1,9 @@
 [package]
 name = "remi-cat"
 version = "0.2.0"
+description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
+license = "MIT"
 repository = "https://github.com/another-s347/remi-cat"
 
 [workspace]

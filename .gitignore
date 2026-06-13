@@ -26,3 +26,17 @@ __pycache__/
 
 # Web UI dependencies are restored from web-ui/package-lock.json.
 web-ui/node_modules/
+
+# ── Multi-platform skill stores (runtime data) ────────────────────────────────
+.agents/
+.claude/
+.hermes/
+.kiro/
+.windsurf/
+
+# ── Downloaded content (runtime data) ─────────────────────────────────────────
+fetch/
+
+# ── Scratch files ─────────────────────────────────────────────────────────────
+test.md
+*.bak
