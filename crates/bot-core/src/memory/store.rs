@@ -29,6 +29,7 @@ use remi_agentloop::prelude::{AgentError, Message, Role};
 use uuid::Uuid;
 
 use crate::tool_pretty::{tool_success, PrettyToolCall};
+use crate::{ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus};
 
 use super::compress::LlmCompressor;
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
@@ -98,6 +99,36 @@ pub struct MemoryRecallResult {
     pub preview: String,
     pub snippet: String,
     pub score: usize,
+}
+
+pub type ContextCompactionSink<'a> = &'a mut dyn FnMut(ContextCompactionEvent);
+
+struct PlannedCompaction {
+    compacted_messages: usize,
+    remaining_messages: usize,
+}
+
+fn emit_compaction_event(
+    sink: &mut Option<ContextCompactionSink<'_>>,
+    id: &str,
+    thread_id: &str,
+    status: ContextCompactionStatus,
+    compacted_messages: usize,
+    remaining_messages: usize,
+    error: Option<String>,
+) {
+    let Some(sink) = sink.as_mut() else {
+        return;
+    };
+    (*sink)(ContextCompactionEvent {
+        id: id.to_string(),
+        thread_id: thread_id.to_string(),
+        status,
+        source: ContextCompactionSource::Auto,
+        compacted_messages,
+        remaining_messages,
+        error,
+    });
 }
 
 const MEMORY_RECALL_SNIPPET_CHARS: usize = 2_000;
@@ -295,6 +326,19 @@ impl MemoryStore {
 
         // 2. Compress.
         let summary = self.compressor.compress(&oldest).await?;
+
+        // ── Skip empty compression results ───────────────────────────────
+        if summary.trim().is_empty() {
+            tracing::warn!(
+                "compress_to_mid_term: empty summary for {} oldest messages                  (all tool/empty after filtering), keeping raw archive without mid-term entry",
+                oldest.len(),
+            );
+            // Return the remaining (newer) messages unchanged —
+            // no empty mid-term entry is created, but the raw archive remains available.
+            return Ok(remaining);
+        }
+
+        // ── Proceed with normal compression output ───────────────────────
         let preview = make_preview(&summary, 100);
 
         // 3. Write summary with timestamp header.
@@ -560,7 +604,17 @@ impl MemoryStore {
     pub async fn save_turn(
         &self,
         thread_id: &str,
+        new_msgs: Vec<Message>,
+    ) -> Result<(), AgentError> {
+        self.save_turn_with_compaction_events(thread_id, new_msgs, None)
+            .await
+    }
+
+    pub async fn save_turn_with_compaction_events(
+        &self,
+        thread_id: &str,
         mut new_msgs: Vec<Message>,
+        mut compaction_sink: Option<ContextCompactionSink<'_>>,
     ) -> Result<(), AgentError> {
         let short_path = self.short_term_path(thread_id);
         let mut all_msgs = Self::read_short_term(&short_path).await;
@@ -580,15 +634,45 @@ impl MemoryStore {
 
         if self.auto_compress {
             while token_estimate(&all_msgs) > self.short_term_tokens && all_msgs.len() > 1 {
+                let attempt = self.plan_mid_term_compression(&all_msgs);
+                let event_id = Uuid::new_v4().to_string();
+                emit_compaction_event(
+                    &mut compaction_sink,
+                    &event_id,
+                    thread_id,
+                    ContextCompactionStatus::Started,
+                    attempt.compacted_messages,
+                    attempt.remaining_messages,
+                    None,
+                );
                 match self.compress_to_mid_term(thread_id, all_msgs.clone()).await {
                     Ok(remaining) => {
+                        emit_compaction_event(
+                            &mut compaction_sink,
+                            &event_id,
+                            thread_id,
+                            ContextCompactionStatus::Completed,
+                            attempt.compacted_messages,
+                            remaining.len(),
+                            None,
+                        );
                         all_msgs = remaining;
                     }
                     Err(e) => {
+                        let error = e.to_string();
+                        emit_compaction_event(
+                            &mut compaction_sink,
+                            &event_id,
+                            thread_id,
+                            ContextCompactionStatus::Failed,
+                            attempt.compacted_messages,
+                            attempt.remaining_messages,
+                            Some(error.clone()),
+                        );
                         // Compression failed (e.g. LLM unavailable or empty response).
                         // Fall back to dropping the oldest half so we can still save.
                         tracing::warn!(
-                            "compress_to_mid_term failed, dropping oldest messages: {e:#}"
+                            "compress_to_mid_term failed, dropping oldest messages: {error}"
                         );
                         let drop_n = (all_msgs.len() / 2).max(1);
                         all_msgs.drain(..drop_n);
@@ -598,6 +682,15 @@ impl MemoryStore {
         }
 
         Self::write_short_term(&short_path, &all_msgs).await
+    }
+
+    fn plan_mid_term_compression(&self, msgs: &[Message]) -> PlannedCompaction {
+        let desired = (msgs.len() / 2).max(1);
+        let split = safe_split_point(msgs, desired);
+        PlannedCompaction {
+            compacted_messages: split,
+            remaining_messages: msgs.len().saturating_sub(split),
+        }
     }
 
     /// Persist tool-managed user_state (todos, etc.) to disk.
@@ -684,6 +777,21 @@ impl MemoryStore {
 
         // ── Compress ──────────────────────────────────────────────────────
         let summary = self.compressor.compress(&compress_msgs).await?;
+
+        // ── Skip empty compression results ───────────────────────────────
+        if summary.trim().is_empty() {
+            tracing::warn!(
+                "compact_now: empty summary for {} messages ({} short-term + {} mid-term context),                  keeping raw archive without mid-term entry",
+                compress_msgs.len(),
+                short_msgs.len(),
+                if combined_text.is_empty() { 0 } else { 1 },
+            );
+            // Clear short-term (these messages were uncompressible).
+            Self::write_short_term(&short_path, &[]).await?;
+            return Ok(0);
+        }
+
+        // ── Proceed with normal compression output ───────────────────────
         let preview = make_preview(&summary, 100);
 
         // ── Write new summary ─────────────────────────────────────────────
@@ -1255,6 +1363,74 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn save_turn_emits_context_compaction_started_and_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = test_store(tmp.path().to_path_buf());
+        store.auto_compress = true;
+        store.short_term_tokens = 15;
+        let mut events = Vec::new();
+        let mut sink = |event| events.push(event);
+
+        store
+            .save_turn_with_compaction_events(
+                "thread-1",
+                vec![
+                    Message::tool_result("call-1", ""),
+                    Message::tool_result("call-2", ""),
+                ],
+                Some(&mut sink),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].status, ContextCompactionStatus::Started);
+        assert_eq!(events[1].status, ContextCompactionStatus::Completed);
+        assert_eq!(events[0].id, events[1].id);
+        assert_eq!(events[0].thread_id, "thread-1");
+        assert_eq!(events[0].compacted_messages, 1);
+        assert_eq!(events[1].remaining_messages, 1);
+        assert!(events[1].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_turn_emits_context_compaction_failed_before_fallback_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = test_store(tmp.path().to_path_buf());
+        store.auto_compress = true;
+        store.short_term_tokens = 15;
+        let mid_dir = store.mid_term_dir("thread-1");
+        tokio::fs::create_dir_all(mid_dir.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&mid_dir, "not a directory").await.unwrap();
+        let mut events = Vec::new();
+        let mut sink = |event| events.push(event);
+
+        store
+            .save_turn_with_compaction_events(
+                "thread-1",
+                vec![
+                    Message::tool_result("call-1", ""),
+                    Message::tool_result("call-2", ""),
+                ],
+                Some(&mut sink),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].status, ContextCompactionStatus::Started);
+        assert_eq!(events[1].status, ContextCompactionStatus::Failed);
+        assert_eq!(events[0].id, events[1].id);
+        assert!(events[1]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Not a directory"));
     }
 
     #[tokio::test]

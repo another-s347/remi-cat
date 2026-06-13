@@ -5,6 +5,7 @@ mod runtime_config;
 mod secret_store;
 mod session;
 mod tui_app;
+mod tui_markdown;
 mod web_chat;
 
 use anyhow::Context;
@@ -58,6 +59,10 @@ const SESSION_DEBUG_METADATA_KEY: &str = "debug";
 const SESSION_MODEL_PROFILE_METADATA_KEY: &str = "model_profile_id";
 const SESSION_INPUT_HISTORY_METADATA_KEY: &str = "input_history";
 const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
+const DEFAULT_UPDATE_REPO: &str = "another-s347/remi-cat";
+const DEFAULT_UPDATE_GIT_URL: &str = "https://github.com/another-s347/remi-cat.git";
+const DEFAULT_FEEDBACK_REPO: &str = "another-s347/remi-cat";
+const GITHUB_API_VERSION: &str = "2026-03-10";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppCommand {
@@ -69,6 +74,8 @@ enum AppCommand {
     SandboxSet(Vec<String>),
     Profile(ProfileCommand),
     Feishu(FeishuCommand),
+    Update(UpdateCommand),
+    Feedback(FeedbackCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +88,56 @@ struct GlobalArgs {
 enum FeishuCommand {
     Init,
     Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateCommand {
+    Check {
+        json: bool,
+    },
+    SelfUpdate {
+        version: Option<String>,
+        force: bool,
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct UpdateStatus {
+    current_version: String,
+    latest_version: String,
+    latest_tag: String,
+    update_available: bool,
+    repo: String,
+    git_url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeedbackCommand {
+    title: String,
+    body: String,
+    repo: Option<String>,
+    labels: Vec<String>,
+    include_logs: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GitHubIssueCreateRequest {
+    title: String,
+    body: String,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubIssueCreateResponse {
+    html_url: String,
+    number: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +275,9 @@ fn parse_command(args: &[String]) -> anyhow::Result<AppCommand> {
         Some("sandbox") => parse_sandbox_command(&args[1..]),
         Some("profile") => Ok(AppCommand::Profile(parse_profile_command(&args[1..])?)),
         Some("feishu") => Ok(AppCommand::Feishu(parse_feishu_command(&args[1..])?)),
+        Some("update") => Ok(AppCommand::Update(parse_update_command(&args[1..])?)),
+        Some("feedback") => Ok(AppCommand::Feedback(parse_feedback_command(&args[1..])?)),
+        Some("issue") => Ok(AppCommand::Feedback(parse_issue_command(&args[1..])?)),
         _ => Ok(AppCommand::Run(CliConfig::from_args(args)?)),
     }
 }
@@ -303,6 +363,536 @@ fn parse_feishu_command(args: &[String]) -> anyhow::Result<FeishuCommand> {
         Some(other) => anyhow::bail!("unknown `remi-cat feishu` subcommand `{other}`"),
         None => anyhow::bail!("usage: remi-cat feishu <init|doctor>"),
     }
+}
+
+fn parse_update_command(args: &[String]) -> anyhow::Result<UpdateCommand> {
+    match args.first().map(String::as_str) {
+        Some("check") => {
+            let mut json = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    other => anyhow::bail!("unknown `remi-cat update check` option `{other}`"),
+                }
+            }
+            Ok(UpdateCommand::Check { json })
+        }
+        Some("self") => {
+            let mut version = None;
+            let mut force = false;
+            let mut dry_run = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--version" => {
+                        if version.is_some() {
+                            anyhow::bail!("--version may only be specified once");
+                        }
+                        version = Some(next_arg(args, i)?);
+                        i += 1;
+                    }
+                    value if value.starts_with("--version=") => {
+                        if version.is_some() {
+                            anyhow::bail!("--version may only be specified once");
+                        }
+                        version = Some(value.trim_start_matches("--version=").to_string());
+                    }
+                    "--force" => force = true,
+                    "--dry-run" => dry_run = true,
+                    other => anyhow::bail!("unknown `remi-cat update self` option `{other}`"),
+                }
+                i += 1;
+            }
+            Ok(UpdateCommand::SelfUpdate {
+                version,
+                force,
+                dry_run,
+            })
+        }
+        Some(other) => anyhow::bail!("unknown `remi-cat update` subcommand `{other}`"),
+        None => anyhow::bail!(
+            "usage: remi-cat update <check|self>\n       remi-cat update check [--json]\n       remi-cat update self [--version <version-or-tag>] [--force] [--dry-run]"
+        ),
+    }
+}
+
+fn parse_issue_command(args: &[String]) -> anyhow::Result<FeedbackCommand> {
+    match args.first().map(String::as_str) {
+        Some("create") => parse_feedback_command(&args[1..]),
+        Some(other) => anyhow::bail!("unknown `remi-cat issue` subcommand `{other}`"),
+        None => anyhow::bail!("usage: remi-cat issue create --title <title> [--body <body>]"),
+    }
+}
+
+fn parse_feedback_command(args: &[String]) -> anyhow::Result<FeedbackCommand> {
+    let mut title = None;
+    let mut body = None;
+    let mut repo = None;
+    let mut labels = vec!["feedback".to_string()];
+    let mut include_logs = false;
+    let mut dry_run = false;
+    let mut positional = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" | "-t" => {
+                title = Some(next_arg(args, i)?);
+                i += 1;
+            }
+            value if value.starts_with("--title=") => {
+                title = Some(value.trim_start_matches("--title=").trim().to_string());
+            }
+            "--body" | "-b" => {
+                body = Some(next_arg(args, i)?);
+                i += 1;
+            }
+            value if value.starts_with("--body=") => {
+                body = Some(value.trim_start_matches("--body=").trim().to_string());
+            }
+            "--repo" => {
+                repo = Some(next_arg(args, i)?);
+                i += 1;
+            }
+            value if value.starts_with("--repo=") => {
+                repo = Some(value.trim_start_matches("--repo=").trim().to_string());
+            }
+            "--label" | "--labels" => {
+                labels.extend(parse_label_list(&next_arg(args, i)?));
+                i += 1;
+            }
+            value if value.starts_with("--label=") => {
+                labels.extend(parse_label_list(value.trim_start_matches("--label=")));
+            }
+            value if value.starts_with("--labels=") => {
+                labels.extend(parse_label_list(value.trim_start_matches("--labels=")));
+            }
+            "--include-logs" => include_logs = true,
+            "--dry-run" => dry_run = true,
+            "--no-default-label" => labels.retain(|label| label != "feedback"),
+            value if value.starts_with('-') => {
+                anyhow::bail!("unknown `remi-cat feedback` option `{value}`");
+            }
+            value => positional.push(value.to_string()),
+        }
+        i += 1;
+    }
+
+    let positional_text = positional.join(" ").trim().to_string();
+    if title.is_none() && !positional_text.is_empty() {
+        title = Some(feedback_title_from_text(&positional_text));
+    }
+    if body.is_none() && !positional_text.is_empty() {
+        body = Some(positional_text);
+    }
+    let title = title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("usage: remi-cat feedback --title <title> [--body <body>]")
+        })?;
+    let body = body
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| title.clone());
+    labels.sort();
+    labels.dedup();
+
+    Ok(FeedbackCommand {
+        title,
+        body,
+        repo,
+        labels,
+        include_logs,
+        dry_run,
+    })
+}
+
+fn parse_label_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn feedback_title_from_text(value: &str) -> String {
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut title = single_line(value)
+        .chars()
+        .take(MAX_TITLE_CHARS)
+        .collect::<String>();
+    if title.chars().count() == MAX_TITLE_CHARS {
+        title.push('…');
+    }
+    if title.is_empty() {
+        "Feedback".to_string()
+    } else {
+        title
+    }
+}
+
+fn update_repo() -> String {
+    std::env::var("REMI_UPDATE_REPO")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string())
+}
+
+fn update_git_url(repo: &str) -> String {
+    std::env::var("REMI_UPDATE_GIT_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if repo == DEFAULT_UPDATE_REPO {
+                DEFAULT_UPDATE_GIT_URL.to_string()
+            } else {
+                format!("https://github.com/{repo}.git")
+            }
+        })
+}
+
+fn parse_release_version(value: &str) -> anyhow::Result<semver::Version> {
+    let version = value.trim().trim_start_matches('v');
+    semver::Version::parse(version).with_context(|| format!("invalid release version `{value}`"))
+}
+
+fn normalize_release_tag(value: &str) -> anyhow::Result<String> {
+    let version = parse_release_version(value)?;
+    Ok(format!("v{version}"))
+}
+
+#[cfg(test)]
+fn update_available(current: &str, latest: &str) -> anyhow::Result<bool> {
+    Ok(parse_release_version(latest)? > parse_release_version(current)?)
+}
+
+fn build_cargo_install_args(git_url: &str, tag: &str) -> Vec<String> {
+    vec![
+        "install".to_string(),
+        "--git".to_string(),
+        git_url.to_string(),
+        "--tag".to_string(),
+        tag.to_string(),
+        "remi-cat".to_string(),
+        "--locked".to_string(),
+        "--force".to_string(),
+    ]
+}
+
+async fn fetch_latest_github_release(repo: &str) -> anyhow::Result<GitHubRelease> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let response = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "remi-cat")
+        .send()
+        .await
+        .with_context(|| format!("failed to query {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub release check failed with HTTP {status}: {body}");
+    }
+
+    response
+        .json::<GitHubRelease>()
+        .await
+        .context("failed to parse GitHub release response")
+}
+
+async fn build_update_status() -> anyhow::Result<UpdateStatus> {
+    let repo = update_repo();
+    let git_url = update_git_url(&repo);
+    let release = fetch_latest_github_release(&repo).await?;
+    let latest = parse_release_version(&release.tag_name)?;
+    let current = parse_release_version(env!("CARGO_PKG_VERSION"))?;
+    Ok(UpdateStatus {
+        current_version: current.to_string(),
+        latest_version: latest.to_string(),
+        latest_tag: release.tag_name,
+        update_available: latest > current,
+        repo,
+        git_url,
+    })
+}
+
+async fn run_update_command(command: UpdateCommand) -> anyhow::Result<()> {
+    match command {
+        UpdateCommand::Check { json } => {
+            let status = build_update_status().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("current: {}", status.current_version);
+                println!("latest: {} ({})", status.latest_version, status.latest_tag);
+                println!(
+                    "update_available: {}",
+                    if status.update_available { "yes" } else { "no" }
+                );
+                if status.update_available {
+                    println!("Run: remi-cat update self");
+                }
+            }
+            Ok(())
+        }
+        UpdateCommand::SelfUpdate {
+            version,
+            force,
+            dry_run,
+        } => {
+            let repo = update_repo();
+            let git_url = update_git_url(&repo);
+            let target_tag = match version {
+                Some(value) => normalize_release_tag(&value)?,
+                None => build_update_status().await?.latest_tag,
+            };
+            let target_version = parse_release_version(&target_tag)?;
+            let current_version = parse_release_version(env!("CARGO_PKG_VERSION"))?;
+            if target_version <= current_version && !force {
+                println!(
+                    "remi-cat is already at {}. Use --force to reinstall {}.",
+                    current_version, target_tag
+                );
+                return Ok(());
+            }
+
+            let install_args = build_cargo_install_args(&git_url, &target_tag);
+            if dry_run {
+                println!("cargo {}", install_args.join(" "));
+                return Ok(());
+            }
+
+            println!(
+                "Installing remi-cat {} from {} via cargo install...",
+                target_tag, git_url
+            );
+            let status = TokioCommand::new("cargo")
+                .args(&install_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .await
+                .context("failed to run cargo install")?;
+            if !status.success() {
+                anyhow::bail!("cargo install failed with status {status}");
+            }
+            println!("remi-cat updated to {target_tag}.");
+            println!("Restart any running remi-cat profile processes to use the new binary.");
+            Ok(())
+        }
+    }
+}
+
+async fn run_feedback_command(
+    store: Arc<Mutex<SecretStore>>,
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    command: FeedbackCommand,
+) -> anyhow::Result<()> {
+    let repo = feedback_repo(command.repo.as_deref())?;
+    let secret_entries = store.lock().await.entries()?;
+    let redactions = redaction_entries(&secret_entries);
+    let body = build_feedback_issue_body(
+        &command.body,
+        profile,
+        data_dir,
+        command.include_logs,
+        &redactions,
+    );
+    let payload = GitHubIssueCreateRequest {
+        title: command.title,
+        body,
+        labels: command.labels,
+    };
+
+    if command.dry_run {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!("repo: {repo}");
+        return Ok(());
+    }
+
+    let Some(token) = github_issue_token(&secret_entries) else {
+        let url = github_new_issue_url(&repo, &payload);
+        println!("GitHub token not found; open this URL to create the issue:");
+        println!("{url}");
+        println!(
+            "To submit directly, set GITHUB_TOKEN, GH_TOKEN, or REMI_GITHUB_TOKEN with Issues: write permission."
+        );
+        return Ok(());
+    };
+
+    let response = create_github_issue(&repo, &token, &payload).await?;
+    println!(
+        "Created GitHub issue #{}: {}",
+        response.number, response.html_url
+    );
+    Ok(())
+}
+
+fn feedback_repo(override_repo: Option<&str>) -> anyhow::Result<String> {
+    let repo = override_repo
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("REMI_FEEDBACK_REPO").ok())
+        .unwrap_or_else(|| DEFAULT_FEEDBACK_REPO.to_string());
+    let repo = repo.trim().trim_start_matches('/').trim_end_matches('/');
+    let parts = repo.split('/').collect::<Vec<_>>();
+    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
+        anyhow::bail!("invalid GitHub repo `{repo}`; expected owner/repo");
+    }
+    Ok(repo.to_string())
+}
+
+fn github_issue_token(secrets: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN", "REMI_GITHUB_TOKEN"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .or_else(|| secrets.get(*key).cloned())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn build_feedback_issue_body(
+    user_body: &str,
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    include_logs: bool,
+    redactions: &HashMap<String, String>,
+) -> String {
+    let setup_state = detect_setup_state(data_dir);
+    let setup_label = match &setup_state {
+        SetupState::Initialized { .. } => "initialized",
+        SetupState::Invalid { .. } => "invalid",
+        SetupState::LegacyEnvCompatible { .. } => "legacy-env-compatible",
+        SetupState::Uninitialized { .. } => "uninitialized",
+    };
+    let mut body = format!(
+        "{}\n\n---\n\n### Diagnostics\n\n```text\nremi-cat_version: {}\nos: {}\narch: {}\nprofile: {}\nsetup_state: {}\n{}\n{}\n```\n",
+        user_body.trim(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        profile.label(),
+        setup_label,
+        sdk_doctor_report(data_dir),
+        sandbox_doctor_report(data_dir, &setup_state),
+    );
+    if include_logs {
+        let logs = collect_feedback_logs(profile, redactions);
+        if logs.trim().is_empty() {
+            body.push_str("\n### Logs\n\nNo log files found.\n");
+        } else {
+            body.push_str("\n### Logs\n\n```text\n");
+            body.push_str(&logs.replace("```", "'''"));
+            body.push_str("\n```\n");
+        }
+    } else {
+        body.push_str(
+            "\nLogs omitted. Re-run with `--include-logs` to attach recent local logs.\n",
+        );
+    }
+    body
+}
+
+fn collect_feedback_logs(
+    profile: &InstanceProfile,
+    redactions: &HashMap<String, String>,
+) -> String {
+    let mut sections = Vec::new();
+    for path in [profile.log_file(), profile.log_dir().join("tui.log")] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let redacted = redact_known_secrets(&text, redactions);
+            sections.push(format!(
+                "== {} ==\n{}",
+                path.display(),
+                tail_lines(&redacted, 200)
+            ));
+        }
+    }
+    sections.join("\n\n")
+}
+
+fn redact_known_secrets(text: &str, redactions: &HashMap<String, String>) -> String {
+    redactions.values().fold(text.to_string(), |acc, secret| {
+        if secret.is_empty() {
+            acc
+        } else {
+            acc.replace(secret, "***REDACTED***")
+        }
+    })
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+async fn create_github_issue(
+    repo: &str,
+    token: &str,
+    payload: &GitHubIssueCreateRequest,
+) -> anyhow::Result<GitHubIssueCreateResponse> {
+    let url = format!("https://api.github.com/repos/{repo}/issues");
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?
+        .post(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .header(reqwest::header::USER_AGENT, "remi-cat")
+        .bearer_auth(token)
+        .json(payload)
+        .send()
+        .await
+        .with_context(|| format!("failed to create GitHub issue at {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub issue creation failed with HTTP {status}: {body}");
+    }
+
+    response
+        .json::<GitHubIssueCreateResponse>()
+        .await
+        .context("failed to parse GitHub issue response")
+}
+
+fn github_new_issue_url(repo: &str, payload: &GitHubIssueCreateRequest) -> String {
+    let mut url = format!(
+        "https://github.com/{repo}/issues/new?title={}&body={}",
+        percent_encode_query(&payload.title),
+        percent_encode_query(&payload.body)
+    );
+    if !payload.labels.is_empty() {
+        url.push_str("&labels=");
+        url.push_str(&percent_encode_query(&payload.labels.join(",")));
+    }
+    url
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            byte => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 struct LocalImFileBridge {
@@ -611,6 +1201,20 @@ async fn main() -> anyhow::Result<()> {
         }
         AppCommand::Feishu(FeishuCommand::Doctor) => {
             run_feishu_doctor().await?;
+            return Ok(());
+        }
+        AppCommand::Update(command) => {
+            run_update_command(command).await?;
+            return Ok(());
+        }
+        AppCommand::Feedback(command) => {
+            run_feedback_command(
+                Arc::clone(&secret_store),
+                &selected_profile,
+                &data_dir,
+                command,
+            )
+            .await?;
             return Ok(());
         }
         AppCommand::Run(ref cli) => {
@@ -2805,6 +3409,12 @@ async fn collect_bot_reply(
                         append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Supervisor, &chunk).await;
                         supervisor_execution_started = false;
                     }
+                    CatEvent::ContextCompaction(event) => {
+                        let line = format_context_compaction_line(&event);
+                        let done = !matches!(event.status, bot_core::ContextCompactionStatus::Started);
+                        update_context_compaction_reply(&mut output, &mut replies, &event.id, &line, done).await;
+                        supervisor_execution_started = false;
+                    }
                     CatEvent::Stats {
                         prompt_tokens,
                         completion_tokens,
@@ -3753,6 +4363,7 @@ struct FeishuReplyStream {
     active_kind: Option<FeishuReplyKind>,
     active_card: Option<StreamingCard>,
     tool_cards: HashMap<String, StreamingCard>,
+    compaction_cards: HashMap<String, StreamingCard>,
 }
 
 impl FeishuReplyStream {
@@ -3763,6 +4374,7 @@ impl FeishuReplyStream {
             active_kind: None,
             active_card: None,
             tool_cards: HashMap::new(),
+            compaction_cards: HashMap::new(),
         }
     }
 
@@ -3787,6 +4399,9 @@ impl FeishuReplyStream {
         for (_, mut card) in self.tool_cards.drain() {
             card.finish().await.ok();
         }
+        for (_, mut card) in self.compaction_cards.drain() {
+            card.finish().await.ok();
+        }
     }
 
     async fn finish_active(&mut self) {
@@ -3807,6 +4422,22 @@ impl FeishuReplyStream {
         if done {
             card.replace_final(line).await.ok();
             self.tool_cards.remove(call_id);
+        } else {
+            card.replace(line).await.ok();
+        }
+    }
+
+    async fn update_context_compaction(&mut self, id: &str, line: &str, done: bool) {
+        self.finish_active().await;
+        let gateway = self.gateway.clone();
+        let parent_message_id = self.parent_message_id.clone();
+        let card = self
+            .compaction_cards
+            .entry(id.to_string())
+            .or_insert_with(|| gateway.begin_streaming_reply(&parent_message_id));
+        if done {
+            card.replace_final(line).await.ok();
+            self.compaction_cards.remove(id);
         } else {
             card.replace(line).await.ok();
         }
@@ -3846,6 +4477,42 @@ async fn update_tool_reply(
     } else {
         output.push_str(line);
         output.push('\n');
+    }
+}
+
+async fn update_context_compaction_reply(
+    output: &mut String,
+    replies: &mut Option<&mut FeishuReplyStream>,
+    id: &str,
+    line: &str,
+    done: bool,
+) {
+    if let Some(replies) = replies.as_deref_mut() {
+        replies.update_context_compaction(id, line, done).await;
+        if done {
+            output.push_str(line);
+            output.push('\n');
+        }
+    } else {
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
+fn format_context_compaction_line(event: &bot_core::ContextCompactionEvent) -> String {
+    match event.status {
+        bot_core::ContextCompactionStatus::Started => format!(
+            "🧠 正在压缩上下文：压缩 {} 条，保留 {} 条",
+            event.compacted_messages, event.remaining_messages
+        ),
+        bot_core::ContextCompactionStatus::Completed => format!(
+            "🧠 上下文已压缩：压缩 {} 条，保留 {} 条",
+            event.compacted_messages, event.remaining_messages
+        ),
+        bot_core::ContextCompactionStatus::Failed => format!(
+            "🧠 上下文压缩失败：{}",
+            event.error.as_deref().unwrap_or("unknown error")
+        ),
     }
 }
 
@@ -4081,12 +4748,15 @@ fn optional_arg(args: &[String], index: usize) -> Option<String> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        extract_first_url, extract_lark_cli_config_from_json, feishu_doctor_message,
-        feishu_session_channel_id, feishu_topic_channel_id, first_available_port,
-        format_feishu_tool_line, is_goal_set_command, parse_command, parse_global_args,
-        parse_goal_max_rounds, prefix_short_config_entry, run_streaming_command,
-        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start, AppCommand,
-        CliConfig, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, ProfileCommand,
+        build_cargo_install_args, extract_first_url, extract_lark_cli_config_from_json,
+        feedback_repo, feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
+        first_available_port, format_context_compaction_line, format_feishu_tool_line,
+        github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_command,
+        parse_global_args, parse_goal_max_rounds, parse_release_version, percent_encode_query,
+        prefix_short_config_entry, redact_known_secrets, run_streaming_command,
+        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start, update_available,
+        AppCommand, CliConfig, FeedbackCommand, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind,
+        GitHubIssueCreateRequest, ProfileCommand, UpdateCommand,
     };
     use crate::profile_command::{
         ProfileAgentCommand, ProfileWorkflowCommand, PROFILE_RUNTIME_ENV_KEYS,
@@ -4376,6 +5046,161 @@ mod cli_tests {
     }
 
     #[test]
+    fn update_check_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&["update", "check"])).unwrap(),
+            AppCommand::Update(UpdateCommand::Check { json: false })
+        ));
+        assert!(matches!(
+            parse_command(&args(&["update", "check", "--json"])).unwrap(),
+            AppCommand::Update(UpdateCommand::Check { json: true })
+        ));
+    }
+
+    #[test]
+    fn update_self_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "update",
+                "self",
+                "--version",
+                "v0.2.1",
+                "--dry-run",
+                "--force",
+            ]))
+            .unwrap(),
+            AppCommand::Update(UpdateCommand::SelfUpdate { version, force: true, dry_run: true })
+                if version.as_deref() == Some("v0.2.1")
+        ));
+        assert!(matches!(
+            parse_command(&args(&["update", "self", "--version=0.2.1"])).unwrap(),
+            AppCommand::Update(UpdateCommand::SelfUpdate { version, force: false, dry_run: false })
+                if version.as_deref() == Some("0.2.1")
+        ));
+    }
+
+    #[test]
+    fn update_version_helpers_normalize_tags_and_compare_versions() {
+        assert_eq!(normalize_release_tag("0.2.1").unwrap(), "v0.2.1");
+        assert_eq!(normalize_release_tag("v0.2.1").unwrap(), "v0.2.1");
+        assert!(parse_release_version("not-a-version").is_err());
+        assert!(update_available("0.2.0", "0.2.1").unwrap());
+        assert!(!update_available("0.2.1", "0.2.1").unwrap());
+        assert!(!update_available("0.3.0", "0.2.1").unwrap());
+        assert!(update_available("0.2.0-alpha.1", "0.2.0").unwrap());
+    }
+
+    #[test]
+    fn update_self_builds_cargo_install_args() {
+        assert_eq!(
+            build_cargo_install_args("https://github.com/another-s347/remi-cat.git", "v0.2.1"),
+            args(&[
+                "install",
+                "--git",
+                "https://github.com/another-s347/remi-cat.git",
+                "--tag",
+                "v0.2.1",
+                "remi-cat",
+                "--locked",
+                "--force",
+            ])
+        );
+    }
+
+    #[test]
+    fn feedback_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "feedback",
+                "--title",
+                "Bash timeout is confusing",
+                "--body",
+                "The command kept running.",
+                "--label",
+                "bug,cli",
+                "--include-logs",
+                "--dry-run",
+            ]))
+            .unwrap(),
+            AppCommand::Feedback(FeedbackCommand {
+                title,
+                body,
+                labels,
+                include_logs: true,
+                dry_run: true,
+                ..
+            }) if title == "Bash timeout is confusing"
+                && body == "The command kept running."
+                && labels == args(&["bug", "cli", "feedback"])
+        ));
+    }
+
+    #[test]
+    fn issue_create_command_reuses_feedback_flow() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "issue",
+                "create",
+                "--title=Install fails",
+                "--repo",
+                "owner/project",
+                "--no-default-label",
+            ]))
+            .unwrap(),
+            AppCommand::Feedback(FeedbackCommand { title, repo, labels, .. })
+                if title == "Install fails"
+                    && repo.as_deref() == Some("owner/project")
+                    && labels.is_empty()
+        ));
+    }
+
+    #[test]
+    fn feedback_positional_message_becomes_title_and_body() {
+        assert!(matches!(
+            parse_command(&args(&["feedback", "short", "message"])).unwrap(),
+            AppCommand::Feedback(FeedbackCommand { title, body, .. })
+                if title == "short message" && body == "short message"
+        ));
+    }
+
+    #[test]
+    fn github_issue_url_is_prefilled_and_encoded() {
+        let payload = GitHubIssueCreateRequest {
+            title: "A bug & a fix".to_string(),
+            body: "line 1\nline 2".to_string(),
+            labels: args(&["feedback", "bug"]),
+        };
+
+        let url = github_new_issue_url("owner/repo", &payload);
+
+        assert!(url.starts_with("https://github.com/owner/repo/issues/new?"));
+        assert!(url.contains("title=A+bug+%26+a+fix"));
+        assert!(url.contains("body=line+1%0Aline+2"));
+        assert!(url.contains("labels=feedback%2Cbug"));
+        assert_eq!(percent_encode_query("你好"), "%E4%BD%A0%E5%A5%BD");
+    }
+
+    #[test]
+    fn feedback_repo_validates_owner_repo() {
+        assert_eq!(feedback_repo(Some("owner/repo")).unwrap(), "owner/repo");
+        assert!(feedback_repo(Some("owner")).is_err());
+        assert!(feedback_repo(Some("owner/repo/extra")).is_err());
+    }
+
+    #[test]
+    fn feedback_log_redaction_replaces_known_secret_values() {
+        let redactions = std::collections::HashMap::from([(
+            "GITHUB_TOKEN".to_string(),
+            "ghp_secret".to_string(),
+        )]);
+
+        assert_eq!(
+            redact_known_secrets("token=ghp_secret", &redactions),
+            "token=***REDACTED***"
+        );
+    }
+
+    #[test]
     fn feishu_reply_events_pair_tool_request_and_response() {
         assert!(!FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Text)));
         assert!(FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Text)));
@@ -4384,6 +5209,25 @@ mod cli_tests {
         assert!(FeishuReplyKind::ToolResult.starts_new_message(None));
         assert!(FeishuReplyKind::ToolResult.finishes_message());
         assert!(FeishuReplyKind::Text.starts_new_message(None));
+    }
+
+    #[test]
+    fn formats_context_compaction_for_feishu() {
+        let mut event = bot_core::ContextCompactionEvent {
+            id: "compact-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            status: bot_core::ContextCompactionStatus::Started,
+            source: bot_core::ContextCompactionSource::Auto,
+            compacted_messages: 5,
+            remaining_messages: 3,
+            error: None,
+        };
+        assert!(format_context_compaction_line(&event).contains("正在压缩上下文"));
+        event.status = bot_core::ContextCompactionStatus::Completed;
+        assert!(format_context_compaction_line(&event).contains("上下文已压缩"));
+        event.status = bot_core::ContextCompactionStatus::Failed;
+        event.error = Some("model unavailable".to_string());
+        assert!(format_context_compaction_line(&event).contains("model unavailable"));
     }
 
     #[test]

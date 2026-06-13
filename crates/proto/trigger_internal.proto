@@ -1,0 +1,311 @@
+syntax = "proto3";
+
+package trigger_internal.v1;
+
+option csharp_namespace = "TriggerInternal.V1";
+option go_package = "github.com/example/projectremi/triggerinternalv1";
+option java_package = "com.example.projectremi.trigger_internal.v1";
+option java_multiple_files = true;
+
+import "remi_options.proto";
+
+// Triggers are rule-based and stored as JSON configuration evaluated with CEL.
+
+// Internal Trigger service - requires secret key authentication
+// Used by internal services (e.g., remi-agent, mobile backend)
+// Allows passing user_id explicitly in requests
+service InternalTriggerService {
+  // Upload a new trigger using streaming
+  rpc UploadTriggerStream(stream UploadTriggerChunk) returns (UploadTriggerResponse);
+
+  // List triggers (optionally for a specific user)
+  rpc ListTriggers(ListTriggersRequest) returns (ListTriggersResponse);
+
+  // Get trigger artifacts using streaming
+  rpc GetTriggerStream(GetTriggerRequest) returns (stream GetTriggerChunk);
+
+  // Record a trigger installation on a device
+  rpc RecordInstallation(RecordInstallationRequest) returns (RecordInstallationResponse);
+
+  // List installations for a trigger or device
+  rpc ListInstallations(ListInstallationsRequest) returns (ListInstallationsResponse);
+}
+
+  // Internal Things service - requires secret key authentication
+  // Used by internal services (e.g., remi-agent)
+  // Allows passing user_id explicitly in requests
+service InternalThingsService {
+    // ========== Things Collection Operations ==========
+  rpc CreateThingCollection(InternalCreateThingCollectionRequest)
+  returns (InternalThingCollectionResponse);
+  rpc ListThingCollections(InternalListThingCollectionsRequest)
+  returns (InternalListThingCollectionsResponse);
+  rpc GetThingCollection(InternalGetThingCollectionRequest)
+  returns (InternalThingCollectionResponse);
+  rpc UpdateThingCollection(InternalUpdateThingCollectionRequest)
+  returns (InternalThingCollectionResponse);
+  rpc DeleteThingCollection(InternalDeleteThingCollectionRequest)
+  returns (InternalDeleteResponse);
+
+    // ========== Things Operations ==========
+  rpc CreateThing(InternalCreateThingRequest) returns (InternalThingResponse);
+  rpc ListThings(InternalListThingsRequest) returns (InternalListThingsResponse);
+  rpc GetThing(InternalGetThingRequest) returns (InternalThingResponse);
+  rpc UpdateThing(InternalUpdateThingRequest) returns (InternalThingResponse);
+  rpc DeleteThing(InternalDeleteThingRequest) returns (InternalDeleteResponse);
+}
+
+message UploadTriggerResponse {
+  string uuid       = 1;
+  string created_at = 2;
+  string message    = 3;
+}
+
+// Request to list triggers
+message ListTriggersRequest {
+  string search_query = 1; // Optional search term
+  int32  limit        = 2; // Maximum number of results
+  int32  offset       = 3; // Offset for pagination
+  string user_id      = 4; // Optional: filter by user_id
+  string device_id    = 5; // Optional: filter by device_id
+}
+
+message TriggerInfo {
+  string uuid           = 1;
+  string name           = 2;
+  string user_request   = 3;
+  string event_analysis = 4;
+  int32  version        = 5;
+  string created_at     = 6;
+  string updated_at     = 7;
+  string user_id        = 8; // Owner of the trigger
+  // Rule-based trigger configuration (JSON string)
+  string rule_config_json = 9;
+  string device_id        = 10;
+}
+
+message ListTriggersResponse {
+  repeated TriggerInfo triggers    = 1;
+  int32                total_count = 2; // Number of triggers in this response (not total in database)
+}
+
+// Request to get a specific trigger
+message GetTriggerRequest {
+  string uuid      = 1;
+  string device_id = 2; // Required: must match trigger's bound device
+}
+
+// Request to record trigger installation
+message RecordInstallationRequest {
+  string trigger_uuid = 1;
+  string platform     = 2;
+  string device_id    = 3;
+  string user_id      = 4; // Optional: user who owns the device
+}
+
+message RecordInstallationResponse {
+  string trigger_uuid = 1;
+  string platform     = 2;
+  string device_id    = 3;
+  string created_at   = 4;
+  string message      = 5;
+}
+
+// Request to list installations
+message ListInstallationsRequest {
+  string trigger_uuid = 1; // Optional: filter by trigger
+  string device_id    = 2; // Optional: filter by device
+  string user_id      = 3; // Optional: filter by user
+  int32  limit        = 4;
+  int32  offset       = 5;
+}
+
+message InstallationInfo {
+  string trigger_uuid = 1;
+  string platform     = 2;
+  string device_id    = 3;
+  string created_at   = 4;
+  string updated_at   = 5;
+  string user_id      = 6; // Optional: user who owns the device
+}
+
+message ListInstallationsResponse {
+  repeated InstallationInfo installations = 1;
+  int32                     total_count   = 2; // Number of installations in this response (not total in database)
+}
+
+// Streaming message for uploading triggers
+message UploadTriggerChunk {
+  // Metadata sent in first chunk
+  message Metadata {
+    string uuid           = 1;
+    string name           = 2;
+    string user_request   = 3;
+    string event_analysis = 4;
+    int32  version        = 5;
+    string user_id        = 6;
+
+    // Optional publish-time binding: attach this trigger to a Thing or a ThingCollection.
+    // Only one may be set.
+    oneof publish_binding {
+      string bind_thing_uuid      = 7;
+      string bind_collection_uuid = 8;
+    }
+
+    // Rule-based trigger configuration (JSON string)
+    string rule_config_json = 9;
+
+    // Required: bind this trigger to a specific device.
+    string device_id = 10;
+  }
+
+  Metadata metadata = 1;
+}
+
+// Streaming message for downloading triggers
+message GetTriggerChunk {
+  // Metadata sent in first chunk
+  message Metadata {
+    string uuid           = 1;
+    string name           = 2;
+    string user_request   = 3;
+    string event_analysis = 4;
+    int32  version        = 5;
+    string user_id        = 6;
+    string created_at     = 7;
+    string updated_at     = 8;
+    // Rule-based trigger configuration (JSON string)
+    string rule_config_json = 9;
+  }
+
+  Metadata metadata = 1;
+}
+
+// ========== Internal Things Messages ==========
+
+message InternalCreateThingCollectionRequest {
+  string uuid    = 1; // Optional: client-generated UUID
+  string title   = 2;
+  string user_id = 3; // Required
+  reserved 4;
+  reserved "trigger_uuid";
+}
+
+message InternalListThingCollectionsRequest {
+  string user_id = 1; // Required
+  int32  limit   = 2;
+  int32  offset  = 3;
+}
+
+message InternalGetThingCollectionRequest {
+  string uuid    = 1;
+  string user_id = 2; // Required
+}
+
+message InternalUpdateThingCollectionRequest {
+  string          uuid         = 1;
+  string          title        = 2;
+  string          user_id      = 3; // Required
+  optional string trigger_uuid = 4; // Optional: set/clear trigger binding
+}
+
+message InternalDeleteThingCollectionRequest {
+  string uuid    = 1;
+  string user_id = 2; // Required
+}
+
+message InternalDeleteThingCollectionResponse {
+  string message = 1;
+}
+
+message InternalDeleteResponse {
+  string message = 1;
+}
+
+message InternalThingCollectionInfo {
+  string uuid  = 1;
+  string title = 2;
+  reserved 3;
+  string created_at   = 4;
+  string updated_at   = 5;
+  string trigger_uuid = 6;
+}
+
+message InternalThingCollectionResponse {
+  InternalThingCollectionInfo collection = 1;
+  string                      message    = 2;
+}
+
+message InternalListThingCollectionsResponse {
+  repeated InternalThingCollectionInfo collections = 1;
+  int32                                total_count = 2;
+}
+
+message InternalCreateThingRequest {
+  string uuid            = 1; // Optional: client-generated UUID
+  string datatype        = 2;
+  string data_json       = 3; // JSON string
+  string parent_uuid     = 4; // Optional: empty means no parent
+  string collection_uuid = 5;
+  string title           = 6;
+  string user_id         = 7; // Required
+  reserved 8;
+  reserved "trigger_uuid";
+}
+
+message InternalListThingsRequest {
+  string user_id         = 1; // Required
+  string collection_uuid = 2;
+  string parent_uuid     = 3;
+  string datatype        = 4;
+  int32  limit           = 5;
+  int32  offset          = 6;
+}
+
+message InternalGetThingRequest {
+  string uuid    = 1;
+  string user_id = 2; // Required
+}
+
+message InternalUpdateThingRequest {
+  string          uuid            = 1;
+  string          datatype        = 2;
+  string          data_json       = 3;
+  string          parent_uuid     = 4; // Empty string to remove parent
+  string          collection_uuid = 5;
+  string          title           = 6;
+  string          user_id         = 7; // Required
+  optional string trigger_uuid    = 8; // Optional: set/clear trigger binding
+}
+
+message InternalDeleteThingRequest {
+  string uuid    = 1;
+  string user_id = 2; // Required
+}
+
+message InternalDeleteThingResponse {
+  string message = 1;
+}
+
+message InternalThingInfo {
+  string uuid            = 1;
+  string datatype        = 2;
+  string data_json       = 3;
+  string parent_uuid     = 4;
+  string collection_uuid = 5;
+  string title           = 6;
+  reserved 7;
+  string created_at   = 8;
+  string updated_at   = 9;
+  string trigger_uuid = 10;
+}
+
+message InternalThingResponse {
+  InternalThingInfo thing   = 1;
+  string            message = 2;
+}
+
+message InternalListThingsResponse {
+  repeated InternalThingInfo things      = 1;
+  int32                      total_count = 2;
+}

@@ -400,36 +400,96 @@ fn classify_bash_risk(args: &serde_json::Value) -> ToolRiskLevel {
     let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
         return ToolRiskLevel::High;
     };
-    let Some(words) = shlex::split(command) else {
-        return ToolRiskLevel::High;
-    };
-    let Some(program) = words.first().map(|word| {
-        std::path::Path::new(word)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(word)
-    }) else {
-        return ToolRiskLevel::High;
-    };
-    match program {
-        "ls" | "grep" | "rg" | "ripgrep" if !command_has_shell_control(command) => {
-            ToolRiskLevel::Low
-        }
-        _ if is_destructive_command(command, &words) => ToolRiskLevel::High,
-        _ => ToolRiskLevel::Medium,
+    if is_readonly_shell_command(command) {
+        return ToolRiskLevel::Low;
     }
+    if is_destructive_shell_command(command) {
+        return ToolRiskLevel::High;
+    }
+    ToolRiskLevel::High
 }
 
-fn command_has_shell_control(command: &str) -> bool {
+fn is_readonly_shell_command(command: &str) -> bool {
+    if command_has_unsafe_shell_syntax(command) {
+        return false;
+    }
+    let mut segments = split_readonly_shell_segments(command)
+        .filter(|segment| !segment.trim().is_empty())
+        .peekable();
+    segments.peek().is_some() && segments.all(|segment| is_readonly_command_segment(segment.trim()))
+}
+
+fn command_has_unsafe_shell_syntax(command: &str) -> bool {
     let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
-            '|' | ';' | '&' | '<' | '>' | '`' => return true,
+            '<' | '>' | '`' => return true,
+            '&' => return true,
             '$' if chars.peek().is_some_and(|next| *next == '(') => return true,
             _ => {}
         }
     }
     false
+}
+
+fn split_readonly_shell_segments(command: &str) -> impl Iterator<Item = &str> {
+    command.split(|ch| matches!(ch, '|' | ';'))
+}
+
+fn is_destructive_shell_command(command: &str) -> bool {
+    split_readonly_shell_segments(command)
+        .filter(|segment| !segment.trim().is_empty())
+        .any(|segment| {
+            let Some(words) = shlex::split(segment.trim()) else {
+                return true;
+            };
+            is_destructive_command(segment, &words)
+        })
+}
+
+fn is_readonly_command_segment(segment: &str) -> bool {
+    let Some(words) = shlex::split(segment) else {
+        return false;
+    };
+    let Some(program) = words.first().map(|word| shell_program_name(word)) else {
+        return false;
+    };
+    match program {
+        "pwd" | "ls" | "cat" | "head" | "tail" | "wc" | "nl" | "sort" | "uniq" | "cut" | "tr"
+        | "file" | "stat" | "du" | "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" => true,
+        "find" => !words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        }),
+        "sed" => !words
+            .iter()
+            .skip(1)
+            .any(|word| word == "-i" || word.starts_with("-i")),
+        "git" => words.get(1).is_some_and(|subcommand| {
+            matches!(
+                subcommand.as_str(),
+                "status"
+                    | "diff"
+                    | "log"
+                    | "show"
+                    | "grep"
+                    | "ls-files"
+                    | "branch"
+                    | "rev-parse"
+                    | "describe"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn shell_program_name(word: &str) -> &str {
+    std::path::Path::new(word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(word)
 }
 
 fn classify_fs_mutation_risk(tool_name: &str, args: &serde_json::Value) -> ToolRiskLevel {
@@ -589,27 +649,71 @@ fn redact_json_value(value: &mut serde_json::Value) {
 }
 
 pub fn review_tool_risk(
-    _tool_name: &str,
-    _args_summary: &str,
+    tool_name: &str,
+    args_summary: &str,
     fallback: ToolRiskLevel,
 ) -> ToolRiskReview {
     let risk = fallback;
     ToolRiskReview {
         risk,
-        reason: match risk {
-            ToolRiskLevel::Low => "The request is read-only and scoped.".to_string(),
-            ToolRiskLevel::Medium => {
-                "The request may access external systems, delegate work, create future automation, or modify workspace files.".to_string()
-            }
-            ToolRiskLevel::High => {
-                "The request can modify files, run commands, or send external messages.".to_string()
-            }
-        },
-        concerns: match risk {
-            ToolRiskLevel::Low => Vec::new(),
-            ToolRiskLevel::Medium => vec!["Review external access or state changes.".to_string()],
-            ToolRiskLevel::High => vec!["Requires explicit human confirmation.".to_string()],
-        },
+        reason: review_reason(tool_name, args_summary, risk),
+        concerns: review_concerns(tool_name, risk),
+    }
+}
+
+fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> String {
+    match risk {
+        ToolRiskLevel::Low if matches!(tool_name, "bash" | "workspace_bash") => {
+            "The shell request is made only of recognized read-only inspection commands."
+                .to_string()
+        }
+        ToolRiskLevel::Low => {
+            "The tool request is classified as read-only or a simple local state update that is safe to auto-run.".to_string()
+        }
+        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash") => {
+            "The shell request is not in the read-only allowlist, but no destructive pattern was detected.".to_string()
+        }
+        ToolRiskLevel::Medium if matches!(tool_name, "fs_write" | "fs_create" | "fs_mkdir") => {
+            "The request creates or updates workspace files and does not target protected configuration paths.".to_string()
+        }
+        ToolRiskLevel::Medium if tool_name.starts_with("agent__") || tool_name == "acp__chat" => {
+            "The request delegates work to another agent and should be reviewed unless this session allows model-auto approval.".to_string()
+        }
+        ToolRiskLevel::Medium if tool_name.starts_with("trigger__") => {
+            "The request changes automation state and should be reviewed unless this session allows model-auto approval.".to_string()
+        }
+        ToolRiskLevel::Medium => {
+            format!(
+                "The `{tool_name}` request is not classified as read-only; review the summarized arguments before allowing it."
+            )
+        }
+        ToolRiskLevel::High if matches!(tool_name, "bash" | "workspace_bash") => {
+            "The shell request may mutate files, change permissions, run privileged/package-management actions, or contains unsupported shell syntax.".to_string()
+        }
+        ToolRiskLevel::High if tool_name == "fs_remove" => {
+            "The request removes filesystem content and always requires human confirmation."
+                .to_string()
+        }
+        ToolRiskLevel::High if args_summary.to_ascii_lowercase().contains("[redacted]") => {
+            "The request touches sensitive-looking arguments and requires human confirmation."
+                .to_string()
+        }
+        ToolRiskLevel::High => {
+            format!("The `{tool_name}` request is high risk and requires human confirmation.")
+        }
+    }
+}
+
+fn review_concerns(tool_name: &str, risk: ToolRiskLevel) -> Vec<String> {
+    match risk {
+        ToolRiskLevel::Low => Vec::new(),
+        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash") => {
+            vec!["Command is outside the read-only shell allowlist.".to_string()]
+        }
+        ToolRiskLevel::Medium => {
+            vec!["Confirm the requested state change is intended.".to_string()]
+        }
+        ToolRiskLevel::High => vec!["Requires explicit human confirmation.".to_string()],
     }
 }
 
@@ -784,9 +888,20 @@ mod tests {
         for command in [
             "ls",
             "ls -la",
+            "pwd",
+            "cat file.txt",
+            "head -n 20 src/main.rs",
+            "tail -n 20 src/main.rs",
+            "wc -l src/main.rs",
+            "find . -type f",
+            "sed -n 1,20p src/main.rs",
             "grep needle file.txt",
             "rg needle",
             "ripgrep needle",
+            "rg needle | head",
+            "grep needle file.txt | wc -l",
+            "git status --short",
+            "git diff -- src/main.rs",
         ] {
             assert_eq!(
                 classify_tool_risk("bash", &serde_json::json!({ "command": command })),
@@ -796,23 +911,15 @@ mod tests {
         }
 
         for command in [
-            "cat file.txt",
-            "find . -type f",
-            "rg needle | head",
-            "grep $(whoami) file.txt",
-        ] {
-            assert_eq!(
-                classify_tool_risk("bash", &serde_json::json!({ "command": command })),
-                ToolRiskLevel::Medium,
-                "{command}"
-            );
-        }
-
-        for command in [
             "ls; rm -rf x",
+            "ls && pwd",
             "rm file.txt",
             "rm -rf src/**/*",
             "sed -i s/a/b/ .env",
+            "find . -type f -delete",
+            "grep $(whoami) file.txt",
+            "python3 script.py",
+            "cargo test -p bot-core",
             "sudo apt-get remove libc6",
         ] {
             assert_eq!(
@@ -821,6 +928,59 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn approval_manager_auto_runs_readonly_bash_but_blocks_unknown_bash() {
+        let manager = ToolApprovalManager::new();
+        let readonly = ToolApprovalRequest {
+            id: "readonly".to_string(),
+            session_id: "s".to_string(),
+            run_id: "r".to_string(),
+            tool_call_id: "tc1".to_string(),
+            tool_name: "bash".to_string(),
+            risk: classify_tool_risk(
+                "bash",
+                &serde_json::json!({ "command": "rg classify_tool_risk crates/bot-core/src/approval.rs | head" }),
+            ),
+            args_summary:
+                r#"{"command":"rg classify_tool_risk crates/bot-core/src/approval.rs | head"}"#
+                    .to_string(),
+            platform: Some("test".to_string()),
+            review: None,
+        };
+
+        let (wait, events) = manager.start_request(readonly).await;
+        assert!(matches!(
+            wait,
+            ApprovalWait::Immediate(ApprovalResolution::Approved)
+        ));
+        assert!(events.is_empty());
+
+        let unknown = ToolApprovalRequest {
+            id: "unknown".to_string(),
+            session_id: "s".to_string(),
+            run_id: "r".to_string(),
+            tool_call_id: "tc2".to_string(),
+            tool_name: "bash".to_string(),
+            risk: classify_tool_risk(
+                "bash",
+                &serde_json::json!({ "command": "cargo test -p bot-core" }),
+            ),
+            args_summary: r#"{"command":"cargo test -p bot-core"}"#.to_string(),
+            platform: Some("test".to_string()),
+            review: None,
+        };
+
+        let (wait, events) = manager.start_request(unknown).await;
+        assert!(matches!(wait, ApprovalWait::Pending(_)));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ApprovalEvent::Updated(request)
+                    if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::High)
+            )
+        }));
     }
 
     #[test]

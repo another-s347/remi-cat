@@ -4,6 +4,33 @@ use remi_agentloop::types::SubSessionEvent;
 use crate::approval::{ToolApprovalDecision, ToolApprovalRequest};
 use crate::supervisor_workflow::{SupervisorTraceEvent, WorkflowReport};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionSource {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContextCompactionEvent {
+    pub id: String,
+    pub thread_id: String,
+    pub status: ContextCompactionStatus,
+    pub source: ContextCompactionSource,
+    pub compacted_messages: usize,
+    pub remaining_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ── Skill events ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -57,6 +84,8 @@ pub enum CatEvent {
     Supervisor(WorkflowReport),
     /// Live progress emitted while the supervisor evaluates a workflow node.
     SupervisorProgress(SupervisorTraceEvent),
+    /// Short-term context was compacted into memory.
+    ContextCompaction(ContextCompactionEvent),
     /// Run completed normally.
     Done,
     /// An error occurred (run aborted).

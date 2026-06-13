@@ -2,6 +2,7 @@
 name = "remi-cat"
 version = "0.2.0"
 edition = "2021"
+repository = "https://github.com/another-s347/remi-cat"
 
 [workspace]
 members = [
@@ -13,6 +14,9 @@ members = [
     "crates/bot-core",
     "crates/mgmt-api",
     "crates/admin-ui",
+    "crates/remi-client-sdk",
+    "crates/remi-things-crdt",
+    "crates/rule-trigger-engine",
 ]
 default-members = ["."]
 resolver = "2"
@@ -34,6 +38,11 @@ dotenvy = "0.15"
 futures = "0.3"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+semver = "1"
 sentry = { version = "0.47", features = ["tracing"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -28,8 +28,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 aho-corasick = "1"
 html2md = "0.2.15"
-remi-client-sdk = { path = "../../../remi-sdk/remi-client-sdk" }
-remi-things-crdt = { path = "../../../remi-sdk/remi-things-crdt" }
+remi-client-sdk = { path = "../remi-client-sdk" }
+remi-things-crdt = { path = "../remi-things-crdt" }
 
 [dev-dependencies]
 tempfile = "3"

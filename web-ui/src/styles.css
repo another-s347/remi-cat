@@ -97,6 +97,12 @@ header { height: 62px; border-bottom: 1px solid #222722; display: flex; align-it
 .approval-actions button.danger { border-color: #663836; color: #ffb4ae; }
 .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
 .approval-status { margin-top: 10px; color: #aeb7ad; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.compaction-card { border: 1px solid #354036; border-radius: 9px; margin: 10px 0; padding: 10px; background: #121612; color: #d9dfd7; }
+.compaction-card.completed { border-color: #354734; }
+.compaction-card.failed { border-color: #6a3330; }
+.compaction-card header { display: flex; align-items: center; gap: 8px; height: auto; padding: 0; color: #d8ff73; }
+.compaction-card header small { margin-left: auto; color: #7f8a7f; text-transform: uppercase; }
+.compaction-card p { margin: 8px 0 0; color: #bfc7bd; }
 .supervisor, .debug { border: 1px solid #354036; border-radius: 10px; margin: 12px 0; background: #121612; color: #aeb7ad; }
 .supervisor summary, .debug summary { cursor: pointer; display: flex; align-items: center; gap: 7px; padding: 9px 11px; color: #d8ff73; }
 .supervisor summary small, .debug summary small { margin-left: auto; color: #7f8a7f; font-size: 11px; }

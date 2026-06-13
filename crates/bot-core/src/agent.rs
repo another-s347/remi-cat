@@ -1111,8 +1111,9 @@ async fn collect_result_with_overflow(
     let mut result = match tokio::fs::write(&file_path, text.as_bytes()).await {
         Ok(()) => CollectedToolResult::text(format!(
             "[Output too large ({total} bytes) — saved to tmp/{filename}]\n\
-             Use fs_read with path=\"tmp/{filename}\" (offset=0, length=8192) \
-             and increment offset until remaining=0."
+             Use fs_read with path=\"tmp/{filename}\" (offset=0, length={}) \
+             and increment offset until remaining=0.",
+            crate::tools::DEFAULT_FS_READ_LENGTH
         )),
         Err(_) => CollectedToolResult::text(text),
     };

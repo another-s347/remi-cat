@@ -944,6 +944,10 @@ async fn run_turn(
                 "supervisor_report",
                 serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
             )),
+            CatEvent::ContextCompaction(event) => Some((
+                "context_compaction",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            )),
             CatEvent::StateUpdate(user_state) => Some((
                 "todo_state",
                 serde_json::json!({

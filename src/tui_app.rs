@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bot_core::{
-    CatEvent, Content, PrettyToolCall, PrettyToolStatus, StreamOptions, SupervisorTraceEvent,
-    ThreadHistoryMessage, ToolApprovalDecision, ToolApprovalRequest, WorkflowReport,
+    CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus, PrettyToolCall,
+    PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage,
+    ToolApprovalDecision, ToolApprovalRequest, WorkflowReport,
 };
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -30,6 +31,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use unicode_width::UnicodeWidthStr;
 
 use crate::session::Session;
+use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
 use crate::{
     process_runtime_commands, CliConfig, Runtime, RuntimeCommandPipelineResult,
     SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
@@ -364,6 +366,7 @@ struct TuiApp {
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
+    supervisors: std::collections::HashMap<String, SupervisorUiState>,
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
     approval_state: &'static str,
@@ -402,6 +405,7 @@ impl TuiApp {
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
+            supervisors: std::collections::HashMap::new(),
             pending_approval: None,
             approval_selected: 0,
             approval_state: "waiting",
@@ -885,6 +889,9 @@ impl TuiApp {
             BotEvent::SupervisorProgress(progress) => self.upsert_supervisor_progress(progress),
             BotEvent::SupervisorReport(report) => self.upsert_supervisor_report(report),
             BotEvent::SubSession(event) => self.upsert_sub_session(event),
+            BotEvent::ContextCompaction(event) => {
+                upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(event));
+            }
             BotEvent::TodoState(body) => {
                 if self.last_todo_body.as_deref() == Some(body.as_str()) {
                     return;
@@ -905,24 +912,25 @@ impl TuiApp {
                 self.pending_approval = Some(request.clone());
                 self.approval_selected = 0;
                 self.approval_state = "waiting";
-                self.upsert_approval_cell(
-                    &request.id,
-                    format_approval_body(&request, self.approval_state, 0, None),
-                );
+                self.upsert_approval_cell(approval_cell(
+                    &request,
+                    self.approval_state,
+                    0,
+                    None,
+                    None,
+                ));
             }
             BotEvent::ApprovalUpdated(request) => {
                 self.pending_approval = Some(request.clone());
                 self.approval_selected = self.approval_selected.min(approval_options_len() - 1);
                 self.approval_state = "reviewed";
-                self.upsert_approval_cell(
-                    &request.id,
-                    format_approval_body(
-                        &request,
-                        self.approval_state,
-                        self.approval_selected,
-                        None,
-                    ),
-                );
+                self.upsert_approval_cell(approval_cell(
+                    &request,
+                    self.approval_state,
+                    self.approval_selected,
+                    None,
+                    None,
+                ));
             }
             BotEvent::ApprovalResolved { request, decision } => {
                 if self
@@ -933,15 +941,13 @@ impl TuiApp {
                     self.pending_approval = None;
                 }
                 self.approval_state = "resolved";
-                self.upsert_approval_cell(
-                    &request.id,
-                    format_approval_body(
-                        &request,
-                        "resolved",
-                        self.approval_selected,
-                        Some(format!("decision: {decision:?}")),
-                    ),
-                );
+                self.upsert_approval_cell(approval_cell(
+                    &request,
+                    "resolved",
+                    self.approval_selected,
+                    Some(format!("decision: {decision:?}")),
+                    Some(decision),
+                ));
             }
             BotEvent::Stats {
                 prompt_tokens,
@@ -963,6 +969,7 @@ impl TuiApp {
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
+                self.supervisors.clear();
                 self.active_supervisor_id = None;
                 self.status.state = "error".to_string();
             }
@@ -973,6 +980,7 @@ impl TuiApp {
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
+                self.supervisors.clear();
                 self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
                 self.refresh_command_catalog();
@@ -1059,13 +1067,12 @@ impl TuiApp {
         let model_profile_id = self.runtime.sessions.try_lock().ok().and_then(|sessions| {
             sessions.metadata_string(&self.session_id, SESSION_MODEL_PROFILE_METADATA_KEY)
         });
-        let model = self
+        let effective_model = self
             .runtime
             .bot
-            .effective_model_profile(model_profile_id.as_deref())
-            .profile
-            .id
-            .clone();
+            .effective_model_profile(model_profile_id.as_deref());
+        let model = effective_model.profile.id.clone();
+        let context_tokens = effective_model.profile.context_tokens;
         let session = short_session_label(&self.session_id);
         let mut spans = vec![
             Span::styled(format!("{model} "), Style::default().fg(CODEX_DIM)),
@@ -1080,9 +1087,7 @@ impl TuiApp {
             Span::styled("· ", Style::default().fg(CODEX_DIM)),
             Span::styled(format!("sid {session}"), Style::default().fg(CODEX_DIM)),
         ];
-        if self.status.max_prompt_tokens > 0 {
-            let used = self.status.prompt_tokens.min(self.status.max_prompt_tokens);
-            let pct = (used as f64 / self.status.max_prompt_tokens as f64 * 100.0).round() as u32;
+        if let Some(pct) = context_usage_percent(self.status.prompt_tokens, context_tokens) {
             spans.push(Span::styled(" · ", Style::default().fg(CODEX_DIM)));
             spans.push(Span::styled(
                 format!("ctx {pct}%"),
@@ -1104,20 +1109,6 @@ impl TuiApp {
             return;
         }
         let mut lines = Vec::new();
-        if let Some(request) = &self.pending_approval {
-            lines.push(Line::from(vec![
-                Span::styled("  approval", Style::default().fg(Color::Yellow)),
-                Span::styled(" · ", Style::default().fg(CODEX_DIM)),
-                Span::styled(
-                    format!("{} wants {:?}", request.tool_name, request.risk),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    " · y once · s session · m auto · n deny",
-                    Style::default().fg(CODEX_DIM),
-                ),
-            ]));
-        }
         if self.running {
             let tool_count = self.active_tool_count();
             let mut detail = format!("{} elapsed", format_elapsed(self.status.elapsed_ms));
@@ -1459,6 +1450,7 @@ impl TuiApp {
             self.sub_tool_args.clear();
             self.sub_tool_names.clear();
             self.sub_sessions.clear();
+            self.supervisors.clear();
             self.pending_approval = None;
             self.approval_selected = 0;
             self.approval_state = "waiting";
@@ -1608,19 +1600,17 @@ impl TuiApp {
             "approval already resolved".to_string()
         };
         self.approval_state = "deciding";
-        self.upsert_approval_cell(
-            &request.id,
-            format_approval_body(
-                &request,
-                self.approval_state,
-                self.approval_selected,
-                Some(status),
-            ),
-        );
+        self.upsert_approval_cell(approval_cell(
+            &request,
+            self.approval_state,
+            self.approval_selected,
+            Some(status),
+            None,
+        ));
     }
 
-    fn upsert_approval_cell(&mut self, approval_id: &str, body: String) {
-        upsert_approval_cell(&mut self.cells, approval_id, body);
+    fn upsert_approval_cell(&mut self, cell: HistoryCell) {
+        upsert_approval_cell(&mut self.cells, cell);
     }
 
     fn move_approval_selection(&mut self, direction: isize) {
@@ -1634,10 +1624,13 @@ impl TuiApp {
             self.approval_selected = (self.approval_selected + 1).min(len - 1);
         }
         if let Some(request) = self.pending_approval.clone() {
-            self.upsert_approval_cell(
-                &request.id,
-                format_approval_body(&request, self.approval_state, self.approval_selected, None),
-            );
+            self.upsert_approval_cell(approval_cell(
+                &request,
+                self.approval_state,
+                self.approval_selected,
+                None,
+                None,
+            ));
         }
     }
 
@@ -1646,19 +1639,25 @@ impl TuiApp {
             .active_supervisor_id
             .clone()
             .unwrap_or_else(|| "supervisor".to_string());
-        let event = format_supervisor_trace_event(&progress);
+        let event = supervisor_event_display(&progress);
+        let state = self.supervisors.entry(id.clone()).or_default();
+        state.push_event(event);
+        let title = state.running_title();
+        let body = state.body();
+        let meta = state.meta();
         if let Some(cell) = self.cells.iter_mut().rev().find(
             |cell| matches!(&cell.kind, CellKind::Supervisor { id: cell_id } if cell_id == &id),
         ) {
-            append_stream_event(&mut cell.body, &event);
+            cell.title = title;
+            cell.body = body;
             cell.status = ToolVisualStatus::Running;
-            cell.meta = "执行中".to_string();
+            cell.meta = meta;
         } else {
             self.cells.push(HistoryCell::supervisor(
                 id,
-                "Supervisor".to_string(),
-                event,
-                "执行中".to_string(),
+                title,
+                body,
+                meta,
                 ToolVisualStatus::Running,
             ));
         }
@@ -1669,21 +1668,22 @@ impl TuiApp {
             .active_supervisor_id
             .clone()
             .unwrap_or_else(|| "supervisor".to_string());
-        let body = format_supervisor_report(&report);
-        let title = format!("Supervisor · {}", report.workflow_name);
-        let meta = format!("{} -> {}", report.from_node, report.to_node);
+        let state = self.supervisors.entry(id.clone()).or_default();
+        state.apply_report(&report);
+        let title = state.resolved_title();
+        let meta = state.meta();
         if let Some(cell) = self.cells.iter_mut().rev().find(
             |cell| matches!(&cell.kind, CellKind::Supervisor { id: cell_id } if cell_id == &id),
         ) {
-            append_stream_event(&mut cell.body, &body);
             cell.title = title;
+            cell.body = String::new();
             cell.meta = meta;
             cell.status = ToolVisualStatus::Success;
         } else {
             self.cells.push(HistoryCell::supervisor(
                 id,
                 title,
-                body,
+                String::new(),
                 meta,
                 ToolVisualStatus::Success,
             ));
@@ -1926,6 +1926,9 @@ async fn run_bot_turn(
                     CatEvent::SubSession(event) => {
                         let _ = tx.send(BotEvent::SubSession(event));
                     }
+                    CatEvent::ContextCompaction(event) => {
+                        let _ = tx.send(BotEvent::ContextCompaction(event));
+                    }
                     CatEvent::Supervisor(report) => {
                         let _ = tx.send(BotEvent::SupervisorReport(report));
                     }
@@ -2001,6 +2004,7 @@ enum BotEvent {
         elapsed_ms: u64,
     },
     SubSession(SubSessionEvent),
+    ContextCompaction(ContextCompactionEvent),
     SupervisorProgress(SupervisorTraceEvent),
     SupervisorReport(WorkflowReport),
     TodoState(String),
@@ -2040,6 +2044,109 @@ impl Default for StatusLine {
             model_elapsed_ms: 0,
             elapsed_ms: 0,
             last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SupervisorUiState {
+    workflow_name: Option<String>,
+    from_node: Option<String>,
+    to_node: Option<String>,
+    edge: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+    events: Vec<SupervisorEventDisplay>,
+}
+
+#[derive(Clone)]
+struct SupervisorEventDisplay {
+    kind: &'static str,
+    label: String,
+    body: String,
+}
+
+impl SupervisorUiState {
+    fn push_event(&mut self, event: SupervisorEventDisplay) {
+        if matches!(event.kind, "output") {
+            if let Some(existing) = self
+                .events
+                .iter_mut()
+                .rev()
+                .find(|item| item.kind == "output")
+            {
+                if !existing.body.is_empty() && !event.body.is_empty() {
+                    existing.body.push(' ');
+                }
+                existing.body.push_str(&event.body);
+                existing.body = truncate_chars(&single_line(&existing.body), MAX_TOOL_BODY_CHARS);
+                return;
+            }
+        }
+        self.events.push(event);
+        if self.events.len() > 3 {
+            let overflow = self.events.len() - 3;
+            self.events.drain(0..overflow);
+        }
+    }
+
+    fn apply_report(&mut self, report: &WorkflowReport) {
+        self.workflow_name = Some(report.workflow_name.clone());
+        self.from_node = Some(report.from_node.clone());
+        self.to_node = Some(report.to_node.clone());
+        self.edge = report.edge.clone();
+        self.status = Some(format!("{:?}", report.status));
+        if !report.reason.trim().is_empty() {
+            self.reason = Some(truncate_chars(
+                &single_line(&report.reason),
+                MAX_TOOL_BODY_CHARS,
+            ));
+        }
+    }
+
+    fn running_title(&self) -> String {
+        let workflow = self.workflow_name.as_deref().unwrap_or("Supervisor");
+        format!("supervisor · {workflow} · reviewing")
+    }
+
+    fn resolved_title(&self) -> String {
+        let workflow = self.workflow_name.as_deref().unwrap_or("Supervisor");
+        let from = self.from_node.as_deref().unwrap_or("?");
+        let to = self.to_node.as_deref().unwrap_or("?");
+        let status = self.status.as_deref().unwrap_or("done");
+        format!("supervisor · {workflow} · {from} -> {to} · {status}")
+    }
+
+    fn meta(&self) -> String {
+        let mut parts = Vec::new();
+        if let (Some(from), Some(to)) = (&self.from_node, &self.to_node) {
+            parts.push(format!("{from} -> {to}"));
+        }
+        if let Some(edge) = &self.edge {
+            parts.push(format!("edge {edge}"));
+        }
+        if parts.is_empty() {
+            "running".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    fn body(&self) -> String {
+        let mut lines = Vec::new();
+        if let (Some(from), Some(to)) = (&self.from_node, &self.to_node) {
+            lines.push(format!("transition: {from} -> {to}"));
+        }
+        if let Some(reason) = &self.reason {
+            lines.push(format!("reason: {reason}"));
+        }
+        for event in &self.events {
+            lines.push(format!("{}: {}", event.label, event.body));
+        }
+        if lines.is_empty() {
+            "reviewing workflow state".to_string()
+        } else {
+            lines.join("\n")
         }
     }
 }
@@ -2283,6 +2390,7 @@ enum CellKind {
     SubSession { id: String },
     TodoState,
     Approval { id: String },
+    ContextCompaction { id: String },
     Error,
 }
 
@@ -2311,8 +2419,34 @@ impl HistoryCell {
         Self::new(CellKind::TodoState, "todos", body)
     }
 
-    fn approval(id: String, body: String) -> Self {
-        Self::new(CellKind::Approval { id }, "approval", body)
+    fn approval_with_title(
+        id: String,
+        title: String,
+        body: String,
+        status: ToolVisualStatus,
+    ) -> Self {
+        Self {
+            kind: CellKind::Approval { id },
+            title,
+            body,
+            meta: String::new(),
+            status,
+        }
+    }
+
+    fn context_compaction(
+        id: String,
+        title: String,
+        body: String,
+        status: ToolVisualStatus,
+    ) -> Self {
+        Self {
+            kind: CellKind::ContextCompaction { id },
+            title,
+            body,
+            meta: String::new(),
+            status,
+        }
     }
 
     fn tool(
@@ -2456,6 +2590,11 @@ impl HistoryCell {
                     .add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::White),
             ),
+            CellKind::ContextCompaction { .. } => (
+                "◇",
+                self.status.style().add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            ),
             CellKind::Error => (
                 "x",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -2478,6 +2617,15 @@ impl HistoryCell {
             Span::styled(history_gutter(prefix), title_style),
             Span::styled(title, title_style),
         ]));
+        if self.body.trim().is_empty()
+            && matches!(
+                self.kind,
+                CellKind::Approval { .. } | CellKind::Supervisor { .. }
+            )
+        {
+            lines.push(Line::from(""));
+            return lines;
+        }
         let body = if self.body.trim().is_empty() {
             "(no content)"
         } else {
@@ -2489,6 +2637,31 @@ impl HistoryCell {
                 lines.push(Line::from(vec![
                     Span::raw(" ".repeat(HISTORY_GUTTER_WIDTH as usize)),
                     line,
+                ]));
+            }
+        } else if matches!(self.kind, CellKind::Assistant) {
+            let wrapped = render_markdown_lines(
+                body,
+                body_width,
+                MarkdownTheme {
+                    base: body_style,
+                    dim: CODEX_DIM,
+                    accent: CODEX_CYAN,
+                    code: Color::Yellow,
+                    quote: CODEX_DIM,
+                },
+            );
+            let truncated = wrapped.len() > MAX_HISTORY_BODY_LINES;
+            for line in wrapped.into_iter().take(MAX_HISTORY_BODY_LINES) {
+                let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                spans.push(Span::raw(" ".repeat(HISTORY_GUTTER_WIDTH as usize)));
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
+            if truncated {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(HISTORY_GUTTER_WIDTH as usize)),
+                    Span::styled("[truncated in TUI]", Style::default().fg(CODEX_DIM)),
                 ]));
             }
         } else {
@@ -2530,16 +2703,55 @@ fn horizontal_rule(width: u16) -> Line<'static> {
     ))
 }
 
-fn upsert_approval_cell(cells: &mut Vec<HistoryCell>, approval_id: &str, body: String) {
+fn upsert_approval_cell(cells: &mut Vec<HistoryCell>, next: HistoryCell) {
+    let next_id = match &next.kind {
+        CellKind::Approval { id } => id.clone(),
+        _ => return,
+    };
     if let Some(cell) = cells
         .iter_mut()
         .rev()
-        .find(|cell| matches!(&cell.kind, CellKind::Approval { id } if id == approval_id))
+        .find(|cell| matches!(&cell.kind, CellKind::Approval { id } if id == &next_id))
     {
-        cell.body = body;
+        *cell = next;
     } else {
-        cells.push(HistoryCell::approval(approval_id.to_string(), body));
+        cells.push(next);
     }
+}
+
+fn upsert_context_compaction_cell(cells: &mut Vec<HistoryCell>, next: HistoryCell) {
+    let next_id = match &next.kind {
+        CellKind::ContextCompaction { id } => id.clone(),
+        _ => return,
+    };
+    if let Some(cell) = cells
+        .iter_mut()
+        .rev()
+        .find(|cell| matches!(&cell.kind, CellKind::ContextCompaction { id } if id == &next_id))
+    {
+        *cell = next;
+    } else {
+        cells.push(next);
+    }
+}
+
+fn context_compaction_cell(event: ContextCompactionEvent) -> HistoryCell {
+    let (title, status) = match event.status {
+        ContextCompactionStatus::Started => ("compressing context", ToolVisualStatus::Running),
+        ContextCompactionStatus::Completed => ("context compressed", ToolVisualStatus::Success),
+        ContextCompactionStatus::Failed => ("context compression failed", ToolVisualStatus::Error),
+    };
+    let body = if matches!(event.status, ContextCompactionStatus::Failed) {
+        event
+            .error
+            .unwrap_or_else(|| "context compression failed".to_string())
+    } else {
+        format!(
+            "compacted {} messages; remaining {} messages",
+            event.compacted_messages, event.remaining_messages
+        )
+    };
+    HistoryCell::context_compaction(event.id, title.to_string(), body, status)
 }
 
 fn history_cell(message: ThreadHistoryMessage) -> Option<HistoryCell> {
@@ -2655,6 +2867,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     output
 }
 
+#[cfg(test)]
 fn append_stream_event(body: &mut String, event: &str) {
     if event.trim().is_empty() {
         return;
@@ -2685,6 +2898,7 @@ fn append_stream_event(body: &mut String, event: &str) {
     }
 }
 
+#[cfg(test)]
 fn body_contains_stream_key(body: &str, event: &str) -> bool {
     let Some(key) = keyed_stream_event(event) else {
         return false;
@@ -2693,6 +2907,7 @@ fn body_contains_stream_key(body: &str, event: &str) -> bool {
         .any(|block| keyed_stream_event(block).as_deref() == Some(key.as_str()))
 }
 
+#[cfg(test)]
 fn mergeable_stream_event(event: &str) -> Option<(String, String)> {
     if let Some(payload) = event.strip_prefix("output\n") {
         return Some(("output".to_string(), payload.to_string()));
@@ -2709,6 +2924,7 @@ fn mergeable_stream_event(event: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(test)]
 fn keyed_stream_event(event: &str) -> Option<String> {
     if let Some(payload) = event.strip_prefix("tool call: ") {
         let (_name, rest) = payload.split_once('\n')?;
@@ -2723,65 +2939,30 @@ fn keyed_stream_event(event: &str) -> Option<String> {
     None
 }
 
-fn format_supervisor_trace_event(event: &SupervisorTraceEvent) -> String {
+fn supervisor_event_display(event: &SupervisorTraceEvent) -> SupervisorEventDisplay {
     match event {
-        SupervisorTraceEvent::Thinking { content } => {
-            format!(
-                "thinking\n{}",
-                truncate_chars(content.trim(), MAX_TOOL_BODY_CHARS)
-            )
-        }
-        SupervisorTraceEvent::ToolCall { name, args } => format!(
-            "tool call: {name}\n{}",
-            truncate_chars(&format_json_summary(args), MAX_TOOL_BODY_CHARS)
-        ),
-        SupervisorTraceEvent::ToolResult { name, result } => format!(
-            "tool result: {name}\n{}",
-            truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS)
-        ),
+        SupervisorTraceEvent::Thinking { content } => SupervisorEventDisplay {
+            kind: "thinking",
+            label: "thinking".to_string(),
+            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
+        },
+        SupervisorTraceEvent::ToolCall { name, args } => SupervisorEventDisplay {
+            kind: "tool_call",
+            label: format!("calling {name}"),
+            body: truncate_chars(&format_json_summary(args), MAX_TOOL_BODY_CHARS),
+        },
+        SupervisorTraceEvent::ToolResult { name, result } => SupervisorEventDisplay {
+            kind: "tool_result",
+            label: format!("{name} result"),
+            body: truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS),
+        },
         SupervisorTraceEvent::OutputDelta { content }
-        | SupervisorTraceEvent::Output { content } => {
-            format!(
-                "output\n{}",
-                truncate_chars(content.trim(), MAX_TOOL_BODY_CHARS)
-            )
-        }
+        | SupervisorTraceEvent::Output { content } => SupervisorEventDisplay {
+            kind: "output",
+            label: "output".to_string(),
+            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
+        },
     }
-}
-
-fn format_supervisor_report(report: &WorkflowReport) -> String {
-    let mut lines = vec![
-        format!("workflow: {}", report.workflow_name),
-        format!("transition: {} -> {}", report.from_node, report.to_node),
-        format!("status: {:?}", report.status),
-    ];
-    if let Some(edge) = &report.edge {
-        lines.push(format!("edge: {edge}"));
-    }
-    if !report.reason.trim().is_empty() {
-        lines.push(format!("reason: {}", report.reason.trim()));
-    }
-    if let Some(message) = report
-        .agent_message
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
-        lines.push(format!(
-            "agent message: {}",
-            truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS)
-        ));
-    }
-    if let Some(message) = report
-        .next_node_message
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
-        lines.push(format!(
-            "next node: {}",
-            truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS)
-        ));
-    }
-    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -2937,27 +3118,6 @@ fn format_todo_state(items: &[bot_core::todo::TodoItem]) -> String {
     lines.join("\n")
 }
 
-fn format_approval_request(request: &bot_core::ToolApprovalRequest, state: &str) -> String {
-    let mut lines = vec![
-        format!("{state}: {}", request.tool_name),
-        format!("risk: {:?}", request.risk),
-        format!("approval_id: {}", request.id),
-    ];
-    if let Some(platform) = request.platform.as_deref() {
-        lines.push(format!("platform: {platform}"));
-    }
-    if !request.args_summary.trim().is_empty() {
-        lines.push(format!("args: {}", request.args_summary.trim()));
-    }
-    if let Some(review) = &request.review {
-        lines.push(format!("review: {:?} · {}", review.risk, review.reason));
-        for concern in &review.concerns {
-            lines.push(format!("  - {concern}"));
-        }
-    }
-    lines.join("\n")
-}
-
 #[derive(Clone, Copy)]
 struct ApprovalOption {
     label: &'static str,
@@ -2998,13 +3158,64 @@ fn approval_option(index: usize) -> Option<ApprovalOption> {
     approval_options().get(index).copied()
 }
 
-fn format_approval_body(
+fn approval_cell(
     request: &bot_core::ToolApprovalRequest,
     state: &str,
     selected: usize,
     status: Option<String>,
-) -> String {
-    let mut lines = vec![format_approval_request(request, state), String::new()];
+    decision: Option<ToolApprovalDecision>,
+) -> HistoryCell {
+    if state == "resolved" {
+        let decision = decision
+            .map(|decision| format!("{decision:?}"))
+            .or(status)
+            .unwrap_or_else(|| "resolved".to_string());
+        return HistoryCell::approval_with_title(
+            request.id.clone(),
+            format!(
+                "approval · resolved · {} · {}",
+                request.tool_name,
+                decision.replace("decision: ", "")
+            ),
+            String::new(),
+            ToolVisualStatus::Success,
+        );
+    }
+
+    let mut lines = Vec::new();
+    let risk = request
+        .review
+        .as_ref()
+        .map(|review| format!("{:?}", review.risk))
+        .unwrap_or_else(|| format!("{:?}", request.risk));
+    lines.push(format!("{} · risk {} · {}", state, risk, request.tool_name));
+    if let Some(platform) = request
+        .platform
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "from {platform} · id {}",
+            short_session_id(&request.id)
+        ));
+    } else {
+        lines.push(format!("id {}", short_session_id(&request.id)));
+    }
+    if let Some(review) = &request.review {
+        if !review.reason.trim().is_empty() {
+            lines.push(format!("review: {}", review.reason.trim()));
+        }
+        for concern in review.concerns.iter().take(3) {
+            lines.push(format!("  - {concern}"));
+        }
+    }
+    if !request.args_summary.trim().is_empty() {
+        lines.push(format!(
+            "args: {}",
+            truncate_chars(&single_line(&request.args_summary), MAX_TOOL_BODY_CHARS)
+        ));
+    }
+    lines.push(String::new());
     for (index, option) in approval_options().iter().enumerate() {
         let marker = if index == selected { "›" } else { " " };
         lines.push(format!(
@@ -3015,11 +3226,16 @@ fn format_approval_body(
         ));
     }
     lines.push(String::new());
-    lines.push("Use ↑/↓ to choose, Enter to confirm.".to_string());
+    lines.push("↑/↓ choose · Enter confirm · Esc deny".to_string());
     if let Some(status) = status {
         lines.push(status);
     }
-    lines.join("\n")
+    HistoryCell::approval_with_title(
+        request.id.clone(),
+        format!("approval · {state} · {}", request.tool_name),
+        lines.join("\n"),
+        ToolVisualStatus::Running,
+    )
 }
 
 fn diff_lines(text: &str, width: u16) -> Vec<Span<'static>> {
@@ -3079,6 +3295,14 @@ fn wrap_line_count(text: &str, width: u16) -> u16 {
         .map(|line| (UnicodeWidthStr::width(line) / width).max(1) as u16)
         .sum::<u16>()
         .max(1)
+}
+
+fn context_usage_percent(prompt_tokens: u32, context_tokens: u32) -> Option<u32> {
+    if context_tokens == 0 {
+        return None;
+    }
+    let used = prompt_tokens.min(context_tokens);
+    Some((used as f64 / context_tokens as f64 * 100.0).round() as u32)
 }
 
 fn truncate_for_width(text: &str, width: u16) -> String {
@@ -3235,6 +3459,14 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_uses_model_context_window() {
+        assert_eq!(context_usage_percent(16_000, 128_000), Some(13));
+        assert_eq!(context_usage_percent(128_000, 128_000), Some(100));
+        assert_eq!(context_usage_percent(130_000, 128_000), Some(100));
+        assert_eq!(context_usage_percent(1, 0), None);
+    }
+
+    #[test]
     fn extracts_apply_patch_argument() {
         let args = serde_json::json!({
             "patch": "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
@@ -3267,15 +3499,165 @@ mod tests {
     }
 
     #[test]
+    fn assistant_cell_renders_markdown_styles() {
+        let cell = HistoryCell::assistant("hello **bold** and `code`");
+        let lines = cell.lines(80);
+        assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.content.as_ref() == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        })));
+        assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.content.as_ref() == "code" && span.style.fg == Some(Color::Yellow)
+        })));
+    }
+
+    #[test]
     fn approval_updates_reuse_one_history_cell() {
         let mut cells = Vec::new();
-        upsert_approval_cell(&mut cells, "approval-1", "waiting".to_string());
-        upsert_approval_cell(&mut cells, "approval-1", "resolved".to_string());
-        upsert_approval_cell(&mut cells, "approval-2", "other".to_string());
+        upsert_approval_cell(
+            &mut cells,
+            HistoryCell::approval_with_title(
+                "approval-1".to_string(),
+                "approval · waiting".to_string(),
+                "waiting".to_string(),
+                ToolVisualStatus::Running,
+            ),
+        );
+        upsert_approval_cell(
+            &mut cells,
+            HistoryCell::approval_with_title(
+                "approval-1".to_string(),
+                "approval · resolved".to_string(),
+                String::new(),
+                ToolVisualStatus::Success,
+            ),
+        );
+        upsert_approval_cell(
+            &mut cells,
+            HistoryCell::approval_with_title(
+                "approval-2".to_string(),
+                "approval · waiting".to_string(),
+                "other".to_string(),
+                ToolVisualStatus::Running,
+            ),
+        );
 
         assert_eq!(cells.len(), 2);
-        assert_eq!(cells[0].body, "resolved");
+        assert_eq!(cells[0].title, "approval · resolved");
+        assert!(cells[0].body.is_empty());
         assert_eq!(cells[1].body, "other");
+    }
+
+    #[test]
+    fn context_compaction_updates_reuse_one_history_cell() {
+        let mut cells = Vec::new();
+        let started = ContextCompactionEvent {
+            id: "compact-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            status: ContextCompactionStatus::Started,
+            source: bot_core::ContextCompactionSource::Auto,
+            compacted_messages: 4,
+            remaining_messages: 3,
+            error: None,
+        };
+        let mut completed = started.clone();
+        completed.status = ContextCompactionStatus::Completed;
+        completed.remaining_messages = 2;
+        upsert_context_compaction_cell(&mut cells, context_compaction_cell(started));
+        upsert_context_compaction_cell(&mut cells, context_compaction_cell(completed));
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].title, "context compressed");
+        assert_eq!(cells[0].body, "compacted 4 messages; remaining 2 messages");
+        assert_eq!(cells[0].status, ToolVisualStatus::Success);
+    }
+
+    #[test]
+    fn resolved_approval_cell_collapses_to_title_only() {
+        let request = ToolApprovalRequest {
+            id: "approval-1".to_string(),
+            session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "fs_remove".to_string(),
+            risk: bot_core::ToolRiskLevel::Medium,
+            args_summary: "{\"path\":\"target/tmp\"}".to_string(),
+            platform: Some("tui".to_string()),
+            review: Some(bot_core::ToolRiskReview {
+                risk: bot_core::ToolRiskLevel::Medium,
+                reason: "mutates files".to_string(),
+                concerns: vec!["Deletes local data".to_string()],
+            }),
+        };
+        let pending = approval_cell(&request, "waiting", 1, None, None);
+        assert!(pending.body.contains("› 2."));
+        assert!(pending.body.contains("review: mutates files"));
+
+        let resolved = approval_cell(
+            &request,
+            "resolved",
+            1,
+            None,
+            Some(ToolApprovalDecision::AllowOnce),
+        );
+        let lines = resolved.lines(100);
+        assert!(resolved.body.is_empty());
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].spans.iter().any(|span| span
+            .content
+            .contains("approval · resolved · fs_remove · AllowOnce")));
+    }
+
+    #[test]
+    fn supervisor_state_keeps_recent_events_and_report_summary() {
+        let mut state = SupervisorUiState::default();
+        for index in 0..5 {
+            state.push_event(SupervisorEventDisplay {
+                kind: "tool_call",
+                label: format!("calling tool{index}"),
+                body: format!("args{index}"),
+            });
+        }
+        assert_eq!(state.events.len(), 3);
+        assert_eq!(state.events[0].label, "calling tool2");
+
+        let report = WorkflowReport {
+            workflow_id: "goal".to_string(),
+            workflow_name: "Goal".to_string(),
+            from_node: "review".to_string(),
+            edge: Some("continue".to_string()),
+            to_node: "work".to_string(),
+            status: bot_core::supervisor_workflow::WorkflowStatus::Active,
+            reason: "Need another step".to_string(),
+            agent_message: None,
+            next_node_message: None,
+            supervisor_trace: Vec::new(),
+            round: 2,
+            max_rounds: bot_core::supervisor_workflow::WorkflowMaxRounds::Limited(5),
+            error: None,
+        };
+        state.apply_report(&report);
+        assert_eq!(
+            state.resolved_title(),
+            "supervisor · Goal · review -> work · Active"
+        );
+        assert!(state.body().contains("transition: review -> work"));
+    }
+
+    #[test]
+    fn resolved_supervisor_cell_collapses_to_title_only() {
+        let cell = HistoryCell::supervisor(
+            "supervisor-1".to_string(),
+            "supervisor · Goal · review -> work · Active".to_string(),
+            String::new(),
+            "review -> work".to_string(),
+            ToolVisualStatus::Success,
+        );
+        let lines = cell.lines(100);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content.contains("supervisor · Goal")));
     }
 
     #[test]

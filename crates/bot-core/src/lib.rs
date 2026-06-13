@@ -40,7 +40,10 @@ pub use approval::{
     ApprovalResolution, ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
     ToolRiskLevel, ToolRiskReview,
 };
-pub use events::{CatEvent, SkillEvent, TodoEvent, TriggerEvent};
+pub use events::{
+    CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, SkillEvent,
+    TodoEvent, TriggerEvent,
+};
 pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use memory::{MemoryStore, ThreadHistoryMessage};
@@ -1237,10 +1240,12 @@ impl CatBot {
                             elapsed_ms = turn_started.elapsed().as_millis() as u64,
                             "agent_turn.cancelled"
                         );
-                        persist_turn(
+                        for event in persist_turn(
                             &self.memory, &thread_id_owned,
                             raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-                        ).await;
+                        ).await {
+                            yield event;
+                        }
                         yield CatEvent::Done;
                         return;
                     }
@@ -1301,10 +1306,12 @@ impl CatBot {
                             } else {
                                 None
                             };
-                            persist_turn(
+                            for event in persist_turn(
                                 &self.memory, &thread_id_owned,
                                 raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-                            ).await;
+                            ).await {
+                                yield event;
+                            }
                             if !round_opts.supervisor_run {
                                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                                 let evaluation = self.evaluate_workflow_after_round(
@@ -1357,10 +1364,12 @@ impl CatBot {
                         }
                         CatEvent::Error(e) => {
                             // Best-effort save on error (partial history is better than nothing).
-                            persist_turn(
+                            for event in persist_turn(
                                 &self.memory, &thread_id_owned,
                                 raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-                            ).await;
+                            ).await {
+                                yield event;
+                            }
                             tracing::warn!(
                                 thread_id = %thread_id_owned,
                                 model_profile = %effective_model.profile.id,
@@ -1380,10 +1389,12 @@ impl CatBot {
             }
 
             // Fallback: stream ended without Done (shouldn't normally happen).
-            persist_turn(
+            for event in persist_turn(
                 &self.memory, &thread_id_owned,
                 raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-            ).await;
+            ).await {
+                yield event;
+            }
             tracing::warn!(
                 thread_id = %thread_id_owned,
                 model_profile = %effective_model.profile.id,
@@ -1432,7 +1443,8 @@ async fn persist_turn(
     user_state: Option<serde_json::Value>,
     skip_count: usize,
     tool_elapsed_ms: &HashMap<String, u64>,
-) {
+) -> Vec<CatEvent> {
+    let mut events = Vec::new();
     if let Some(all_msgs) = history {
         let mut new_msgs: Vec<Message> = all_msgs.into_iter().skip(skip_count).collect();
         annotate_tool_elapsed_ms(&mut new_msgs, tool_elapsed_ms);
@@ -1450,7 +1462,11 @@ async fn persist_turn(
             );
         }
         if !new_msgs.is_empty() {
-            if let Err(e) = memory.save_turn(thread_id, new_msgs).await {
+            let mut sink = |event| events.push(CatEvent::ContextCompaction(event));
+            if let Err(e) = memory
+                .save_turn_with_compaction_events(thread_id, new_msgs, Some(&mut sink))
+                .await
+            {
                 tracing::warn!(thread_id, error = %e, "memory.persist.failed");
             }
         }
@@ -1460,6 +1476,7 @@ async fn persist_turn(
             tracing::warn!(thread_id, error = %e, "memory.user_state.persist.failed");
         }
     }
+    events
 }
 
 fn annotate_tool_elapsed_ms(messages: &mut [Message], tool_elapsed_ms: &HashMap<String, u64>) {

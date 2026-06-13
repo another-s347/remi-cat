@@ -1,0 +1,67 @@
+[package]
+name = "remi-client-sdk"
+version = "0.1.0"
+edition = "2024"
+resolver = "2"
+
+[dependencies]
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop", rev = "7042298bd454792a59eeccf4936e104c5a132f4c", default-features = false, features = ["native", "tracing-langsmith"] }
+remi-agentloop-wasm = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop-wasm", rev = "7042298bd454792a59eeccf4936e104c5a132f4c", default-features = false, features = ["http-host"] }
+remi-things-crdt = { path = "../remi-things-crdt" }
+rule-trigger-engine = { path = "../rule-trigger-engine" }
+anyhow = "1.0"
+anytomd = "1.2.1"
+base64 = "0.22"
+kamadak-exif = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+croner = "3.0.1"
+futures = "0.3"
+async-stream = "0.3"
+http = "0.2"
+once_cell = "1.19"
+prost = "0.14"
+prost-types = "0.14"
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+jsonschema = "0.18"
+thiserror = "1.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+urlencoding = "2.1"
+tonic = { version = "0.14", features = ["transport"] }
+tonic_conn = { git = "https://github.com/another-s347/decenet.git", rev = "d37d9a6cb9319f3cd8979555bc21498f1f914b40" }
+decentralized_network = { git = "https://github.com/another-s347/decenet.git", rev = "d37d9a6cb9319f3cd8979555bc21498f1f914b40" }
+tonic-prost = "0.14"
+tracing = "0.1"
+automerge = "0.7.2"
+sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "reqwest", "rustls"], optional = true }
+unpdf = "0.2.4"
+uuid = { version = "1.10", features = ["v4"] }
+async-trait = "0.1"
+rquickjs-core = { version = "0.8.1", default-features = false, features = ["bindgen", "rust-alloc"], optional = true }
+
+[features]
+default = []
+sentry-integration = ["sentry"]
+# Enables Cranelift JIT compilation in the WASM runtime.
+# Required for File/Bytes WASM loading (desktop). Omit for Android.
+local-wasm-compiler = ["remi-agentloop-wasm/compiler"]
+quickjs = ["dep:rquickjs-core"]
+
+[build-dependencies]
+protoc-bin-vendored = "3.0"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sdk_agent_tools"
+harness = false

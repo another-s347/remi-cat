@@ -66,6 +66,16 @@ export type DebugStats = {
   elapsed_ms?: number;
 };
 
+export type ContextCompactionEvent = {
+  id: string;
+  thread_id: string;
+  status: "started" | "completed" | "failed";
+  source: "auto" | "manual";
+  compacted_messages: number;
+  remaining_messages: number;
+  error?: string | null;
+};
+
 export type PrettyToolCall = {
   id: string;
   tool_name: string;

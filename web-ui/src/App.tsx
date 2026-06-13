@@ -33,6 +33,7 @@ import {
   api,
   type ActiveRun,
   type CommandCatalogEntry,
+  type ContextCompactionEvent,
   type DebugStats,
   type HistoryMessage,
   type PrettyToolCall,
@@ -307,6 +308,29 @@ function ApprovalPart({ args, result }: ToolCallMessagePartProps) {
   );
 }
 
+function ContextCompactionPart({ args, result }: ToolCallMessagePartProps) {
+  const event = (result ?? args) as ContextCompactionEvent | undefined;
+  if (!event) return null;
+  const title = event.status === "failed"
+    ? "上下文压缩失败"
+    : event.status === "completed"
+      ? "上下文已压缩"
+      : "正在压缩上下文";
+  const detail = event.status === "failed" && event.error
+    ? event.error
+    : `压缩 ${event.compacted_messages} 条，保留 ${event.remaining_messages} 条`;
+  return (
+    <section className={`compaction-card ${event.status}`}>
+      <header>
+        <Activity size={15} />
+        <strong>{title}</strong>
+        <small>{event.source}</small>
+      </header>
+      <p>{detail}</p>
+    </section>
+  );
+}
+
 function ToolPart({ toolName, args, argsText, result, status }: ToolCallMessagePartProps) {
   const pretty = prettyFromPart(args, result);
   if (pretty) {
@@ -537,6 +561,7 @@ const partComponents = {
       __remi_supervisor: SupervisorPart,
       __remi_sub_session: SubSessionPart,
       __remi_approval: ApprovalPart,
+      __remi_context_compaction: ContextCompactionPart,
     },
     Fallback: ToolPart,
   },

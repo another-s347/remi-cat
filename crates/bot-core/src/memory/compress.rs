@@ -77,6 +77,10 @@ impl LlmCompressor {
             .join("\n\n");
 
         if text.is_empty() {
+            tracing::warn!(
+                "LlmCompressor: all {} messages filtered out (tool/empty), nothing to compress",
+                messages.len(),
+            );
             return Ok(String::new());
         }
 

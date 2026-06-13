@@ -3,14 +3,24 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 pub type SandboxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+const BASH_TASK_RETAIN: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxBashStatus {
+    Completed,
+    Running,
+    Cancelled,
+    NotFound,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxBashOutput {
@@ -18,6 +28,55 @@ pub struct SandboxBashOutput {
     pub stderr: String,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub status: SandboxBashStatus,
+    pub pid: Option<String>,
+    pub os_pid: Option<u32>,
+    pub message: Option<String>,
+}
+
+impl SandboxBashOutput {
+    fn running(task: &mut BashTaskState, timed_out: bool) -> Self {
+        let stdout = take_incremental(&task.stdout, &mut task.stdout_cursor);
+        let stderr = take_incremental(&task.stderr, &mut task.stderr_cursor);
+        Self {
+            stdout,
+            stderr,
+            exit_code: -1,
+            timed_out,
+            status: SandboxBashStatus::Running,
+            pid: Some(task.pid.clone()),
+            os_pid: task.os_pid,
+            message: None,
+        }
+    }
+
+    fn terminal(task: &mut BashTaskState, status: SandboxBashStatus) -> Self {
+        let stdout = take_incremental(&task.stdout, &mut task.stdout_cursor);
+        let stderr = take_incremental(&task.stderr, &mut task.stderr_cursor);
+        Self {
+            stdout,
+            stderr,
+            exit_code: task.exit_code.unwrap_or(-1),
+            timed_out: false,
+            status,
+            pid: Some(task.pid.clone()),
+            os_pid: task.os_pid,
+            message: task.message.clone(),
+        }
+    }
+
+    fn not_found(pid: &str) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: -1,
+            timed_out: false,
+            status: SandboxBashStatus::NotFound,
+            pid: Some(pid.to_string()),
+            os_pid: None,
+            message: Some("bash task not found; it may have completed and expired".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +181,8 @@ pub trait Sandbox: Send + Sync {
         named: Option<&'a str>,
         timeout_ms: u64,
     ) -> SandboxFuture<'a, SandboxBashOutput>;
+    fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
+    fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +196,7 @@ pub enum ReplaceResult {
 pub struct NoSandbox {
     root: PathBuf,
     sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<BashSession>>>>>,
+    tasks: BashTaskRegistry,
 }
 
 impl NoSandbox {
@@ -142,6 +204,7 @@ impl NoSandbox {
         Self {
             root,
             sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            tasks: BashTaskRegistry::new(),
         }
     }
 
@@ -152,7 +215,7 @@ impl NoSandbox {
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(command);
         cmd.current_dir(&self.root);
-        run_command_with_timeout(cmd, timeout_ms).await
+        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
     }
 
     async fn bash_named(
@@ -166,6 +229,7 @@ impl NoSandbox {
             .context("creating sandbox root")?;
         run_named_bash(
             &self.sessions,
+            self.tasks.clone(),
             named,
             || BashSession::start_local(&self.root),
             command,
@@ -290,12 +354,21 @@ impl Sandbox for NoSandbox {
             }
         })
     }
+
+    fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
+        Box::pin(async move { Ok(self.tasks.poll(pid).await) })
+    }
+
+    fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
+        Box::pin(async move { Ok(self.tasks.cancel(pid).await) })
+    }
 }
 
 #[derive(Clone)]
 pub struct DockerSandbox {
     config: DockerSandboxConfig,
     sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<BashSession>>>>>,
+    tasks: BashTaskRegistry,
 }
 
 impl DockerSandbox {
@@ -303,6 +376,7 @@ impl DockerSandbox {
         Self {
             config,
             sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            tasks: BashTaskRegistry::new(),
         }
     }
 
@@ -374,7 +448,7 @@ impl DockerSandbox {
             cmd.args(["-u", user]);
         }
         cmd.args([&self.config.container_name, "bash", "-lc", command]);
-        run_command_with_timeout(cmd, timeout_ms).await
+        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
     }
 
     async fn bash_session(
@@ -389,6 +463,7 @@ impl DockerSandbox {
         let user = self.config.user.clone();
         run_named_bash(
             &self.sessions,
+            self.tasks.clone(),
             named,
             || BashSession::start_docker(&container_name, &container_dir, user.as_deref()),
             command,
@@ -469,6 +544,14 @@ impl Sandbox for DockerSandbox {
             }
         })
     }
+
+    fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
+        Box::pin(async move { Ok(self.tasks.poll(pid).await) })
+    }
+
+    fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
+        Box::pin(async move { Ok(self.tasks.cancel(pid).await) })
+    }
 }
 
 #[derive(Debug)]
@@ -476,6 +559,129 @@ struct BashSession {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashTaskStatus {
+    Running,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct BashTaskState {
+    pid: String,
+    named: Option<String>,
+    stdout: String,
+    stderr: String,
+    stdout_cursor: usize,
+    stderr_cursor: usize,
+    os_pid: Option<u32>,
+    exit_code: Option<i32>,
+    status: BashTaskStatus,
+    message: Option<String>,
+    finished_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct BashTaskRegistry {
+    tasks: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<BashTaskState>>>>>,
+}
+
+impl BashTaskRegistry {
+    fn new() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn insert(&self, state: BashTaskState) -> Arc<Mutex<BashTaskState>> {
+        self.prune().await;
+        let pid = state.pid.clone();
+        let task = Arc::new(Mutex::new(state));
+        self.tasks.lock().await.insert(pid, Arc::clone(&task));
+        task
+    }
+
+    async fn active_named_pid(&self, named: &str) -> Option<String> {
+        self.prune().await;
+        let tasks: Vec<_> = self.tasks.lock().await.values().cloned().collect();
+        for task in tasks {
+            let task = task.lock().await;
+            if task.status == BashTaskStatus::Running && task.named.as_deref() == Some(named) {
+                return Some(task.pid.clone());
+            }
+        }
+        None
+    }
+
+    async fn poll(&self, pid: &str) -> SandboxBashOutput {
+        self.prune().await;
+        let task = self.tasks.lock().await.get(pid).cloned();
+        let Some(task) = task else {
+            return SandboxBashOutput::not_found(pid);
+        };
+        let mut task = task.lock().await;
+        match task.status {
+            BashTaskStatus::Running => SandboxBashOutput::running(&mut task, false),
+            BashTaskStatus::Completed => {
+                SandboxBashOutput::terminal(&mut task, SandboxBashStatus::Completed)
+            }
+            BashTaskStatus::Cancelled => {
+                SandboxBashOutput::terminal(&mut task, SandboxBashStatus::Cancelled)
+            }
+        }
+    }
+
+    async fn cancel(&self, pid: &str) -> SandboxBashOutput {
+        self.prune().await;
+        let task = self.tasks.lock().await.get(pid).cloned();
+        let Some(task) = task else {
+            return SandboxBashOutput::not_found(pid);
+        };
+        let os_pid = {
+            let mut task = task.lock().await;
+            if task.status == BashTaskStatus::Running {
+                task.status = BashTaskStatus::Cancelled;
+                task.exit_code = Some(-1);
+                task.message = Some("bash task cancelled".to_string());
+                task.finished_at = Some(Instant::now());
+            }
+            task.os_pid
+        };
+        if let Some(os_pid) = os_pid {
+            terminate_process(os_pid).await;
+        }
+        let mut task = task.lock().await;
+        SandboxBashOutput::terminal(&mut task, SandboxBashStatus::Cancelled)
+    }
+
+    async fn prune(&self) {
+        let tasks: Vec<_> = self
+            .tasks
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut expired = Vec::new();
+        for (pid, task) in tasks {
+            let task = task.lock().await;
+            if task
+                .finished_at
+                .map(|finished_at| finished_at.elapsed() >= BASH_TASK_RETAIN)
+                .unwrap_or(false)
+            {
+                expired.push(pid);
+            }
+        }
+        if !expired.is_empty() {
+            let mut tasks = self.tasks.lock().await;
+            for pid in expired {
+                tasks.remove(&pid);
+            }
+        }
+    }
 }
 
 impl BashSession {
@@ -532,7 +738,15 @@ impl BashSession {
         })
     }
 
-    async fn run(&mut self, command: &str) -> Result<SandboxBashOutput> {
+    fn os_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn run_into_task(
+        &mut self,
+        command: &str,
+        task: Arc<Mutex<BashTaskState>>,
+    ) -> Result<i32> {
         let marker = format!("__REMI_BASH_DONE_{}__", uuid::Uuid::new_v4().simple());
         let wrapped = format!(
             "{command} 2>&1\n__remi_status=$?\nprintf '\\n{marker}:%s\\n' \"$__remi_status\"\n"
@@ -546,7 +760,6 @@ impl BashSession {
             .await
             .context("flushing docker bash session")?;
 
-        let mut stdout = String::new();
         let mut line = String::new();
         loop {
             line.clear();
@@ -559,51 +772,84 @@ impl BashSession {
                 return Err(anyhow!("named bash session exited"));
             }
             if let Some(exit_code) = parse_marker_line(&line, &marker) {
-                if stdout.ends_with('\n') {
-                    stdout.pop();
-                    if stdout.ends_with('\r') {
-                        stdout.pop();
-                    }
-                }
-                return Ok(SandboxBashOutput {
-                    stdout,
-                    stderr: String::new(),
-                    exit_code,
-                    timed_out: false,
-                });
+                trim_task_stdout_newline(&task).await;
+                return Ok(exit_code);
             }
-            stdout.push_str(&line);
+            append_task_stdout(&task, &line).await;
         }
-    }
-
-    async fn kill(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
     }
 }
 
-async fn run_command_with_timeout(mut cmd: Command, timeout_ms: u64) -> Result<SandboxBashOutput> {
+async fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout_ms: u64,
+    named: Option<String>,
+    tasks: BashTaskRegistry,
+) -> Result<SandboxBashOutput> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let run = cmd.output();
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
-        Err(_) => Ok(SandboxBashOutput {
+    let mut child = cmd.spawn().context("running sandbox command")?;
+    let os_pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("sandbox command stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("sandbox command stderr unavailable"))?;
+    let task = tasks
+        .insert(BashTaskState {
+            pid: new_bash_pid(),
+            named,
             stdout: String::new(),
             stderr: String::new(),
-            exit_code: -1,
-            timed_out: true,
-        }),
-        Ok(Err(err)) => Err(err).context("running sandbox command"),
-        Ok(Ok(output)) => Ok(SandboxBashOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code().unwrap_or(-1),
-            timed_out: false,
-        }),
-    }
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            os_pid,
+            exit_code: None,
+            status: BashTaskStatus::Running,
+            message: None,
+            finished_at: None,
+        })
+        .await;
+    spawn_reader(stdout, Arc::clone(&task), true);
+    spawn_reader(stderr, Arc::clone(&task), false);
+    tokio::spawn({
+        let wait_task = Arc::clone(&task);
+        async move {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let mut task = wait_task.lock().await;
+                        if task.status == BashTaskStatus::Running {
+                            task.exit_code = Some(status.code().unwrap_or(-1));
+                            task.status = BashTaskStatus::Completed;
+                            task.finished_at = Some(Instant::now());
+                        }
+                        break;
+                    }
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(err) => {
+                        let mut task = wait_task.lock().await;
+                        if task.status == BashTaskStatus::Running {
+                            task.exit_code = Some(-1);
+                            task.status = BashTaskStatus::Completed;
+                            task.message = Some(format!("bash wait failed: {err}"));
+                            task.finished_at = Some(Instant::now());
+                        }
+                        break;
+                    }
+                }
+            }
+            let _ = child.wait().await;
+        }
+    });
+    wait_for_task(task, timeout_ms).await
 }
 
 async fn run_named_bash<F, Fut>(
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<BashSession>>>>>,
+    tasks: BashTaskRegistry,
     named: &str,
     start: F,
     command: &str,
@@ -614,6 +860,11 @@ where
     Fut: Future<Output = Result<BashSession>>,
 {
     let named = validate_named(named)?;
+    if let Some(pid) = tasks.active_named_pid(&named).await {
+        return Err(anyhow!(
+            "named bash session `{named}` is still running task `{pid}`; poll or cancel that pid, wait for it to complete, or use a different named session"
+        ));
+    }
     let session = {
         let mut sessions = sessions.lock().await;
         if let Some(session) = sessions.get(&named) {
@@ -625,25 +876,172 @@ where
         }
     };
 
-    let run = async {
-        let mut session = session.lock().await;
-        session.run(command).await
-    };
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
-        Ok(result) => result,
-        Err(_) => {
-            let mut sessions = sessions.lock().await;
-            if let Some(session) = sessions.remove(&named) {
+    let task = tasks
+        .insert(BashTaskState {
+            pid: new_bash_pid(),
+            named: Some(named.clone()),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            os_pid: None,
+            exit_code: None,
+            status: BashTaskStatus::Running,
+            message: None,
+            finished_at: None,
+        })
+        .await;
+    let sessions = Arc::clone(sessions);
+    let command = command.to_string();
+    tokio::spawn({
+        let task = Arc::clone(&task);
+        async move {
+            let result = {
                 let mut session = session.lock().await;
-                session.kill().await;
+                {
+                    let mut task = task.lock().await;
+                    task.os_pid = session.os_pid();
+                }
+                session.run_into_task(&command, Arc::clone(&task)).await
+            };
+            let mut remove_session = false;
+            {
+                let mut task = task.lock().await;
+                match task.status {
+                    BashTaskStatus::Cancelled => {
+                        remove_session = true;
+                    }
+                    BashTaskStatus::Running => match result {
+                        Ok(exit_code) => {
+                            task.exit_code = Some(exit_code);
+                            task.status = BashTaskStatus::Completed;
+                            task.finished_at = Some(Instant::now());
+                        }
+                        Err(err) => {
+                            task.exit_code = Some(-1);
+                            task.status = BashTaskStatus::Completed;
+                            task.message = Some(err.to_string());
+                            task.finished_at = Some(Instant::now());
+                            remove_session = true;
+                        }
+                    },
+                    BashTaskStatus::Completed => {}
+                }
             }
-            Ok(SandboxBashOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: true,
-            })
+            if remove_session {
+                sessions.lock().await.remove(&named);
+            }
         }
+    });
+    wait_for_task(task, timeout_ms).await
+}
+
+async fn wait_for_task(
+    task: Arc<Mutex<BashTaskState>>,
+    timeout_ms: u64,
+) -> Result<SandboxBashOutput> {
+    let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout);
+    loop {
+        {
+            let mut task = task.lock().await;
+            match task.status {
+                BashTaskStatus::Running => {}
+                BashTaskStatus::Completed => {
+                    let mut output =
+                        SandboxBashOutput::terminal(&mut task, SandboxBashStatus::Completed);
+                    output.pid = None;
+                    output.os_pid = None;
+                    return Ok(output);
+                }
+                BashTaskStatus::Cancelled => {
+                    return Ok(SandboxBashOutput::terminal(
+                        &mut task,
+                        SandboxBashStatus::Cancelled,
+                    ));
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            _ = &mut timeout => {
+                let mut task = task.lock().await;
+                return Ok(SandboxBashOutput::running(&mut task, true));
+            }
+        }
+    }
+}
+
+fn new_bash_pid() -> String {
+    format!("bash_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn take_incremental(buffer: &str, cursor: &mut usize) -> String {
+    let cursor_value = (*cursor).min(buffer.len());
+    let out = buffer[cursor_value..].to_string();
+    *cursor = buffer.len();
+    out
+}
+
+fn spawn_reader<R>(mut reader: R, task: Arc<Mutex<BashTaskState>>, stdout: bool)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if stdout {
+                        append_task_stdout(&task, &chunk).await;
+                    } else {
+                        append_task_stderr(&task, &chunk).await;
+                    }
+                }
+                Err(err) => {
+                    append_task_stderr(&task, &format!("\n[read error: {err}]")).await;
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn append_task_stdout(task: &Arc<Mutex<BashTaskState>>, chunk: &str) {
+    task.lock().await.stdout.push_str(chunk);
+}
+
+async fn append_task_stderr(task: &Arc<Mutex<BashTaskState>>, chunk: &str) {
+    task.lock().await.stderr.push_str(chunk);
+}
+
+async fn trim_task_stdout_newline(task: &Arc<Mutex<BashTaskState>>) {
+    let mut task = task.lock().await;
+    if task.stdout.ends_with('\n') {
+        task.stdout.pop();
+        if task.stdout.ends_with('\r') {
+            task.stdout.pop();
+        }
+    }
+}
+
+async fn terminate_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .output()
+            .await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output()
+            .await;
     }
 }
 
@@ -803,10 +1201,11 @@ async fn resolve_creatable_dir_path(root: &Path, path: &str) -> Result<PathBuf> 
 mod tests {
     use super::{
         current_host_user_spec, DockerSandbox, DockerSandboxConfig, NoSandbox, ReplaceResult,
-        Sandbox,
+        Sandbox, SandboxBashStatus,
     };
     use std::path::PathBuf;
     use std::process::Command;
+    use std::time::Duration;
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("remi-sandbox-test-{}", uuid::Uuid::new_v4()))
@@ -872,6 +1271,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, "missing");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_unnamed_bash_returns_pid_and_poll_completes() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let out = sandbox
+            .bash("printf start; sleep 0.2; printf done", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(out.status, SandboxBashStatus::Running);
+        assert!(out.timed_out);
+        let pid = out.pid.clone().expect("timed out bash should return pid");
+        let mut combined_stdout = out.stdout;
+        let mut completed = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let poll = sandbox.bash_poll(&pid).await.unwrap();
+            combined_stdout.push_str(&poll.stdout);
+            if poll.status == SandboxBashStatus::Completed {
+                completed = Some(poll);
+                break;
+            }
+        }
+        let completed = completed.expect("bash task should complete");
+        assert_eq!(completed.exit_code, 0);
+        assert!(combined_stdout.contains("start"));
+        assert!(combined_stdout.contains("done"));
+
+        let repeated = sandbox.bash_poll(&pid).await.unwrap();
+        assert_eq!(repeated.status, SandboxBashStatus::Completed);
+        assert!(repeated.stdout.is_empty());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_unnamed_bash_can_be_cancelled() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let out = sandbox.bash("sleep 5", None, 10).await.unwrap();
+        let pid = out.pid.clone().expect("timed out bash should return pid");
+
+        let cancelled = sandbox.bash_cancel(&pid).await.unwrap();
+        assert_eq!(cancelled.status, SandboxBashStatus::Cancelled);
+        assert_eq!(cancelled.exit_code, -1);
+
+        let polled = sandbox.bash_poll(&pid).await.unwrap();
+        assert_eq!(polled.status, SandboxBashStatus::Cancelled);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_named_bash_blocks_same_name_until_complete() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let out = sandbox
+            .bash(
+                "export REMI_LOCAL_MARK=kept; sleep 0.2; printf \"$REMI_LOCAL_MARK\"",
+                Some("alpha"),
+                10,
+            )
+            .await
+            .unwrap();
+        let pid = out
+            .pid
+            .clone()
+            .expect("timed out named bash should return pid");
+
+        let err = sandbox
+            .bash("printf should-not-run", Some("alpha"), 10_000)
+            .await
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("still running task"));
+        assert!(err.contains(&pid));
+
+        let beta = sandbox
+            .bash("printf beta", Some("beta"), 10_000)
+            .await
+            .unwrap();
+        assert_eq!(beta.stdout, "beta");
+
+        let mut completed = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let poll = sandbox.bash_poll(&pid).await.unwrap();
+            if poll.status == SandboxBashStatus::Completed {
+                completed = Some(poll);
+                break;
+            }
+        }
+        let completed = completed.expect("named task should complete");
+        assert_eq!(completed.exit_code, 0);
+
+        let after = sandbox
+            .bash("printf \"$REMI_LOCAL_MARK\"", Some("alpha"), 10_000)
+            .await
+            .unwrap();
+        assert_eq!(after.stdout, "kept");
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

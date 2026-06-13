@@ -17,12 +17,14 @@ use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::Context;
 use async_stream::stream;
 use base64::Engine as _;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentError, Content, ContentPart, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
 };
 
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxBashOutput, SandboxBashStatus};
+
+pub const DEFAULT_FS_READ_LENGTH: usize = 32 * 1024;
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
@@ -195,7 +197,9 @@ impl Tool for WorkspaceBashTool {
     fn description(&self) -> &str {
         "Execute a bash command in the workspace. Relative paths resolve in the \
          same workspace used by fs_read/fs_write. Pass `named` to reuse a shell \
-         and preserve state such as cd and exported variables."
+         and preserve state such as cd and exported variables. If a command \
+         times out it keeps running and returns a pid; call bash again with \
+         that pid and action=poll or action=cancel."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -203,9 +207,10 @@ impl Tool for WorkspaceBashTool {
             "properties": {
                 "command":    { "type": "string",  "description": "Shell command to execute" },
                 "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." },
-                "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds" }
-            },
-            "required": ["command"]
+                "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds" },
+                "pid":        { "type": "string",  "description": "Existing bash task pid returned after a timeout" },
+                "action":     { "type": "string",  "enum": ["poll", "cancel"], "description": "Action for an existing pid. Defaults to poll when pid is provided." }
+            }
         })
     }
     fn execute(
@@ -218,9 +223,39 @@ impl Tool for WorkspaceBashTool {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         async move {
+            let pid = arguments["pid"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let action = arguments["action"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("poll")
+                .to_ascii_lowercase();
+            if let Some(pid) = pid {
+                return Ok(ToolResult::Output(
+                    stream! {
+                        let result = match action.as_str() {
+                            "poll" => sandbox.bash_poll(&pid).await,
+                            "cancel" => sandbox.bash_cancel(&pid).await,
+                            other => Err(anyhow::anyhow!("unsupported bash action `{other}`")),
+                        };
+                        match result {
+                            Ok(output) => {
+                                let value = bash_task_json(output, &redactor);
+                                yield ToolOutput::text(json_text(value));
+                            }
+                            Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
+                        }
+                    }
+                    .boxed(),
+                ));
+            }
             let command = arguments["command"]
                 .as_str()
-                .ok_or_else(|| AgentError::tool("bash", "missing 'command'"))?
+                .ok_or_else(|| AgentError::tool("bash", "missing 'command' or 'pid'"))?
                 .to_string();
             let named = arguments["named"]
                 .as_str()
@@ -241,7 +276,7 @@ impl Tool for WorkspaceBashTool {
                     "bash.start"
                 );
                 match sandbox.bash(&command, named.as_deref(), timeout_ms).await {
-                    Ok(output) if output.timed_out => {
+                    Ok(output) if output.timed_out || output.status == SandboxBashStatus::Running => {
                         tracing::warn!(
                             command = %cmd_preview,
                             command_len = command.len(),
@@ -251,7 +286,8 @@ impl Tool for WorkspaceBashTool {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "bash.failed"
                         );
-                        yield ToolOutput::text(format!("[timed out after {timeout_ms}ms]"));
+                        let value = bash_task_json(output, &redactor);
+                        yield ToolOutput::text(json_text(value));
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -267,6 +303,8 @@ impl Tool for WorkspaceBashTool {
                         yield ToolOutput::text(format!("error: {e:#}"));
                     }
                     Ok(output) => {
+                        let structured = !matches!(output.status, SandboxBashStatus::Completed)
+                            || output.pid.is_some();
                         let stdout = output.stdout;
                         let stderr = output.stderr;
                         let code   = output.exit_code;
@@ -299,19 +337,79 @@ impl Tool for WorkspaceBashTool {
                                 "bash.failed"
                             );
                         }
-                        let mut r = stdout;
-                        if !stderr.is_empty() {
-                            if !r.is_empty() { r.push('\n'); }
-                            r.push_str("[stderr] "); r.push_str(&stderr);
+                        if !structured {
+                            let r = format_bash_text(stdout, stderr, code, &redactor);
+                            yield ToolOutput::text(r);
+                        } else {
+                            let value = bash_task_json(SandboxBashOutput {
+                                stdout,
+                                stderr,
+                                exit_code: code,
+                                timed_out: output.timed_out,
+                                status: output.status,
+                                pid: output.pid,
+                                os_pid: output.os_pid,
+                                message: output.message,
+                            }, &redactor);
+                            yield ToolOutput::text(json_text(value));
                         }
-                        if code != 0 { r.push_str(&format!("\n[exit {code}]")); }
-                        let r = redactor.read().unwrap().redact(&r);
-                        yield ToolOutput::text(r);
                     }
                 }
-            }))
+            }.boxed()))
         }
     }
+}
+
+fn format_bash_text(
+    stdout: String,
+    stderr: String,
+    code: i32,
+    redactor: &SharedRedactor,
+) -> String {
+    let mut r = stdout;
+    if !stderr.is_empty() {
+        if !r.is_empty() {
+            r.push('\n');
+        }
+        r.push_str("[stderr] ");
+        r.push_str(&stderr);
+    }
+    if code != 0 {
+        r.push_str(&format!("\n[exit {code}]"));
+    }
+    redactor.read().unwrap().redact(&r)
+}
+
+fn bash_task_json(output: SandboxBashOutput, redactor: &SharedRedactor) -> serde_json::Value {
+    let status = match output.status {
+        SandboxBashStatus::Completed => "completed",
+        SandboxBashStatus::Running => "running",
+        SandboxBashStatus::Cancelled => "cancelled",
+        SandboxBashStatus::NotFound => "not_found",
+    };
+    let stdout = redactor.read().unwrap().redact(&output.stdout);
+    let stderr = redactor.read().unwrap().redact(&output.stderr);
+    let mut value = serde_json::json!({
+        "status": status,
+        "pid": output.pid,
+        "os_pid": output.os_pid,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": if matches!(output.status, SandboxBashStatus::Completed) { Some(output.exit_code) } else { None },
+        "timed_out": output.timed_out,
+        "message": output.message,
+    });
+    if matches!(output.status, SandboxBashStatus::Running) {
+        let pid = value["pid"].as_str().unwrap_or_default();
+        value["poll_hint"] = serde_json::Value::String(format!(
+            "Call bash again with pid={pid} and action=poll. Use action=cancel to terminate it."
+        ));
+    }
+    value
+}
+
+fn json_text(value: serde_json::Value) -> String {
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
 }
 
 // ── ManageYourselfTool ────────────────────────────────────────────────────────
@@ -501,7 +599,10 @@ impl Tool for RootedFsReadTool {
             "properties": {
                 "path":   { "type": "string",  "description": "File path (relative to workspace root)" },
                 "offset": { "type": "integer", "description": "Byte offset to start for text files (default 0)" },
-                "length": { "type": "integer", "description": "Max bytes to return for text files (default 8192)" }
+                "length": {
+                    "type": "integer",
+                    "description": format!("Max bytes to return for text files (default {DEFAULT_FS_READ_LENGTH})")
+                }
             },
             "required": ["path"]
         })
@@ -521,7 +622,9 @@ impl Tool for RootedFsReadTool {
                 .ok_or_else(|| AgentError::tool("fs_read", "missing 'path'"))?
                 .to_string();
             let offset = arguments["offset"].as_u64().unwrap_or(0) as usize;
-            let length = arguments["length"].as_u64().unwrap_or(8192) as usize;
+            let length = arguments["length"]
+                .as_u64()
+                .unwrap_or(DEFAULT_FS_READ_LENGTH as u64) as usize;
             Ok(ToolResult::Output(stream! {
                 let started = Instant::now();
                 tracing::info!(
@@ -1591,7 +1694,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::{
         format_command_output, parse_apply_patch, parse_manage_yourself_command, ParsedPatchOp,
-        PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor,
+        PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, WorkspaceBashTool,
     };
     use crate::sandbox::NoSandbox;
     use futures::StreamExt;
@@ -1687,6 +1790,126 @@ mod tests {
         }
     }
 
+    async fn collect_tool_text(
+        result: ToolResult<impl futures::Stream<Item = ToolOutput>>,
+    ) -> String {
+        collect_tool_content(result).await.text_content()
+    }
+
+    #[tokio::test]
+    async fn bash_tool_timeout_returns_pid_and_poll_completes() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        let tool = WorkspaceBashTool::new(
+            Arc::new(NoSandbox::new(root.clone())),
+            Arc::new(RwLock::new(SecretRedactor::empty())),
+        );
+        let ctx = test_tool_context();
+
+        let started = collect_tool_text(
+            <WorkspaceBashTool as Tool>::execute(
+                &tool,
+                json!({
+                    "command": "printf start; sleep 0.2; printf done",
+                    "timeout_ms": 10
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("bash start should succeed"),
+        )
+        .await;
+        let started: serde_json::Value =
+            serde_json::from_str(&started).expect("timeout output should be json");
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["timed_out"], true);
+        let pid = started["pid"]
+            .as_str()
+            .expect("timeout output should include pid")
+            .to_string();
+
+        let mut combined_stdout = started["stdout"].as_str().unwrap_or_default().to_string();
+        let mut completed = None;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let polled = collect_tool_text(
+                <WorkspaceBashTool as Tool>::execute(
+                    &tool,
+                    json!({ "pid": pid, "action": "poll" }),
+                    None,
+                    &ctx,
+                )
+                .await
+                .expect("bash poll should succeed"),
+            )
+            .await;
+            let polled: serde_json::Value =
+                serde_json::from_str(&polled).expect("poll output should be json");
+            combined_stdout.push_str(polled["stdout"].as_str().unwrap_or_default());
+            if polled["status"] == "completed" {
+                completed = Some(polled);
+                break;
+            }
+        }
+
+        let completed = completed.expect("bash task should complete");
+        assert_eq!(completed["exit_code"], 0);
+        assert!(combined_stdout.contains("start"));
+        assert!(combined_stdout.contains("done"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn bash_tool_timeout_task_can_be_cancelled() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        let tool = WorkspaceBashTool::new(
+            Arc::new(NoSandbox::new(root.clone())),
+            Arc::new(RwLock::new(SecretRedactor::empty())),
+        );
+        let ctx = test_tool_context();
+
+        let started = collect_tool_text(
+            <WorkspaceBashTool as Tool>::execute(
+                &tool,
+                json!({ "command": "sleep 5", "timeout_ms": 10 }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("bash start should succeed"),
+        )
+        .await;
+        let started: serde_json::Value =
+            serde_json::from_str(&started).expect("timeout output should be json");
+        let pid = started["pid"]
+            .as_str()
+            .expect("timeout output should include pid")
+            .to_string();
+
+        let cancelled = collect_tool_text(
+            <WorkspaceBashTool as Tool>::execute(
+                &tool,
+                json!({ "pid": pid, "action": "cancel" }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("bash cancel should succeed"),
+        )
+        .await;
+        let cancelled: serde_json::Value =
+            serde_json::from_str(&cancelled).expect("cancel output should be json");
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["message"], "bash task cancelled");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
     #[tokio::test]
     async fn fs_read_returns_multimodal_content_for_png() {
         let root = test_root();
@@ -1762,6 +1985,38 @@ mod tests {
         let text = content.text_content();
         assert!(text.contains("world"));
         assert!(text.contains("[offset=6 length=5 total_bytes=11 remaining=0]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_default_length_handles_larger_source_chunks() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        let body = "a".repeat(12_000);
+        tokio::fs::write(root.join("large.rs"), &body)
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "large.rs" }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await;
+
+        let text = content.text_content();
+        assert!(text.contains("[offset=0 length=12000 total_bytes=12000 remaining=0]"));
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ import {
   api,
   streamRun,
   type ActiveRun,
+  type ContextCompactionEvent,
   type DebugStats,
   type HistoryMessage,
   type PrettyToolCall,
@@ -141,6 +142,40 @@ function upsertApprovalPart(
     args: payload as never,
     argsText: "",
     result: decision ? payload : undefined,
+  });
+}
+
+function contextCompactionToolCallId(event: ContextCompactionEvent) {
+  return `context-compaction-${event.id}`;
+}
+
+function upsertContextCompactionPart(
+  parts: ThreadAssistantMessagePart[],
+  indexes: Map<string, number>,
+  event: ContextCompactionEvent,
+) {
+  const toolCallId = contextCompactionToolCallId(event);
+  const index = indexes.get(toolCallId);
+  if (index !== undefined) {
+    const part = parts[index];
+    if (part?.type === "tool-call") {
+      parts[index] = {
+        ...part,
+        args: event as never,
+        argsText: "",
+        result: event.status === "started" ? undefined : event,
+      };
+    }
+    return;
+  }
+  indexes.set(toolCallId, parts.length);
+  parts.push({
+    type: "tool-call",
+    toolCallId,
+    toolName: "__remi_context_compaction",
+    args: event as never,
+    argsText: "",
+    result: event.status === "started" ? undefined : event,
   });
 }
 
@@ -504,6 +539,14 @@ export function RemiRuntimeProvider({
               appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
               break;
             }
+            case "context_compaction": {
+              upsertContextCompactionPart(
+                parts,
+                toolIndexes,
+                data as unknown as ContextCompactionEvent,
+              );
+              break;
+            }
             case "stats":
               onStatsChangedRef.current(data as DebugStats);
               break;
@@ -719,6 +762,14 @@ export function RemiRuntimeProvider({
             }
             case "sub_session": {
               appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
+              break;
+            }
+            case "context_compaction": {
+              upsertContextCompactionPart(
+                parts,
+                toolIndexes,
+                data as unknown as ContextCompactionEvent,
+              );
               break;
             }
             case "stats": {
