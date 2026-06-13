@@ -79,7 +79,13 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build release binary
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p remi-cat
+
+      - name: Build release binary (Linux musl, no keyring)
+        if: runner.os == 'Linux'
+        run: >
+          cargo build --release --target ${{ matrix.target }} -p remi-cat --no-default-features
 
       - name: Prepare artifact (Linux / macOS)
         if: runner.os != 'Windows'
