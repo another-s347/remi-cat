@@ -31,7 +31,7 @@ tools:
   - todo__update
   - todo__remove
   - memory__get_detail
-  - acp__chat
+  - codex
   - manage_yourself
   - fs_read
   - fs_write

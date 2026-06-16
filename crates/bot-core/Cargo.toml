@@ -3,6 +3,9 @@ name = "bot-core"
 version = "0.1.7"
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
     "http-client",

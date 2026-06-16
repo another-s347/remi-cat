@@ -62,7 +62,8 @@ impl CliGateway {
                             "cli-msg-{}",
                             gateway.next_message_id.fetch_add(1, Ordering::Relaxed)
                         );
-                        let event = CliEvent::MessageReceived(Self::build_message(message_id, text));
+                        let event =
+                            CliEvent::MessageReceived(Self::build_message(message_id, text));
                         if tx.send(event).await.is_err() {
                             break;
                         }
@@ -140,6 +141,7 @@ impl CliGateway {
             files: Vec::new(),
             documents: Vec::new(),
             parent_id: None,
+            thread_id: None,
             at_bot: true,
             mentions: Vec::new(),
         }

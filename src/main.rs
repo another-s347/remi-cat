@@ -1,11 +1,13 @@
 mod host_admin;
 mod instance_profile;
+mod local_trigger_scheduler;
 mod profile_command;
 mod runtime_config;
 mod secret_store;
 mod session;
 mod tui_app;
 mod tui_markdown;
+mod tui_text;
 mod web_chat;
 mod workspace_files;
 
@@ -27,21 +29,24 @@ use bot_core::{
     install_embedded_agent_profiles, install_embedded_model_profiles, AccountBalance, AccountUsage,
     AccountUsageStatus, AgentProfile, AgentRegistry, CatBot, CatBotBuilder, CatEvent, Content,
     ContentPart, GoalMaxRounds, ImAttachment, ImDocument, ModelProfileRegistry, SkillDocument,
-    StreamOptions,
+    SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, StreamOptions, ToolApprovalDecision,
+    ToolApprovalRequest,
 };
+use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
+use im_feishu::client::{build_tool_approval_card, build_tool_approval_resolved_card};
 use im_feishu::{FeishuEvent, FeishuEventHookConfig, FeishuGateway, FeishuMessage, StreamingCard};
 use instance_profile::{InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
 use profile_command::{
     apply_runtime_config_entries, available_container_name, configured_ports,
-    ensure_builtin_diagnostic_profile, first_available_port, parse_profile_command,
-    prefix_short_config_entry, print_port_adjustment, run_noninteractive_setup,
-    run_profile_command, ProfileCommand,
+    ensure_builtin_diagnostic_profile, first_available_port, prefix_short_config_entry,
+    print_port_adjustment, run_noninteractive_setup, run_profile_command, ProfileCommand,
 };
 use remi_agentloop::types::{SubSessionEvent, SubSessionEventPayload};
 use runtime_config::{
     detect_setup_state, has_legacy_env_credentials, load_dotenv_pairs, upsert_dotenv_value,
-    write_runtime_config, FeishuTransport, ImMode, RuntimeConfig, RuntimeSandboxKind, SetupState,
+    write_runtime_config, AcpClient, AcpMode, FeishuTransport, ImMode, RuntimeConfig,
+    RuntimeSandboxKind, SetupState,
 };
 use secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use session::{ChannelBinding, SessionRuntime, SubSessionKind};
@@ -75,19 +80,526 @@ enum AppCommand {
     SandboxSet(Vec<String>),
     Profile(ProfileCommand),
     Feishu(FeishuCommand),
+    Codex(CodexCommand),
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GlobalArgs {
     profile: Option<String>,
     command_args: Vec<String>,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "remi-cat",
+    version,
+    about = "Single-process AI agent runtime for Feishu/Lark, Web Chat, and local CLI",
+    long_about = "remi-cat runs IM ingress, Web Chat, session routing, agent execution, ACP support, and local tooling in one host process."
+)]
+struct CliArgs {
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        value_parser = validate_profile_arg,
+        help = "Select a named runtime profile"
+    )]
+    profile: Option<String>,
+
+    #[arg(
+        long = "tool-output-overflow-bytes",
+        visible_alias = "overflow-bytes",
+        global = true,
+        value_name = "BYTES",
+        value_parser = validate_positive_usize_arg,
+        help = "Override the tool-output overflow threshold in bytes"
+    )]
+    tool_output_overflow_bytes: Option<usize>,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, Args, Default)]
+struct RunArgs {
+    #[arg(long = "local", help = "Start local CLI chat mode")]
+    local: bool,
+
+    #[arg(long = "cli-im", help = "Start local CLI chat mode")]
+    cli_im: bool,
+
+    #[arg(
+        long = "cli-im-once",
+        alias = "cli-message",
+        short = 'm',
+        num_args = 1..,
+        trailing_var_arg = true,
+        value_name = "MESSAGE",
+        help = "Send one local CLI message and exit"
+    )]
+    cli_message: Vec<String>,
+
+    #[arg(long = "admin-only", help = "Serve only the local management API")]
+    admin_only: bool,
+
+    #[arg(
+        short = 'p',
+        long = "prompt",
+        num_args = 1..,
+        trailing_var_arg = true,
+        value_name = "PROMPT",
+        help = "Send one prompt-style local message and exit"
+    )]
+    prompt: Vec<String>,
+
+    #[arg(
+        long = "resume",
+        value_name = "SESSION_ID",
+        num_args = 0..=1,
+        require_equals = false,
+        help = "Open the TUI resume picker or resume a specific TUI session"
+    )]
+    resume: Option<Option<String>>,
+
+    #[arg(
+        long = "cli-channel",
+        visible_alias = "channel",
+        visible_alias = "session",
+        default_value = CLI_CHAT_ID,
+        value_name = "ID",
+        help = "CLI channel/session id"
+    )]
+    channel_id: String,
+
+    #[arg(
+        long = "cli-user",
+        visible_alias = "user",
+        default_value = CLI_USER_ID,
+        value_name = "ID",
+        help = "CLI user id"
+    )]
+    user_id: String,
+
+    #[arg(
+        long = "cli-name",
+        visible_alias = "name",
+        default_value = CLI_USERNAME,
+        value_name = "NAME",
+        help = "CLI display name"
+    )]
+    username: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    #[command(about = "Run the interactive setup wizard or non-interactive setup")]
+    Setup(SetupArgs),
+    #[command(
+        alias = "check",
+        about = "Inspect local runtime configuration and readiness"
+    )]
+    Doctor,
+    #[command(alias = "secret", about = "List, read, set, or delete secrets")]
+    Secrets(SecretsArgs),
+    #[command(about = "Update runtime config")]
+    Config(ConfigArgs),
+    #[command(about = "Update sandbox runtime config")]
+    Sandbox(SandboxArgs),
+    #[command(about = "Manage runtime profiles")]
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCliCommand,
+    },
+    #[command(about = "Manage Feishu/Lark setup")]
+    Feishu {
+        #[command(subcommand)]
+        command: FeishuCliCommand,
+    },
+    #[command(about = "Configure and inspect Codex ACP")]
+    Codex {
+        #[command(subcommand)]
+        command: CodexCliCommand,
+    },
+    #[command(about = "Check for or install remi-cat updates")]
+    Update {
+        #[command(subcommand)]
+        command: UpdateCliCommand,
+    },
+    #[command(about = "Create a GitHub feedback issue")]
+    Feedback(FeedbackArgs),
+    #[command(about = "Create a GitHub issue")]
+    Issue {
+        #[command(subcommand)]
+        command: IssueCliCommand,
+    },
+    #[command(about = "Start local CLI chat mode")]
+    Cli(LocalChatArgs),
+    #[command(about = "Start terminal UI mode")]
+    Tui(TuiArgs),
+    #[command(about = "Send one prompt-style local message and exit")]
+    Prompt(PromptArgs),
+    #[command(about = "Serve only the local management API")]
+    Admin,
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "KEY=VALUE",
+        help = "Non-interactive runtime config entries"
+    )]
+    entries: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct SecretsArgs {
+    #[command(subcommand)]
+    command: Option<SecretCliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCliCommand {
+    #[command(about = "List known secret keys")]
+    List,
+    #[command(about = "Print one secret value")]
+    Get { key: String },
+    #[command(about = "Set one secret value")]
+    Set { key: String, value: String },
+    #[command(alias = "remove", alias = "unset", about = "Delete one secret")]
+    Delete { key: String },
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCliCommand {
+    #[command(about = "Set runtime config entries")]
+    Set(KeyValueArgs),
+}
+
+#[derive(Debug, Args)]
+struct SandboxArgs {
+    #[command(subcommand)]
+    command: SandboxCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SandboxCliCommand {
+    #[command(about = "Set sandbox config entries")]
+    Set(KeyValueArgs),
+}
+
+#[derive(Debug, Args)]
+struct KeyValueArgs {
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "KEY=VALUE"
+    )]
+    entries: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum FeishuCliCommand {
+    #[command(
+        about = "Initialize Feishu/Lark CLI and app credentials",
+        after_help = "This configures credentials. Feishu/Lark chat routing is automatic from incoming IM events; local CLI sessions use `remi-cat cli --channel <id>`."
+    )]
+    Init,
+    #[command(
+        alias = "check",
+        about = "Inspect Feishu/Lark CLI and credential readiness",
+        after_help = "Checks lark-cli auth and remi-cat app credentials. It does not create or select a Feishu/Lark chat channel."
+    )]
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexCliCommand {
+    #[command(
+        about = "Configure local Codex as the ACP client",
+        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n\nThis writes `acp.mode=local`, `acp.client=codex`, and optional Codex binary/agent settings to the selected profile runtime config."
+    )]
+    Setup {
+        #[arg(long = "bin", value_name = "PATH", help = "Path to the codex binary")]
+        bin: Option<String>,
+        #[arg(long, value_name = "NAME", help = "ACP agent name")]
+        agent: Option<String>,
+    },
+    #[command(about = "Inspect Codex ACP configuration")]
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum UpdateCliCommand {
+    #[command(
+        about = "Check the latest GitHub release",
+        after_help = "Queries GitHub releases for the configured remi-cat repository."
+    )]
+    Check {
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+    #[command(
+        name = "self",
+        about = "Install a selected remi-cat release with cargo install",
+        after_help = "Examples:\n  remi-cat update self --dry-run\n  remi-cat update self --version v0.2.1\n\nThe installer uses `cargo install --git https://github.com/another-s347/remi-cat.git --tag <version>`."
+    )]
+    SelfUpdate {
+        #[arg(
+            long,
+            value_name = "VERSION_OR_TAG",
+            help = "Release version or tag to install"
+        )]
+        version: Option<String>,
+        #[arg(long, help = "Reinstall even when the selected version is not newer")]
+        force: bool,
+        #[arg(long, help = "Print the install command without running it")]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct FeedbackArgs {
+    #[arg(short, long)]
+    title: Option<String>,
+    #[arg(short, long)]
+    body: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long = "label", visible_alias = "labels", value_delimiter = ',')]
+    labels: Vec<String>,
+    #[arg(long)]
+    include_logs: bool,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    no_default_label: bool,
+    #[arg(trailing_var_arg = true, value_name = "MESSAGE")]
+    message: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum IssueCliCommand {
+    #[command(about = "Create a GitHub issue using the feedback flow")]
+    Create(FeedbackArgs),
+}
+
+#[derive(Debug, Args)]
+struct LocalChatArgs {
+    #[command(flatten)]
+    common: LocalCommonArgs,
+    #[arg(trailing_var_arg = true, value_name = "MESSAGE")]
+    message: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PromptArgs {
+    #[command(flatten)]
+    common: LocalCommonArgs,
+    #[arg(required = true, trailing_var_arg = true, value_name = "PROMPT")]
+    prompt: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct TuiArgs {
+    #[command(flatten)]
+    common: LocalCommonArgs,
+    #[command(subcommand)]
+    command: Option<TuiCliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TuiCliCommand {
+    #[command(about = "Open the resume picker or resume a specific session")]
+    Resume {
+        #[arg(value_name = "SESSION_ID")]
+        session_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct LocalCommonArgs {
+    #[arg(
+        long = "cli-channel",
+        visible_alias = "channel",
+        visible_alias = "session",
+        default_value = CLI_CHAT_ID,
+        value_name = "ID",
+        help = "Local CLI channel id; the same id resumes the same persisted session"
+    )]
+    channel_id: String,
+    #[arg(
+        long = "cli-user",
+        visible_alias = "user",
+        default_value = CLI_USER_ID,
+        value_name = "ID",
+        help = "Local CLI user id used for message metadata"
+    )]
+    user_id: String,
+    #[arg(
+        long = "cli-name",
+        visible_alias = "name",
+        default_value = CLI_USERNAME,
+        value_name = "NAME",
+        help = "Local CLI display name used for message metadata"
+    )]
+    username: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCliCommand {
+    #[command(about = "List configured profiles")]
+    List,
+    #[command(about = "Show profile configuration and status")]
+    Show { name: String },
+    #[command(about = "Create a profile")]
+    Create(ProfileCreateArgs),
+    #[command(about = "Delete a profile")]
+    Delete {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    #[command(about = "Start a profile in the background")]
+    Start { name: String },
+    #[command(about = "Stop a background profile process")]
+    Stop {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    #[command(about = "Restart a background profile process")]
+    Restart {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    #[command(about = "Show profile process status")]
+    Status(ProfileStatusArgs),
+    #[command(about = "Manage profile agent definitions")]
+    Agent {
+        #[command(subcommand)]
+        command: ProfileAgentCliCommand,
+    },
+    #[command(about = "Manage profile supervisor workflows")]
+    Workflow {
+        #[command(subcommand)]
+        command: ProfileWorkflowCliCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ProfileCreateArgs {
+    #[arg(help = "Profile name to create under .remi-cat/profiles/<name>")]
+    name: String,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "KEY=VALUE",
+        help = "Runtime config override, for example admin.enabled=false or acp.client=codex"
+    )]
+    entries: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProfileStatusArgs {
+    name: Option<String>,
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileAgentCliCommand {
+    #[command(about = "List builtin and profile-specific agent definitions")]
+    List {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+    },
+    #[command(about = "Show one resolved agent definition")]
+    Show {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Agent id from the Markdown frontmatter")]
+        agent_id: String,
+    },
+    #[command(
+        about = "Validate and copy an agent Markdown file into a profile",
+        after_help = "Agent files use YAML frontmatter followed by the system prompt body. The command writes to `<profile-data-dir>/agents/<id>.md`."
+    )]
+    Upsert {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Path to an agent Markdown file")]
+        path: String,
+    },
+    #[command(about = "Set the profile root agent id")]
+    SetDefault {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Agent id to use as the profile root agent")]
+        agent_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileWorkflowCliCommand {
+    #[command(about = "List builtin and profile-specific supervisor workflows")]
+    List {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+    },
+    #[command(about = "Show one resolved supervisor workflow")]
+    Show {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Workflow id")]
+        workflow_id: String,
+    },
+    #[command(
+        about = "Validate and copy a supervisor workflow JSON file into a profile",
+        after_help = "Workflow files are JSON graph definitions. The command writes to `<profile-data-dir>/workflows/<id>.json`."
+    )]
+    Upsert {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Path to a workflow JSON file")]
+        path: String,
+    },
+    #[command(about = "Delete a profile-specific supervisor workflow")]
+    Delete {
+        #[arg(help = "Runtime profile name")]
+        profile: String,
+        #[arg(help = "Workflow id")]
+        workflow_id: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FeishuCommand {
     Init,
+    Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexCommand {
+    Setup {
+        bin: Option<String>,
+        agent: Option<String>,
+    },
     Doctor,
 }
 
@@ -164,6 +676,7 @@ struct CliConfig {
 }
 
 impl CliConfig {
+    #[cfg(test)]
     fn from_args(args: &[String]) -> anyhow::Result<Self> {
         let mut enabled = args
             .iter()
@@ -265,22 +778,339 @@ impl CliConfig {
     }
 }
 
+#[cfg(test)]
 fn parse_command(args: &[String]) -> anyhow::Result<AppCommand> {
-    match args.first().map(String::as_str) {
-        Some("setup") => Ok(AppCommand::Setup(args[1..].to_vec())),
-        Some("doctor") | Some("check") => Ok(AppCommand::Doctor),
-        Some("secrets") | Some("secret") => {
-            Ok(AppCommand::Secrets(parse_secret_command(&args[1..])?))
-        }
-        Some("config") => parse_config_command(&args[1..]),
-        Some("sandbox") => parse_sandbox_command(&args[1..]),
-        Some("profile") => Ok(AppCommand::Profile(parse_profile_command(&args[1..])?)),
-        Some("feishu") => Ok(AppCommand::Feishu(parse_feishu_command(&args[1..])?)),
-        Some("update") => Ok(AppCommand::Update(parse_update_command(&args[1..])?)),
-        Some("feedback") => Ok(AppCommand::Feedback(parse_feedback_command(&args[1..])?)),
-        Some("issue") => Ok(AppCommand::Feedback(parse_issue_command(&args[1..])?)),
-        _ => Ok(AppCommand::Run(CliConfig::from_args(args)?)),
+    parse_cli_args(args).map(|parsed| parsed.command)
+}
+
+fn parse_cli_args(args: &[String]) -> anyhow::Result<GlobalArgsAndCommand> {
+    let cli = try_parse_cli_args(args)?;
+    let tool_output_overflow_bytes = cli.tool_output_overflow_bytes;
+    let command = cli_command_to_app(cli.command, cli.run)?;
+    Ok(GlobalArgsAndCommand {
+        profile: cli.profile,
+        tool_output_overflow_bytes,
+        command,
+    })
+}
+
+fn try_parse_cli_args(args: &[String]) -> Result<CliArgs, clap::Error> {
+    let argv = std::iter::once("remi-cat".to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    CliArgs::try_parse_from(argv)
+}
+
+#[derive(Debug)]
+struct GlobalArgsAndCommand {
+    profile: Option<String>,
+    tool_output_overflow_bytes: Option<usize>,
+    command: AppCommand,
+}
+
+fn validate_profile_arg(value: &str) -> Result<String, String> {
+    instance_profile::validate_profile_name(value)
+        .map(|_| value.to_string())
+        .map_err(|err| err.to_string())
+}
+
+fn validate_positive_usize_arg(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid positive integer `{value}`: {err}"))?;
+    if parsed == 0 {
+        Err("value must be greater than 0".to_string())
+    } else {
+        Ok(parsed)
     }
+}
+
+fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Result<AppCommand> {
+    match command {
+        Some(CliCommand::Setup(args)) => Ok(AppCommand::Setup(args.entries)),
+        Some(CliCommand::Doctor) => Ok(AppCommand::Doctor),
+        Some(CliCommand::Secrets(args)) => Ok(AppCommand::Secrets(secret_cli_to_command(args))),
+        Some(CliCommand::Config(args)) => match args.command {
+            ConfigCliCommand::Set(entries) => Ok(AppCommand::ConfigSet(entries.entries)),
+        },
+        Some(CliCommand::Sandbox(args)) => match args.command {
+            SandboxCliCommand::Set(entries) => Ok(AppCommand::SandboxSet(entries.entries)),
+        },
+        Some(CliCommand::Profile { command }) => {
+            Ok(AppCommand::Profile(profile_cli_to_command(command)?))
+        }
+        Some(CliCommand::Feishu { command }) => Ok(AppCommand::Feishu(match command {
+            FeishuCliCommand::Init => FeishuCommand::Init,
+            FeishuCliCommand::Doctor => FeishuCommand::Doctor,
+        })),
+        Some(CliCommand::Codex { command }) => Ok(AppCommand::Codex(match command {
+            CodexCliCommand::Setup { bin, agent } => CodexCommand::Setup { bin, agent },
+            CodexCliCommand::Doctor => CodexCommand::Doctor,
+        })),
+        Some(CliCommand::Update { command }) => Ok(AppCommand::Update(match command {
+            UpdateCliCommand::Check { json } => UpdateCommand::Check { json },
+            UpdateCliCommand::SelfUpdate {
+                version,
+                force,
+                dry_run,
+            } => UpdateCommand::SelfUpdate {
+                version,
+                force,
+                dry_run,
+            },
+        })),
+        Some(CliCommand::Feedback(args)) => {
+            Ok(AppCommand::Feedback(feedback_args_to_command(args)?))
+        }
+        Some(CliCommand::Issue { command }) => match command {
+            IssueCliCommand::Create(args) => {
+                Ok(AppCommand::Feedback(feedback_args_to_command(args)?))
+            }
+        },
+        Some(CliCommand::Cli(args)) => Ok(AppCommand::Run(local_chat_args_to_config(args))),
+        Some(CliCommand::Tui(args)) => Ok(AppCommand::Run(tui_args_to_config(args))),
+        Some(CliCommand::Prompt(args)) => Ok(AppCommand::Run(prompt_args_to_config(args))),
+        Some(CliCommand::Admin) => Ok(AppCommand::Run(CliConfig {
+            enabled: false,
+            tui: false,
+            resume: false,
+            resume_session_id: None,
+            once: None,
+            pure_prompt: false,
+            admin_only: true,
+            channel_id: CLI_CHAT_ID.to_string(),
+            user_id: CLI_USER_ID.to_string(),
+            username: CLI_USERNAME.to_string(),
+        })),
+        None => Ok(AppCommand::Run(run_args_to_config(run)?)),
+    }
+}
+
+fn secret_cli_to_command(args: SecretsArgs) -> SecretCommand {
+    match args.command.unwrap_or(SecretCliCommand::List) {
+        SecretCliCommand::List => SecretCommand::List,
+        SecretCliCommand::Get { key } => SecretCommand::Get(key),
+        SecretCliCommand::Set { key, value } => SecretCommand::Set { key, value },
+        SecretCliCommand::Delete { key } => SecretCommand::Delete(key),
+    }
+}
+
+fn feedback_args_to_command(args: FeedbackArgs) -> anyhow::Result<FeedbackCommand> {
+    let mut labels = if args.no_default_label {
+        Vec::new()
+    } else {
+        vec!["feedback".to_string()]
+    };
+    labels.extend(args.labels);
+
+    let positional_text = args.message.join(" ").trim().to_string();
+    let title = args
+        .title
+        .or_else(|| {
+            (!positional_text.is_empty()).then(|| feedback_title_from_text(&positional_text))
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("usage: remi-cat feedback --title <title> [--body <body>]")
+        })?;
+    let body = args
+        .body
+        .or_else(|| (!positional_text.is_empty()).then_some(positional_text))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| title.clone());
+    labels.sort();
+    labels.dedup();
+    Ok(FeedbackCommand {
+        title,
+        body,
+        repo: args.repo,
+        labels,
+        include_logs: args.include_logs,
+        dry_run: args.dry_run,
+    })
+}
+
+fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileCommand> {
+    match command {
+        ProfileCliCommand::List => Ok(ProfileCommand::List),
+        ProfileCliCommand::Show { name } => {
+            let _ = InstanceProfile::from_label(&name)?;
+            Ok(ProfileCommand::Show(name))
+        }
+        ProfileCliCommand::Create(args) => {
+            if args.name == DIAGNOSTIC_PROFILE_NAME {
+                anyhow::bail!(
+                    "profile `{DIAGNOSTIC_PROFILE_NAME}` is builtin and cannot be created manually"
+                );
+            }
+            instance_profile::validate_profile_name(&args.name)?;
+            Ok(ProfileCommand::Create {
+                name: args.name,
+                entries: args.entries,
+            })
+        }
+        ProfileCliCommand::Delete { name, force } => {
+            if name == "default" {
+                anyhow::bail!("the default profile cannot be deleted");
+            }
+            if name == DIAGNOSTIC_PROFILE_NAME {
+                anyhow::bail!("builtin profile `{DIAGNOSTIC_PROFILE_NAME}` cannot be deleted");
+            }
+            instance_profile::validate_profile_name(&name)?;
+            Ok(ProfileCommand::Delete { name, force })
+        }
+        ProfileCliCommand::Start { name } => {
+            let _ = InstanceProfile::from_label(&name)?;
+            Ok(ProfileCommand::Start(name))
+        }
+        ProfileCliCommand::Stop { name, force } => {
+            let _ = InstanceProfile::from_label(&name)?;
+            Ok(ProfileCommand::Stop { name, force })
+        }
+        ProfileCliCommand::Restart { name, force } => {
+            let _ = InstanceProfile::from_label(&name)?;
+            Ok(ProfileCommand::Restart { name, force })
+        }
+        ProfileCliCommand::Status(args) => {
+            if args.all {
+                Ok(ProfileCommand::StatusAll)
+            } else {
+                let name = args
+                    .name
+                    .ok_or_else(|| anyhow::anyhow!("usage: remi-cat profile status <profile>"))?;
+                let _ = InstanceProfile::from_label(&name)?;
+                Ok(ProfileCommand::Status(name))
+            }
+        }
+        ProfileCliCommand::Agent { command } => Ok(ProfileCommand::Agent(match command {
+            ProfileAgentCliCommand::List { profile } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileAgentCommand::List { profile }
+            }
+            ProfileAgentCliCommand::Show { profile, agent_id } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileAgentCommand::Show { profile, agent_id }
+            }
+            ProfileAgentCliCommand::Upsert { profile, path } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileAgentCommand::Upsert { profile, path }
+            }
+            ProfileAgentCliCommand::SetDefault { profile, agent_id } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileAgentCommand::SetDefault { profile, agent_id }
+            }
+        })),
+        ProfileCliCommand::Workflow { command } => Ok(ProfileCommand::Workflow(match command {
+            ProfileWorkflowCliCommand::List { profile } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileWorkflowCommand::List { profile }
+            }
+            ProfileWorkflowCliCommand::Show {
+                profile,
+                workflow_id,
+            } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::validate_file_id(&workflow_id)?;
+                profile_command::ProfileWorkflowCommand::Show {
+                    profile,
+                    workflow_id,
+                }
+            }
+            ProfileWorkflowCliCommand::Upsert { profile, path } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::ProfileWorkflowCommand::Upsert { profile, path }
+            }
+            ProfileWorkflowCliCommand::Delete {
+                profile,
+                workflow_id,
+            } => {
+                let _ = InstanceProfile::from_label(&profile)?;
+                profile_command::validate_file_id(&workflow_id)?;
+                if workflow_id == "goal" {
+                    anyhow::bail!("embedded workflow `goal` cannot be deleted");
+                }
+                profile_command::ProfileWorkflowCommand::Delete {
+                    profile,
+                    workflow_id,
+                }
+            }
+        })),
+    }
+}
+
+fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
+    CliConfig {
+        enabled: true,
+        tui: false,
+        resume: false,
+        resume_session_id: None,
+        once: (!args.message.is_empty()).then(|| args.message.join(" ")),
+        pure_prompt: false,
+        admin_only: false,
+        channel_id: args.common.channel_id,
+        user_id: args.common.user_id,
+        username: args.common.username,
+    }
+}
+
+fn tui_args_to_config(args: TuiArgs) -> CliConfig {
+    let (resume, resume_session_id) = match args.command {
+        Some(TuiCliCommand::Resume { session_id }) => (true, session_id),
+        None => (false, None),
+    };
+    CliConfig {
+        enabled: true,
+        tui: true,
+        resume,
+        resume_session_id,
+        once: None,
+        pure_prompt: false,
+        admin_only: false,
+        channel_id: args.common.channel_id,
+        user_id: args.common.user_id,
+        username: args.common.username,
+    }
+}
+
+fn prompt_args_to_config(args: PromptArgs) -> CliConfig {
+    CliConfig {
+        enabled: true,
+        tui: false,
+        resume: false,
+        resume_session_id: None,
+        once: Some(args.prompt.join(" ")),
+        pure_prompt: true,
+        admin_only: false,
+        channel_id: args.common.channel_id,
+        user_id: args.common.user_id,
+        username: args.common.username,
+    }
+}
+
+fn run_args_to_config(args: RunArgs) -> anyhow::Result<CliConfig> {
+    let pure_prompt = !args.prompt.is_empty();
+    let once = if pure_prompt {
+        Some(args.prompt.join(" "))
+    } else if !args.cli_message.is_empty() {
+        Some(args.cli_message.join(" "))
+    } else {
+        None
+    };
+    let resume = args.resume.is_some();
+    Ok(CliConfig {
+        enabled: args.local || args.cli_im || args.cli_message.len() > 0 || pure_prompt,
+        tui: resume,
+        resume,
+        resume_session_id: args.resume.flatten(),
+        once,
+        pure_prompt,
+        admin_only: args.admin_only,
+        channel_id: args.channel_id,
+        user_id: args.user_id,
+        username: args.username,
+    })
 }
 
 fn parse_secret_command(args: &[String]) -> anyhow::Result<SecretCommand> {
@@ -307,22 +1137,7 @@ fn parse_secret_command(args: &[String]) -> anyhow::Result<SecretCommand> {
     }
 }
 
-fn parse_config_command(args: &[String]) -> anyhow::Result<AppCommand> {
-    match args.first().map(String::as_str) {
-        Some("set") => Ok(AppCommand::ConfigSet(args[1..].to_vec())),
-        Some(other) => anyhow::bail!("unknown `remi-cat config` subcommand `{other}`"),
-        None => anyhow::bail!("usage: remi-cat config set <key=value>..."),
-    }
-}
-
-fn parse_sandbox_command(args: &[String]) -> anyhow::Result<AppCommand> {
-    match args.first().map(String::as_str) {
-        Some("set") => Ok(AppCommand::SandboxSet(args[1..].to_vec())),
-        Some(other) => anyhow::bail!("unknown `remi-cat sandbox` subcommand `{other}`"),
-        None => anyhow::bail!("usage: remi-cat sandbox set <key=value>..."),
-    }
-}
-
+#[cfg(test)]
 fn parse_global_args(args: &[String]) -> anyhow::Result<GlobalArgs> {
     let mut profile = None;
     let mut command_args = Vec::with_capacity(args.len());
@@ -355,167 +1170,6 @@ fn parse_global_args(args: &[String]) -> anyhow::Result<GlobalArgs> {
         profile,
         command_args,
     })
-}
-
-fn parse_feishu_command(args: &[String]) -> anyhow::Result<FeishuCommand> {
-    match args.first().map(String::as_str) {
-        Some("init") => Ok(FeishuCommand::Init),
-        Some("doctor") | Some("check") => Ok(FeishuCommand::Doctor),
-        Some(other) => anyhow::bail!("unknown `remi-cat feishu` subcommand `{other}`"),
-        None => anyhow::bail!("usage: remi-cat feishu <init|doctor>"),
-    }
-}
-
-fn parse_update_command(args: &[String]) -> anyhow::Result<UpdateCommand> {
-    match args.first().map(String::as_str) {
-        Some("check") => {
-            let mut json = false;
-            for arg in &args[1..] {
-                match arg.as_str() {
-                    "--json" => json = true,
-                    other => anyhow::bail!("unknown `remi-cat update check` option `{other}`"),
-                }
-            }
-            Ok(UpdateCommand::Check { json })
-        }
-        Some("self") => {
-            let mut version = None;
-            let mut force = false;
-            let mut dry_run = false;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--version" => {
-                        if version.is_some() {
-                            anyhow::bail!("--version may only be specified once");
-                        }
-                        version = Some(next_arg(args, i)?);
-                        i += 1;
-                    }
-                    value if value.starts_with("--version=") => {
-                        if version.is_some() {
-                            anyhow::bail!("--version may only be specified once");
-                        }
-                        version = Some(value.trim_start_matches("--version=").to_string());
-                    }
-                    "--force" => force = true,
-                    "--dry-run" => dry_run = true,
-                    other => anyhow::bail!("unknown `remi-cat update self` option `{other}`"),
-                }
-                i += 1;
-            }
-            Ok(UpdateCommand::SelfUpdate {
-                version,
-                force,
-                dry_run,
-            })
-        }
-        Some(other) => anyhow::bail!("unknown `remi-cat update` subcommand `{other}`"),
-        None => anyhow::bail!(
-            "usage: remi-cat update <check|self>\n       remi-cat update check [--json]\n       remi-cat update self [--version <version-or-tag>] [--force] [--dry-run]"
-        ),
-    }
-}
-
-fn parse_issue_command(args: &[String]) -> anyhow::Result<FeedbackCommand> {
-    match args.first().map(String::as_str) {
-        Some("create") => parse_feedback_command(&args[1..]),
-        Some(other) => anyhow::bail!("unknown `remi-cat issue` subcommand `{other}`"),
-        None => anyhow::bail!("usage: remi-cat issue create --title <title> [--body <body>]"),
-    }
-}
-
-fn parse_feedback_command(args: &[String]) -> anyhow::Result<FeedbackCommand> {
-    let mut title = None;
-    let mut body = None;
-    let mut repo = None;
-    let mut labels = vec!["feedback".to_string()];
-    let mut include_logs = false;
-    let mut dry_run = false;
-    let mut positional = Vec::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--title" | "-t" => {
-                title = Some(next_arg(args, i)?);
-                i += 1;
-            }
-            value if value.starts_with("--title=") => {
-                title = Some(value.trim_start_matches("--title=").trim().to_string());
-            }
-            "--body" | "-b" => {
-                body = Some(next_arg(args, i)?);
-                i += 1;
-            }
-            value if value.starts_with("--body=") => {
-                body = Some(value.trim_start_matches("--body=").trim().to_string());
-            }
-            "--repo" => {
-                repo = Some(next_arg(args, i)?);
-                i += 1;
-            }
-            value if value.starts_with("--repo=") => {
-                repo = Some(value.trim_start_matches("--repo=").trim().to_string());
-            }
-            "--label" | "--labels" => {
-                labels.extend(parse_label_list(&next_arg(args, i)?));
-                i += 1;
-            }
-            value if value.starts_with("--label=") => {
-                labels.extend(parse_label_list(value.trim_start_matches("--label=")));
-            }
-            value if value.starts_with("--labels=") => {
-                labels.extend(parse_label_list(value.trim_start_matches("--labels=")));
-            }
-            "--include-logs" => include_logs = true,
-            "--dry-run" => dry_run = true,
-            "--no-default-label" => labels.retain(|label| label != "feedback"),
-            value if value.starts_with('-') => {
-                anyhow::bail!("unknown `remi-cat feedback` option `{value}`");
-            }
-            value => positional.push(value.to_string()),
-        }
-        i += 1;
-    }
-
-    let positional_text = positional.join(" ").trim().to_string();
-    if title.is_none() && !positional_text.is_empty() {
-        title = Some(feedback_title_from_text(&positional_text));
-    }
-    if body.is_none() && !positional_text.is_empty() {
-        body = Some(positional_text);
-    }
-    let title = title
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("usage: remi-cat feedback --title <title> [--body <body>]")
-        })?;
-    let body = body
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| title.clone());
-    labels.sort();
-    labels.dedup();
-
-    Ok(FeedbackCommand {
-        title,
-        body,
-        repo,
-        labels,
-        include_logs,
-        dry_run,
-    })
-}
-
-fn parse_label_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn feedback_title_from_text(value: &str) -> String {
@@ -1135,16 +1789,23 @@ struct FeishuDoctorStatus {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match parse_cli_args(&raw_args) {
+        Ok(parsed) => parsed,
+        Err(err) => match try_parse_cli_args(&raw_args) {
+            Ok(_) => return Err(err),
+            Err(clap_err) => clap_err.exit(),
+        },
+    };
     let explicit_data_dir = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from);
     let _ = dotenvy::dotenv();
     let secret_store = Arc::new(Mutex::new(SecretStore::from_env()));
     let startup_secrets = secret_store.lock().await.entries()?;
     apply_entries_to_env(&startup_secrets);
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let global_args = parse_global_args(&raw_args)?;
-    let command = parse_command(&global_args.command_args)?;
-    let selected_profile = resolve_instance_profile(global_args.profile, explicit_data_dir)?;
+    let tool_output_overflow_bytes = parsed.tool_output_overflow_bytes;
+    let command = parsed.command;
+    let selected_profile = resolve_instance_profile(parsed.profile, explicit_data_dir)?;
     if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
         ensure_builtin_diagnostic_profile()?;
     }
@@ -1204,6 +1865,10 @@ async fn main() -> anyhow::Result<()> {
             run_feishu_doctor().await?;
             return Ok(());
         }
+        AppCommand::Codex(command) => {
+            run_codex_command(&selected_profile, &data_dir, command)?;
+            return Ok(());
+        }
         AppCommand::Update(command) => {
             run_update_command(command).await?;
             return Ok(());
@@ -1227,6 +1892,14 @@ async fn main() -> anyhow::Result<()> {
                 data_dir = std::path::PathBuf::from(
                     std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
                 );
+            }
+            if let Some(overflow_bytes) = tool_output_overflow_bytes {
+                unsafe {
+                    std::env::set_var(
+                        "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
+                        overflow_bytes.to_string(),
+                    );
+                }
             }
             if !matches!(cli.admin_only, true)
                 && !matches!(
@@ -1314,6 +1987,13 @@ async fn main() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
+    let (trigger_dispatch_tx, trigger_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
+    if !cli.once.is_some() && !cli.pure_prompt {
+        local_trigger_scheduler::spawn_local_trigger_scheduler(
+            data_dir.clone(),
+            trigger_dispatch_tx,
+        );
+    }
     if !cli.pure_prompt && !cli.tui {
         let workspace_dir = current_workspace_dir(&data_dir);
         maybe_start_admin(host_admin::AdminState {
@@ -1333,9 +2013,19 @@ async fn main() -> anyhow::Result<()> {
     let local_set = tokio::task::LocalSet::new();
     local_set
         .run_until(async move {
+            let mut trigger_dispatch_rx = Some(trigger_dispatch_rx);
             tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
+            if !cli.tui {
+                tokio::task::spawn_local(run_local_trigger_dispatcher(
+                    Rc::clone(&runtime),
+                    trigger_dispatch_rx
+                        .take()
+                        .expect("trigger dispatcher receiver should be available"),
+                    None,
+                ));
+            }
             if cli.tui {
-                return tui_app::run_tui(runtime, cli).await;
+                return tui_app::run_tui(runtime, cli, trigger_dispatch_rx.take()).await;
             }
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
@@ -1402,6 +2092,70 @@ async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> 
             warn!("admin server stopped: {err:#}");
         }
     });
+    Ok(())
+}
+
+async fn run_local_trigger_dispatcher(
+    runtime: Rc<Runtime>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<local_trigger_scheduler::LocalTriggerDispatch>,
+    output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) {
+    while let Some(dispatch) = rx.recv().await {
+        let runtime = Rc::clone(&runtime);
+        let output_tx = output_tx.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = run_local_trigger_dispatch(runtime, dispatch, output_tx).await {
+                tracing::warn!(error = %err, "local trigger dispatch failed");
+            }
+        });
+    }
+}
+
+async fn run_local_trigger_dispatch(
+    runtime: Rc<Runtime>,
+    dispatch: local_trigger_scheduler::LocalTriggerDispatch,
+    output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        trigger_uuid = %dispatch.trigger_uuid,
+        trigger_name = %dispatch.trigger_name,
+        thread_id = %dispatch.thread_id,
+        "running local trigger dispatch"
+    );
+    if let Some(tx) = &output_tx {
+        let _ = tx.send(format!(
+            "触发器「{}」已触发，开始执行。\n",
+            dispatch.trigger_name
+        ));
+    }
+    let opts = StreamOptions {
+        sender_user_id: Some(dispatch.owner_user_id),
+        sender_username: dispatch.owner_username,
+        message_id: Some(format!("trigger-{}", uuid::Uuid::new_v4())),
+        chat_type: dispatch.chat_type.or_else(|| Some("p2p".to_string())),
+        platform: dispatch.platform,
+        todo_create_via_sdk: true,
+        trigger_tools_enabled: false,
+        trigger_run: true,
+        ..StreamOptions::default()
+    };
+    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
+        &dispatch.thread_id,
+        Content::text(dispatch.request),
+        opts,
+    ));
+    while let Some(event) = stream.next().await {
+        match event {
+            CatEvent::Text(delta) => {
+                if let Some(tx) = &output_tx {
+                    let _ = tx.send(delta);
+                }
+            }
+            CatEvent::Error(err) => return Err(anyhow::anyhow!(err.to_string())),
+            CatEvent::Done => break,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -1709,6 +2463,14 @@ fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> 
             println!("root_agent_id: {}", config.root_agent_id);
             println!("model_profile: {}", config.model_profile);
             println!(
+                "tool_output_overflow_bytes: {}",
+                config
+                    .tool_output
+                    .overflow_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "model_profile_default".to_string())
+            );
+            println!(
                 "admin: {}",
                 if config.admin.enabled {
                     format!("http://{}:{}", config.admin.host, config.admin.port)
@@ -1719,6 +2481,7 @@ fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> 
             println!("sandbox_container: {}", config.sandbox.container_name);
             println!("feishu_transport: {}", config.im.transport.as_env_value());
             println!("im_mode: {}", config.im.mode.as_env_value());
+            print_codex_status(config);
             if matches!(config.im.transport, FeishuTransport::EventHook) {
                 println!(
                     "feishu_event_hook: http://{}:{}{}",
@@ -1817,6 +2580,185 @@ fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> 
         }
     }
     Ok(())
+}
+
+fn run_codex_command(
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    command: CodexCommand,
+) -> anyhow::Result<()> {
+    match command {
+        CodexCommand::Setup { bin, agent } => run_codex_setup(profile, data_dir, bin, agent),
+        CodexCommand::Doctor => run_codex_doctor(profile, data_dir),
+    }
+}
+
+fn run_codex_setup(
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    bin: Option<String>,
+    agent: Option<String>,
+) -> anyhow::Result<()> {
+    let mut entries = vec![
+        "admin.enabled=false".to_string(),
+        "im.mode=disabled".to_string(),
+        "acp.mode=local".to_string(),
+        "acp.client=codex".to_string(),
+    ];
+    if let Some(bin) = bin
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entries.push(format!("acp.codex_bin={bin}"));
+    }
+    if let Some(agent) = agent
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entries.push(format!("acp.agent_name={agent}"));
+    }
+    apply_runtime_config_entries(profile, data_dir, &entries, true)?;
+    println!();
+    run_codex_doctor(profile, data_dir)
+}
+
+fn run_codex_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
+    println!("remi-cat codex doctor");
+    println!("profile: {}", profile.label());
+    println!("data_dir: {}", data_dir.display());
+    match detect_setup_state(data_dir) {
+        SetupState::Initialized {
+            config_path,
+            config,
+        } => {
+            println!("runtime_config: {}", config_path.display());
+            println!("setup: initialized");
+            print_codex_status(&config);
+        }
+        SetupState::Invalid { config_path, error } => {
+            println!("runtime_config: {}", config_path.display());
+            println!("setup: invalid");
+            println!("error: {error}");
+        }
+        SetupState::LegacyEnvCompatible { data_dir } => {
+            println!(
+                "runtime_config: {}",
+                data_dir.join("runtime.yaml").display()
+            );
+            println!("setup: legacy-env-compatible (no runtime.yaml)");
+            print_codex_env_status();
+        }
+        SetupState::Uninitialized { data_dir } => {
+            println!(
+                "runtime_config: {}",
+                data_dir.join("runtime.yaml").display()
+            );
+            println!("setup: not initialized");
+            print_codex_env_status();
+        }
+    }
+    Ok(())
+}
+
+fn print_codex_status(config: &RuntimeConfig) {
+    let bin = configured_codex_bin(config);
+    let binary_status = codex_binary_status(&bin);
+    println!("acp_mode: {}", config.acp.mode.as_env_value());
+    println!("acp_client: {}", config.acp.client.as_env_value());
+    println!(
+        "acp_agent_name: {}",
+        config.acp.agent_name.as_deref().unwrap_or("default")
+    );
+    println!("codex_bin: {bin}");
+    println!("codex_binary: {}", binary_status.label());
+    println!(
+        "codex_tool: {}",
+        if codex_tool_configured(config) && matches!(binary_status, CodexBinaryStatus::Available) {
+            "available"
+        } else {
+            "not injected"
+        }
+    );
+}
+
+fn print_codex_env_status() {
+    let bin = std::env::var("REMI_ACP_CODEX_BIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string());
+    let binary_status = codex_binary_status(&bin);
+    let client = std::env::var("REMI_ACP_CLIENT").unwrap_or_else(|_| "unset".to_string());
+    let mode = std::env::var("REMI_ACP_MODE").unwrap_or_else(|_| "unset".to_string());
+    println!("acp_mode: {mode}");
+    println!("acp_client: {client}");
+    println!(
+        "acp_agent_name: {}",
+        std::env::var("REMI_ACP_AGENT_NAME").unwrap_or_else(|_| "default".to_string())
+    );
+    println!("codex_bin: {bin}");
+    println!("codex_binary: {}", binary_status.label());
+    println!(
+        "codex_tool: {}",
+        if client.trim().eq_ignore_ascii_case("codex")
+            && matches!(binary_status, CodexBinaryStatus::Available)
+        {
+            "available"
+        } else {
+            "not injected"
+        }
+    );
+}
+
+fn codex_tool_configured(config: &RuntimeConfig) -> bool {
+    matches!(config.acp.client, AcpClient::Codex) && matches!(config.acp.mode, AcpMode::LocalStub)
+}
+
+fn configured_codex_bin(config: &RuntimeConfig) -> String {
+    config
+        .acp
+        .codex_bin
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("REMI_ACP_CODEX_BIN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexBinaryStatus {
+    Available,
+    Missing,
+    Failed(String),
+}
+
+impl CodexBinaryStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Available => "available".to_string(),
+            Self::Missing => "missing".to_string(),
+            Self::Failed(message) => format!("failed ({message})"),
+        }
+    }
+}
+
+fn codex_binary_status(bin: &str) -> CodexBinaryStatus {
+    match std::process::Command::new(bin).arg("--version").output() {
+        Ok(output) if output.status.success() => CodexBinaryStatus::Available,
+        Ok(output) => CodexBinaryStatus::Failed(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("version command failed")
+                .trim()
+                .to_string(),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CodexBinaryStatus::Missing,
+        Err(err) => CodexBinaryStatus::Failed(err.to_string()),
+    }
 }
 
 fn has_all_tools(tools: &[String], required: &[&str]) -> bool {
@@ -3032,8 +3974,73 @@ async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> anyhow::Res
             FeishuEvent::Unknown { event_type, .. } => {
                 info!("ignored event type: {event_type}");
             }
-            FeishuEvent::CardAction { .. } => {}
+            FeishuEvent::CardAction {
+                card_message_id,
+                action_value,
+                user_open_id,
+            } => {
+                let runtime = Rc::clone(&runtime);
+                let gateway = gateway.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = process_feishu_card_action(
+                        runtime,
+                        gateway,
+                        card_message_id,
+                        action_value,
+                        user_open_id,
+                    )
+                    .await
+                    {
+                        warn!("failed to process Feishu card action: {err:#}");
+                    }
+                });
+            }
         }
+    }
+    Ok(())
+}
+
+async fn process_feishu_card_action(
+    runtime: Rc<Runtime>,
+    gateway: FeishuGateway,
+    card_message_id: String,
+    action_value: serde_json::Value,
+    user_open_id: String,
+) -> anyhow::Result<()> {
+    let action = action_value
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if action != "approval_decide" {
+        return Ok(());
+    }
+    let approval_id = action_value
+        .get("approval_id")
+        .and_then(|value| value.as_str())
+        .context("missing approval_id in approval action")?;
+    let decision = action_value
+        .get("decision")
+        .and_then(|value| value.as_str())
+        .and_then(parse_tool_approval_decision)
+        .context("invalid approval decision")?;
+    let resolved = runtime
+        .bot
+        .approval_manager()
+        .decide(approval_id, decision)
+        .await;
+    if resolved.is_none() {
+        warn!(
+            approval_id,
+            user = %user_open_id,
+            "approval card action did not match a pending request"
+        );
+        gateway
+            .update_card_raw(
+                &card_message_id,
+                build_tool_approval_notice_card("Approval is no longer pending."),
+            )
+            .await
+            .ok();
     }
     Ok(())
 }
@@ -3434,6 +4441,24 @@ async fn collect_bot_reply(
                         update_context_compaction_reply(&mut output, &mut replies, &event.id, &line, done).await;
                         supervisor_execution_started = false;
                     }
+                    CatEvent::ToolApprovalRequested(request) => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.approval_requested(&request).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
+                    CatEvent::ToolApprovalUpdated(request) => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.approval_updated(&request).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
+                    CatEvent::ToolApprovalResolved { request, decision } => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.approval_resolved(&request, decision).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
                     CatEvent::Stats {
                         prompt_tokens,
                         completion_tokens,
@@ -3636,6 +4661,9 @@ pub(crate) async fn handle_runtime_command(
     session_id: &str,
     command: &str,
 ) -> anyhow::Result<Option<RuntimeCommandResult>> {
+    if command == "/help" || command == "/commands" {
+        return Ok(Some(RuntimeCommandResult::Reply(runtime_command_help())));
+    }
     if command == "/tools" {
         let reply = runtime
             .bot
@@ -3728,7 +4756,31 @@ pub(crate) async fn handle_runtime_command(
             &usage,
         ))));
     }
+    if let Some(reply) = handle_direct_workflow_command(&runtime.bot, session_id, command).await? {
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
     Ok(None)
+}
+
+fn runtime_command_help() -> String {
+    [
+        "**runtime commands**",
+        "",
+        "- `/help` - show this command list",
+        "- `/tools` - list tools available to the current agent",
+        "- `/skill list` - list available local and builtin skills",
+        "- `/skill status` - show skills already read or activated in this session",
+        "- `/skill:<name> <task>` - load a skill for the same message and run the task",
+        "- `/doctor` - show runtime readiness for the current session",
+        "- `/model` or `/model list` - inspect or select model profiles for this session",
+        "- `/permissions` - inspect or change tool approval mode for this session",
+        "- `/goal ...` - inspect or manage the current goal workflow",
+        "- `/workflow ...` - inspect or manage supervisor workflow state",
+        "- `/<workflow-id> ...` - start a supervisor workflow directly",
+        "- `/compact` - compact short-term memory",
+        "- `/clear` - clear chat memory for this session",
+    ]
+    .join("\n")
 }
 
 async fn handle_permissions_command(
@@ -3998,14 +5050,48 @@ async fn parse_skill_prefixes(
 fn format_skill_list(bot: &CatBot) -> String {
     let mut skills = bot.skill_summaries();
     skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
+    let diagnostics = bot.skill_load_diagnostics();
     if skills.is_empty() {
-        return "No skills are available.".to_string();
+        let mut text = "No skills are available.".to_string();
+        text.push_str(&format_skill_load_diagnostics(&diagnostics));
+        return text;
     }
     let mut lines = vec!["**skills**".to_string(), String::new()];
     for skill in skills {
         lines.push(format!(
             "- `/skill:{}` - {} ({})",
             skill.name, skill.description, skill.source
+        ));
+    }
+    let mut text = lines.join("\n");
+    text.push_str(&format_skill_load_diagnostics(&diagnostics));
+    text
+}
+
+fn format_skill_load_diagnostics(diagnostics: &[SkillLoadDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        String::new(),
+        "**skill load diagnostics**".to_string(),
+    ];
+    let limit = 8;
+    for diagnostic in diagnostics.iter().take(limit) {
+        let severity = match diagnostic.severity {
+            SkillLoadDiagnosticSeverity::Warning => "warning",
+            SkillLoadDiagnosticSeverity::Error => "error",
+        };
+        lines.push(format!(
+            "- `{severity}` {} - {}",
+            diagnostic.path, diagnostic.message
+        ));
+    }
+    if diagnostics.len() > limit {
+        lines.push(format!(
+            "- ... {} more diagnostic(s) omitted",
+            diagnostics.len() - limit
         ));
     }
     lines.join("\n")
@@ -4156,10 +5242,75 @@ async fn handle_workflow_command(
     };
     let mut split = set_args.splitn(2, char::is_whitespace);
     let workflow_id = split.next().unwrap_or("").trim();
-    let mut options = split.next().unwrap_or("").trim();
+    let options = split.next().unwrap_or("").trim();
     if workflow_id.is_empty() {
         return Ok("用法：/workflow set <id> ...".to_string());
     }
+    start_workflow_command(bot, session_id, workflow_id, options).await
+}
+
+async fn handle_direct_workflow_command(
+    bot: &CatBot,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some((workflow_id, options)) = resolve_direct_workflow_command(bot, command)? else {
+        return Ok(None);
+    };
+    start_workflow_command(bot, session_id, &workflow_id, options)
+        .await
+        .map(Some)
+}
+
+fn resolve_direct_workflow_command<'a>(
+    bot: &CatBot,
+    command: &'a str,
+) -> anyhow::Result<Option<(String, &'a str)>> {
+    let Some(rest) = command.trim().strip_prefix('/') else {
+        return Ok(None);
+    };
+    if rest.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut workflows = bot.workflow_definitions()?;
+    workflows.sort_by(|a, b| {
+        b.name
+            .len()
+            .cmp(&a.name.len())
+            .then_with(|| b.id.len().cmp(&a.id.len()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    for workflow in workflows {
+        if workflow.id == "goal" {
+            continue;
+        }
+        if let Some(options) = direct_workflow_options(rest, &workflow.id)
+            .or_else(|| direct_workflow_options(rest, &workflow.name))
+        {
+            return Ok(Some((workflow.id, options)));
+        }
+    }
+    Ok(None)
+}
+
+fn direct_workflow_options<'a>(rest: &'a str, name: &str) -> Option<&'a str> {
+    let options = rest.strip_prefix(name)?;
+    if options.is_empty() {
+        return Some("");
+    }
+    options
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then(|| options.trim())
+}
+
+async fn start_workflow_command(
+    bot: &CatBot,
+    session_id: &str,
+    workflow_id: &str,
+    mut options: &str,
+) -> anyhow::Result<String> {
     let mut max_rounds = GoalMaxRounds::default();
     let mut context = serde_json::json!({});
     while !options.is_empty() {
@@ -4383,6 +5534,7 @@ struct FeishuReplyStream {
     active_card: Option<StreamingCard>,
     tool_cards: HashMap<String, StreamingCard>,
     compaction_cards: HashMap<String, StreamingCard>,
+    approval_cards: HashMap<String, String>,
 }
 
 impl FeishuReplyStream {
@@ -4394,6 +5546,7 @@ impl FeishuReplyStream {
             active_card: None,
             tool_cards: HashMap::new(),
             compaction_cards: HashMap::new(),
+            approval_cards: HashMap::new(),
         }
     }
 
@@ -4461,6 +5614,124 @@ impl FeishuReplyStream {
             card.replace(line).await.ok();
         }
     }
+
+    async fn approval_requested(&mut self, request: &ToolApprovalRequest) {
+        self.finish_active().await;
+        let card = build_tool_approval_card(
+            &request.id,
+            &request.tool_name,
+            tool_risk_value(request.risk),
+            &request.args_summary,
+            approval_review_text(request).as_deref(),
+        );
+        match self
+            .gateway
+            .reply_card_raw(&self.parent_message_id, card)
+            .await
+        {
+            Ok(card_message_id) => {
+                self.approval_cards
+                    .insert(request.id.clone(), card_message_id);
+            }
+            Err(err) => warn!("send approval card failed: {err:#}"),
+        }
+    }
+
+    async fn approval_updated(&mut self, request: &ToolApprovalRequest) {
+        self.finish_active().await;
+        let Some(card_message_id) = self.approval_cards.get(&request.id) else {
+            return;
+        };
+        let card = build_tool_approval_card(
+            &request.id,
+            &request.tool_name,
+            tool_risk_value(request.risk),
+            &request.args_summary,
+            approval_review_text(request).as_deref(),
+        );
+        if let Err(err) = self.gateway.update_card_raw(card_message_id, card).await {
+            warn!("update approval card failed: {err:#}");
+        }
+    }
+
+    async fn approval_resolved(
+        &mut self,
+        request: &ToolApprovalRequest,
+        decision: ToolApprovalDecision,
+    ) {
+        self.finish_active().await;
+        let Some(card_message_id) = self.approval_cards.remove(&request.id) else {
+            return;
+        };
+        let card = build_tool_approval_resolved_card(
+            &request.tool_name,
+            tool_risk_value(request.risk),
+            &request.args_summary,
+            tool_approval_decision_value(decision),
+        );
+        if let Err(err) = self.gateway.update_card_raw(&card_message_id, card).await {
+            warn!("resolve approval card failed: {err:#}");
+        }
+    }
+}
+
+fn parse_tool_approval_decision(value: &str) -> Option<ToolApprovalDecision> {
+    match value {
+        "deny" => Some(ToolApprovalDecision::Deny),
+        "allow_once" => Some(ToolApprovalDecision::AllowOnce),
+        "allow_session" => Some(ToolApprovalDecision::AllowSession),
+        "allow_session_model_auto" => Some(ToolApprovalDecision::AllowSessionModelAuto),
+        _ => None,
+    }
+}
+
+fn tool_approval_decision_value(decision: ToolApprovalDecision) -> &'static str {
+    match decision {
+        ToolApprovalDecision::Deny => "deny",
+        ToolApprovalDecision::AllowOnce => "allow_once",
+        ToolApprovalDecision::AllowSession => "allow_session",
+        ToolApprovalDecision::AllowSessionModelAuto => "allow_session_model_auto",
+    }
+}
+
+fn tool_risk_value(risk: bot_core::approval::ToolRiskLevel) -> &'static str {
+    match risk {
+        bot_core::approval::ToolRiskLevel::Low => "low",
+        bot_core::approval::ToolRiskLevel::Medium => "medium",
+        bot_core::approval::ToolRiskLevel::High => "high",
+    }
+}
+
+fn approval_review_text(request: &ToolApprovalRequest) -> Option<String> {
+    let review = request.review.as_ref()?;
+    let mut text = review.reason.trim().to_string();
+    if !review.concerns.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str("Concerns:");
+        for concern in &review.concerns {
+            text.push_str("\n- ");
+            text.push_str(concern);
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn build_tool_approval_notice_card(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": message
+            }]
+        },
+        "header": {
+            "title": { "tag": "plain_text", "content": "Tool approval" },
+            "template": "grey"
+        }
+    })
 }
 
 async fn append_reply_chunk(
@@ -4769,6 +6040,7 @@ fn next_arg(args: &[String], index: usize) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} requires a value", args[index]))
 }
 
+#[cfg(test)]
 fn optional_arg(args: &[String], index: usize) -> Option<String> {
     args.get(index + 1)
         .map(|value| value.trim())
@@ -4785,14 +6057,17 @@ mod cli_tests {
         github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_command,
         parse_global_args, parse_goal_max_rounds, parse_release_version, percent_encode_query,
         prefix_short_config_entry, redact_known_secrets, run_streaming_command,
-        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start, update_available,
-        AppCommand, CliConfig, FeedbackCommand, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind,
-        GitHubIssueCreateRequest, ProfileCommand, UpdateCommand,
+        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
+        try_parse_cli_args, update_available, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
+        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest,
+        ProfileCommand, UpdateCommand,
     };
+    use crate::direct_workflow_options;
     use crate::profile_command::{
         ProfileAgentCommand, ProfileWorkflowCommand, PROFILE_RUNTIME_ENV_KEYS,
     };
     use bot_core::{GoalMaxRounds, PrettyToolCall};
+    use clap::error::ErrorKind;
     use im_feishu::FeishuMessage;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -4808,6 +6083,16 @@ mod cli_tests {
         assert!(!config.tui);
         assert_eq!(config.once, None);
         assert!(!config.pure_prompt);
+    }
+
+    #[test]
+    fn global_tool_output_overflow_bytes_arg_is_parsed() {
+        let cli =
+            try_parse_cli_args(&args(&["--tool-output-overflow-bytes", "32768", "cli"])).unwrap();
+        assert_eq!(cli.tool_output_overflow_bytes, Some(32_768));
+
+        let cli = try_parse_cli_args(&args(&["--overflow-bytes=4096", "tui"])).unwrap();
+        assert_eq!(cli.tool_output_overflow_bytes, Some(4_096));
     }
 
     #[test]
@@ -4869,6 +6154,30 @@ mod cli_tests {
         let config = CliConfig::from_args(&args(&["admin"])).unwrap();
         assert!(config.admin_only);
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn clap_help_is_handled_before_runtime_command() {
+        assert_eq!(
+            try_parse_cli_args(&args(&["--help"])).unwrap_err().kind(),
+            ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            try_parse_cli_args(&args(&["help"])).unwrap_err().kind(),
+            ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            try_parse_cli_args(&args(&["profile", "agent", "--help"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            try_parse_cli_args(&args(&["update", "self", "--help"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
+        );
     }
 
     #[test]
@@ -4986,6 +6295,26 @@ mod cli_tests {
     }
 
     #[test]
+    fn direct_workflow_options_require_exact_command_boundary() {
+        assert_eq!(
+            direct_workflow_options("review-loop", "review-loop"),
+            Some("")
+        );
+        assert_eq!(
+            direct_workflow_options("review-loop --max-rounds 1", "review-loop"),
+            Some("--max-rounds 1")
+        );
+        assert_eq!(
+            direct_workflow_options("Review Loop --context {}", "Review Loop"),
+            Some("--context {}")
+        );
+        assert_eq!(
+            direct_workflow_options("review-looping", "review-loop"),
+            None
+        );
+    }
+
+    #[test]
     fn profile_start_clears_runtime_override_env() {
         for key in [
             "REMI_AGENT_ID",
@@ -5073,6 +6402,32 @@ mod cli_tests {
         assert!(matches!(
             parse_command(&args(&["feishu", "doctor"])).unwrap(),
             AppCommand::Feishu(FeishuCommand::Doctor)
+        ));
+    }
+
+    #[test]
+    fn codex_setup_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "codex",
+                "setup",
+                "--bin",
+                "/usr/local/bin/codex",
+                "--agent",
+                "default"
+            ]))
+            .unwrap(),
+            AppCommand::Codex(CodexCommand::Setup { bin, agent })
+                if bin.as_deref() == Some("/usr/local/bin/codex")
+                    && agent.as_deref() == Some("default")
+        ));
+    }
+
+    #[test]
+    fn codex_doctor_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&["codex", "doctor"])).unwrap(),
+            AppCommand::Codex(CodexCommand::Doctor)
         ));
     }
 
@@ -5287,7 +6642,7 @@ mod cli_tests {
             "call-1",
             "manage_yourself",
             &serde_json::json!({"command": "profile agent list default"}),
-            "default\tRemi\tdefault\tsearch, skill__get, skill__read_resource, todo__add, todo__list, todo__complete, todo__update, todo__remove, trigger__upsert, trigger__list, trigger__delete, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, acp__chat, manage_yourself",
+            "default\tRemi\tdefault\tsearch, skill__get, todo__add, todo__list, todo__complete, todo__update, todo__remove, trigger__upsert, trigger__list, trigger__delete, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, codex, manage_yourself",
             true,
             511,
         );
@@ -5296,7 +6651,8 @@ mod cli_tests {
 
         assert!(line.chars().count() <= 141);
         assert!(line.contains("default"));
-        assert!(!line.contains("skill__read_resource"));
+        assert!(line.contains("Remi"));
+        assert!(!line.contains("memory__upsert_named"));
     }
 
     #[test]

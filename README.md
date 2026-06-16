@@ -191,7 +191,7 @@ tools:
   - todo__add
   - todo__list
   - memory__get_detail
-  - acp__chat
+  - codex
   - manage_yourself
 delegates: []
 max_turns: null
@@ -300,7 +300,8 @@ sub-session channel binding. Parent agent context receives the final tool
 result; intermediate child output stays observable as sub-session progress.
 By default, local ACP uses the installed Codex CLI (`codex exec`) when
 `acp.client` is `codex`; set `REMI_ACP_CODEX_BIN` to override the binary path,
-or set `acp.client: remi` to use the in-process Remi runner/stub.
+or run `remi-cat codex setup --bin /path/to/codex`. The model only sees the
+`codex` tool when the Codex binary is configured and executable.
 
 ## Admin API
 

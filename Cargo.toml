@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.0"
+version = "0.2.3"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -23,6 +23,9 @@ members = [
     "crates/matcher",
     "crates/user-store",
     "crates/bot-core",
+    "crates/proto",
+    "crates/agent",
+    "crates/daemon",
     "crates/mgmt-api",
     "crates/admin-ui",
     "crates/remi-client-sdk",
@@ -39,6 +42,8 @@ secure-storage = ["dep:keyring"]
 [dependencies]
 bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
+remi-client-sdk = { path = "crates/remi-client-sdk" }
+remi-things-crdt = { path = "crates/remi-things-crdt" }
 user-store = { path = "crates/user-store" }
 remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
     "http-client",
@@ -49,6 +54,7 @@ anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
 dotenvy = "0.15"
 futures = "0.3"
 pulldown-cmark = "0.13"

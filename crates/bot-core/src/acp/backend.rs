@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::im_tools::{AcpBindingDeleteRequest, AcpBindingUpsertRequest, ImFileBridge};
@@ -90,6 +91,15 @@ impl AcpRemoteClient {
     }
 }
 
+impl std::fmt::Display for AcpRemoteClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Remi => f.write_str("remi"),
+            Self::Codex => f.write_str("codex"),
+        }
+    }
+}
+
 impl AcpConfig {
     fn from_env() -> Self {
         let agent_name = std::env::var("REMI_ACP_AGENT_NAME")
@@ -150,6 +160,20 @@ pub struct AcpToolResponse {
     pub final_summary: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpToolTaskStatus {
+    pub status: String,
+    pub task_id: String,
+    pub session_id: String,
+    pub sub_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<AcpToolResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedToolTurn {
     pub session_id: String,
@@ -171,8 +195,15 @@ pub struct AcpBackend {
     config: AcpConfig,
     store_path: PathBuf,
     store: Mutex<AcpStore>,
+    tool_tasks: Mutex<HashMap<String, AcpToolTask>>,
     im_bridge: Option<Arc<dyn ImFileBridge>>,
     local_runner: std::sync::RwLock<Option<Arc<dyn AcpLocalRunner>>>,
+}
+
+struct AcpToolTask {
+    session_id: String,
+    sub_session_id: String,
+    handle: JoinHandle<Result<AcpToolResponse>>,
 }
 
 impl AcpBackend {
@@ -183,6 +214,7 @@ impl AcpBackend {
             config: AcpConfig::from_env(),
             store_path,
             store: Mutex::new(store),
+            tool_tasks: Mutex::new(HashMap::new()),
             im_bridge,
             local_runner: std::sync::RwLock::new(None),
         }
@@ -204,6 +236,29 @@ impl AcpBackend {
 
     pub fn is_enabled(&self) -> bool {
         true
+    }
+
+    pub fn client_name(&self) -> &'static str {
+        match &self.config {
+            AcpConfig::Local { client, .. } | AcpConfig::Remote { client, .. } => match client {
+                AcpRemoteClient::Remi => "remi",
+                AcpRemoteClient::Codex => "codex",
+            },
+        }
+    }
+
+    pub fn uses_codex(&self) -> bool {
+        self.client_name() == "codex"
+    }
+
+    pub fn codex_tool_available(&self) -> bool {
+        if !self.uses_codex() {
+            return false;
+        }
+        match &self.config {
+            AcpConfig::Local { .. } => local_codex_binary_available(),
+            AcpConfig::Remote { base_url, .. } => !base_url.trim().is_empty(),
+        }
     }
 
     pub async fn prepare_tool_turn(&self, request: AcpToolRequest) -> Result<PreparedToolTurn> {
@@ -367,6 +422,149 @@ impl AcpBackend {
             "acp.run.completed"
         );
         Ok(response)
+    }
+
+    async fn run_prepared_codex_tool_turn(
+        &self,
+        prepared: PreparedToolTurn,
+    ) -> Result<AcpToolResponse> {
+        let started = Instant::now();
+        tracing::info!(
+            acp_session_id = %prepared.session_id,
+            sub_session_id = %prepared.sub_session_id,
+            message_len = prepared.message.len(),
+            prompt_len = prepared.prompt.len(),
+            "acp.run.start"
+        );
+        let reply = match self
+            .invoke_codex(&prepared.session_id, &prepared.prompt)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                tracing::warn!(
+                    acp_session_id = %prepared.session_id,
+                    sub_session_id = %prepared.sub_session_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "acp.run.failed"
+                );
+                return Err(err).with_context(|| {
+                    format!("ACP request failed for session {}", prepared.session_id)
+                });
+            }
+        };
+        let final_summary = reply.trim().to_string();
+        let response = AcpToolResponse {
+            session_id: prepared.session_id.clone(),
+            reply: reply.clone(),
+            final_summary: final_summary.clone(),
+        };
+        self.persist_turn(
+            &prepared.session_id,
+            &prepared.message,
+            &reply,
+            &final_summary,
+        )
+        .await?;
+        tracing::info!(
+            acp_session_id = %prepared.session_id,
+            sub_session_id = %prepared.sub_session_id,
+            reply_len = reply.len(),
+            final_summary_len = final_summary.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "acp.run.completed"
+        );
+        Ok(response)
+    }
+
+    pub async fn spawn_prepared_tool_turn(
+        self: &Arc<Self>,
+        prepared: PreparedToolTurn,
+        wait_ms: u64,
+    ) -> AcpToolTaskStatus {
+        let task_id = Uuid::new_v4().to_string();
+        let session_id = prepared.session_id.clone();
+        let sub_session_id = prepared.sub_session_id.clone();
+        let backend = Arc::clone(self);
+        let handle =
+            tokio::spawn(async move { backend.run_prepared_codex_tool_turn(prepared).await });
+        self.tool_tasks.lock().await.insert(
+            task_id.clone(),
+            AcpToolTask {
+                session_id: session_id.clone(),
+                sub_session_id: sub_session_id.clone(),
+                handle,
+            },
+        );
+
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+        self.poll_tool_task(&task_id).await
+    }
+
+    pub async fn poll_tool_task(&self, task_id: &str) -> AcpToolTaskStatus {
+        let mut tasks = self.tool_tasks.lock().await;
+        let Some(task) = tasks.get(task_id) else {
+            return AcpToolTaskStatus {
+                status: "not_found".to_string(),
+                task_id: task_id.to_string(),
+                session_id: String::new(),
+                sub_session_id: String::new(),
+                poll_hint: None,
+                response: None,
+                error: Some("Codex ACP task not found; it may have already been collected or the process restarted".to_string()),
+            };
+        };
+        if !task.handle.is_finished() {
+            return AcpToolTaskStatus {
+                status: "running".to_string(),
+                task_id: task_id.to_string(),
+                session_id: task.session_id.clone(),
+                sub_session_id: task.sub_session_id.clone(),
+                poll_hint: Some(format!(
+                    "Call codex again with task_id={task_id} and action=poll."
+                )),
+                response: None,
+                error: None,
+            };
+        }
+
+        let task = tasks
+            .remove(task_id)
+            .expect("finished Codex ACP task should still be present");
+        drop(tasks);
+
+        match task.handle.await {
+            Ok(Ok(response)) => AcpToolTaskStatus {
+                status: "completed".to_string(),
+                task_id: task_id.to_string(),
+                session_id: task.session_id,
+                sub_session_id: task.sub_session_id,
+                poll_hint: None,
+                response: Some(response),
+                error: None,
+            },
+            Ok(Err(err)) => AcpToolTaskStatus {
+                status: "failed".to_string(),
+                task_id: task_id.to_string(),
+                session_id: task.session_id,
+                sub_session_id: task.sub_session_id,
+                poll_hint: None,
+                response: None,
+                error: Some(err.to_string()),
+            },
+            Err(err) => AcpToolTaskStatus {
+                status: "failed".to_string(),
+                task_id: task_id.to_string(),
+                session_id: task.session_id,
+                sub_session_id: task.sub_session_id,
+                poll_hint: None,
+                response: None,
+                error: Some(format!("Codex ACP task failed to join: {err}")),
+            },
+        }
     }
 
     pub async fn continue_bound_session(&self, session_id: &str, message: &str) -> Result<String> {
@@ -570,13 +768,92 @@ impl AcpBackend {
             }
         }
     }
+
+    async fn invoke_codex(&self, session_id: &str, prompt: &str) -> Result<String> {
+        match &self.config {
+            AcpConfig::Local {
+                client: AcpRemoteClient::Codex,
+                ..
+            } => {
+                tracing::info!(
+                    acp_session_id = session_id,
+                    acp_client = "codex",
+                    prompt_len = prompt.len(),
+                    "acp.invoke.start"
+                );
+                invoke_local_codex(prompt).await
+            }
+            AcpConfig::Remote {
+                base_url,
+                client: AcpRemoteClient::Codex,
+                agent_name,
+                api_key,
+                model,
+            } => {
+                let endpoint = format!("{}/responses", base_url);
+                tracing::info!(
+                    acp_session_id = session_id,
+                    acp_client = "codex",
+                    endpoint = %endpoint,
+                    agent_name,
+                    prompt_len = prompt.len(),
+                    "acp.remote.start"
+                );
+                let mut request = reqwest::Client::new()
+                    .post(&endpoint)
+                    .header(CONTENT_TYPE, "application/json");
+                if let Some(api_key) = api_key {
+                    request = request.header(AUTHORIZATION, format!("Bearer {api_key}"));
+                }
+                let body = serde_json::json!({
+                    "model": model.clone().unwrap_or_else(|| "gpt-5-codex".to_string()),
+                    "input": prompt,
+                    "metadata": {
+                        "acp_agent": agent_name,
+                        "acp_session_id": session_id,
+                    }
+                });
+                let response = request
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("failed to send ACP request")?
+                    .error_for_status()
+                    .context("ACP server returned error status")?;
+                let json: Value = response.json().await.context("invalid ACP JSON response")?;
+                let text = extract_text_from_response(&json)
+                    .context("ACP response did not contain readable text")?;
+                tracing::info!(
+                    acp_session_id = session_id,
+                    acp_client = "codex",
+                    endpoint = %endpoint,
+                    response_len = text.len(),
+                    "acp.remote.completed"
+                );
+                Ok(text)
+            }
+            _ => anyhow::bail!("Codex ACP polling is only available when acp.client=codex"),
+        }
+    }
+}
+
+fn local_codex_binary() -> String {
+    std::env::var("REMI_ACP_CODEX_BIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn local_codex_binary_available() -> bool {
+    StdCommand::new(local_codex_binary())
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 async fn invoke_local_codex(prompt: &str) -> Result<String> {
-    let program = std::env::var("REMI_ACP_CODEX_BIN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "codex".to_string());
+    let program = local_codex_binary();
     invoke_local_codex_with_program(&program, prompt).await
 }
 
@@ -958,6 +1235,32 @@ mod tests {
         result
     }
 
+    fn with_acp_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _guard = ACP_ENV_LOCK.lock().unwrap();
+        let previous = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        unsafe {
+            for (key, value) in vars {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        let result = f();
+        unsafe {
+            for (key, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        result
+    }
+
     struct EchoLocalRunner;
 
     impl super::AcpLocalRunner for EchoLocalRunner {
@@ -1091,6 +1394,89 @@ printf '{{"output_text":"json fallback"}}\n'
         assert!(args.ends_with(" -\n"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_task_returns_running_and_poll_completes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ACP_ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("codex");
+        let mut file = std::fs::File::create(&bin_path).unwrap();
+        writeln!(
+            file,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+sleep 0.1
+prompt="$(cat)"
+out=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--output-last-message" ]]; then
+    out="$arg"
+    break
+  fi
+  prev="$arg"
+done
+printf 'slow codex saw: %s\n' "$prompt" > "$out"
+"#
+        )
+        .unwrap();
+        drop(file);
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        unsafe {
+            std::env::set_var("REMI_ACP_CLIENT", "codex");
+            std::env::set_var("REMI_ACP_CODEX_BIN", &bin_path);
+        }
+
+        let backend = Arc::new(AcpBackend::new(dir.path().to_path_buf(), None));
+        let prepared = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "hello slow codex".to_string(),
+                session_id: None,
+                title: Some("slow codex".to_string()),
+                current_channel: None,
+            })
+            .await
+            .unwrap();
+        let started = backend.spawn_prepared_tool_turn(prepared, 1).await;
+        assert_eq!(started.status, "running");
+        assert!(started
+            .poll_hint
+            .as_deref()
+            .unwrap()
+            .contains("action=poll"));
+
+        let mut completed = None;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let status = backend.poll_tool_task(&started.task_id).await;
+            if status.status == "completed" {
+                completed = Some(status);
+                break;
+            }
+            assert_eq!(status.status, "running");
+        }
+        let completed = completed.expect("Codex task should complete");
+        let response = completed
+            .response
+            .expect("completed task should include response");
+        assert!(response.reply.contains("slow codex saw: ACP agent"));
+        assert!(response.reply.contains("hello slow codex"));
+
+        let store = backend.store.lock().await;
+        let record = store.sessions.get(&response.session_id).unwrap();
+        assert_eq!(record.transcript.len(), 1);
+
+        unsafe {
+            std::env::remove_var("REMI_ACP_CLIENT");
+            std::env::remove_var("REMI_ACP_CODEX_BIN");
+        }
+    }
+
     #[test]
     fn remote_client_defaults_to_remi() {
         with_acp_client_env(None, || {
@@ -1103,5 +1489,51 @@ printf '{{"output_text":"json fallback"}}\n'
         with_acp_client_env(Some("codex"), || {
             assert_eq!(AcpRemoteClient::from_env(), AcpRemoteClient::Codex);
         });
+    }
+
+    #[test]
+    fn codex_tool_is_unavailable_when_local_binary_is_missing() {
+        with_acp_env(
+            &[
+                ("REMI_ACP_CLIENT", Some("codex")),
+                ("REMI_ACP_MODE", Some("local")),
+                (
+                    "REMI_ACP_CODEX_BIN",
+                    Some("/definitely/missing/remi-cat-codex"),
+                ),
+            ],
+            || {
+                let dir = tempdir().unwrap();
+                let backend = AcpBackend::new(dir.path().to_path_buf(), None);
+                assert!(backend.uses_codex());
+                assert!(!backend.codex_tool_available());
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_tool_is_available_when_local_binary_runs_version() {
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("codex");
+        std::fs::write(&bin_path, "#!/usr/bin/env sh\nprintf 'codex 1.0.0\\n'\n").unwrap();
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+        let bin = bin_path.to_string_lossy().to_string();
+
+        with_acp_env(
+            &[
+                ("REMI_ACP_CLIENT", Some("codex")),
+                ("REMI_ACP_MODE", Some("local")),
+                ("REMI_ACP_CODEX_BIN", Some(bin.as_str())),
+            ],
+            || {
+                let data_dir = tempdir().unwrap();
+                let backend = AcpBackend::new(data_dir.path().to_path_buf(), None);
+                assert!(backend.uses_codex());
+                assert!(backend.codex_tool_available());
+            },
+        );
     }
 }

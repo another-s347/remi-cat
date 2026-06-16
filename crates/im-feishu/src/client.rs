@@ -2013,8 +2013,8 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
-        ContactUserIdType, MessageResponse,
+        build_tool_approval_card, log_text_preview, preferred_contact_user_id_types,
+        should_retry_contact_user_lookup, ContactUserIdType, MessageResponse,
     };
 
     #[test]
@@ -2032,6 +2032,29 @@ mod tests {
         let data = parsed.data.unwrap();
         assert_eq!(data.message_id, "om_msg");
         assert_eq!(data.thread_id.as_deref(), Some("omt_topic"));
+    }
+
+    #[test]
+    fn tool_approval_card_contains_interactive_decision_payloads() {
+        let card = build_tool_approval_card(
+            "approval-123",
+            "shell.exec",
+            "high",
+            r#"{"cmd":"cargo test"}"#,
+            Some("review text"),
+        );
+        let encoded = serde_json::to_string(&card).unwrap();
+
+        assert!(encoded.contains(r#""action":"approval_decide""#));
+        assert!(encoded.contains(r#""approval_id":"approval-123""#));
+        for decision in [
+            "allow_once",
+            "allow_session",
+            "allow_session_model_auto",
+            "deny",
+        ] {
+            assert!(encoded.contains(&format!(r#""decision":"{decision}""#)));
+        }
     }
 
     #[test]
@@ -2211,6 +2234,156 @@ pub fn build_secret_manager_card(keys: &[(&str, bool)]) -> serde_json::Value {
         "header": {
             "title": { "tag": "plain_text", "content": "🔑 Secret 管理" },
             "template": "yellow"
+        }
+    })
+}
+
+pub fn build_tool_approval_card(
+    approval_id: &str,
+    tool_name: &str,
+    risk: &str,
+    args_summary: &str,
+    review_text: Option<&str>,
+) -> serde_json::Value {
+    let template = match risk {
+        "high" => "red",
+        "medium" => "yellow",
+        _ => "blue",
+    };
+    let mut elements = vec![
+        serde_json::json!({
+            "tag": "markdown",
+            "content": format!("**Tool:** `{}`\n\n**Risk:** `{}`", tool_name, risk)
+        }),
+        serde_json::json!({
+            "tag": "markdown",
+            "content": format!("**Arguments**\n```json\n{}\n```", args_summary)
+        }),
+    ];
+    if let Some(review_text) = review_text.filter(|text| !text.trim().is_empty()) {
+        elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": format!("**Review**\n{}", review_text)
+        }));
+    }
+    elements.push(serde_json::json!({
+        "tag": "hr"
+    }));
+    elements.push(serde_json::json!({
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "Allow once" },
+                    "type": "primary",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "approval_decide",
+                            "approval_id": approval_id,
+                            "decision": "allow_once"
+                        }
+                    }]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "Allow session" },
+                    "type": "default",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "approval_decide",
+                            "approval_id": approval_id,
+                            "decision": "allow_session"
+                        }
+                    }]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "Model auto" },
+                    "type": "default",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "approval_decide",
+                            "approval_id": approval_id,
+                            "decision": "allow_session_model_auto"
+                        }
+                    }]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "Deny" },
+                    "type": "danger",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "approval_decide",
+                            "approval_id": approval_id,
+                            "decision": "deny"
+                        }
+                    }]
+                }]
+            }
+        ]
+    }));
+
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": elements },
+        "header": {
+            "title": { "tag": "plain_text", "content": "Tool approval required" },
+            "template": template
+        }
+    })
+}
+
+pub fn build_tool_approval_resolved_card(
+    tool_name: &str,
+    risk: &str,
+    args_summary: &str,
+    decision: &str,
+) -> serde_json::Value {
+    let template = if decision == "deny" { "red" } else { "green" };
+    serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "**Tool:** `{}`\n\n**Risk:** `{}`\n\n**Decision:** `{}`\n\n**Arguments**\n```json\n{}\n```",
+                        tool_name,
+                        risk,
+                        decision,
+                        args_summary
+                    )
+                }
+            ]
+        },
+        "header": {
+            "title": { "tag": "plain_text", "content": "Tool approval resolved" },
+            "template": template
         }
     })
 }

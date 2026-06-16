@@ -199,6 +199,8 @@ impl SchedulerRuntime {
                         .map(trigger_rule_from_spec)
                         .collect(),
                     condition: attrs.condition.iter().map(trigger_rule_from_spec).collect(),
+                    action_uuid: None,
+                    action_args: serde_json::json!({}),
                 })?;
             }
 

@@ -22,6 +22,7 @@ message DaemonMessage {
     ImBridgeResponse im_bridge_response = 5;
     ChatCancelSignal chat_cancel        = 6;
     TriggerRunEvent  trigger_run        = 7;
+    ToolApprovalDecisionEvent tool_approval_decision = 8;
   }
 }
 
@@ -109,6 +110,9 @@ message AgentMessage {
     AgentError      error             = 8;
     ImBridgeRequest im_bridge_request = 9;
     AgentTodoState  todo_state        = 10;
+    AgentToolApprovalRequested tool_approval_requested = 11;
+    AgentToolApprovalUpdated   tool_approval_updated   = 12;
+    AgentToolApprovalResolved  tool_approval_resolved  = 13;
   }
 }
 
@@ -131,6 +135,41 @@ message AgentTodoState { string markdown = 1; }
 message AgentDone  {}
 
 message AgentError { string message = 1; }
+
+message ToolApprovalDecisionEvent {
+  string approval_id = 1;
+  string decision    = 2;
+}
+
+message AgentToolApprovalRequested {
+  string approval_id  = 1;
+  string session_id   = 2;
+  string run_id       = 3;
+  string tool_call_id = 4;
+  string tool_name    = 5;
+  string risk         = 6;
+  string args_summary = 7;
+  string review_json  = 8;
+}
+
+message AgentToolApprovalUpdated {
+  string approval_id  = 1;
+  string session_id   = 2;
+  string run_id       = 3;
+  string tool_call_id = 4;
+  string tool_name    = 5;
+  string risk         = 6;
+  string args_summary = 7;
+  string review_json  = 8;
+}
+
+message AgentToolApprovalResolved {
+  string approval_id  = 1;
+  string tool_name    = 2;
+  string decision     = 3;
+  string risk         = 4;
+  string args_summary = 5;
+}
 
 message ImBridgeRequest {
   string request_id = 1;

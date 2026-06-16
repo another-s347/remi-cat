@@ -25,12 +25,13 @@ use std::time::Duration;
 use anyhow::Result;
 use bot_core::{
     todo::current_todo_card_markdown, CatBot, CatEvent, Content, ContentPart, ImAttachment,
-    ImDocument, ImFileBridge, StreamOptions,
+    ImDocument, ImFileBridge, StreamOptions, ToolApprovalDecision, ToolApprovalRequest,
 };
 use futures::StreamExt;
 use remi_proto::{
     agent_message::Payload as AgentPayload, AgentDone, AgentError as AgentErrorMsg, AgentMessage,
-    AgentStats, AgentTextDelta, AgentThinking, AgentTodoState, AgentToolCall, AgentToolResult,
+    AgentStats, AgentTextDelta, AgentThinking, AgentTodoState, AgentToolApprovalRequested,
+    AgentToolApprovalResolved, AgentToolApprovalUpdated, AgentToolCall, AgentToolResult,
     DaemonPayload, DaemonServiceClient,
 };
 use tokio::sync::mpsc;
@@ -369,6 +370,36 @@ async fn run_session(addr: &str) -> Result<()> {
                     info!(chat_id = %ev.chat_id, "received ChatCancelSignal — cooperative cancel signalled");
                 }
             }
+            DaemonPayload::ToolApprovalDecision(ev) => {
+                let Some(bot_rc) = bot.as_ref().map(Rc::clone) else {
+                    warn!(
+                        approval_id = %ev.approval_id,
+                        "received approval decision before CatBot initialized"
+                    );
+                    continue;
+                };
+                let Some(decision) = parse_tool_approval_decision(&ev.decision) else {
+                    warn!(
+                        approval_id = %ev.approval_id,
+                        decision = %ev.decision,
+                        "received invalid approval decision"
+                    );
+                    continue;
+                };
+                let approval_id = ev.approval_id.clone();
+                tokio::task::spawn_local(async move {
+                    let resolved = bot_rc
+                        .approval_manager()
+                        .decide(&approval_id, decision)
+                        .await;
+                    if resolved.is_none() {
+                        warn!(
+                            approval_id = %approval_id,
+                            "approval decision did not match a pending request"
+                        );
+                    }
+                });
+            }
             DaemonPayload::Shutdown(_) => {
                 info!("received Shutdown signal from Daemon — exiting");
                 std::process::exit(0);
@@ -586,6 +617,7 @@ async fn handle_trigger_run(
 ) {
     let reply_to = ev.execution_id.clone();
     let opts = StreamOptions {
+        model_profile_id: None,
         sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
         sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.reply_to_message_id.clone()).filter(|s| !s.is_empty()),
@@ -594,6 +626,7 @@ async fn handle_trigger_run(
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: true,
+        supervisor_run: false,
         skill_injections: Vec::new(),
         im_attachments: Vec::new(),
         im_documents: Vec::new(),
@@ -687,6 +720,7 @@ fn trigger_command_help_text() -> String {
 
 fn trigger_command_stream_options(ev: &remi_proto::ImMessageEvent) -> StreamOptions {
     StreamOptions {
+        model_profile_id: None,
         sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
         sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
@@ -695,6 +729,7 @@ fn trigger_command_stream_options(ev: &remi_proto::ImMessageEvent) -> StreamOpti
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: false,
+        supervisor_run: false,
         skill_injections: Vec::new(),
         im_attachments: Vec::new(),
         im_documents: Vec::new(),
@@ -707,6 +742,7 @@ fn stream_options_from_im_message(
     cancel: Option<Arc<tokio::sync::Notify>>,
 ) -> StreamOptions {
     StreamOptions {
+        model_profile_id: None,
         sender_user_id: Some(ev.sender_user_id.clone()).filter(|s| !s.is_empty()),
         sender_username: Some(ev.sender_username.clone()).filter(|s| !s.is_empty()),
         message_id: Some(ev.message_id.clone()).filter(|s| !s.is_empty()),
@@ -715,6 +751,7 @@ fn stream_options_from_im_message(
         todo_create_via_sdk: ev.todo_create_via_sdk,
         trigger_tools_enabled: ev.trigger_tools_enabled,
         trigger_run: false,
+        supervisor_run: false,
         skill_injections: Vec::new(),
         im_attachments: ev
             .attachments
@@ -852,6 +889,15 @@ async fn forward_stream(
                         Some(AgentPayload::TodoState(AgentTodoState {
                             markdown: current_todo_card_markdown(&us).unwrap_or_default(),
                         })),
+                    CatEvent::ToolApprovalRequested(request) =>
+                        Some(AgentPayload::ToolApprovalRequested(agent_approval_requested(&request))),
+                    CatEvent::ToolApprovalUpdated(request) =>
+                        Some(AgentPayload::ToolApprovalUpdated(agent_approval_updated(&request))),
+                    CatEvent::ToolApprovalResolved { request, decision } =>
+                        Some(AgentPayload::ToolApprovalResolved(agent_approval_resolved(
+                            &request,
+                            decision,
+                        ))),
                     CatEvent::Error(e) => {
                         tx.send(AgentMessage {
                             reply_to_message_id: reply_to.clone(),
@@ -898,6 +944,80 @@ async fn forward_stream(
     })
     .await
     .ok();
+}
+
+fn parse_tool_approval_decision(value: &str) -> Option<ToolApprovalDecision> {
+    match value {
+        "deny" => Some(ToolApprovalDecision::Deny),
+        "allow_once" => Some(ToolApprovalDecision::AllowOnce),
+        "allow_session" => Some(ToolApprovalDecision::AllowSession),
+        "allow_session_model_auto" => Some(ToolApprovalDecision::AllowSessionModelAuto),
+        _ => None,
+    }
+}
+
+fn tool_approval_decision_value(decision: ToolApprovalDecision) -> &'static str {
+    match decision {
+        ToolApprovalDecision::Deny => "deny",
+        ToolApprovalDecision::AllowOnce => "allow_once",
+        ToolApprovalDecision::AllowSession => "allow_session",
+        ToolApprovalDecision::AllowSessionModelAuto => "allow_session_model_auto",
+    }
+}
+
+fn tool_risk_value(risk: bot_core::approval::ToolRiskLevel) -> &'static str {
+    match risk {
+        bot_core::approval::ToolRiskLevel::Low => "low",
+        bot_core::approval::ToolRiskLevel::Medium => "medium",
+        bot_core::approval::ToolRiskLevel::High => "high",
+    }
+}
+
+fn approval_review_json(request: &ToolApprovalRequest) -> String {
+    request
+        .review
+        .as_ref()
+        .and_then(|review| serde_json::to_string(review).ok())
+        .unwrap_or_default()
+}
+
+fn agent_approval_requested(request: &ToolApprovalRequest) -> AgentToolApprovalRequested {
+    AgentToolApprovalRequested {
+        approval_id: request.id.clone(),
+        session_id: request.session_id.clone(),
+        run_id: request.run_id.clone(),
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.tool_name.clone(),
+        risk: tool_risk_value(request.risk).to_string(),
+        args_summary: request.args_summary.clone(),
+        review_json: approval_review_json(request),
+    }
+}
+
+fn agent_approval_updated(request: &ToolApprovalRequest) -> AgentToolApprovalUpdated {
+    AgentToolApprovalUpdated {
+        approval_id: request.id.clone(),
+        session_id: request.session_id.clone(),
+        run_id: request.run_id.clone(),
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.tool_name.clone(),
+        risk: tool_risk_value(request.risk).to_string(),
+        args_summary: request.args_summary.clone(),
+        review_json: approval_review_json(request),
+    }
+}
+
+fn agent_approval_resolved(
+    request: &ToolApprovalRequest,
+    decision: ToolApprovalDecision,
+) -> AgentToolApprovalResolved {
+    AgentToolApprovalResolved {
+        approval_id: request.id.clone(),
+        tool_name: request.tool_name.clone(),
+        decision: tool_approval_decision_value(decision).to_string(),
+        risk: tool_risk_value(request.risk).to_string(),
+        args_summary: request.args_summary.clone(),
+    }
 }
 
 #[cfg(test)]

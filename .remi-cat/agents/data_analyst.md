@@ -28,7 +28,7 @@ tools:
   - fs_remove
   - fs_ls
   - fetch
-  - acp__chat
+  - codex
   - manage_yourself
 delegates: []
 max_turns: null

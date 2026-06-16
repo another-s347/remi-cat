@@ -5,7 +5,7 @@
 //! ```text
 //! CatBot
 //!   └── CatAgent<AgentLoop<OpenAIClient>>
-//!         ├── local_tools: search / skill__get / skill__read_resource
+//!         ├── local_tools: search / skill__get
 //!         ├── local_tools: todo__add / todo__list / todo__complete / todo__update / todo__remove
 //!         └── local_tools: memory__get_detail
 //!   └── MemoryStore  (shared via Arc)
@@ -53,11 +53,14 @@ pub use model_profile::{
 };
 pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{
-    install_embedded_agent_profiles, AgentModelBindings, AgentProfile, AgentRegistry,
+    embedded_agent_profile, install_embedded_agent_profiles, AgentModelBindings, AgentProfile,
+    AgentRegistry,
 };
 pub use remi_agentloop::prelude::{Content, ContentPart, Message};
 pub use skill::store::{BuiltinSkillStore, FileSkillStore};
-pub use skill::store::{SkillDocument, SkillSummary};
+pub use skill::store::{
+    SkillDocument, SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, SkillSummary,
+};
 pub use supervisor_workflow::{
     SupervisorTraceEvent, WorkflowDecision, WorkflowDefinition, WorkflowEdge, WorkflowInstance,
     WorkflowMaxRounds, WorkflowNode, WorkflowReport, WorkflowStatus,
@@ -74,8 +77,8 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    AgentBuilder, AgentConfig, AgentError, AgentEvent, LoopInput, OpenAIClient, ReqwestTransport,
-    RunId, ThreadId, ToolContext,
+    AgentBuilder, AgentConfig, AgentError, AgentEvent, LoopInput, MessageId, OpenAIClient,
+    ReqwestTransport, Role, RunId, ThreadId, ToolContext,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use remi_agentloop_deepagent::{SubAgentEventStream, SubAgentToolAdapter};
@@ -297,6 +300,10 @@ impl CatBot {
         self.skill_store.featured_summaries()
     }
 
+    pub fn skill_load_diagnostics(&self) -> Vec<SkillLoadDiagnostic> {
+        self.skill_store.load_diagnostics()
+    }
+
     pub async fn get_skill(&self, name: &str) -> Result<Option<SkillDocument>, AgentError> {
         self.skill_store.get(name).await
     }
@@ -304,6 +311,10 @@ impl CatBot {
     pub async fn read_skill_names(&self, thread_id: &str) -> Vec<String> {
         let user_state = self.memory.load_user_state(thread_id).await;
         skill::tools::read_skill_names(&user_state)
+    }
+
+    pub fn workflow_definitions(&self) -> Result<Vec<WorkflowDefinition>, AgentError> {
+        supervisor_workflow::list_definitions(&self.memory.data_dir).map_err(AgentError::other)
     }
 
     pub fn default_model_profile(&self) -> &ModelProfileConfig {
@@ -672,7 +683,7 @@ impl CatBot {
         self.acp_backend
             .continue_bound_session(session_id, message)
             .await
-            .map_err(|err| remi_agentloop::prelude::AgentError::tool("acp__chat", err.to_string()))
+            .map_err(|err| remi_agentloop::prelude::AgentError::tool("codex", err.to_string()))
     }
 
     pub async fn acp_binding_status(
@@ -683,7 +694,7 @@ impl CatBot {
         self.acp_backend
             .binding_status_text(platform, channel_id)
             .await
-            .map_err(|err| remi_agentloop::prelude::AgentError::tool("acp__chat", err.to_string()))
+            .map_err(|err| remi_agentloop::prelude::AgentError::tool("codex", err.to_string()))
     }
 
     pub async fn acp_unbind_channel(
@@ -695,9 +706,7 @@ impl CatBot {
             .acp_backend
             .unbind_channel(platform, channel_id)
             .await
-            .map_err(|err| {
-                remi_agentloop::prelude::AgentError::tool("acp__chat", err.to_string())
-            })?;
+            .map_err(|err| remi_agentloop::prelude::AgentError::tool("codex", err.to_string()))?;
         if removed {
             Ok("ACP 绑定已解除。".to_string())
         } else {
@@ -1197,6 +1206,20 @@ impl CatBot {
 
             let initial_user_state = ctx.user_state.clone();
 
+            let current_user_message = Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: injected_user_name.clone(),
+                reasoning_content: None,
+                metadata: message_metadata.clone(),
+            };
+            let mut partial_base_history = history.clone();
+            partial_base_history.push(current_user_message);
+            let mut partial_turn = PartialTurnRecorder::new(partial_base_history);
+
             let mut input = LoopInput::start_content(content)
                 .history(history)
                 .metadata(meta)
@@ -1208,7 +1231,7 @@ impl CatBot {
                 input = input.message_metadata(mm);
             }
 
-            yield CatEvent::StateUpdate(initial_user_state);
+            yield CatEvent::StateUpdate(initial_user_state.clone());
 
             // 4. Drive inner agent, intercept History event to persist.
             let mut raw_history: Option<Vec<Message>> = None;
@@ -1245,7 +1268,9 @@ impl CatBot {
                         );
                         for event in persist_turn(
                             &self.memory, &thread_id_owned,
-                            raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                            raw_history.take().or_else(|| partial_turn.synthesize_history()),
+                            raw_user_state.take().or_else(|| Some(initial_user_state.clone())),
+                            skip_count, &tool_elapsed_ms,
                         ).await {
                             yield event;
                         }
@@ -1258,8 +1283,29 @@ impl CatBot {
                             raw_history = Some(msgs);
                             raw_user_state = Some(us);
                         }
+                        CatEvent::Text(text) => {
+                            partial_turn.on_text(&text);
+                            yield CatEvent::Text(text);
+                        }
+                        CatEvent::Thinking(content) => {
+                            partial_turn.on_thinking(content.clone());
+                            yield CatEvent::Thinking(content);
+                        }
+                        CatEvent::ToolCallStart { id, name } => {
+                            partial_turn.on_tool_start(id.clone(), name.clone());
+                            yield CatEvent::ToolCallStart { id, name };
+                        }
+                        CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                            partial_turn.on_tool_arguments_delta(&id, &delta);
+                            yield CatEvent::ToolCallArgumentsDelta { id, delta };
+                        }
+                        CatEvent::ToolCall { id, name, args } => {
+                            partial_turn.on_tool_call(id.clone(), name.clone(), args.clone());
+                            yield CatEvent::ToolCall { id, name, args };
+                        }
                         // Persist user_state immediately after each tool round.
                         CatEvent::StateUpdate(us) => {
+                            raw_user_state = Some(us.clone());
                             yield persist_intermediate_user_state(
                                 &self.memory,
                                 &thread_id_owned,
@@ -1276,6 +1322,14 @@ impl CatBot {
                             elapsed_ms,
                         } => {
                             tool_elapsed_ms.insert(id.clone(), elapsed_ms);
+                            partial_turn.on_tool_result(
+                                id.clone(),
+                                name.clone(),
+                                args.clone(),
+                                result.clone(),
+                                success,
+                                elapsed_ms,
+                            );
                             yield CatEvent::ToolCallResult {
                                 id,
                                 name,
@@ -1422,6 +1476,138 @@ enum WorkflowRoundOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+struct PartialToolActivity {
+    id: String,
+    name: String,
+    arguments_delta: String,
+    arguments: Option<serde_json::Value>,
+    result: Option<String>,
+    success: Option<bool>,
+    elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialTurnRecorder {
+    base_messages: Vec<Message>,
+    assistant_text: String,
+    reasoning_content: Option<String>,
+    tools: Vec<PartialToolActivity>,
+}
+
+impl PartialTurnRecorder {
+    fn new(base_messages: Vec<Message>) -> Self {
+        Self {
+            base_messages,
+            assistant_text: String::new(),
+            reasoning_content: None,
+            tools: Vec::new(),
+        }
+    }
+
+    fn on_text(&mut self, text: &str) {
+        self.assistant_text.push_str(text);
+    }
+
+    fn on_thinking(&mut self, content: String) {
+        self.reasoning_content = Some(content);
+    }
+
+    fn on_tool_start(&mut self, id: String, name: String) {
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.name = name;
+            return;
+        }
+        self.tools.push(PartialToolActivity {
+            id,
+            name,
+            arguments_delta: String::new(),
+            arguments: None,
+            result: None,
+            success: None,
+            elapsed_ms: None,
+        });
+    }
+
+    fn on_tool_arguments_delta(&mut self, id: &str, delta: &str) {
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.arguments_delta.push_str(delta);
+        }
+    }
+
+    fn on_tool_call(&mut self, id: String, name: String, args: serde_json::Value) {
+        self.on_tool_start(id.clone(), name);
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.arguments = Some(args);
+        }
+    }
+
+    fn on_tool_result(
+        &mut self,
+        id: String,
+        name: String,
+        args: serde_json::Value,
+        result: String,
+        success: bool,
+        elapsed_ms: u64,
+    ) {
+        self.on_tool_call(id.clone(), name, args);
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.result = Some(result);
+            tool.success = Some(success);
+            tool.elapsed_ms = Some(elapsed_ms);
+        }
+    }
+
+    fn synthesize_history(&self) -> Option<Vec<Message>> {
+        if self.assistant_text.is_empty()
+            && self.reasoning_content.is_none()
+            && self.tools.is_empty()
+        {
+            return (!self.base_messages.is_empty()).then(|| self.base_messages.clone());
+        }
+
+        let mut messages = self.base_messages.clone();
+        let mut content = self.assistant_text.clone();
+        if !self.tools.is_empty() {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str("[Cancelled tool activity]");
+            for tool in &self.tools {
+                content.push_str("\n- ");
+                content.push_str(&format!("{} ({})", tool.name, tool.id));
+                let args = tool
+                    .arguments
+                    .as_ref()
+                    .map(|value| value.to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| tool.arguments_delta.clone());
+                if !args.trim().is_empty() {
+                    content.push_str(&format!(" args: {}", args));
+                }
+                match (&tool.result, tool.success, tool.elapsed_ms) {
+                    (Some(result), Some(success), Some(elapsed_ms)) => {
+                        content.push_str(&format!(
+                            " result: {} success: {} elapsed_ms: {}",
+                            result, success, elapsed_ms
+                        ));
+                    }
+                    _ => content.push_str(" status: cancelled before completion"),
+                }
+            }
+        }
+        if content.is_empty() {
+            content = "[Cancelled before assistant text was produced]".to_string();
+        }
+
+        let mut message = Message::assistant(content);
+        message.reasoning_content = self.reasoning_content.clone();
+        messages.push(message);
+        Some(messages)
+    }
+}
+
 fn workflow_round_allows_continue(
     max_rounds: &WorkflowMaxRounds,
     completed_continuations: u32,
@@ -1547,10 +1733,17 @@ fn insert_skill_injection_prompts(
     }
     let mut offset = 0;
     for skill in skills {
+        let resource_hint = match (&skill.skill_file_path, &skill.resource_root_path) {
+            (Some(skill_file), Some(resource_root)) => format!(
+                "Use fs_read with skill_file_path={skill_file}; resource_root_path={resource_root} for supporting files."
+            ),
+            _ => "Supporting files for this skill are not readable through fs_read because the skill is outside the workspace root.".to_string(),
+        };
         let prompt = format!(
-            "Skill `{}` loaded for this turn from {}.\n\n{}",
+            "Skill `{}` loaded for this turn from {}. {}\n\n{}",
             skill.name,
             skill.source,
+            resource_hint,
             skill.content.trim_end()
         );
         history.insert(
@@ -1938,6 +2131,28 @@ fn auto_compress_context_percent() -> anyhow::Result<usize> {
     Ok(percent)
 }
 
+fn tool_output_overflow_bytes_from_env() -> anyhow::Result<Option<usize>> {
+    let Some((key, raw)) = ["REMI_TOOL_OUTPUT_OVERFLOW_BYTES", "REMI_OVERFLOW_BYTES"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        })
+    else {
+        return Ok(None);
+    };
+    let bytes = raw
+        .parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("invalid {key} `{raw}`: {err}"))?;
+    if bytes == 0 {
+        anyhow::bail!("{key} must be greater than 0");
+    }
+    Ok(Some(bytes))
+}
+
 fn context_percent_tokens(profile: &ModelProfileConfig, percent: usize) -> usize {
     let context_tokens = profile.context_tokens as usize;
     context_tokens.saturating_mul(percent).div_ceil(100).max(1)
@@ -1984,6 +2199,7 @@ impl CatBotBuilder {
         let short_term_tokens = std::env::var("REMI_SHORT_TERM_TOKENS")
             .ok()
             .and_then(|value| value.parse().ok());
+        let overflow_bytes = tool_output_overflow_bytes_from_env()?;
         let bash_mode = match std::env::var("REMI_SHELL_MODE")
             .or_else(|_| std::env::var("REMI_BASH_MODE"))
             .as_deref()
@@ -2013,7 +2229,7 @@ impl CatBotBuilder {
             data_dir: data_dir.clone(),
             agent_md_path,
             short_term_tokens,
-            overflow_bytes: None,
+            overflow_bytes,
             memory_days,
             sandbox_config,
             im_bridge: None,
@@ -2030,6 +2246,7 @@ impl CatBotBuilder {
         let agents_dir = std::env::var("REMI_AGENTS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir.join("agents"));
+        install_embedded_agent_profiles(&agents_dir)?;
         builder.agents_dir = agents_dir.clone();
         if let Ok(registry) = AgentRegistry::load(agents_dir) {
             if let Some(profile) = registry.get(&agent_id) {
@@ -2204,6 +2421,7 @@ impl CatBotBuilder {
         let data_dir = memory.data_dir.clone();
         let sandbox = self.sandbox_config.build()?;
         let agents_dir = self.agents_dir.clone();
+        install_embedded_agent_profiles(&agents_dir)?;
         let active_agent_id = self.active_agent_id.clone();
         let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
         let trigger_backend = Arc::new(trigger::TriggerBackend::new(data_dir.clone()));
@@ -2359,13 +2577,14 @@ impl CatBotBuilder {
                 model_extra_options.clone(),
             );
             let model_tools = tool_deps.build_tools(model_profile, model_extra_options, true);
+            let model_overflow_bytes = self.overflow_bytes.unwrap_or(model_profile.overflow_bytes);
             model_agents.insert(
                 model_profile.id.clone(),
                 CatAgent {
                     inner: model_inner,
                     local_tools: model_tools,
                     data_dir: memory.data_dir.clone(),
-                    overflow_bytes: model_profile.overflow_bytes,
+                    overflow_bytes: model_overflow_bytes,
                     im_bridge: self.im_bridge.clone(),
                     tool_allowlist: self.tool_allowlist.clone(),
                     approval_manager: Arc::clone(&approval_manager),
@@ -2413,13 +2632,39 @@ fn register_delegate_agent_tools(
     extra_options: serde_json::Map<String, serde_json::Value>,
     overflow_bytes: usize,
 ) {
-    let Ok(agent_registry) = AgentRegistry::load(&deps.agents_dir) else {
-        return;
+    let agent_registry = match AgentRegistry::load(&deps.agents_dir) {
+        Ok(registry) => Some(registry),
+        Err(err) => {
+            tracing::warn!(
+                agents_dir = %deps.agents_dir.display(),
+                error = %err,
+                "agent profile registry could not be loaded; using embedded delegate fallbacks"
+            );
+            None
+        }
     };
     for delegate_id in delegate_ids {
-        let Some(profile) = agent_registry.get(delegate_id).cloned() else {
-            tracing::warn!(delegate_id, "delegate agent profile not found");
-            continue;
+        let profile = match agent_registry
+            .as_ref()
+            .and_then(|registry| registry.get(delegate_id))
+            .cloned()
+        {
+            Some(profile) => profile,
+            None => match embedded_agent_profile(delegate_id) {
+                Ok(Some(profile)) => profile,
+                Ok(None) => {
+                    tracing::warn!(delegate_id, "delegate agent profile not found");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        delegate_id,
+                        error = %err,
+                        "embedded delegate agent profile is invalid"
+                    );
+                    continue;
+                }
+            },
         };
         let tool_name = delegate_tool_name(&profile.id);
         let tool_description = format!(
@@ -2616,15 +2861,17 @@ mod tests {
         model_profile::ModelProfileConfig,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
-        GoalMaxRounds, Message, ModelProfileRegistry, SandboxConfig, ThreadRunLocks,
-        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        GoalMaxRounds, Message, ModelProfileRegistry, PartialTurnRecorder, SandboxConfig,
+        StreamOptions, ThreadRunLocks, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::todo::tools::TodoItem;
     use futures::StreamExt as _;
+    use remi_agentloop::prelude::Role;
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
@@ -2647,6 +2894,148 @@ mod tests {
             auto_compress: true,
             extra_options: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn build_installs_embedded_delegate_agent_profiles() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile: test_model_profile(),
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: vec!["explorer".to_string()],
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            agents_dir: agents_dir.clone(),
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .build()
+        .unwrap();
+
+        assert!(bot
+            .tool_list()
+            .iter()
+            .any(|(name, _)| name == "agent__explorer"));
+        assert!(agents_dir.join("explorer.md").exists());
+    }
+
+    #[test]
+    fn partial_turn_recorder_synthesizes_safe_cancel_history() {
+        let mut recorder = PartialTurnRecorder::new(vec![
+            Message::system("system"),
+            Message::user("inspect repo"),
+        ]);
+        recorder.on_text("I found the issue.");
+        recorder.on_tool_start("call_1".to_string(), "read_file".to_string());
+        recorder.on_tool_arguments_delta("call_1", "{\"path\":\"src/lib.rs\"");
+
+        let history = recorder
+            .synthesize_history()
+            .expect("partial history should be synthesized");
+        let assistant = history.last().expect("assistant message should exist");
+
+        assert_eq!(history.len(), 3);
+        assert!(matches!(assistant.role, Role::Assistant));
+        assert!(assistant.tool_calls.is_none());
+        assert!(assistant.tool_call_id.is_none());
+        let content = assistant.content.text_content();
+        assert!(content.contains("I found the issue."));
+        assert!(content.contains("[Cancelled tool activity]"));
+        assert!(content.contains("read_file (call_1)"));
+        assert!(content.contains("cancelled before completion"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_persists_partial_assistant_text() {
+        let (base_url, _requests) = start_slow_openai_mock_server("partial answer").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            agents_dir,
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .build()
+        .unwrap();
+
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let mut stream = std::pin::pin!(bot.stream_with_options(
+            "cancel-partial-thread",
+            Content::text("start"),
+            StreamOptions {
+                cancel: Some(Arc::clone(&cancel)),
+                ..StreamOptions::default()
+            },
+        ));
+        let mut saw_partial = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                CatEvent::Text(text) => {
+                    if text.contains("partial answer") {
+                        saw_partial = true;
+                        cancel.notify_one();
+                    }
+                }
+                CatEvent::Done => break,
+                CatEvent::Error(err) => panic!("stream error: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(saw_partial);
+        let persisted = tokio::fs::read_to_string(
+            data_dir
+                .path()
+                .join("memory/cancel-partial-thread/short_term.jsonl"),
+        )
+        .await
+        .expect("partial turn should be persisted");
+        assert!(persisted.contains("start"));
+        assert!(persisted.contains("partial answer"));
     }
 
     #[test]
@@ -3188,6 +3577,78 @@ You are Remi.
         (format!("http://{addr}/v1"), requests)
     }
 
+    async fn start_slow_openai_mock_server(
+        first_content: &str,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let first_content = first_content.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = Arc::clone(&captured_requests);
+                let first_content = first_content.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0_u8; 1024];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = find_header_end(&buffer) {
+                            break pos;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while buffer.len() < body_start + content_length {
+                        let mut chunk = vec![0_u8; body_start + content_length - buffer.len()];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                    }
+                    let body =
+                        String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
+                            .to_string();
+                    requests.lock().expect("request lock poisoned").push(body);
+
+                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    let chunk = json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": first_content},
+                            "finish_reason": null
+                        }]
+                    });
+                    socket
+                        .write_all(format!("data: {chunk}\n\n").as_bytes())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = socket.write_all(b"data: [DONE]\n\n").await;
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
     fn find_header_end(buffer: &[u8]) -> Option<usize> {
         buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
@@ -3290,7 +3751,7 @@ fn default_system_prompt() -> String {
      complete named memory before acknowledging it; do not rely only on short-term chat history. \
      When editing files, prefer apply_patch for focused changes to existing files. Use fs_write \
      only to create a new file or when you intentionally replace a whole file after reading it. \
-     Use skill__get/skill__read_resource to inspect reusable procedures and related resources, todo tools \
+    Use skill__get to inspect reusable procedures; use fs_read with the returned resource_root_path for related resources. Use todo tools \
      (todo__add/list/complete/update/remove) to track multi-step work per thread; \
      todo__add creates a titled batch of child todos and returns their IDs, \
      memory__upsert_named to save stable facts, preferences, and project conventions, \

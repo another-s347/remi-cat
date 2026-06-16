@@ -10,9 +10,13 @@ const KEYRING_INDEX_USER: &str = "__remi_cat_secret_index";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretBackend {
-    Dotenv { path: PathBuf },
+    Dotenv {
+        path: PathBuf,
+    },
     #[cfg(feature = "secure-storage")]
-    Keyring { service: String },
+    Keyring {
+        service: String,
+    },
 }
 
 #[derive(Debug, Clone)]

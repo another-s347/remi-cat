@@ -18,8 +18,8 @@ use crate::instance_profile::{
     DIAGNOSTIC_PROFILE_NAME,
 };
 use crate::runtime_config::{
-    detect_setup_state, write_runtime_config, FeishuTransport, ImMode, RuntimeConfig,
-    RuntimeSandboxKind, SetupState, ShellMode,
+    detect_setup_state, write_runtime_config, AcpClient, AcpMode, FeishuTransport, ImMode,
+    RuntimeConfig, RuntimeSandboxKind, SetupState, ShellMode,
 };
 
 pub(crate) const PROFILE_RUNTIME_ENV_KEYS: &[&str] = &[
@@ -100,156 +100,6 @@ pub enum ProfileWorkflowCommand {
     },
 }
 
-pub fn parse_profile_command(args: &[String]) -> anyhow::Result<ProfileCommand> {
-    match args.first().map(String::as_str) {
-        Some("list") => Ok(ProfileCommand::List),
-        Some("show") => {
-            let name = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Show(name))
-        }
-        Some("create") => {
-            let name = next_arg(args, 0)?;
-            if name == DIAGNOSTIC_PROFILE_NAME {
-                anyhow::bail!("profile `{DIAGNOSTIC_PROFILE_NAME}` is builtin and cannot be created manually");
-            }
-            crate::instance_profile::validate_profile_name(&name)?;
-            Ok(ProfileCommand::Create {
-                name,
-                entries: args[2..].to_vec(),
-            })
-        }
-        Some("delete") => {
-            let name = next_arg(args, 0)?;
-            if name == "default" {
-                anyhow::bail!("the default profile cannot be deleted");
-            }
-            if name == DIAGNOSTIC_PROFILE_NAME {
-                anyhow::bail!("builtin profile `{DIAGNOSTIC_PROFILE_NAME}` cannot be deleted");
-            }
-            crate::instance_profile::validate_profile_name(&name)?;
-            Ok(ProfileCommand::Delete {
-                name,
-                force: args[2..].iter().any(|arg| arg == "--force"),
-            })
-        }
-        Some("start") => {
-            let name = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Start(name))
-        }
-        Some("stop") => {
-            let name = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Stop {
-                name,
-                force: args[2..].iter().any(|arg| arg == "--force"),
-            })
-        }
-        Some("restart") => {
-            let name = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Restart {
-                name,
-                force: args[2..].iter().any(|arg| arg == "--force"),
-            })
-        }
-        Some("status") if args.get(1).map(String::as_str) == Some("--all") => {
-            Ok(ProfileCommand::StatusAll)
-        }
-        Some("status") => {
-            let name = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Status(name))
-        }
-        Some("agent") => Ok(ProfileCommand::Agent(parse_profile_agent_command(
-            &args[1..],
-        )?)),
-        Some("workflow") => Ok(ProfileCommand::Workflow(parse_profile_workflow_command(
-            &args[1..],
-        )?)),
-        Some(other) => anyhow::bail!("unknown `remi-cat profile` subcommand `{other}`"),
-        None => anyhow::bail!(
-            "usage: remi-cat profile <list|show|create|delete|start|stop|restart|status|agent|workflow>"
-        ),
-    }
-}
-
-fn parse_profile_agent_command(args: &[String]) -> anyhow::Result<ProfileAgentCommand> {
-    match args.first().map(String::as_str) {
-        Some("list") => {
-            let profile = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileAgentCommand::List { profile })
-        }
-        Some("show") => {
-            let profile = next_arg(args, 0)?;
-            let agent_id = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileAgentCommand::Show { profile, agent_id })
-        }
-        Some("upsert") => {
-            let profile = next_arg(args, 0)?;
-            let path = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileAgentCommand::Upsert { profile, path })
-        }
-        Some("set-default") => {
-            let profile = next_arg(args, 0)?;
-            let agent_id = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileAgentCommand::SetDefault { profile, agent_id })
-        }
-        Some(other) => anyhow::bail!("unknown `remi-cat profile agent` subcommand `{other}`"),
-        None => anyhow::bail!(
-            "usage: remi-cat profile agent <list|show|upsert|set-default> <profile> ..."
-        ),
-    }
-}
-
-fn parse_profile_workflow_command(args: &[String]) -> anyhow::Result<ProfileWorkflowCommand> {
-    match args.first().map(String::as_str) {
-        Some("list") => {
-            let profile = next_arg(args, 0)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileWorkflowCommand::List { profile })
-        }
-        Some("show") => {
-            let profile = next_arg(args, 0)?;
-            let workflow_id = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            validate_file_id(&workflow_id)?;
-            Ok(ProfileWorkflowCommand::Show {
-                profile,
-                workflow_id,
-            })
-        }
-        Some("upsert") => {
-            let profile = next_arg(args, 0)?;
-            let path = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            Ok(ProfileWorkflowCommand::Upsert { profile, path })
-        }
-        Some("delete") => {
-            let profile = next_arg(args, 0)?;
-            let workflow_id = next_arg(args, 1)?;
-            let _ = InstanceProfile::from_label(&profile)?;
-            validate_file_id(&workflow_id)?;
-            if workflow_id == "goal" {
-                anyhow::bail!("embedded workflow `goal` cannot be deleted");
-            }
-            Ok(ProfileWorkflowCommand::Delete {
-                profile,
-                workflow_id,
-            })
-        }
-        Some(other) => anyhow::bail!("unknown `remi-cat profile workflow` subcommand `{other}`"),
-        None => anyhow::bail!(
-            "usage: remi-cat profile workflow <list|show|upsert|delete> <profile> ..."
-        ),
-    }
-}
-
 pub fn run_noninteractive_setup(
     profile: &InstanceProfile,
     data_dir: &Path,
@@ -310,6 +160,14 @@ pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
                     println!("runtime_config: {}", config_path.display());
                     println!("root_agent_id: {}", config.root_agent_id);
                     println!("model_profile: {}", config.model_profile);
+                    println!(
+                        "tool_output_overflow_bytes: {}",
+                        config
+                            .tool_output
+                            .overflow_bytes
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "model_profile_default".to_string())
+                    );
                     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
                     println!("sandbox_container: {}", config.sandbox.container_name);
                     println!("im_mode: {}", config.im.mode.as_env_value());
@@ -607,7 +465,7 @@ fn read_cli_input(path: &str) -> anyhow::Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
 }
 
-fn validate_file_id(id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_file_id(id: &str) -> anyhow::Result<()> {
     if id.is_empty()
         || !id
             .bytes()
@@ -962,6 +820,10 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
     match key.as_str() {
         "root_agent_id" | "root_agent" | "agent" => config.root_agent_id = value.to_string(),
         "model_profile" | "model" => config.model_profile = value.to_string(),
+        "tool_output_overflow_bytes"
+        | "tool_output.overflow_bytes"
+        | "overflow_bytes"
+        | "tool_overflow_bytes" => config.tool_output.overflow_bytes = Some(parse_usize(value)?),
         "admin_enabled" | "admin.enabled" => config.admin.enabled = parse_bool(value)?,
         "admin_host" | "admin.host" => config.admin.host = value.to_string(),
         "admin_port" | "admin.port" => config.admin.port = parse_port(value)?,
@@ -975,6 +837,14 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
             config.sandbox.container_name = value.to_string()
         }
         "shell_mode" | "shell.mode" => config.shell.mode = parse_shell_mode(value)?,
+        "acp_mode" | "acp.mode" => config.acp.mode = parse_acp_mode(value)?,
+        "acp_client" | "acp.client" => config.acp.client = parse_acp_client(value)?,
+        "acp_agent_name" | "acp.agent_name" | "acp.agent" => {
+            config.acp.agent_name = nonempty_optional(value)
+        }
+        "acp_codex_bin" | "acp.codex_bin" | "codex.bin" | "codex_bin" => {
+            config.acp.codex_bin = nonempty_optional(value)
+        }
         "im_mode" | "im.mode" => config.im.mode = parse_im_mode(value)?,
         "feishu_transport" | "im_transport" | "im.transport" | "feishu.transport" => {
             config.im.transport = parse_feishu_transport(value)?
@@ -1051,6 +921,14 @@ fn parse_port(value: &str) -> anyhow::Result<u16> {
     value.parse().context("invalid TCP port")
 }
 
+fn parse_usize(value: &str) -> anyhow::Result<usize> {
+    let parsed = value.parse().context("invalid positive integer")?;
+    if parsed == 0 {
+        anyhow::bail!("value must be greater than 0");
+    }
+    Ok(parsed)
+}
+
 fn parse_sandbox_kind(value: &str) -> anyhow::Result<RuntimeSandboxKind> {
     match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "disabled" => Ok(RuntimeSandboxKind::Disabled),
@@ -1082,6 +960,27 @@ fn parse_feishu_transport(value: &str) -> anyhow::Result<FeishuTransport> {
         "event_hook" | "hook" | "webhook" => Ok(FeishuTransport::EventHook),
         _ => anyhow::bail!("unknown Feishu transport `{value}`"),
     }
+}
+
+fn parse_acp_mode(value: &str) -> anyhow::Result<AcpMode> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "local" | "local_stub" | "stub" => Ok(AcpMode::LocalStub),
+        "remote" => Ok(AcpMode::Remote),
+        other => anyhow::bail!("unknown ACP mode `{other}`"),
+    }
+}
+
+fn parse_acp_client(value: &str) -> anyhow::Result<AcpClient> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "codex" => Ok(AcpClient::Codex),
+        "remi" | "stub" | "local" => Ok(AcpClient::Remi),
+        other => anyhow::bail!("unknown ACP client `{other}`"),
+    }
+}
+
+fn nonempty_optional(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub fn format_admin_addr(config: &RuntimeConfig) -> String {
@@ -1147,11 +1046,4 @@ pub fn available_container_name(requested: &str, data_dir: &Path) -> anyhow::Res
         }
     }
     unreachable!("u32 container-name suffix space exhausted")
-}
-
-fn next_arg(args: &[String], index: usize) -> anyhow::Result<String> {
-    args.get(index + 1)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{} requires a value", args[index]))
 }

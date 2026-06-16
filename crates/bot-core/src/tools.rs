@@ -426,7 +426,7 @@ impl Tool for ManageYourselfTool {
     }
 
     fn description(&self) -> &str {
-        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. The command is parsed as shell-like arguments but is not executed through a shell."
+        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. Use help commands such as {\"command\":\"help\"} or {\"command\":\"profile agent --help\"} to inspect available CLI commands. The command is parsed as shell-like arguments but is not executed through a shell."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -435,7 +435,7 @@ impl Tool for ManageYourselfTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "remi-cat arguments without the binary name, for example: profile list"
+                    "description": "remi-cat arguments without the binary name, for example: profile list; use help or <command> --help to inspect available commands"
                 }
             },
             "required": ["command"]
@@ -1663,7 +1663,8 @@ impl Tool for ExaSearchTool {
 
 // ── NowTool ───────────────────────────────────────────────────────────────────
 
-/// Returns the current UTC date and time.
+/// Returns the current date and time with timezone support.
+/// Includes Unix timestamp and day of week.
 pub struct NowTool;
 
 impl Tool for NowTool {
@@ -1671,42 +1672,169 @@ impl Tool for NowTool {
         "now"
     }
     fn description(&self) -> &str {
-        "Return the current UTC date and time in ISO 8601 format. \
+        "Return the current date and time with timezone, Unix timestamp, and weekday. \
          Use this whenever you need to know what time or date it is."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
-            "properties": {}
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "Optional timezone offset like '+08:00', '-05:00', '+0800', 'UTC', 'local', or 'Asia/Shanghai'. Defaults to the system local timezone."
+                }
+            }
         })
     }
     fn execute(
         &self,
-        _arguments: serde_json::Value,
+        arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         async move {
+            use chrono::{Datelike, FixedOffset, TimeZone, Timelike, Utc, Weekday};
+
+            let timezone_arg = arguments
+                .get("timezone")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local");
+            let timezone = parse_timezone_spec(timezone_arg).ok_or_else(|| {
+                AgentError::tool(
+                    "now",
+                    format!(
+                        "invalid timezone `{timezone_arg}`; use `local`, `UTC`, an offset like `+08:00`, or `Asia/Shanghai`"
+                    ),
+                )
+            })?;
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            let secs = now.as_secs();
-            // Format as ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
-            let s = secs % 60;
-            let m = (secs / 60) % 60;
-            let h = (secs / 3600) % 24;
-            let days = secs / 86400; // days since 1970-01-01
-            let (year, month, day) = days_to_ymd(days);
-            let formatted = format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z (unix: {})",
-                year, month, day, h, m, s, secs
-            );
+            let unix_secs = now.as_secs();
+
+            // Use chrono for timezone-aware datetime
+            let utc_dt = Utc
+                .timestamp_opt(unix_secs as i64, 0)
+                .single()
+                .unwrap_or_else(|| Utc::now());
+
+            let offset = FixedOffset::east_opt(timezone.offset_seconds)
+                .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+            let local_dt = utc_dt.with_timezone(&offset);
+
+            let weekday_en = match local_dt.weekday() {
+                Weekday::Mon => "Monday",
+                Weekday::Tue => "Tuesday",
+                Weekday::Wed => "Wednesday",
+                Weekday::Thu => "Thursday",
+                Weekday::Fri => "Friday",
+                Weekday::Sat => "Saturday",
+                Weekday::Sun => "Sunday",
+            };
+            let weekday_cn = match local_dt.weekday() {
+                Weekday::Mon => "周一",
+                Weekday::Tue => "周二",
+                Weekday::Wed => "周三",
+                Weekday::Thu => "周四",
+                Weekday::Fri => "周五",
+                Weekday::Sat => "周六",
+                Weekday::Sun => "周日",
+            };
+
+            let formatted = serde_json::json!({
+                "datetime": local_dt.to_rfc3339(),
+                "date": format!("{:04}-{:02}-{:02}", local_dt.year(), local_dt.month(), local_dt.day()),
+                "time": format!("{:02}:{:02}:{:02}", local_dt.hour(), local_dt.minute(), local_dt.second()),
+                "timezone": timezone.name,
+                "utc_offset": format_utc_offset(timezone.offset_seconds),
+                "unix_timestamp": unix_secs,
+                "unix_timestamp_ms": now.as_millis(),
+                "weekday": {
+                    "english": weekday_en,
+                    "chinese": weekday_cn,
+                    "iso_number": local_dt.weekday().number_from_monday(),
+                },
+            })
+            .to_string();
             Ok(ToolResult::Output(async_stream::stream! {
                 yield ToolOutput::text(formatted);
             }))
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTimezone {
+    name: String,
+    offset_seconds: i32,
+}
+
+/// Parse a timezone string into an offset in seconds east of UTC.
+/// Supports formats: "+08:00", "+0800", "-05:00", "UTC", "local", and a small
+/// set of fixed-offset aliases used by Remi deployments.
+fn parse_timezone_spec(s: &str) -> Option<ParsedTimezone> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("local") {
+        let now = chrono::Local::now();
+        let offset_seconds = now.offset().local_minus_utc();
+        return Some(ParsedTimezone {
+            name: "local".to_string(),
+            offset_seconds,
+        });
+    }
+    if s.eq_ignore_ascii_case("UTC") || s == "Z" || s == "z" {
+        return Some(ParsedTimezone {
+            name: "UTC".to_string(),
+            offset_seconds: 0,
+        });
+    }
+    if s.eq_ignore_ascii_case("Asia/Shanghai") || s.eq_ignore_ascii_case("Asia/Chongqing") {
+        return Some(ParsedTimezone {
+            name: "Asia/Shanghai".to_string(),
+            offset_seconds: 8 * 3600,
+        });
+    }
+
+    // Try to parse as "+HH:MM" or "+HHMM" or "-HH:MM" or "-HHMM"
+    let (sign, rest) = if let Some(rest) = s.strip_prefix('+') {
+        (1, rest)
+    } else if let Some(rest) = s.strip_prefix('-') {
+        (-1, rest)
+    } else {
+        return None;
+    };
+
+    let (hours, minutes): (i32, i32) = if let Some(pos) = rest.find(':') {
+        let h = rest[..pos].parse().unwrap_or(0);
+        let m = rest[pos + 1..].parse().unwrap_or(0);
+        (h, m)
+    } else if rest.len() == 4 {
+        let h = rest[..2].parse().unwrap_or(0);
+        let m = rest[2..].parse().unwrap_or(0);
+        (h, m)
+    } else {
+        return None;
+    };
+
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+
+    let offset_seconds = sign * (hours * 3600 + minutes * 60);
+    Some(ParsedTimezone {
+        name: format_utc_offset(offset_seconds),
+        offset_seconds,
+    })
+}
+
+fn format_utc_offset(offset_seconds: i32) -> String {
+    let offset_sign = if offset_seconds >= 0 { '+' } else { '-' };
+    let offset_abs = offset_seconds.abs();
+    let offset_h = offset_abs / 3600;
+    let offset_m = (offset_abs % 3600) / 60;
+    format!("{offset_sign}{offset_h:02}:{offset_m:02}")
 }
 
 /// Pause the tool loop briefly so the agent can wait before polling another tool.
@@ -1763,27 +1891,12 @@ impl Tool for SleepTool {
     }
 }
 
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // Shift epoch to 1 Mar 0000 (proleptic Gregorian) for easier math.
-    days += 719468;
-    let era = days / 146097;
-    let doe = days % 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        format_command_output, parse_apply_patch, parse_manage_yourself_command, ParsedPatchOp,
-        PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, WorkspaceBashTool,
+        format_command_output, format_utc_offset, parse_apply_patch, parse_manage_yourself_command,
+        parse_timezone_spec, NowTool, ParsedPatchOp, PatchHunk, RootedFsApplyPatchTool,
+        RootedFsReadTool, SecretRedactor, WorkspaceBashTool,
     };
     use crate::sandbox::NoSandbox;
     use futures::StreamExt;
@@ -1818,6 +1931,51 @@ mod tests {
             metadata: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
+    }
+
+    #[test]
+    fn now_timezone_parser_accepts_offsets_and_aliases() {
+        assert_eq!(parse_timezone_spec("UTC").unwrap().offset_seconds, 0);
+        assert_eq!(
+            parse_timezone_spec("Asia/Shanghai").unwrap().offset_seconds,
+            8 * 3600
+        );
+        assert_eq!(
+            parse_timezone_spec("+08:00").unwrap().offset_seconds,
+            8 * 3600
+        );
+        assert_eq!(
+            parse_timezone_spec("-0530").unwrap().offset_seconds,
+            -19_800
+        );
+        assert_eq!(format_utc_offset(-19_800), "-05:30");
+        assert!(parse_timezone_spec("not-a-zone").is_none());
+    }
+
+    #[tokio::test]
+    async fn now_tool_returns_timezone_timestamp_and_weekday() {
+        let content = collect_tool_content(
+            <NowTool as Tool>::execute(
+                &NowTool,
+                json!({ "timezone": "Asia/Shanghai" }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("now should return tool output"),
+        )
+        .await;
+        let value: serde_json::Value =
+            serde_json::from_str(&content.text_content()).expect("now output should be json");
+
+        assert_eq!(value["timezone"], "Asia/Shanghai");
+        assert_eq!(value["utc_offset"], "+08:00");
+        assert!(value["datetime"].as_str().unwrap().contains("+08:00"));
+        assert!(value["unix_timestamp"].as_u64().is_some());
+        assert!(value["unix_timestamp_ms"].as_u64().is_some());
+        assert!(value["weekday"]["english"].as_str().is_some());
+        assert!(value["weekday"]["chinese"].as_str().is_some());
+        assert!(value["weekday"]["iso_number"].as_u64().is_some());
     }
 
     #[test]

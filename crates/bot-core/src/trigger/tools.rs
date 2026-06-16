@@ -278,7 +278,7 @@ impl Tool for TriggerUpsertTool {
                 },
                 "precondition": {
                     "type": "array",
-                    "description": "Trigger rules evaluated before the main condition. Inspect the builtin trigger skill for supported patterns.",
+                    "description": "Trigger rules evaluated before the main condition. Use timer('5m') for one-shot relative waits and cron('0 9 * * *') only for recurring schedules. Inspect the builtin trigger skill for supported patterns.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -290,7 +290,7 @@ impl Tool for TriggerUpsertTool {
                 },
                 "condition": {
                     "type": "array",
-                    "description": "Additional trigger rules. Inspect the builtin trigger skill for supported patterns.",
+                    "description": "Additional trigger rules. Use timer(...) for one-shot timing and cron(...) only for recurring timing. Inspect the builtin trigger skill for supported patterns.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -424,8 +424,52 @@ impl Tool for TriggerDeleteTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_upsert_request, TriggerRuleSpec};
+    use super::{
+        parse_upsert_request, TriggerDeleteTool, TriggerListTool, TriggerRuleSpec,
+        TriggerUpsertTool,
+    };
+    use crate::trigger::backend::TriggerBackend;
+    use futures::StreamExt;
+    use remi_agentloop::prelude::{AgentConfig, Tool, ToolContext, ToolOutput, ToolResult};
     use serde_json::json;
+    use std::sync::{Arc, RwLock};
+
+    fn test_tool_context() -> ToolContext {
+        ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(json!("trigger-tool-test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(json!("trigger-tool-test-run"))
+                .expect("run_id should deserialize"),
+            metadata: Some(json!({
+                "thread_id": "trigger-tool-test-thread",
+                "trigger_tools_enabled": true,
+                "sender_user_id": "trigger-tool-test-user",
+                "sender_username": "Trigger Tool Test",
+            })),
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        }
+    }
+
+    async fn tool_output_text(
+        result: ToolResult<impl futures::Stream<Item = ToolOutput>>,
+    ) -> String {
+        match result {
+            ToolResult::Output(stream) => {
+                let mut stream = Box::pin(stream);
+                let mut text = String::new();
+                while let Some(output) = stream.next().await {
+                    if let ToolOutput::Result(content) = output {
+                        text.push_str(&content.text_content());
+                    }
+                }
+                text
+            }
+            ToolResult::Interrupt(_) => panic!("tool should not interrupt"),
+        }
+    }
 
     #[test]
     fn parse_upsert_request_requires_at_least_one_rule() {
@@ -469,5 +513,78 @@ mod tests {
                 description: "Every day at 09:00".to_string(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn trigger_tools_create_list_and_delete_with_local_backend() {
+        let data_dir =
+            std::env::temp_dir().join(format!("remi-trigger-tool-test-{}", uuid::Uuid::new_v4()));
+        let backend = Arc::new(TriggerBackend::new(data_dir.clone()));
+        let ctx = test_tool_context();
+
+        let upsert = TriggerUpsertTool::new(Arc::clone(&backend));
+        let list = TriggerListTool::new(Arc::clone(&backend));
+        let delete = TriggerDeleteTool::new(backend);
+
+        let created = tool_output_text(
+            upsert
+                .execute(
+                    json!({
+                        "name": "Morning summary",
+                        "request": "Send me a short summary every morning.",
+                        "precondition": [
+                            {
+                                "rule": "cron('0 9 * * *')",
+                                "description": "Every day at 09:00"
+                            }
+                        ],
+                        "condition": [
+                            {
+                                "rule": "true",
+                                "description": "Always run when scheduled"
+                            }
+                        ],
+                        "enabled": true
+                    }),
+                    None,
+                    &ctx,
+                )
+                .await
+                .expect("trigger upsert should succeed"),
+        )
+        .await;
+        let created: serde_json::Value =
+            serde_json::from_str(&created).expect("upsert output should be JSON");
+        assert_eq!(created["operation"], "created");
+        assert_eq!(created["item"]["id"], 1);
+        assert_eq!(created["item"]["name"], "Morning summary");
+
+        let listed = tool_output_text(
+            list.execute(json!({}), None, &ctx)
+                .await
+                .expect("trigger list should succeed"),
+        )
+        .await;
+        assert!(listed.contains("[1] Morning summary"));
+        assert!(listed.contains("cron('0 9 * * *')"));
+
+        let deleted = tool_output_text(
+            delete
+                .execute(json!({ "id": 1 }), None, &ctx)
+                .await
+                .expect("trigger delete should succeed"),
+        )
+        .await;
+        assert_eq!(deleted, "Removed trigger #1.");
+
+        let listed = tool_output_text(
+            list.execute(json!({}), None, &ctx)
+                .await
+                .expect("trigger list after delete should succeed"),
+        )
+        .await;
+        assert_eq!(listed, "No triggers.");
+
+        let _ = tokio::fs::remove_dir_all(data_dir).await;
     }
 }

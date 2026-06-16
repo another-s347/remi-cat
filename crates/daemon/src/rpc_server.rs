@@ -25,10 +25,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
+use im_feishu::client::{build_tool_approval_card, build_tool_approval_resolved_card};
 use remi_proto::{
     AgentPayload, AgentStats, DaemonMessage, DaemonPayload, DaemonService, DaemonServiceServer,
-    ImAttachmentRef, ImDocumentRef, ImMessageEvent, ImReactionEvent, SecretsSync,
-    ShutdownSignal, TriggerRunEvent,
+    ImAttachmentRef, ImDocumentRef, ImMessageEvent, ImReactionEvent, SecretsSync, ShutdownSignal,
+    TriggerRunEvent,
 };
 
 use crate::acp_bindings::{AcpBindingStore, AcpChannelBinding};
@@ -92,7 +93,11 @@ impl RpcServer {
         )
     }
 
-    pub async fn get_acp_binding(&self, platform: &str, channel_id: &str) -> Option<AcpChannelBinding> {
+    pub async fn get_acp_binding(
+        &self,
+        platform: &str,
+        channel_id: &str,
+    ) -> Option<AcpChannelBinding> {
         self.acp_bindings.lock().await.get(platform, channel_id)
     }
 
@@ -252,6 +257,7 @@ impl DaemonService for RpcServer {
             let mut inbound = request.into_inner();
             let mut cards: HashMap<String, StreamingReply> = HashMap::new();
             let mut todo_cards: HashMap<String, String> = HashMap::new();
+            let mut approval_cards: HashMap<String, String> = HashMap::new();
 
             while let Some(result) = inbound.next().await {
                 let agent_msg = match result {
@@ -333,6 +339,59 @@ impl DaemonService for RpcServer {
                             todo_cards.insert(reply_to.clone(), markdown);
                         } else {
                             todo_cards.remove(&reply_to);
+                        }
+                    }
+
+                    Some(AgentPayload::ToolApprovalRequested(request)) => {
+                        let card = build_tool_approval_card(
+                            &request.approval_id,
+                            &request.tool_name,
+                            &request.risk,
+                            &request.args_summary,
+                            approval_review_text(&request.review_json).as_deref(),
+                        );
+                        match transport.reply_card_raw_with_id(&reply_to, card).await {
+                            Ok(Some(card_message_id)) => {
+                                approval_cards.insert(request.approval_id, card_message_id);
+                            }
+                            Ok(None) => {
+                                debug!("approval card sent on transport without update id");
+                            }
+                            Err(err) => {
+                                warn!("send approval card failed: {err:#}");
+                            }
+                        }
+                    }
+
+                    Some(AgentPayload::ToolApprovalUpdated(request)) => {
+                        let Some(card_message_id) = approval_cards.get(&request.approval_id) else {
+                            continue;
+                        };
+                        let card = build_tool_approval_card(
+                            &request.approval_id,
+                            &request.tool_name,
+                            &request.risk,
+                            &request.args_summary,
+                            approval_review_text(&request.review_json).as_deref(),
+                        );
+                        if let Err(err) = transport.update_card_raw(card_message_id, card).await {
+                            warn!("update approval card failed: {err:#}");
+                        }
+                    }
+
+                    Some(AgentPayload::ToolApprovalResolved(resolved)) => {
+                        let Some(card_message_id) = approval_cards.remove(&resolved.approval_id)
+                        else {
+                            continue;
+                        };
+                        let card = build_tool_approval_resolved_card(
+                            &resolved.tool_name,
+                            &resolved.risk,
+                            &resolved.args_summary,
+                            &resolved.decision,
+                        );
+                        if let Err(err) = transport.update_card_raw(&card_message_id, card).await {
+                            warn!("resolve approval card failed: {err:#}");
                         }
                     }
 
@@ -586,6 +645,39 @@ fn stats_block(stats: &AgentStats) -> String {
         "\n\n---\n📊 *tokens: {}↑ {}↓ | 耗时: {}.{:03}s*",
         stats.prompt_tokens, stats.completion_tokens, secs, ms
     )
+}
+
+fn approval_review_text(review_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(review_json).ok()?;
+    let reason = value
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let concerns = value
+        .get("concerns")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut text = String::new();
+    if !reason.trim().is_empty() {
+        text.push_str(reason.trim());
+    }
+    if !concerns.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str("Concerns:");
+        for concern in concerns {
+            text.push_str("\n- ");
+            text.push_str(concern);
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
 }
 
 #[cfg(test)]

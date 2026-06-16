@@ -12,6 +12,8 @@ pub struct RuntimeConfig {
     pub root_agent_id: String,
     pub model_profile: String,
     #[serde(default)]
+    pub tool_output: ToolOutputConfig,
+    #[serde(default)]
     pub sandbox: RuntimeSandboxConfig,
     #[serde(default)]
     pub admin: AdminConfig,
@@ -29,6 +31,7 @@ impl RuntimeConfig {
             data_dir: data_dir.display().to_string(),
             root_agent_id: "default".to_string(),
             model_profile: "default".to_string(),
+            tool_output: ToolOutputConfig::default(),
             sandbox: RuntimeSandboxConfig::default_for(data_dir),
             admin: AdminConfig::default(),
             im: ImConfig::default(),
@@ -41,6 +44,12 @@ impl RuntimeConfig {
         set_env_if_absent("REMI_DATA_DIR", &self.data_dir);
         set_env_if_absent("REMI_AGENT_ID", &self.root_agent_id);
         set_env_if_absent("REMI_MODEL_PROFILE", &self.model_profile);
+        if let Some(overflow_bytes) = self.tool_output.overflow_bytes {
+            set_env_if_absent(
+                "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
+                &overflow_bytes.to_string(),
+            );
+        }
         set_env_if_absent("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
         set_env_if_absent(
             "REMI_SANDBOX_HOST_DIR",
@@ -72,7 +81,29 @@ impl RuntimeConfig {
         set_env_if_absent("REMI_SHELL_MODE", self.shell.mode.as_env_value());
         set_env_if_absent("REMI_ACP_MODE", self.acp.mode.as_env_value());
         set_env_if_absent("REMI_ACP_CLIENT", self.acp.client.as_env_value());
+        if let Some(agent_name) = self
+            .acp
+            .agent_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_AGENT_NAME", agent_name);
+        }
+        if let Some(codex_bin) = self
+            .acp
+            .codex_bin
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_CODEX_BIN", codex_bin);
+        }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolOutputConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +306,10 @@ pub struct AcpConfig {
     pub mode: AcpMode,
     #[serde(default)]
     pub client: AcpClient,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_bin: Option<String>,
 }
 
 impl Default for AcpConfig {
@@ -282,6 +317,8 @@ impl Default for AcpConfig {
         Self {
             mode: AcpMode::LocalStub,
             client: AcpClient::Codex,
+            agent_name: None,
+            codex_bin: None,
         }
     }
 }
@@ -289,8 +326,8 @@ impl Default for AcpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpClient {
-    #[default]
     Remi,
+    #[default]
     Codex,
 }
 
@@ -467,6 +504,9 @@ mod tests {
             data_dir: dir.display().to_string(),
             root_agent_id: "default".into(),
             model_profile: "deepseek-v4-flash".into(),
+            tool_output: super::ToolOutputConfig {
+                overflow_bytes: Some(32_768),
+            },
             sandbox: super::RuntimeSandboxConfig::default_for(&dir),
             admin: AdminConfig::default(),
             im: Default::default(),
@@ -477,6 +517,18 @@ mod tests {
         let loaded = load_runtime_config(&dir).unwrap().unwrap();
         assert_eq!(loaded, cfg);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_config_defaults_missing_tool_output() {
+        let raw = r#"
+data_dir: .remi-cat
+root_agent_id: default
+model_profile: default
+"#;
+        let cfg: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
+
+        assert_eq!(cfg.tool_output.overflow_bytes, None);
     }
 
     #[test]

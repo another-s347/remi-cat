@@ -10,5 +10,7 @@ pub fn register_acp_tools(
     registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry,
     backend: Arc<AcpBackend>,
 ) {
-    registry.register(AcpChatTool::new(backend));
+    if backend.codex_tool_available() {
+        registry.register(AcpChatTool::codex(backend));
+    }
 }

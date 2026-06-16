@@ -138,7 +138,10 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
         }
         value if value.starts_with("memory__") => ("检索/更新记忆".to_string(), value.to_string()),
         value if value.starts_with("trigger__") => ("管理触发器".to_string(), value.to_string()),
-        "acp__chat" => ("调用 ACP 子会话".to_string(), "等待子会话回复".to_string()),
+        "codex" => (
+            "调用 Codex 子会话".to_string(),
+            "等待 Codex 回复".to_string(),
+        ),
         value if value.starts_with("agent__") => {
             let agent = value.strip_prefix("agent__").unwrap_or(value);
             (format!("调用 agent {agent}"), "等待子会话回复".to_string())
@@ -177,7 +180,7 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
         "fetch" => fetch_summary(result).unwrap_or(started),
         "workspace_bash" | "bash" => bash_summary(args, result),
         "manage_yourself" => remi_command_summary(args, result),
-        "acp__chat" => acp_chat_summary(result).unwrap_or_else(|| "子会话已完成".to_string()),
+        "codex" => acp_chat_summary(result).unwrap_or_else(|| "Codex 子会话已完成".to_string()),
         value if value.starts_with("agent__") => "子会话已完成".to_string(),
         _ => first_line(result).unwrap_or(&started).to_string(),
     };

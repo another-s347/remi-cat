@@ -10,6 +10,10 @@ const EMBEDDED_AGENT_PROFILES: &[(&str, &str)] = &[
         include_str!("../../../.remi-cat/agents/default.md"),
     ),
     (
+        "explorer.md",
+        include_str!("../../../.remi-cat/agents/explorer.md"),
+    ),
+    (
         "remi_diagnostics.md",
         include_str!("../../../.remi-cat/agents/remi_diagnostics.md"),
     ),
@@ -74,6 +78,16 @@ pub fn install_embedded_agent_profiles(dir: impl AsRef<Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn embedded_agent_profile(id: &str) -> Result<Option<AgentProfile>> {
+    for (_, contents) in EMBEDDED_AGENT_PROFILES {
+        let profile = AgentProfile::from_markdown(contents)?;
+        if profile.id == id {
+            return Ok(Some(profile));
+        }
+    }
+    Ok(None)
 }
 
 impl AgentRegistry {
@@ -169,7 +183,7 @@ fn validate_required(field: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_embedded_agent_profiles, AgentProfile};
+    use super::{embedded_agent_profile, install_embedded_agent_profiles, AgentProfile};
 
     const PROFILE: &str = r#"---
 id: default
@@ -181,7 +195,7 @@ models:
   vision: gpt-4o
 tools:
   - search
-  - acp__chat
+  - codex
 delegates:
   - coder
 max_turns: 12
@@ -196,7 +210,7 @@ You are Remi.
         assert_eq!(profile.system_prompt, "You are Remi.");
         assert_eq!(profile.models.helper.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(profile.models.vision.as_deref(), Some("gpt-4o"));
-        assert!(profile.allows_tool("acp__chat"));
+        assert!(profile.allows_tool("codex"));
         assert!(!profile.allows_tool("bash"));
     }
 
@@ -217,6 +231,14 @@ You are Remi.
         let profile = AgentProfile::from_markdown_file(&path).unwrap();
         assert_eq!(profile.id, "default");
         assert!(profile.allows_tool("fetch"));
+        assert!(profile.allows_tool("now"));
+        assert_eq!(profile.delegates, vec!["explorer".to_string()]);
+        let explorer_path = dir.join("explorer.md");
+        assert!(explorer_path.exists());
+        let explorer = AgentProfile::from_markdown_file(&explorer_path).unwrap();
+        assert_eq!(explorer.id, "explorer");
+        assert!(explorer.allows_tool("fs_read"));
+        assert!(explorer.allows_tool("fs_ls"));
         let diagnostics_path = dir.join("remi_diagnostics.md");
         assert!(diagnostics_path.exists());
         let diagnostics = AgentProfile::from_markdown_file(&diagnostics_path).unwrap();
@@ -245,5 +267,13 @@ Custom prompt.
         );
         assert!(dir.join("remi_diagnostics.md").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn embedded_agent_profile_can_load_explorer_without_filesystem() {
+        let explorer = embedded_agent_profile("explorer").unwrap().unwrap();
+        assert_eq!(explorer.id, "explorer");
+        assert!(explorer.allows_tool("fs_read"));
+        assert!(embedded_agent_profile("missing").unwrap().is_none());
     }
 }

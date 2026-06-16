@@ -13,7 +13,7 @@ im-feishu = { path = "../im-feishu" }
 im-gateway = { path = "../im-gateway" }
 matcher = { path = "../matcher" }
 user-store = { path = "../user-store" }
-remi-client-sdk = { path = "../../../remi-sdk/remi-client-sdk" }
+remi-client-sdk = { path = "../remi-client-sdk" }
 
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"

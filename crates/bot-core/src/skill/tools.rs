@@ -5,9 +5,12 @@ use remi_agentloop::prelude::{
 };
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 
-use super::store::{SkillStore, SkillSummary};
+use super::store::{
+    canonical_name, SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, SkillStore, SkillSummary,
+};
 use crate::{suppress_trigger_management, trigger::BUILTIN_TRIGGER_SKILL_NAME};
 
 pub const READ_SKILLS_STATE_KEY: &str = "__read_skills";
@@ -20,9 +23,65 @@ fn render_skill_summary(summary: &SkillSummary) -> String {
     )
 }
 
+pub fn render_skill_diagnostics_summary(diagnostics: &[SkillLoadDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\n\nSkill load diagnostics:\n");
+    let limit = 8;
+    for diagnostic in diagnostics.iter().take(limit) {
+        let severity = match diagnostic.severity {
+            SkillLoadDiagnosticSeverity::Warning => "warning",
+            SkillLoadDiagnosticSeverity::Error => "error",
+        };
+        let skill = diagnostic
+            .skill
+            .as_deref()
+            .map(|skill| format!(" skill={skill}"))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "- {severity}:{skill} {} - {}\n",
+            diagnostic.path, diagnostic.message
+        ));
+    }
+    if diagnostics.len() > limit {
+        text.push_str(&format!(
+            "- ... {} more diagnostic(s) omitted\n",
+            diagnostics.len() - limit
+        ));
+    }
+    text.trim_end().to_string()
+}
+
+fn diagnostics_for_skill_name(
+    diagnostics: &[SkillLoadDiagnostic],
+    name: &str,
+) -> Vec<SkillLoadDiagnostic> {
+    let requested = canonical_name(name);
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .skill
+                .as_deref()
+                .map(canonical_name)
+                .is_some_and(|skill| skill == requested)
+                || diagnostic_path_skill_name(&diagnostic.path)
+                    .map(|skill| skill == requested)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn diagnostic_path_skill_name(path: &str) -> Option<String> {
+    let skill_dir = Path::new(path).parent()?.file_name()?.to_str()?;
+    Some(canonical_name(skill_dir))
+}
+
 fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
-        return "Local skills follow the Agent Skills SKILL.md directory format. Use skill__search with keywords to discover skills by name and description. Use skill__get to read one skill's instructions for the current turn; reading a skill also makes its resources available through skill__read_resource.".to_string();
+        return "Local skills follow the Agent Skills SKILL.md directory format. Use skill__search with keywords to discover skills by name and description. Use skill__get to read one skill's instructions for the current turn; use fs_read with the returned resource_root_path for supporting files.".to_string();
     }
 
     let mut prompt = String::from(
@@ -92,12 +151,6 @@ fn mark_skill_read(ctx: &ToolContext, name: &str) {
     }
 }
 
-fn skill_was_read(ctx: &ToolContext, name: &str) -> bool {
-    read_skill_names(&ctx.user_state.read().unwrap())
-        .iter()
-        .any(|item| item == name)
-}
-
 pub struct SkillGetTool<S> {
     pub(crate) store: Arc<S>,
 }
@@ -108,7 +161,7 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     }
 
     fn description(&self) -> &str {
-        "Read the full SKILL.md instructions for a local skill by name. The instructions are returned in this tool result; reading a skill also enables skill__read_resource for files in that skill."
+        "Read the full SKILL.md instructions for a local skill by name. The instructions are returned in this tool result. For supporting files, use fs_read with the returned resource_root_path."
     }
 
     fn extra_prompt(&self, ctx: &ToolDefinitionContext) -> Option<String> {
@@ -146,14 +199,37 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
             match self.store.get(&name).await? {
                 Some(doc) => {
                     mark_skill_read(ctx, &doc.name);
-                    format!(
-                        "{}\n\n[skill read: {} from {}; resources available via skill__read_resource]",
+                    let diagnostics =
+                        diagnostics_for_skill_name(&self.store.load_diagnostics(), &doc.name);
+                    let resource_hint = match (&doc.skill_file_path, &doc.resource_root_path) {
+                        (Some(skill_file), Some(resource_root)) => format!(
+                            "fs_read skill_file_path={skill_file}; resource_root_path={resource_root}"
+                        ),
+                        _ => "resources are not readable through fs_read because this skill is outside the workspace root".to_string(),
+                    };
+                    let mut text = format!(
+                        "{}\n\n[skill read: {} from {}; {}]",
                         doc.content.trim_end(),
                         doc.name,
-                        doc.source
+                        doc.source,
+                        resource_hint
+                    );
+                    text.push_str(&render_skill_diagnostics_summary(&diagnostics));
+                    text
+                }
+                None => {
+                    let diagnostics = self.store.load_diagnostics();
+                    let relevant = diagnostics_for_skill_name(&diagnostics, &name);
+                    let diagnostics = if relevant.is_empty() {
+                        diagnostics
+                    } else {
+                        relevant
+                    };
+                    format!(
+                        "Skill '{name}' not found.{}",
+                        render_skill_diagnostics_summary(&diagnostics)
                     )
                 }
-                None => format!("Skill '{name}' not found."),
             }
         };
         Ok(ToolResult::Output(
@@ -203,9 +279,11 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
             self.store.search(&query).await?,
             suppress_trigger_management(ctx.metadata.as_ref()),
         );
+        let diagnostics = self.store.load_diagnostics();
         let result = if matches.is_empty() {
             format!(
-                "No skills matched '{query}'. Search checks skill names and descriptions; try broader keywords."
+                "No skills matched '{query}'. Search checks skill names and descriptions; try broader keywords.{}",
+                render_skill_diagnostics_summary(&diagnostics)
             )
         } else {
             let mut text = format!("Found {} matching skill(s) for '{query}':\n", matches.len());
@@ -214,66 +292,8 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
                 text.push('\n');
             }
             text.push_str("Use skill__get with the exact skill name to read one.");
+            text.push_str(&render_skill_diagnostics_summary(&diagnostics));
             text
-        };
-        Ok(ToolResult::Output(
-            stream! { yield ToolOutput::text(result); },
-        ))
-    }
-}
-
-pub struct SkillReadResourceTool<S> {
-    pub(crate) store: Arc<S>,
-}
-
-impl<S: SkillStore + 'static> Tool for SkillReadResourceTool<S> {
-    fn name(&self) -> &str {
-        "skill__read_resource"
-    }
-
-    fn description(&self) -> &str {
-        "Read a UTF-8 text resource from a skill directory after that skill has been read with skill__get. Use this for scripts, templates, and reference files mentioned by SKILL.md."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "skill": { "type": "string", "description": "Skill name previously read with skill__get" },
-                "path": { "type": "string", "description": "Relative path inside the skill directory" }
-            },
-            "required": ["skill", "path"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
-        let skill = arguments["skill"]
-            .as_str()
-            .ok_or_else(|| AgentError::tool("skill__read_resource", "missing 'skill'"))?
-            .to_string();
-        let path = arguments["path"]
-            .as_str()
-            .ok_or_else(|| AgentError::tool("skill__read_resource", "missing 'path'"))?
-            .to_string();
-        let result = if !skill_was_read(ctx, &skill) {
-            format!(
-                "Skill '{skill}' has not been read in this session. Read it first with skill__get."
-            )
-        } else {
-            let resource = self.store.read_resource(&skill, &path).await?;
-            if resource.binary {
-                format!(
-                    "Resource '{}' in skill '{}' is binary ({} bytes); binary content was not inlined.",
-                    resource.path, resource.skill, resource.size
-                )
-            } else {
-                resource.content.unwrap_or_default()
-            }
         };
         Ok(ToolResult::Output(
             stream! { yield ToolOutput::text(result); },
@@ -285,6 +305,7 @@ impl<S: SkillStore + 'static> Tool for SkillReadResourceTool<S> {
 mod tests {
     use super::{
         filter_trigger_skill, read_skill_names, render_skill_get_extra_prompt, SkillGetTool,
+        SkillSearchTool,
     };
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, SkillSummary};
     use futures::StreamExt;
@@ -292,6 +313,13 @@ mod tests {
         AgentConfig, Tool, ToolContext, ToolDefinitionContext, ToolOutput, ToolResult,
     };
     use std::sync::{Arc, RwLock};
+    use uuid::Uuid;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("remi-skill-tool-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn empty_featured_prompt_points_to_search_and_get() {
@@ -299,7 +327,7 @@ mod tests {
         assert!(prompt.contains("skill__search"));
         assert!(prompt.contains("skill__get"));
         assert!(prompt.contains("current turn"));
-        assert!(prompt.contains("skill__read_resource"));
+        assert!(prompt.contains("fs_read"));
     }
 
     #[test]
@@ -394,10 +422,201 @@ mod tests {
 
         assert!(output.contains("Use primary sources."));
         assert!(output.contains("[skill read: researcher"));
+        assert!(output.contains("resources are not readable through fs_read"));
         assert!(!output.contains("[skill activated:"));
         assert_eq!(
             read_skill_names(&ctx.user_state.read().unwrap()),
             vec!["researcher"]
         );
+    }
+
+    #[tokio::test]
+    async fn skill_get_returns_fs_read_resource_paths_for_file_skills() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat").join("skills");
+        let skill_dir = primary.join("docs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: docs\ndescription: Docs workflow\n---\n\nRead references.",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("reference.md"), "details").unwrap();
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::new_in_workspace(&primary, &workspace),
+            [],
+        ));
+        let tool = SkillGetTool { store };
+        let ctx = ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "docs" }), None, &ctx)
+            .await
+            .expect("skill__get should succeed");
+        let ToolResult::Output(stream) = result else {
+            panic!("expected tool output");
+        };
+        let mut stream = std::pin::pin!(stream);
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+
+        assert!(output.contains("skill_file_path=.remi-cat/skills/docs/SKILL.md"));
+        assert!(output.contains("resource_root_path=.remi-cat/skills/docs"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn skill_get_includes_relevant_warnings_for_leniently_loaded_skill() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat").join("skills");
+        let skill_dir = primary.join("Loose Skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Loose workflow\n\nUse it.").unwrap();
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::new_in_workspace(&primary, &workspace),
+            [],
+        ));
+        let tool = SkillGetTool { store };
+        let ctx = ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "loose-skill" }), None, &ctx)
+            .await
+            .expect("skill__get should succeed");
+        let ToolResult::Output(stream) = result else {
+            panic!("expected tool output");
+        };
+        let mut stream = std::pin::pin!(stream);
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+
+        assert!(output.contains("[skill read: loose-skill"));
+        assert!(output.contains("Skill load diagnostics"));
+        assert!(output.contains("skill=loose-skill"));
+        assert!(output.contains("missing YAML frontmatter"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn skill_get_returns_diagnostics_for_failed_skill_by_directory_name() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat").join("skills");
+        let skill_dir = primary.join("broken");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: [broken\ndescription: Bad\n---\n\nBody",
+        )
+        .unwrap();
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::new_in_workspace(&primary, &workspace),
+            [],
+        ));
+        let tool = SkillGetTool { store };
+        let ctx = ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "broken" }), None, &ctx)
+            .await
+            .expect("skill__get should return diagnostics");
+        let ToolResult::Output(stream) = result else {
+            panic!("expected tool output");
+        };
+        let mut stream = std::pin::pin!(stream);
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+
+        assert!(output.contains("Skill 'broken' not found"));
+        assert!(output.contains("Skill load diagnostics"));
+        assert!(output.contains("skill=broken"));
+        assert!(output.contains("invalid skill frontmatter"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn skill_search_includes_load_diagnostics() {
+        let primary = temp_dir();
+        let compat = temp_dir();
+        let dir = primary.join("Loose Skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# Loose workflow\n\nUse it.").unwrap();
+        let store = Arc::new(BuiltinSkillStore::new(
+            FileSkillStore::with_roots([
+                (primary.clone(), ".remi-cat/skills".to_string()),
+                (compat.clone(), ".agents/skills".to_string()),
+            ]),
+            [],
+        ));
+        let tool = SkillSearchTool { store };
+        let ctx = ToolContext {
+            config: AgentConfig::default(),
+            thread_id: Some(
+                serde_json::from_value(serde_json::json!("test-thread"))
+                    .expect("thread_id should deserialize"),
+            ),
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({ "query": "loose" }), None, &ctx)
+            .await
+            .expect("skill__search should succeed");
+        let ToolResult::Output(stream) = result else {
+            panic!("expected tool output");
+        };
+        let mut stream = std::pin::pin!(stream);
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+
+        assert!(output.contains("loose-skill"));
+        assert!(output.contains("Skill load diagnostics"));
+        assert!(output.contains("missing YAML frontmatter"));
+
+        let _ = std::fs::remove_dir_all(primary);
+        let _ = std::fs::remove_dir_all(compat);
     }
 }

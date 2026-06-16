@@ -316,7 +316,7 @@ where
                                         ApprovalWait::Pending(rx) => {
                                             let should_wait = matches!(
                                                 approval_request.platform.as_deref(),
-                                                Some("web" | "tui")
+                                                Some("web" | "tui" | "feishu")
                                             );
                                             let wait_started = Instant::now();
                                             tracing::info!(
@@ -381,6 +381,10 @@ where
                                 }
 
                                 let resume_map = HashMap::new();
+                                let tool_names: HashMap<String, String> = approved_local
+                                    .iter()
+                                    .map(|tc| (tc.id.clone(), tc.name.clone()))
+                                    .collect();
                                 let started_at: HashMap<String, Instant> = approved_local
                                     .iter()
                                     .map(|tc| (tc.id.clone(), Instant::now()))
@@ -411,6 +415,7 @@ where
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
                                 let mut collect_fut = std::pin::pin!(collect_tool_results_parallel(
                                     results,
+                                    &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
@@ -530,7 +535,7 @@ where
                                         ApprovalWait::Pending(rx) => {
                                             let should_wait = matches!(
                                                 approval_request.platform.as_deref(),
-                                                Some("web" | "tui")
+                                                Some("web" | "tui" | "feishu")
                                             );
                                             let wait_started = Instant::now();
                                             tracing::info!(
@@ -595,6 +600,10 @@ where
                                 }
 
                                 let resume_map = HashMap::new();
+                                let tool_names: HashMap<String, String> = approved_dynamic
+                                    .iter()
+                                    .map(|tc| (tc.id.clone(), tc.name.clone()))
+                                    .collect();
                                 let started_at: HashMap<String, Instant> = approved_dynamic
                                     .iter()
                                     .map(|tc| (tc.id.clone(), Instant::now()))
@@ -624,6 +633,7 @@ where
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
                                 let mut collect_fut = std::pin::pin!(collect_tool_results_parallel(
                                     results,
+                                    &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
@@ -796,6 +806,7 @@ where
                                 elapsed_ms = run_start.elapsed().as_millis() as u64,
                                 "agent_run.cancelled"
                             );
+                            yield CatEvent::History(last_messages.clone(), last_user_state.clone());
                             yield CatEvent::Done;
                             return;
                         }
@@ -1014,6 +1025,7 @@ fn build_dynamic_tools(
 /// This const is the hard floor; the actual threshold comes from
 /// [`CatAgent::overflow_bytes`] which is derived from the model profile.
 const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
+const TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 512;
 
 #[derive(Debug, Clone)]
 struct CollectedToolResult {
@@ -1092,6 +1104,7 @@ fn preview_text_for_content(content: &Content) -> String {
 
 async fn collect_tool_results_parallel<'a>(
     results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
+    tool_names: &HashMap<String, String>,
     data_dir: &Path,
     overflow_bytes: usize,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
@@ -1100,6 +1113,7 @@ async fn collect_tool_results_parallel<'a>(
     let futures = results.into_iter().map(|(call_id, result)| {
         let data_dir = data_dir.clone();
         let side_event_tx = side_event_tx.clone();
+        let tool_name = tool_names.get(&call_id).cloned().unwrap_or_default();
         async move {
             let collected = collect_result_with_overflow(
                 result,
@@ -1107,6 +1121,7 @@ async fn collect_tool_results_parallel<'a>(
                 overflow_bytes,
                 side_event_tx,
                 Some(call_id.as_str()),
+                tool_name.as_str(),
             )
             .await;
             (call_id, collected)
@@ -1161,6 +1176,7 @@ async fn collect_result_with_overflow(
     overflow_bytes: usize,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
     parent_tool_call_id: Option<&str>,
+    tool_name: &str,
 ) -> CollectedToolResult {
     let collected = collect_result(result, side_event_tx, parent_tool_call_id).await;
     if collected.content.is_multimodal() {
@@ -1176,22 +1192,122 @@ async fn collect_result_with_overflow(
         };
     }
 
-    let tmp_dir = data_dir.join("tmp");
-    let _ = tokio::fs::create_dir_all(&tmp_dir).await;
-    let filename = format!("tool_out_{}.txt", uuid::Uuid::new_v4());
-    let file_path = tmp_dir.join(&filename);
     let total = text.len();
-    let mut result = match tokio::fs::write(&file_path, text.as_bytes()).await {
-        Ok(()) => CollectedToolResult::text(format!(
-            "[Output too large ({total} bytes) — saved to tmp/{filename}]\n\
-             Use fs_read with path=\"tmp/{filename}\" (offset=0, length={}) \
-             and increment offset until remaining=0.",
-            crate::tools::DEFAULT_FS_READ_LENGTH
-        )),
+    if tool_name == "fs_read" {
+        let mut result = CollectedToolResult::text(fs_read_overflow_summary(total, overflow_bytes));
+        result.side_events = side_events;
+        return result;
+    }
+    let mut result = match spill_tool_output_chunks(data_dir, &text, overflow_bytes).await {
+        Ok(spill) => CollectedToolResult::text(spill.summary(total)),
         Err(_) => CollectedToolResult::text(text),
     };
     result.side_events = side_events;
     result
+}
+
+fn fs_read_overflow_summary(total: usize, overflow_bytes: usize) -> String {
+    let suggested = fs_read_safe_retry_length(overflow_bytes);
+    format!(
+        "[fs_read output too large ({total} bytes) — not saved to a temporary file]\n\
+         Retry fs_read on the same path with a smaller length, for example length={suggested}, \
+         and advance offset by the returned length until remaining=0."
+    )
+}
+
+fn fs_read_safe_retry_length(overflow_bytes: usize) -> usize {
+    overflow_bytes
+        .saturating_sub(TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES)
+        .min(crate::tools::DEFAULT_FS_READ_LENGTH)
+        .max(1)
+}
+
+#[derive(Debug, Clone)]
+struct ToolOutputChunkSpill {
+    dir_name: String,
+    part_count: usize,
+    chunk_bytes: usize,
+}
+
+impl ToolOutputChunkSpill {
+    fn summary(&self, total: usize) -> String {
+        let width = part_number_width(self.part_count);
+        let first = chunk_filename(1, self.part_count);
+        let last = chunk_filename(self.part_count, self.part_count);
+        format!(
+            "[Output too large ({total} bytes) — split into {} chunk files under tmp/{}]\n\
+             Each chunk is at most {} bytes; there is no complete single output file.\n\
+             Read one chunk at a time with fs_read, for example path=\"tmp/{}/{}\".\n\
+             Continue in order through path=\"tmp/{}/{}\". Do not concatenate or read the whole directory at once.\n\
+             Filename pattern: part_<n>_of_<total>.txt with zero-padded {width}-digit numbers.",
+            self.part_count,
+            self.dir_name,
+            self.chunk_bytes,
+            self.dir_name,
+            first,
+            self.dir_name,
+            last
+        )
+    }
+}
+
+async fn spill_tool_output_chunks(
+    data_dir: &Path,
+    text: &str,
+    overflow_bytes: usize,
+) -> std::io::Result<ToolOutputChunkSpill> {
+    let chunk_bytes = tool_output_chunk_bytes(overflow_bytes);
+    let chunks = split_utf8_chunks(text, chunk_bytes);
+    let part_count = chunks.len().max(1);
+    let dir_name = format!("tool_out_{}", uuid::Uuid::new_v4());
+    let spill_dir = data_dir.join("tmp").join(&dir_name);
+    tokio::fs::create_dir_all(&spill_dir).await?;
+
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let filename = chunk_filename(index + 1, part_count);
+        tokio::fs::write(spill_dir.join(filename), chunk.as_bytes()).await?;
+    }
+
+    Ok(ToolOutputChunkSpill {
+        dir_name,
+        part_count,
+        chunk_bytes,
+    })
+}
+
+fn tool_output_chunk_bytes(overflow_bytes: usize) -> usize {
+    overflow_bytes
+        .saturating_sub(TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES)
+        .min(crate::tools::DEFAULT_FS_READ_LENGTH)
+        .max(1)
+}
+
+fn split_utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
+    let max_bytes = max_bytes.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut current = 0usize;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if current > start && next - start > max_bytes {
+            chunks.push(&text[start..current]);
+            start = index;
+        }
+        current = next;
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+fn chunk_filename(index: usize, total: usize) -> String {
+    let width = part_number_width(total);
+    format!("part_{index:0width$}_of_{total:0width$}.txt")
+}
+
+fn part_number_width(total: usize) -> usize {
+    total.max(1).to_string().len().max(4)
 }
 
 fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
@@ -1212,18 +1328,20 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
 mod tests {
     use super::{
         approval_request_for_tool, collect_result_with_overflow, collect_tool_results_parallel,
-        CatAgent,
+        fs_read_overflow_summary, split_utf8_chunks, tool_output_chunk_bytes, CatAgent,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
-        Agent, AgentError, AgentState, Content, ContentPart, LoopInput, ParsedToolCall, StepConfig,
-        ToolCallOutcome, ToolContext, ToolOutput, ToolResult,
+        Agent, AgentError, AgentState, Checkpoint, CheckpointStatus, Content, ContentPart,
+        LoopInput, Message, ParsedToolCall, StepConfig, ToolCallOutcome, ToolContext, ToolOutput,
+        ToolResult,
     };
     use remi_agentloop::tool::{
         registry::DefaultToolRegistry, BoxedToolResult, BoxedToolStream, Tool,
     };
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -1269,6 +1387,7 @@ mod tests {
             8,
             None,
             None,
+            "",
         )
         .await;
 
@@ -1286,7 +1405,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_text_results_still_spill_to_tmp_file() {
+    async fn large_text_results_spill_to_chunk_files() {
+        let root = test_root();
+        let text = "x".repeat(64);
+        let collected = collect_result_with_overflow(
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
+                text.clone(),
+            )]))),
+            &root,
+            8,
+            None,
+            None,
+            "",
+        )
+        .await;
+
+        let preview = collected.preview;
+        assert!(preview.contains("[Output too large (64 bytes)"));
+        assert!(preview.contains("split into 64 chunk files"));
+        assert!(preview.contains("there is no complete single output file"));
+        assert!(matches!(collected.content, Content::Text(ref text) if text == &preview));
+
+        let mut entries = tokio::fs::read_dir(root.join("tmp"))
+            .await
+            .expect("tmp dir should exist after overflow spill");
+        let spill_dir = entries
+            .next_entry()
+            .await
+            .expect("tmp dir should be readable")
+            .expect("chunk spill dir should exist")
+            .path();
+        assert!(spill_dir.is_dir());
+        assert!(entries
+            .next_entry()
+            .await
+            .expect("tmp dir should be readable")
+            .is_none());
+
+        let mut part_entries = tokio::fs::read_dir(&spill_dir)
+            .await
+            .expect("spill dir should be readable");
+        let mut parts = Vec::new();
+        while let Some(entry) = part_entries
+            .next_entry()
+            .await
+            .expect("spill dir entry should be readable")
+        {
+            parts.push(entry.path());
+        }
+        parts.sort();
+        assert_eq!(parts.len(), 64);
+        assert_eq!(
+            parts[0].file_name().and_then(|name| name.to_str()),
+            Some("part_0001_of_0064.txt")
+        );
+        assert_eq!(
+            parts[63].file_name().and_then(|name| name.to_str()),
+            Some("part_0064_of_0064.txt")
+        );
+
+        let mut reconstructed = String::new();
+        for part in parts {
+            let chunk = tokio::fs::read_to_string(&part)
+                .await
+                .expect("chunk should be readable");
+            assert!(chunk.len() <= tool_output_chunk_bytes(8));
+            reconstructed.push_str(&chunk);
+        }
+        assert_eq!(reconstructed, text);
+        assert!(tokio::fs::metadata(spill_dir.with_extension("txt"))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn split_utf8_chunks_preserves_character_boundaries() {
+        let text = "a你b🙂c";
+        let chunks = split_utf8_chunks(text, 4);
+
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 4));
+        assert_eq!(chunks, vec!["a你", "b", "🙂", "c"]);
+    }
+
+    #[tokio::test]
+    async fn fs_read_overflow_returns_retry_hint_without_spilling_file() {
         let root = test_root();
         let collected = collect_result_with_overflow(
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
@@ -1296,21 +1499,16 @@ mod tests {
             8,
             None,
             None,
+            "fs_read",
         )
         .await;
 
         let preview = collected.preview;
-        assert!(preview.contains("[Output too large (64 bytes)"));
-        assert!(matches!(collected.content, Content::Text(ref text) if text == &preview));
-
-        let mut entries = tokio::fs::read_dir(root.join("tmp"))
-            .await
-            .expect("tmp dir should exist after overflow spill");
-        assert!(entries
-            .next_entry()
-            .await
-            .expect("tmp dir should be readable")
-            .is_some());
+        assert!(preview.contains("[fs_read output too large (64 bytes)"));
+        assert!(preview.contains("not saved to a temporary file"));
+        assert!(preview.contains("Retry fs_read"));
+        assert_eq!(preview, fs_read_overflow_summary(64, 8));
+        assert!(tokio::fs::metadata(root.join("tmp")).await.is_err());
     }
 
     fn delayed_boxed_result(
@@ -1328,6 +1526,10 @@ mod tests {
     async fn tool_result_streams_are_collected_in_parallel() {
         let root = test_root();
         let started = Instant::now();
+        let tool_names = HashMap::from([
+            ("call_a".to_string(), "lazy_wait".to_string()),
+            ("call_b".to_string(), "lazy_wait".to_string()),
+        ]);
         let results = collect_tool_results_parallel(
             vec![
                 (
@@ -1339,6 +1541,7 @@ mod tests {
                     delayed_boxed_result("b", Duration::from_millis(300)),
                 ),
             ],
+            &tool_names,
             &root,
             8_192,
             None,
@@ -1371,8 +1574,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             yield ToolOutput::text("done");
         });
+        let tool_names = HashMap::from([("call".to_string(), "sub_agent".to_string())]);
         let mut collect_fut = std::pin::pin!(collect_tool_results_parallel(
             vec![("call".to_string(), Ok(ToolResult::Output(output)))],
+            &tool_names,
             &root,
             8_192,
             Some(tx),
@@ -1609,6 +1814,34 @@ mod tests {
         }
     }
 
+    struct CancelledWithCheckpointInnerAgent;
+
+    impl Agent for CancelledWithCheckpointInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            _req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            let mut state = AgentState::new(StepConfig::new("test-model"));
+            state.messages = vec![Message::user("hello"), Message::assistant("partial")];
+            Ok(stream::iter(vec![
+                remi_agentloop::types::AgentEvent::Checkpoint(Checkpoint::new(
+                    state.thread_id.clone(),
+                    state.run_id.clone(),
+                    state,
+                    None,
+                    1,
+                    CheckpointStatus::Cancelled,
+                    1,
+                )),
+                remi_agentloop::types::AgentEvent::Cancelled,
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn usage_events_emit_stats_before_done() {
         let agent = CatAgent {
@@ -1643,6 +1876,40 @@ mod tests {
                 max_prompt_tokens: 12,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_event_emits_history_before_done() {
+        let agent = CatAgent {
+            inner: CancelledWithCheckpointInnerAgent,
+            local_tools: DefaultToolRegistry::new(),
+            data_dir: test_root(),
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("cancel"))
+            .collect::<Vec<_>>()
+            .await;
+        let history_index = events
+            .iter()
+            .position(|event| matches!(event, CatEvent::History(_, _)))
+            .expect("history event should be emitted");
+        let done_index = events
+            .iter()
+            .position(|event| matches!(event, CatEvent::Done))
+            .expect("done event should be emitted");
+
+        assert!(history_index < done_index);
+        assert!(matches!(
+            &events[history_index],
+            CatEvent::History(messages, _) if messages
+                .last()
+                .is_some_and(|message| message.content.text_content() == "partial")
         ));
     }
 

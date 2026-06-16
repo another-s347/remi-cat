@@ -55,11 +55,11 @@ mod secret_store;
 mod trigger_scheduler;
 mod volume_store;
 
-use anyhow::{Context, Result};
 use acp_bindings::AcpBindingStore;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
-use local_cli::{CliEvent, CliGateway, CLI_CHANNEL, CLI_CHAT_ID, CLI_USER_ID, CLI_USERNAME};
+use local_cli::{CliEvent, CliGateway, CLI_CHANNEL, CLI_CHAT_ID, CLI_USERNAME, CLI_USER_ID};
 use matcher::{BanResult, OwnerMatcher, OwnerStatus, UnbanResult, PAIR_COMMAND};
 use mgmt_server::MgmtContext;
 use reply_transport::ReplyTransport;
@@ -320,8 +320,11 @@ async fn main() -> Result<()> {
     let restart = RestartHandle::new();
     let start_time = Instant::now();
     let volume_store = Arc::new(RwLock::new(VolumeStore::load(VolumeStore::resolve_path())?));
-    let (rpc, _agent_sink) =
-        RpcServer::new(transport.clone(), Arc::clone(&secret_store), Arc::clone(&acp_bindings));
+    let (rpc, _agent_sink) = RpcServer::new(
+        transport.clone(),
+        Arc::clone(&secret_store),
+        Arc::clone(&acp_bindings),
+    );
 
     // Per-chat serial queues: one bounded mpsc channel per chat_id.
     // Each queue item is either a user IM message or a daemon-originated
@@ -417,7 +420,10 @@ async fn main() -> Result<()> {
                         ReplyTransport::Feishu(gateway) => match gateway
                             .send_text(
                                 &dispatch.chat_id,
-                                &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
+                                &format!(
+                                    "⏰ 触发器「{}」已触发，开始执行。",
+                                    dispatch.trigger_name
+                                ),
                             )
                             .await
                         {
@@ -431,7 +437,10 @@ async fn main() -> Result<()> {
                             if let Err(err) = cli
                                 .send_text(
                                     &dispatch.chat_id,
-                                    &format!("⏰ 触发器「{}」已触发，开始执行。", dispatch.trigger_name),
+                                    &format!(
+                                        "⏰ 触发器「{}」已触发，开始执行。",
+                                        dispatch.trigger_name
+                                    ),
                                 )
                                 .await
                             {
@@ -814,7 +823,9 @@ async fn main() -> Result<()> {
                     sender_username,
                     todo_create_via_sdk: owner_sdk_tools_enabled,
                     trigger_tools_enabled: owner_sdk_tools_enabled,
-                    acp_session_id: acp_binding.as_ref().map(|binding| binding.session_id.clone()),
+                    acp_session_id: acp_binding
+                        .as_ref()
+                        .map(|binding| binding.session_id.clone()),
                 }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -832,7 +843,8 @@ async fn main() -> Result<()> {
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         warn!(chat = %chat_id, msg = %msg_id, "chat queue worker died");
                         chat_queues.lock().await.remove(&chat_id);
-                        send_reply(&transport, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。").await;
+                        send_reply(&transport, &msg_id, &chat_id, "⚠️ 内部错误，请稍后重试。")
+                            .await;
                     }
                 }
             }
@@ -918,6 +930,28 @@ async fn main() -> Result<()> {
 
                     let result: anyhow::Result<()> = async {
                         match action.as_str() {
+                            "approval_decide" => {
+                                let approval_id =
+                                    action_value["approval_id"].as_str().ok_or_else(|| {
+                                        anyhow::anyhow!("missing approval_id in approval action")
+                                    })?;
+                                let decision =
+                                    action_value["decision"].as_str().ok_or_else(|| {
+                                        anyhow::anyhow!("missing decision in approval action")
+                                    })?;
+                                rpc.send_to_agent(remi_proto::DaemonMessage {
+                                    payload: Some(
+                                        remi_proto::daemon_message::Payload::ToolApprovalDecision(
+                                            remi_proto::ToolApprovalDecisionEvent {
+                                                approval_id: approval_id.to_string(),
+                                                decision: decision.to_string(),
+                                            },
+                                        ),
+                                    ),
+                                })
+                                .await;
+                                info!(approval_id, decision, "tool approval decided via card");
+                            }
                             "delete" => {
                                 let key = action_value["key"].as_str().ok_or_else(|| {
                                     anyhow::anyhow!("missing key in delete action")
@@ -966,9 +1000,12 @@ async fn main() -> Result<()> {
                                 return Ok(());
                             }
                         }
-                        // Close the card after a successful action.
-                        if let Err(e) = gateway.delete_message(&card_message_id).await {
-                            warn!("delete card message after action failed: {e:#}");
+                        // Close secret-manager cards after a successful action. Approval
+                        // cards stay visible so the Agent can update them to resolved.
+                        if action != "approval_decide" {
+                            if let Err(e) = gateway.delete_message(&card_message_id).await {
+                                warn!("delete card message after action failed: {e:#}");
+                            }
                         }
                         Ok(())
                     }
@@ -1024,37 +1061,33 @@ async fn handle_cli_message_event(
     {
         if command::is_daemon_command(&cmd.name) {
             if is_blacklist_command(&cmd.name) {
-                let reply = match resolve_blacklist_target(
-                    &cmd.name,
-                    &cmd.args,
-                    &msg,
-                    user_store,
-                    matcher,
-                ) {
-                    Ok(target_uuid) => match cmd.name.as_str() {
-                        "ban" => match matcher.ban(&target_uuid) {
-                            Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
-                            Ok(BanResult::AlreadyBanned) => {
-                                format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
-                            }
-                            Ok(BanResult::ProtectedOwner) => {
-                                "⚠️ 不能拉黑主人或系统放行用户。".into()
-                            }
-                            Err(e) => format!("❌ 拉黑失败: {e}"),
+                let reply =
+                    match resolve_blacklist_target(&cmd.name, &cmd.args, &msg, user_store, matcher)
+                    {
+                        Ok(target_uuid) => match cmd.name.as_str() {
+                            "ban" => match matcher.ban(&target_uuid) {
+                                Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
+                                Ok(BanResult::AlreadyBanned) => {
+                                    format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
+                                }
+                                Ok(BanResult::ProtectedOwner) => {
+                                    "⚠️ 不能拉黑主人或系统放行用户。".into()
+                                }
+                                Err(e) => format!("❌ 拉黑失败: {e}"),
+                            },
+                            "unban" => match matcher.unban(&target_uuid) {
+                                Ok(UnbanResult::Removed) => {
+                                    format!("✅ 已解除拉黑：{}", target_uuid)
+                                }
+                                Ok(UnbanResult::NotBanned) => {
+                                    format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
+                                }
+                                Err(e) => format!("❌ 解除拉黑失败: {e}"),
+                            },
+                            _ => unreachable!("checked by is_blacklist_command"),
                         },
-                        "unban" => match matcher.unban(&target_uuid) {
-                            Ok(UnbanResult::Removed) => {
-                                format!("✅ 已解除拉黑：{}", target_uuid)
-                            }
-                            Ok(UnbanResult::NotBanned) => {
-                                format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
-                            }
-                            Err(e) => format!("❌ 解除拉黑失败: {e}"),
-                        },
-                        _ => unreachable!("checked by is_blacklist_command"),
-                    },
-                    Err(err) => err,
-                };
+                        Err(err) => err,
+                    };
                 send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
                 return;
             }
@@ -1079,15 +1112,17 @@ async fn handle_cli_message_event(
 
     let chat_id = msg.chat_id.clone();
     let msg_id = msg.message_id.clone();
-    let queue_tx = get_or_spawn_chat_queue(&chat_id, &chat_queues, transport.clone(), rpc.clone())
-        .await;
+    let queue_tx =
+        get_or_spawn_chat_queue(&chat_id, &chat_queues, transport.clone(), rpc.clone()).await;
     match queue_tx.try_send(ChatQueueItem::ImMessage {
         msg,
         user_uuid,
         sender_username,
         todo_create_via_sdk: sdk_todo_enabled,
         trigger_tools_enabled: sdk_todo_enabled,
-        acp_session_id: acp_binding.as_ref().map(|binding| binding.session_id.clone()),
+        acp_session_id: acp_binding
+            .as_ref()
+            .map(|binding| binding.session_id.clone()),
     }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1139,37 +1174,33 @@ async fn handle_cli_single_message(
     {
         if command::is_daemon_command(&cmd.name) {
             if is_blacklist_command(&cmd.name) {
-                let reply = match resolve_blacklist_target(
-                    &cmd.name,
-                    &cmd.args,
-                    &msg,
-                    user_store,
-                    matcher,
-                ) {
-                    Ok(target_uuid) => match cmd.name.as_str() {
-                        "ban" => match matcher.ban(&target_uuid) {
-                            Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
-                            Ok(BanResult::AlreadyBanned) => {
-                                format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
-                            }
-                            Ok(BanResult::ProtectedOwner) => {
-                                "⚠️ 不能拉黑主人或系统放行用户。".into()
-                            }
-                            Err(e) => format!("❌ 拉黑失败: {e}"),
+                let reply =
+                    match resolve_blacklist_target(&cmd.name, &cmd.args, &msg, user_store, matcher)
+                    {
+                        Ok(target_uuid) => match cmd.name.as_str() {
+                            "ban" => match matcher.ban(&target_uuid) {
+                                Ok(BanResult::Added) => format!("✅ 已拉黑用户：{}", target_uuid),
+                                Ok(BanResult::AlreadyBanned) => {
+                                    format!("ℹ️ 用户已在黑名单中：{}", target_uuid)
+                                }
+                                Ok(BanResult::ProtectedOwner) => {
+                                    "⚠️ 不能拉黑主人或系统放行用户。".into()
+                                }
+                                Err(e) => format!("❌ 拉黑失败: {e}"),
+                            },
+                            "unban" => match matcher.unban(&target_uuid) {
+                                Ok(UnbanResult::Removed) => {
+                                    format!("✅ 已解除拉黑：{}", target_uuid)
+                                }
+                                Ok(UnbanResult::NotBanned) => {
+                                    format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
+                                }
+                                Err(e) => format!("❌ 解除拉黑失败: {e}"),
+                            },
+                            _ => unreachable!("checked by is_blacklist_command"),
                         },
-                        "unban" => match matcher.unban(&target_uuid) {
-                            Ok(UnbanResult::Removed) => {
-                                format!("✅ 已解除拉黑：{}", target_uuid)
-                            }
-                            Ok(UnbanResult::NotBanned) => {
-                                format!("ℹ️ 该用户当前不在黑名单中：{}", target_uuid)
-                            }
-                            Err(e) => format!("❌ 解除拉黑失败: {e}"),
-                        },
-                        _ => unreachable!("checked by is_blacklist_command"),
-                    },
-                    Err(err) => err,
-                };
+                        Err(err) => err,
+                    };
                 send_reply(transport, &msg.message_id, &msg.chat_id, &reply).await;
                 return;
             }
@@ -1198,7 +1229,9 @@ async fn handle_cli_single_message(
         Some(CLI_USERNAME),
         sdk_todo_enabled,
         sdk_todo_enabled,
-        acp_binding.as_ref().map(|binding| binding.session_id.as_str()),
+        acp_binding
+            .as_ref()
+            .map(|binding| binding.session_id.as_str()),
     );
     match rpc
         .send_to_agent_and_await(daemon_msg, &msg.message_id)
@@ -1593,12 +1626,7 @@ fn resolve_blacklist_channel_id(
     }
 }
 
-async fn send_reply(
-    transport: &ReplyTransport,
-    message_id: &str,
-    chat_id: &str,
-    text: &str,
-) {
+async fn send_reply(transport: &ReplyTransport, message_id: &str, chat_id: &str, text: &str) {
     if let Err(e) = transport.reply_text(message_id, chat_id, text).await {
         warn!("send reply failed: {e:#}");
     }

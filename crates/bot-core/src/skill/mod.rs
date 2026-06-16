@@ -2,7 +2,7 @@ pub mod store;
 pub mod tools;
 
 pub use store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, SkillStore};
-pub use tools::{SkillGetTool, SkillReadResourceTool, SkillSearchTool};
+pub use tools::{SkillGetTool, SkillSearchTool};
 
 use remi_agentloop::prelude::ParsedToolCall;
 use std::sync::Arc;
@@ -18,9 +18,6 @@ pub fn register_skill_tools<S: SkillStore>(
         store: Arc::clone(&store),
     });
     registry.register(SkillSearchTool {
-        store: Arc::clone(&store),
-    });
-    registry.register(SkillReadResourceTool {
         store: Arc::clone(&store),
     });
 }
@@ -44,7 +41,13 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "skill__search"));
         assert!(names.iter().any(|name| name == "skill__get"));
-        assert!(names.iter().any(|name| name == "skill__read_resource"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("skill__"))
+                .count(),
+            2
+        );
         assert!(!names.iter().any(|name| name == "skill__save"));
         assert!(!names.iter().any(|name| name == "skill__delete"));
     }

@@ -362,7 +362,6 @@ pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRisk
         | "search"
         | "skill__get"
         | "skill__search"
-        | "skill__read_resource"
         | "apply_patch"
         | "fetch"
         | "memory__get_detail"
@@ -388,7 +387,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRisk
             ToolRiskLevel::High
         }
         "agent__explorer" => ToolRiskLevel::Low,
-        "acp__chat" => ToolRiskLevel::Medium,
+        "codex" => ToolRiskLevel::Medium,
         name if name.starts_with("agent__") || name.starts_with("trigger__") => {
             ToolRiskLevel::Medium
         }
@@ -676,7 +675,7 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
         ToolRiskLevel::Medium if matches!(tool_name, "fs_write" | "fs_create" | "fs_mkdir") => {
             "The request creates or updates workspace files and does not target protected configuration paths.".to_string()
         }
-        ToolRiskLevel::Medium if tool_name.starts_with("agent__") || tool_name == "acp__chat" => {
+        ToolRiskLevel::Medium if tool_name.starts_with("agent__") || tool_name == "codex" => {
             "The request delegates work to another agent and should be reviewed unless this session allows model-auto approval.".to_string()
         }
         ToolRiskLevel::Medium if tool_name.starts_with("trigger__") => {

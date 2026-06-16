@@ -207,6 +207,42 @@ pub fn embedded_goal_definition() -> WorkflowDefinition {
         .expect("embedded goal workflow must be valid")
 }
 
+pub fn list_definitions(data_dir: &Path) -> Result<Vec<WorkflowDefinition>, String> {
+    let mut definitions = vec![embedded_goal_definition()];
+    let dir = data_dir.join("workflows");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(definitions),
+        Err(err) => return Err(format!("reading {}: {err}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("reading {}: {err}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| format!("reading {}: {err}", path.display()))?;
+        let definition: WorkflowDefinition = serde_json::from_str(&text)
+            .map_err(|err| format!("parsing {}: {err}", path.display()))?;
+        definition
+            .validate()
+            .map_err(|err| format!("invalid workflow {}: {err}", path.display()))?;
+        if definition.id != id {
+            return Err(format!(
+                "workflow id `{}` does not match file name `{id}.json`",
+                definition.id
+            ));
+        }
+        definitions.push(definition);
+    }
+    definitions.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(definitions)
+}
+
 pub const USER_STATE_KEY: &str = "__supervisor_workflow";
 
 pub fn instance_from_user_state(user_state: &serde_json::Value) -> Option<WorkflowInstance> {
@@ -461,6 +497,51 @@ mod tests {
     #[test]
     fn goal_graph_is_valid() {
         embedded_goal_definition().validate().unwrap();
+    }
+
+    #[test]
+    fn lists_embedded_and_profile_workflows() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let workflows_dir = data_dir.path().join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        let definition = WorkflowDefinition {
+            version: 1,
+            id: "verify".into(),
+            name: "Verify Work".into(),
+            description: "Check the work".into(),
+            prompt: "supervise".into(),
+            start_prompt: "start".into(),
+            initial_node: "review".into(),
+            terminal_node: "done".into(),
+            nodes: vec![
+                WorkflowNode {
+                    id: "review".into(),
+                    prompt: "review".into(),
+                },
+                WorkflowNode {
+                    id: "done".into(),
+                    prompt: "done".into(),
+                },
+            ],
+            edges: vec![WorkflowEdge {
+                id: "complete".into(),
+                from: "review".into(),
+                to: "done".into(),
+                prompt: "complete".into(),
+            }],
+        };
+        std::fs::write(
+            workflows_dir.join("verify.json"),
+            serde_json::to_string_pretty(&definition).unwrap(),
+        )
+        .unwrap();
+
+        let definitions = list_definitions(data_dir.path()).unwrap();
+
+        assert!(definitions.iter().any(|workflow| workflow.id == "goal"));
+        assert!(definitions
+            .iter()
+            .any(|workflow| workflow.id == "verify" && workflow.name == "Verify Work"));
     }
 
     #[test]

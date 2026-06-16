@@ -13,13 +13,15 @@ use bot_core::{
     PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage,
     ToolApprovalDecision, ToolApprovalRequest, WorkflowReport,
 };
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
+use crossterm::style::ResetColor;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -35,6 +37,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::session::Session;
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
+#[cfg(test)]
+use crate::tui_text::contains_tui_control;
+use crate::tui_text::sanitize_tui_text;
 use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
@@ -60,7 +65,13 @@ const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Result<()> {
+pub(crate) async fn run_tui(
+    runtime: Rc<Runtime>,
+    cli: CliConfig,
+    trigger_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::local_trigger_scheduler::LocalTriggerDispatch>,
+    >,
+) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let session_id = if cli.resume {
         if let Some(selector) = cli.resume_session_id.as_deref() {
@@ -81,7 +92,7 @@ pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Res
         )?
     };
 
-    let mut app = TuiApp::new(runtime, cli, session_id).await;
+    let mut app = TuiApp::new(runtime, cli, session_id, trigger_rx).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
     result
@@ -188,7 +199,7 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
         .skip(offset)
         .take(list_height)
         .map(|(index, session)| {
-            let title = session.title.as_deref().unwrap_or("untitled");
+            let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
             let marker = if index == selected { "›" } else { " " };
             let prefix = if index < 9 {
                 format!("{marker} {}. ", index + 1)
@@ -210,7 +221,7 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
                     Style::default().fg(CODEX_DIM),
                 ),
                 Span::raw("  "),
-                Span::raw(truncate_for_width(title, 36)),
+                Span::raw(truncate_for_width(&title, 36)),
                 Span::styled(
                     format!("  {}", session.updated_at),
                     Style::default().fg(CODEX_DIM),
@@ -224,7 +235,7 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
     );
 
     let session = &sessions[selected];
-    let title = session.title.as_deref().unwrap_or("untitled");
+    let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -333,6 +344,9 @@ impl TerminalGuard {
             self.terminal.backend_mut(),
             DisableBracketedPaste,
             DisableMouseCapture,
+            ResetColor,
+            Show,
+            EnableLineWrap,
             LeaveAlternateScreen
         )
         .context("leave alternate screen")?;
@@ -446,7 +460,8 @@ impl ComposerInput {
         for segment in &self.segments {
             match segment {
                 InputSegment::Text(text) => {
-                    for (index, part) in text.split('\n').enumerate() {
+                    let safe_text = sanitize_tui_text(text);
+                    for (index, part) in safe_text.split('\n').enumerate() {
                         if index > 0 {
                             lines.push(Vec::new());
                         }
@@ -959,10 +974,21 @@ struct TuiApp {
     last_todo_body: Option<String>,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
+    trigger_rx:
+        Option<UnboundedReceiverStream<crate::local_trigger_scheduler::LocalTriggerDispatch>>,
 }
 
 impl TuiApp {
-    async fn new(runtime: Rc<Runtime>, cli: CliConfig, session_id: String) -> Self {
+    async fn new(
+        runtime: Rc<Runtime>,
+        cli: CliConfig,
+        session_id: String,
+        trigger_rx: Option<
+            tokio::sync::mpsc::UnboundedReceiver<
+                crate::local_trigger_scheduler::LocalTriggerDispatch,
+            >,
+        >,
+    ) -> Self {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
@@ -1007,6 +1033,7 @@ impl TuiApp {
             last_todo_body: None,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
+            trigger_rx: trigger_rx.map(UnboundedReceiverStream::new),
         };
         app.refresh_command_catalog();
         app.load_input_history().await;
@@ -1044,6 +1071,11 @@ impl TuiApp {
                 }
                 Some(event) = self.bot_rx.next() => {
                     self.handle_bot_event(event).await;
+                }
+                maybe_trigger = next_trigger_dispatch(&mut self.trigger_rx) => {
+                    if let Some(dispatch) = maybe_trigger {
+                        self.start_trigger_turn(dispatch);
+                    }
                 }
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
@@ -1425,6 +1457,36 @@ impl TuiApp {
         }));
     }
 
+    fn start_trigger_turn(
+        &mut self,
+        dispatch: crate::local_trigger_scheduler::LocalTriggerDispatch,
+    ) {
+        self.cells.push(HistoryCell::system(format!(
+            "触发器「{}」已触发，开始执行。",
+            dispatch.trigger_name
+        )));
+        while self.cells.len() > MAX_HISTORY_CELLS {
+            self.cells.remove(0);
+        }
+
+        let cancel = Arc::new(Notify::new());
+        self.cancel = Some(Arc::clone(&cancel));
+        self.running = true;
+        self.run_started_at = Some(Instant::now());
+        self.status.state = "running".to_string();
+        self.status.last_error = None;
+        self.last_stats_snapshot = TokenStatsSnapshot::default();
+        self.pending_token_delta = TokenDelta::default();
+        self.last_token_cell_index = None;
+        self.active_supervisor_id = Some(format!("supervisor-{}", uuid::Uuid::new_v4()));
+
+        let runtime = Rc::clone(&self.runtime);
+        let tx = self.bot_tx.clone();
+        self.run_handle = Some(tokio::task::spawn_local(async move {
+            run_tui_trigger_turn(runtime, dispatch, cancel, tx).await;
+        }));
+    }
+
     async fn handle_bot_event(&mut self, event: BotEvent) {
         match event {
             BotEvent::Prefix(text) => {
@@ -1801,7 +1863,7 @@ impl TuiApp {
             .status
             .last_error
             .as_deref()
-            .map(|value| format!(" · {value}"))
+            .map(|value| format!(" · {}", sanitize_tui_text(value)))
             .unwrap_or_default();
         let line = Line::from(vec![
             Span::styled(
@@ -2054,7 +2116,7 @@ impl TuiApp {
                         format!("{marker} {:<22}", command.value.trim_end()),
                         command_style,
                     ),
-                    Span::styled(command.description.clone(), description_style),
+                    Span::styled(sanitize_tui_text(&command.description), description_style),
                 ]))
             })
             .collect::<Vec<_>>();
@@ -2180,14 +2242,10 @@ impl TuiApp {
         let Some(input) = self.composer.command_text() else {
             return Vec::new();
         };
-        let normalized = input.trim_start().trim_start_matches('/').to_lowercase();
-        let terms = normalized.split_whitespace().collect::<Vec<_>>();
+        let terms = command_filter_terms(input);
         self.command_catalog
             .iter()
-            .filter(|command| {
-                let searchable = command.searchable.to_lowercase();
-                terms.iter().all(|term| searchable.contains(term))
-            })
+            .filter(|command| command_matches_filter(command, &terms))
             .collect()
     }
 
@@ -2346,6 +2404,23 @@ impl TuiApp {
 
     fn refresh_command_catalog(&mut self) {
         let mut commands = static_commands();
+        if let Ok(mut workflows) = self.runtime.bot.workflow_definitions() {
+            workflows.sort_by(|a, b| a.id.cmp(&b.id));
+            commands.extend(
+                workflows
+                    .into_iter()
+                    .filter(|workflow| workflow.id != "goal")
+                    .map(|workflow| CommandEntry {
+                        value: format!("/{} ", workflow.id),
+                        description: format!("启动 workflow: {}", workflow.name),
+                        accepts_arguments: true,
+                        searchable: format!(
+                            "/{} {} {} workflow {}",
+                            workflow.id, workflow.name, workflow.description, workflow.id
+                        ),
+                    }),
+            );
+        }
         let mut skills = self.runtime.bot.skill_summaries();
         skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
         commands.extend(skills.into_iter().map(|skill| CommandEntry {
@@ -2679,7 +2754,8 @@ impl TuiApp {
     }
 
     fn composer_height(&self, width: u16) -> u16 {
-        let rows = wrap_line_count(&self.composer.display_text(), width.saturating_sub(3)).max(1);
+        let display = sanitize_tui_text(&self.composer.display_text());
+        let rows = wrap_line_count(&display, width.saturating_sub(3)).max(1);
         rows.clamp(1, 6).saturating_add(1)
     }
 
@@ -2700,7 +2776,7 @@ impl TuiApp {
     fn cursor_position(&self, area: Rect) -> (u16, u16) {
         let display = self.composer.display_text();
         let cursor = self.composer.cursor_display_byte().min(display.len());
-        let before = &display[..cursor];
+        let before = sanitize_tui_text(&display[..cursor]);
         let inner_width = area.width.saturating_sub(3).max(1);
         let mut row = 0_u16;
         let mut col = 0_u16;
@@ -2717,6 +2793,17 @@ impl TuiApp {
             area.x + 3 + col.min(inner_width.saturating_sub(1)),
             area.y + row.min(area.height.saturating_sub(1)),
         )
+    }
+}
+
+async fn next_trigger_dispatch(
+    trigger_rx: &mut Option<
+        UnboundedReceiverStream<crate::local_trigger_scheduler::LocalTriggerDispatch>,
+    >,
+) -> Option<crate::local_trigger_scheduler::LocalTriggerDispatch> {
+    match trigger_rx {
+        Some(rx) => rx.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2859,6 +2946,121 @@ async fn run_bot_turn(
             let _ = tx.send(BotEvent::Done);
         }
     }
+}
+
+async fn run_tui_trigger_turn(
+    runtime: Rc<Runtime>,
+    dispatch: crate::local_trigger_scheduler::LocalTriggerDispatch,
+    cancel: Arc<Notify>,
+    tx: mpsc::UnboundedSender<BotEvent>,
+) {
+    let model_profile_id = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_string(&dispatch.thread_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+    let opts = StreamOptions {
+        model_profile_id,
+        sender_user_id: Some(dispatch.owner_user_id),
+        sender_username: dispatch.owner_username,
+        message_id: Some(format!("trigger-{}", uuid::Uuid::new_v4())),
+        chat_type: dispatch.chat_type.or_else(|| Some("p2p".to_string())),
+        platform: dispatch.platform.or_else(|| Some(TUI_CHANNEL.to_string())),
+        todo_create_via_sdk: true,
+        trigger_tools_enabled: false,
+        trigger_run: true,
+        cancel: Some(cancel),
+        ..StreamOptions::default()
+    };
+    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
+        &dispatch.thread_id,
+        Content::text(dispatch.request),
+        opts
+    ));
+    while let Some(event) = stream.next().await {
+        match event {
+            CatEvent::Text(delta) => {
+                let _ = tx.send(BotEvent::Text(delta));
+            }
+            CatEvent::Thinking(delta) => {
+                let _ = tx.send(BotEvent::Thinking(delta));
+            }
+            CatEvent::ToolCallStart { id, name } => {
+                let _ = tx.send(BotEvent::ToolStart { id, name });
+            }
+            CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                let _ = tx.send(BotEvent::ToolArgs { id, delta });
+            }
+            CatEvent::ToolCall { id, name, args } => {
+                let _ = tx.send(BotEvent::ToolCall {
+                    id,
+                    name,
+                    args: args.to_string(),
+                });
+            }
+            CatEvent::ToolCallResult {
+                id,
+                name,
+                args,
+                result,
+                success,
+                elapsed_ms,
+            } => {
+                let _ = tx.send(BotEvent::ToolDone {
+                    id,
+                    name,
+                    args: args.to_string(),
+                    result,
+                    success,
+                    elapsed_ms,
+                });
+            }
+            CatEvent::SubSession(event) => {
+                let _ = tx.send(BotEvent::SubSession(event));
+            }
+            CatEvent::ContextCompaction(event) => {
+                let _ = tx.send(BotEvent::ContextCompaction(event));
+            }
+            CatEvent::Supervisor(report) => {
+                let _ = tx.send(BotEvent::SupervisorReport(report));
+            }
+            CatEvent::SupervisorProgress(progress) => {
+                let _ = tx.send(BotEvent::SupervisorProgress(progress));
+            }
+            CatEvent::ToolApprovalRequested(request) => {
+                let _ = tx.send(BotEvent::ApprovalRequested(request));
+            }
+            CatEvent::ToolApprovalUpdated(request) => {
+                let _ = tx.send(BotEvent::ApprovalUpdated(request));
+            }
+            CatEvent::ToolApprovalResolved { request, decision } => {
+                let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
+            }
+            CatEvent::StateUpdate(user_state) => {
+                let items = bot_core::todo::todos_from_user_state(&user_state);
+                let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
+            }
+            CatEvent::Stats {
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+                elapsed_ms,
+            } => {
+                let _ = tx.send(BotEvent::Stats {
+                    prompt_tokens,
+                    completion_tokens,
+                    max_prompt_tokens,
+                    elapsed_ms,
+                });
+            }
+            CatEvent::Error(error) => {
+                let _ = tx.send(BotEvent::Error(error.to_string()));
+            }
+            CatEvent::Done => break,
+            _ => {}
+        }
+    }
+    let _ = tx.send(BotEvent::Done);
 }
 
 async fn run_tui_fork_command(
@@ -3387,6 +3589,22 @@ fn static_commands() -> Vec<CommandEntry> {
     .collect()
 }
 
+fn command_filter_terms(input: &str) -> Vec<String> {
+    input
+        .trim_start()
+        .trim_start_matches('/')
+        .to_lowercase()
+        .split(|ch: char| ch.is_whitespace() || ch == ':')
+        .filter(|term| !term.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn command_matches_filter(command: &CommandEntry, terms: &[String]) -> bool {
+    let searchable = command.searchable.to_lowercase();
+    terms.iter().all(|term| searchable.contains(term))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneLaunchCommand {
     kind: &'static str,
@@ -3887,6 +4105,7 @@ impl HistoryCell {
         } else {
             format!("{} · {} · {}", self.title, self.status.label(), self.meta)
         };
+        let title = sanitize_tui_text(&title);
         lines.push(Line::from(vec![
             Span::styled(history_gutter(prefix), title_style),
             Span::styled(title, title_style),
@@ -3900,11 +4119,13 @@ impl HistoryCell {
             lines.push(Line::from(""));
             return lines;
         }
-        let body = if self.body.trim().is_empty() {
+        let raw_body = if self.body.trim().is_empty() {
             "(no content)"
         } else {
             self.body.trim_end()
         };
+        let safe_body = sanitize_tui_text(raw_body);
+        let body = safe_body.trim_end();
         let body_width = width.saturating_sub(HISTORY_GUTTER_WIDTH).max(16);
         if matches!(self.kind, CellKind::PatchDiff { .. }) {
             for line in diff_lines(body, body_width) {
@@ -4559,6 +4780,7 @@ fn approval_cell(
 
 fn diff_lines(text: &str, width: u16) -> Vec<Span<'static>> {
     let width = width.max(16);
+    let text = sanitize_tui_text(text);
     text.lines()
         .flat_map(|line| {
             let style = diff_line_style(line);
@@ -4594,6 +4816,7 @@ fn diff_line_style(line: &str) -> Style {
 
 fn wrap_text(text: &str, width: u16) -> Vec<String> {
     let width = width.max(16) as usize;
+    let text = sanitize_tui_text(text);
     text.lines()
         .flat_map(|line| {
             if line.is_empty() {
@@ -4610,6 +4833,7 @@ fn wrap_text(text: &str, width: u16) -> Vec<String> {
 
 fn wrap_line_count(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
+    let text = sanitize_tui_text(text);
     text.lines()
         .map(|line| (UnicodeWidthStr::width(line) / width).max(1) as u16)
         .sum::<u16>()
@@ -4626,11 +4850,12 @@ fn context_usage_percent(prompt_tokens: u32, context_tokens: u32) -> Option<u32>
 
 fn truncate_for_width(text: &str, width: u16) -> String {
     let width = width as usize;
+    let text = sanitize_tui_text(text);
     if width == 0 {
         return String::new();
     }
-    if UnicodeWidthStr::width(text) <= width {
-        return text.to_string();
+    if UnicodeWidthStr::width(text.as_str()) <= width {
+        return text;
     }
     let mut output = String::new();
     let limit = width.saturating_sub(1);
@@ -4761,6 +4986,41 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| command.value == "/model status"));
+    }
+
+    #[test]
+    fn command_filter_matches_skill_prefix_syntax() {
+        let command = CommandEntry {
+            value: "/skill:code-review ".to_string(),
+            description: "Review code".to_string(),
+            accepts_arguments: true,
+            searchable: "skill code-review 技能 .agents/skills".to_string(),
+        };
+
+        let colon_terms = command_filter_terms("/skill:code");
+        assert_eq!(colon_terms, vec!["skill", "code"]);
+        assert!(command_matches_filter(&command, &colon_terms));
+
+        let space_terms = command_filter_terms("/skill code");
+        assert_eq!(space_terms, vec!["skill", "code"]);
+        assert!(command_matches_filter(&command, &space_terms));
+    }
+
+    #[test]
+    fn command_filter_matches_workflow_names() {
+        let command = CommandEntry {
+            value: "/review-loop ".to_string(),
+            description: "启动 workflow: Review Loop".to_string(),
+            accepts_arguments: true,
+            searchable: "/review-loop Review Loop Verify changes workflow review-loop".to_string(),
+        };
+
+        let id_terms = command_filter_terms("/review");
+        assert!(command_matches_filter(&command, &id_terms));
+
+        let name_terms = command_filter_terms("/Review Loop");
+        assert_eq!(name_terms, vec!["review", "loop"]);
+        assert!(command_matches_filter(&command, &name_terms));
     }
 
     #[test]
@@ -5084,6 +5344,48 @@ mod tests {
         assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
             span.content.as_ref() == "code" && span.style.fg == Some(Color::Yellow)
         })));
+    }
+
+    #[test]
+    fn history_cells_strip_terminal_control_sequences() {
+        let cells = [
+            HistoryCell::user("hello\x1b[?7l wrapped"),
+            HistoryCell::assistant("**ok**\x1b]0;bad\x07\u{202e}"),
+            HistoryCell::tool(
+                "tool-1".to_string(),
+                "tool\x1b[31m".to_string(),
+                "result\rb\x08\x07".to_string(),
+                "meta\x1b[0m".to_string(),
+                ToolVisualStatus::Success,
+            ),
+            HistoryCell::patch_diff(
+                "patch-1".to_string(),
+                "--- a\n+++ b\n+\x1b[32mnew\x1b[0m\n".to_string(),
+                "1ms".to_string(),
+                ToolVisualStatus::Success,
+            ),
+        ];
+
+        for cell in cells {
+            let rendered = rendered_text(&cell.lines(80));
+            assert!(
+                !contains_tui_control(&rendered),
+                "rendered cell still contains controls: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_display_strips_controls_but_keeps_submitted_text() {
+        let raw = "show\x1b[31m red\x1b[0m\nnext\x07";
+        let mut input = ComposerInput::default();
+        input.insert_paste(raw.to_string());
+
+        assert_eq!(input.to_text(), raw);
+        let rendered = rendered_text(&input.display_lines());
+        assert!(!contains_tui_control(&rendered));
+        assert!(rendered.contains("show red"));
+        assert!(rendered.contains("next"));
     }
 
     #[test]
@@ -5495,5 +5797,14 @@ mod tests {
         args.iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

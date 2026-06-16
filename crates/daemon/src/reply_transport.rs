@@ -63,7 +63,9 @@ impl ReplyTransport {
             Self::Feishu(gateway) => {
                 if let Err(err) = gateway.reply_text(message_id, text).await {
                     gateway.send_text(chat_id, text).await.map_err(|send_err| {
-                        anyhow!("reply_text failed: {err:#}; send_text fallback failed: {send_err:#}")
+                        anyhow!(
+                            "reply_text failed: {err:#}; send_text fallback failed: {send_err:#}"
+                        )
                     })?;
                 }
                 Ok(())
@@ -113,9 +115,38 @@ impl ReplyTransport {
         }
     }
 
+    pub async fn reply_card_raw_with_id(
+        &self,
+        message_id: &str,
+        card: serde_json::Value,
+    ) -> Result<Option<String>> {
+        match self {
+            Self::Feishu(gateway) => gateway.reply_card_raw(message_id, card).await.map(Some),
+            Self::Cli(gateway) => {
+                gateway
+                    .reply_card(message_id, &serde_json::to_string_pretty(&card)?)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn update_card_raw(&self, message_id: &str, card: serde_json::Value) -> Result<()> {
+        match self {
+            Self::Feishu(gateway) => gateway.update_card_raw(message_id, card).await,
+            Self::Cli(gateway) => {
+                gateway
+                    .reply_card(message_id, &serde_json::to_string_pretty(&card)?)
+                    .await
+            }
+        }
+    }
+
     pub fn begin_streaming_reply(&self, reply_to: &str) -> StreamingReply {
         match self {
-            Self::Feishu(gateway) => StreamingReply::Feishu(gateway.begin_streaming_reply(reply_to)),
+            Self::Feishu(gateway) => {
+                StreamingReply::Feishu(gateway.begin_streaming_reply(reply_to))
+            }
             Self::Cli(gateway) => StreamingReply::Cli(gateway.begin_streaming_reply(reply_to)),
         }
     }
@@ -210,13 +241,17 @@ pub async fn handle_im_bridge_request(
                     },
                 )
             } else {
-                Err(anyhow!("download request must specify attachment_key or document_url"))
+                Err(anyhow!(
+                    "download request must specify attachment_key or document_url"
+                ))
             };
             match result {
                 Ok(downloaded) => ImBridgeResponse {
                     request_id,
                     error: String::new(),
-                    payload: Some(remi_proto::im_bridge_response::Payload::Downloaded(downloaded)),
+                    payload: Some(remi_proto::im_bridge_response::Payload::Downloaded(
+                        downloaded,
+                    )),
                 },
                 Err(err) => ImBridgeResponse {
                     request_id,
@@ -255,9 +290,11 @@ pub async fn handle_im_bridge_request(
                         .await
                     {
                         Ok(message_id) => message_id,
-                        Err(_) => gateway
-                            .send_file(&upload.chat_id, &file_key, &upload.file_type)
-                            .await?,
+                        Err(_) => {
+                            gateway
+                                .send_file(&upload.chat_id, &file_key, &upload.file_type)
+                                .await?
+                        }
                     }
                 } else {
                     gateway

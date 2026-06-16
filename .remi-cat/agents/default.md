@@ -28,7 +28,8 @@ tools:
   - fs_remove
   - fs_ls
   - fetch
-  - acp__chat
+  - now
+  - codex
   - manage_yourself
 delegates:
   - explorer

@@ -2,6 +2,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::tui_text::sanitize_tui_text;
+
 #[derive(Clone, Copy)]
 pub(crate) struct MarkdownTheme {
     pub(crate) base: Style,
@@ -16,8 +18,9 @@ pub(crate) fn render_markdown_lines(
     width: u16,
     theme: MarkdownTheme,
 ) -> Vec<Line<'static>> {
+    let input = sanitize_tui_text(input);
     let mut renderer = MarkdownRenderer::new(theme);
-    renderer.render(input);
+    renderer.render(&input);
     wrap_styled_lines(renderer.finish(), width.max(16) as usize, theme.dim)
 }
 
@@ -750,5 +753,22 @@ mod tests {
         assert!(lines.iter().any(|line| line.spans.iter().any(|span| {
             span.content.as_ref() == "42%" && span.style.fg == Some(Color::Yellow)
         })));
+    }
+
+    #[test]
+    fn strips_terminal_control_sequences_before_rendering() {
+        let lines = render_markdown_lines(
+            "hello \x1b[31m**bold**\x1b[0m \x1b]0;bad\x07ok\u{202e}",
+            80,
+            theme(),
+        );
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "hello bold ok");
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{202e}'));
     }
 }
