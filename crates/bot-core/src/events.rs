@@ -31,6 +31,72 @@ pub struct ContextCompactionEvent {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInputSegmentCategory {
+    SystemPrompt,
+    SkillInjection,
+    History,
+    ToolInput,
+    ToolOutput,
+    CurrentUser,
+    Metadata,
+    UserState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInputSegment {
+    pub id: String,
+    pub category: ModelInputSegmentCategory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub title: String,
+    pub content: String,
+    pub token_estimate: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInputTotals {
+    pub estimated_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInputSnapshot {
+    pub run_id: String,
+    pub thread_id: String,
+    pub model_profile_id: String,
+    pub model: String,
+    pub created_at: String,
+    pub segments: Vec<ModelInputSegment>,
+    pub totals: ModelInputTotals,
+}
+
+impl ModelInputSnapshot {
+    pub fn apply_usage(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        max_prompt_tokens: u32,
+        context_tokens: u32,
+    ) {
+        self.totals.prompt_tokens = Some(prompt_tokens);
+        self.totals.completion_tokens = Some(completion_tokens);
+        self.totals.total_tokens = Some(prompt_tokens.saturating_add(completion_tokens));
+        self.totals.max_prompt_tokens = Some(max_prompt_tokens);
+        self.totals.context_tokens = Some(context_tokens);
+    }
+}
+
 // ── Skill events ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -86,6 +152,8 @@ pub enum CatEvent {
     SupervisorProgress(SupervisorTraceEvent),
     /// Short-term context was compacted into memory.
     ContextCompaction(ContextCompactionEvent),
+    /// Full model input snapshot captured before the request is sent.
+    ModelInputSnapshot(ModelInputSnapshot),
     /// Run completed normally.
     Done,
     /// An error occurred (run aborted).

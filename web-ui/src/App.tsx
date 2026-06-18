@@ -37,6 +37,9 @@ import {
   type ContextCompactionEvent,
   type DebugStats,
   type HistoryMessage,
+  type ModelInputCategory,
+  type ModelInputSnapshot,
+  type ModelInputSummary,
   type PrettyToolCall,
   type SecretList,
   type Session,
@@ -507,9 +510,24 @@ function subSessionLabel(event: SubSessionEvent) {
   }
 }
 
+function isSubSessionActivity(event: SubSessionEvent) {
+  const type = event.sub_type ?? "event";
+  return type !== "start";
+}
+
+function subSessionEventBody(event: SubSessionEvent) {
+  if (event.content) return event.content;
+  if (event.delta) return event.delta;
+  if (event.result !== undefined) return event.result;
+  if (event.final_output) return event.final_output;
+  if (event.message) return event.message;
+  return undefined;
+}
+
 function SubSessionPart({ args, result, status }: ToolCallMessagePartProps) {
   const payload = args as SubSessionArgs;
   const events = payload.events ?? [];
+  const recentEvents = events.filter(isSubSessionActivity).slice(-3);
   const final = result as SubSessionEvent | undefined;
   const title = payload.title || payload.agentName || "Sub-agent";
   const state = final?.sub_type === "error" ? "failed" : final ? "done" : "running";
@@ -521,15 +539,11 @@ function SubSessionPart({ args, result, status }: ToolCallMessagePartProps) {
         <small>{payload.threadId ? String(payload.threadId).slice(0, 8) : state}</small>
       </summary>
       <div className="supervisor-body">
-        {events.map((event, index) => (
+        {recentEvents.map((event, index) => (
           <div className={`supervisor-event ${event.sub_type ?? "event"}`} key={index}>
             <strong>{subSessionLabel(event)}</strong>
             {event.id && <code>{event.id}</code>}
-            {event.content && <pre>{event.content}</pre>}
-            {event.delta && <pre>{event.delta}</pre>}
-            {event.result !== undefined && <pre>{event.result}</pre>}
-            {event.final_output && <pre>{event.final_output}</pre>}
-            {event.message && <pre>{event.message}</pre>}
+            {subSessionEventBody(event) && <pre>{subSessionEventBody(event)}</pre>}
           </div>
         ))}
       </div>
@@ -546,7 +560,7 @@ function formatTokens(value?: number) {
   return (value ?? 0).toLocaleString();
 }
 
-function DebugPanel({ stats }: { stats?: DebugStats }) {
+function DebugPanel({ stats, onOpenContext }: { stats?: DebugStats; onOpenContext: () => void }) {
   if (!stats) return null;
   const contextPercent = Math.min(100, Math.max(0, (stats.context_usage ?? 0) * 100));
   return (
@@ -564,6 +578,7 @@ function DebugPanel({ stats }: { stats?: DebugStats }) {
         <span>Context</span>
         <strong>{formatTokens(stats.max_prompt_tokens)} / {formatTokens(stats.context_tokens)} ({contextPercent.toFixed(1)}%)</strong>
         <div><i style={{ width: `${contextPercent}%` }} /></div>
+        <button type="button" onClick={onOpenContext}>查看完整上下文</button>
       </div>
     </details>
   );
@@ -872,7 +887,17 @@ function CommandComposer({ sessionId }: { sessionId: string }) {
   );
 }
 
-function ChatThread({ sessionId, todos, stats }: { sessionId: string; todos: TodoItem[]; stats?: DebugStats }) {
+function ChatThread({
+  sessionId,
+  todos,
+  stats,
+  onOpenContext,
+}: {
+  sessionId: string;
+  todos: TodoItem[];
+  stats?: DebugStats;
+  onOpenContext: () => void;
+}) {
   return (
     <ThreadPrimitive.Root className="thread">
       <ThreadPrimitive.Viewport className="viewport">
@@ -883,7 +908,7 @@ function ChatThread({ sessionId, todos, stats }: { sessionId: string; todos: Tod
         <ThreadPrimitive.ViewportFooter className="composer-wrap">
           <div className="composer-status">
             <ActiveTodoPanel items={todos} />
-            <DebugPanel stats={stats} />
+            <DebugPanel stats={stats} onOpenContext={onOpenContext} />
           </div>
           <CommandComposer sessionId={sessionId} />
         </ThreadPrimitive.ViewportFooter>
@@ -922,6 +947,148 @@ function ActiveTodoPanel({ items }: { items: TodoItem[] }) {
         ))}
       </div>
     </details>
+  );
+}
+
+const MODEL_INPUT_FILTERS: { value: "all" | ModelInputCategory; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "system_prompt", label: "System" },
+  { value: "history", label: "History" },
+  { value: "tool_input", label: "Tool input" },
+  { value: "tool_output", label: "Tool output" },
+  { value: "current_user", label: "Current" },
+  { value: "metadata", label: "Metadata" },
+  { value: "user_state", label: "State" },
+];
+
+function categoryLabel(category: ModelInputCategory) {
+  return category.replaceAll("_", " ");
+}
+
+function shortRunId(runId: string) {
+  return runId.length > 8 ? runId.slice(0, 8) : runId;
+}
+
+function ModelInputPanel({
+  sessionId,
+  onClose,
+  onError,
+}: {
+  sessionId: string;
+  onClose: () => void;
+  onError: (message: string) => void;
+}) {
+  const [items, setItems] = useState<ModelInputSummary[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string>();
+  const [snapshot, setSnapshot] = useState<ModelInputSnapshot>();
+  const [filter, setFilter] = useState<"all" | ModelInputCategory>("all");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api.modelInputs(sessionId)
+      .then((next) => {
+        if (cancelled) return;
+        setItems(next);
+        setSelectedRunId(next[0]?.run_id);
+      })
+      .catch((reason) => onError(String(reason)))
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onError, sessionId]);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setSnapshot(undefined);
+      return;
+    }
+    let cancelled = false;
+    api.modelInput(sessionId, selectedRunId)
+      .then((next) => {
+        if (!cancelled) setSnapshot(next);
+      })
+      .catch((reason) => onError(String(reason)));
+    return () => {
+      cancelled = true;
+    };
+  }, [onError, selectedRunId, sessionId]);
+
+  const visibleSegments = snapshot?.segments.filter((segment) =>
+    filter === "all" ? true : segment.category === filter,
+  ) ?? [];
+  const actual = snapshot?.totals.prompt_tokens;
+  const contextPercent = snapshot?.totals.context_tokens
+    ? Math.min(100, ((snapshot.totals.max_prompt_tokens ?? actual ?? 0) / snapshot.totals.context_tokens) * 100)
+    : undefined;
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="model-input-panel">
+        <header>
+          <div>
+            <strong>Model Context</strong>
+            <span>{snapshot ? `${snapshot.model_profile_id} · ${snapshot.model}` : "captured run input"}</span>
+          </div>
+          <button className="menu" onClick={onClose} aria-label="关闭">×</button>
+        </header>
+        {loading ? (
+          <div className="model-input-empty">加载中...</div>
+        ) : !items.length ? (
+          <div className="model-input-empty">No captured model input for this session.</div>
+        ) : (
+          <>
+            <div className="model-input-toolbar">
+              <select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>
+                {items.map((item) => (
+                  <option key={item.run_id} value={item.run_id}>
+                    {shortRunId(item.run_id)} · {new Date(item.created_at).toLocaleString()}
+                  </option>
+                ))}
+              </select>
+              <div className="model-input-tabs">
+                {MODEL_INPUT_FILTERS.map((item) => (
+                  <button
+                    key={item.value}
+                    className={filter === item.value ? "active" : ""}
+                    onClick={() => setFilter(item.value)}
+                    type="button"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {snapshot && (
+              <div className="model-input-summary">
+                <div><span>Estimated input</span><strong>{formatTokens(snapshot.totals.estimated_tokens)}</strong></div>
+                <div><span>Actual input</span><strong>{actual === undefined || actual === null ? "N/A" : formatTokens(actual)}</strong></div>
+                <div><span>Output</span><strong>{formatTokens(snapshot.totals.completion_tokens ?? 0)}</strong></div>
+                <div><span>Context</span><strong>{contextPercent === undefined ? "N/A" : `${contextPercent.toFixed(1)}%`}</strong></div>
+              </div>
+            )}
+            <div className="model-input-segments">
+              {visibleSegments.map((segment) => (
+                <details className={`model-input-segment ${segment.category}`} key={segment.id} open={segment.category !== "history"}>
+                  <summary>
+                    <span>{categoryLabel(segment.category)}</span>
+                    <strong>{segment.title}</strong>
+                    {segment.role && <code>{segment.role}</code>}
+                    <small>{formatTokens(segment.token_estimate)} est.</small>
+                  </summary>
+                  <pre>{segment.content}</pre>
+                </details>
+              ))}
+              {!visibleSegments.length && <div className="model-input-empty">No segments in this category.</div>}
+            </div>
+          </>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -998,6 +1165,7 @@ export default function App() {
   const [stats, setStats] = useState<DebugStats>();
   const [secrets, setSecrets] = useState<SecretList>();
   const [secretsOpen, setSecretsOpen] = useState(false);
+  const [modelInputOpen, setModelInputOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     const next = await api.listSessions();
@@ -1155,8 +1323,22 @@ export default function App() {
           onDelete={deleteSecret}
         />
       )}
+      {modelInputOpen && activeId && (
+        <ModelInputPanel
+          sessionId={activeId}
+          onClose={() => setModelInputOpen(false)}
+          onError={setError}
+        />
+      )}
       <main>
-        <header><button className="menu" onClick={() => setSidebarOpen((value) => !value)}><Menu size={20} /></button><div><strong>{active?.title || "新对话"}</strong><span>本机单用户</span></div></header>
+        <header>
+          <button className="menu" onClick={() => setSidebarOpen((value) => !value)}><Menu size={20} /></button>
+          <div><strong>{active?.title || "新对话"}</strong><span>本机单用户</span></div>
+          <button className="header-action" onClick={() => setModelInputOpen(true)} title="查看模型输入上下文">
+            <FileText size={16} />
+            <span>Context</span>
+          </button>
+        </header>
         {error && <div className="error" onClick={() => setError(undefined)}>{error}</div>}
         {loading || !activeId ? <div className="loading">加载中...</div> : (
           <RemiRuntimeProvider
@@ -1175,7 +1357,12 @@ export default function App() {
               void refreshTodos();
             }}
           >
-            <ChatThread sessionId={activeId} todos={todos} stats={stats} />
+            <ChatThread
+              sessionId={activeId}
+              todos={todos}
+              stats={stats}
+              onOpenContext={() => setModelInputOpen(true)}
+            />
           </RemiRuntimeProvider>
         )}
       </main>

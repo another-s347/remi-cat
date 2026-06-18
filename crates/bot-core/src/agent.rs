@@ -1146,6 +1146,15 @@ async fn collect_result(
                 match out {
                     ToolOutput::Result(c) => last = c,
                     ToolOutput::SubSession(mut event) => {
+                        if let Some(event) = crate::cat_event_from_subagent_approval_marker(&event)
+                        {
+                            if let Some(tx) = &side_event_tx {
+                                let _ = tx.send(event);
+                            } else {
+                                side_events.push(event);
+                            }
+                            continue;
+                        }
                         if event.parent_tool_call_id.is_empty() {
                             if let Some(parent) = parent_tool_call_id {
                                 event.parent_tool_call_id = parent.to_string();

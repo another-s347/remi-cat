@@ -5340,6 +5340,45 @@ impl TriggerSdk {
     pub fn delete_chat_runtime_state(&self, session_id: &str) -> Result<()> {
         self.storage.delete_chat_runtime_state(session_id)
     }
+
+    /// Persist a per-run model input snapshot as raw JSON.
+    pub fn upsert_chat_model_input_json(
+        &self,
+        session_id: String,
+        run_id: String,
+        created_at_ms: i64,
+        snapshot_json: String,
+    ) -> Result<()> {
+        self.storage.upsert_chat_model_input_json(
+            &session_id,
+            &run_id,
+            created_at_ms,
+            &snapshot_json,
+        )
+    }
+
+    /// List model input snapshots for a session as raw JSON, newest first.
+    pub fn list_chat_model_input_json(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<String>> {
+        self.storage.list_chat_model_input_json(session_id, limit)
+    }
+
+    /// Fetch one model input snapshot as raw JSON.
+    pub fn get_chat_model_input_json(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        self.storage.get_chat_model_input_json(session_id, run_id)
+    }
+
+    /// Delete all model input snapshots for a session.
+    pub fn delete_chat_model_inputs(&self, session_id: &str) -> Result<()> {
+        self.storage.delete_chat_model_inputs(session_id)
+    }
 }
 
 #[cfg(test)]

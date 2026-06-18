@@ -379,6 +379,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRisk
         | "lazy_wait"
         | "sleep" => ToolRiskLevel::Low,
         "workspace_bash" | "bash" => classify_bash_risk(args),
+        "ssh" => classify_ssh_risk(args),
         "fs_write" | "fs_create" | "fs_mkdir" | "fs_remove" => {
             classify_fs_mutation_risk(tool_name, args)
         }
@@ -406,6 +407,28 @@ fn classify_bash_risk(args: &serde_json::Value) -> ToolRiskLevel {
         return ToolRiskLevel::High;
     }
     ToolRiskLevel::High
+}
+
+fn classify_ssh_risk(args: &serde_json::Value) -> ToolRiskLevel {
+    if args
+        .get("pid")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        let action = args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("poll");
+        return match action {
+            "poll" => ToolRiskLevel::Low,
+            "cancel" => ToolRiskLevel::Medium,
+            _ => ToolRiskLevel::High,
+        };
+    }
+    classify_bash_risk(args)
 }
 
 fn is_readonly_shell_command(command: &str) -> bool {
@@ -518,6 +541,8 @@ fn classify_manage_yourself_risk(args: &serde_json::Value) -> ToolRiskLevel {
         return ToolRiskLevel::High;
     };
     match words.as_slice() {
+        [top] if top == "tools" => ToolRiskLevel::Low,
+        [top, flag] if top == "tools" && flag == "--json" => ToolRiskLevel::Low,
         [top, sub] if top == "profile" && matches!(sub.as_str(), "list" | "show") => {
             ToolRiskLevel::Low
         }
@@ -662,14 +687,14 @@ pub fn review_tool_risk(
 
 fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> String {
     match risk {
-        ToolRiskLevel::Low if matches!(tool_name, "bash" | "workspace_bash") => {
+        ToolRiskLevel::Low if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
             "The shell request is made only of recognized read-only inspection commands."
                 .to_string()
         }
         ToolRiskLevel::Low => {
             "The tool request is classified as read-only or a simple local state update that is safe to auto-run.".to_string()
         }
-        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash") => {
+        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
             "The shell request is not in the read-only allowlist, but no destructive pattern was detected.".to_string()
         }
         ToolRiskLevel::Medium if matches!(tool_name, "fs_write" | "fs_create" | "fs_mkdir") => {
@@ -686,7 +711,7 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
                 "The `{tool_name}` request is not classified as read-only; review the summarized arguments before allowing it."
             )
         }
-        ToolRiskLevel::High if matches!(tool_name, "bash" | "workspace_bash") => {
+        ToolRiskLevel::High if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
             "The shell request may mutate files, change permissions, run privileged/package-management actions, or contains unsupported shell syntax.".to_string()
         }
         ToolRiskLevel::High if tool_name == "fs_remove" => {
@@ -706,7 +731,7 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
 fn review_concerns(tool_name: &str, risk: ToolRiskLevel) -> Vec<String> {
     match risk {
         ToolRiskLevel::Low => Vec::new(),
-        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash") => {
+        ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
             vec!["Command is outside the read-only shell allowlist.".to_string()]
         }
         ToolRiskLevel::Medium => {
@@ -927,6 +952,35 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_policy_reuses_bash_command_classification_and_handles_tasks() {
+        assert_eq!(
+            classify_tool_risk(
+                "ssh",
+                &serde_json::json!({ "host": "prod", "command": "ls -la" })
+            ),
+            ToolRiskLevel::Low
+        );
+        assert_eq!(
+            classify_tool_risk(
+                "ssh",
+                &serde_json::json!({ "host": "prod", "command": "rm -rf /tmp/x" })
+            ),
+            ToolRiskLevel::High
+        );
+        assert_eq!(
+            classify_tool_risk("ssh", &serde_json::json!({ "pid": "ssh_1" })),
+            ToolRiskLevel::Low
+        );
+        assert_eq!(
+            classify_tool_risk(
+                "ssh",
+                &serde_json::json!({ "pid": "ssh_1", "action": "cancel" })
+            ),
+            ToolRiskLevel::Medium
+        );
     }
 
     #[tokio::test]

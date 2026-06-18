@@ -41,7 +41,8 @@ pub use approval::{
     ToolRiskLevel, ToolRiskReview,
 };
 pub use events::{
-    CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, SkillEvent,
+    CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
+    ModelInputSegment, ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillEvent,
     TodoEvent, TriggerEvent,
 };
 pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
@@ -77,11 +78,11 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    AgentBuilder, AgentConfig, AgentError, AgentEvent, LoopInput, MessageId, OpenAIClient,
-    ReqwestTransport, Role, RunId, ThreadId, ToolContext,
+    AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ReqwestTransport,
+    ResumePayload, Role, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool,
+    ToolContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
-use remi_agentloop_deepagent::{SubAgentEventStream, SubAgentToolAdapter};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::im_tools::register_fetch_tool;
@@ -95,7 +96,7 @@ use search::SearchTool;
 use tools::{
     BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RootedFsApplyPatchTool,
     RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
-    SecretRedactor, SleepTool, WorkspaceBashTool,
+    SecretRedactor, SleepTool, WorkspaceBashTool, WorkspaceSshTool,
 };
 
 const DEFAULT_AGENT_ID: &str = "default";
@@ -264,6 +265,19 @@ pub struct CatBot {
     redactor: SharedRedactor,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegisteredToolStatus {
+    pub name: String,
+    pub description: String,
+    pub registered: bool,
+    pub enabled: bool,
+    pub in_active_allowlist: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveModelProfile {
     pub profile: ModelProfileConfig,
@@ -418,6 +432,19 @@ impl CatBot {
 
     pub async fn thread_history(&self, thread_id: &str) -> Vec<ThreadHistoryMessage> {
         self.memory.thread_history(thread_id).await
+    }
+
+    pub async fn append_thread_messages(
+        &self,
+        thread_id: &str,
+        messages: Vec<remi_agentloop::prelude::Message>,
+    ) -> Result<(), remi_agentloop::prelude::AgentError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let run_lock = self.thread_run_lock(thread_id).await;
+        let _run_guard = run_lock.lock().await;
+        self.memory.save_turn(thread_id, messages).await
     }
 
     pub async fn delete_thread_data(
@@ -686,6 +713,12 @@ impl CatBot {
             .map_err(|err| remi_agentloop::prelude::AgentError::tool("codex", err.to_string()))
     }
 
+    pub async fn acp_session_id_for_sub_session(&self, sub_session_id: &str) -> Option<String> {
+        self.acp_backend
+            .session_id_for_sub_session(sub_session_id)
+            .await
+    }
+
     pub async fn acp_binding_status(
         &self,
         platform: &str,
@@ -768,6 +801,82 @@ impl CatBot {
             })
             .map(|d| (d.function.name, d.function.description))
             .collect()
+    }
+
+    /// Return every tool known to this runtime, without applying the active
+    /// agent allowlist. This is intended for diagnostics and self-management:
+    /// an agent can inspect unavailable tools and decide how to update its
+    /// profile allowlist or runtime configuration.
+    pub fn registered_tool_statuses(&self) -> Vec<RegisteredToolStatus> {
+        use remi_agentloop::tool::registry::ToolRegistry;
+
+        let enabled_defs = self.inner.local_tools.definitions(&serde_json::Value::Null);
+        let mut by_name: HashMap<String, RegisteredToolStatus> = HashMap::new();
+        for definition in enabled_defs {
+            let name = definition.function.name;
+            by_name.insert(
+                name.clone(),
+                RegisteredToolStatus {
+                    description: definition.function.description,
+                    registered: true,
+                    enabled: true,
+                    in_active_allowlist: self.tool_in_active_allowlist(&name),
+                    warnings: tool_warnings(&name),
+                    errors: tool_runtime_errors(&name),
+                    name,
+                },
+            );
+        }
+
+        for (name, description) in builtin_tool_catalog() {
+            let registered = self.inner.local_tools.contains(name);
+            by_name
+                .entry(name.to_string())
+                .or_insert_with(|| RegisteredToolStatus {
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    registered,
+                    enabled: registered,
+                    in_active_allowlist: self.tool_in_active_allowlist(name),
+                    warnings: tool_warnings(name),
+                    errors: {
+                        let mut errors = tool_errors(name, registered);
+                        errors.extend(tool_runtime_errors(name));
+                        errors
+                    },
+                });
+        }
+
+        if !self.acp_backend.codex_tool_available() {
+            by_name
+                .entry("codex".to_string())
+                .and_modify(|entry| {
+                    entry.registered = false;
+                    entry.enabled = false;
+                    entry.errors = tool_errors("codex", false);
+                })
+                .or_insert_with(|| RegisteredToolStatus {
+                    name: "codex".to_string(),
+                    description: "Open, resume, or poll a Codex ACP session.".to_string(),
+                    registered: false,
+                    enabled: false,
+                    in_active_allowlist: self.tool_in_active_allowlist("codex"),
+                    warnings: Vec::new(),
+                    errors: tool_errors("codex", false),
+                });
+        }
+
+        let mut tools = by_name.into_values().collect::<Vec<_>>();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
+    fn tool_in_active_allowlist(&self, name: &str) -> bool {
+        self.inner
+            .tool_allowlist
+            .as_ref()
+            .map(|allowlist| allowlist.iter().any(|tool| tool == name))
+            .unwrap_or(true)
     }
 
     async fn evaluate_workflow_after_round(
@@ -1229,6 +1338,16 @@ impl CatBot {
             }
             if let Some(mm) = message_metadata {
                 input = input.message_metadata(mm);
+            }
+
+            if let Some(snapshot) = model_input_snapshot_from_loop_input(
+                &input,
+                &thread_id_owned,
+                round_opts.message_id.as_deref(),
+                &effective_model.profile.id,
+                &effective_model.profile.model,
+            ) {
+                yield CatEvent::ModelInputSnapshot(snapshot);
             }
 
             yield CatEvent::StateUpdate(initial_user_state.clone());
@@ -1783,6 +1902,225 @@ fn apply_skill_injections(user_state: &mut serde_json::Value, skills: &[SkillDoc
     }
 }
 
+fn model_input_snapshot_from_loop_input(
+    input: &LoopInput,
+    thread_id: &str,
+    run_id: Option<&str>,
+    model_profile_id: &str,
+    model: &str,
+) -> Option<ModelInputSnapshot> {
+    let LoopInput::Start {
+        content,
+        history,
+        metadata,
+        message_metadata,
+        user_state,
+        ..
+    } = input
+    else {
+        return None;
+    };
+
+    let mut segments = Vec::new();
+    for (index, message) in history.iter().enumerate() {
+        append_message_model_input_segments(&mut segments, index, message);
+    }
+    append_segment(
+        &mut segments,
+        ModelInputSegmentCategory::CurrentUser,
+        Some("user".to_string()),
+        "Current user input".to_string(),
+        content_to_model_input_text(content),
+    );
+    if let Some(metadata) = metadata {
+        append_json_segment(
+            &mut segments,
+            ModelInputSegmentCategory::Metadata,
+            "Request metadata",
+            metadata,
+        );
+    }
+    if let Some(message_metadata) = message_metadata {
+        append_json_segment(
+            &mut segments,
+            ModelInputSegmentCategory::Metadata,
+            "Message metadata",
+            message_metadata,
+        );
+    }
+    if let Some(user_state) = user_state {
+        append_json_segment(
+            &mut segments,
+            ModelInputSegmentCategory::UserState,
+            "User state",
+            user_state,
+        );
+    }
+
+    let estimated_tokens = segments.iter().fold(0_u32, |sum, segment| {
+        sum.saturating_add(segment.token_estimate)
+    });
+    Some(ModelInputSnapshot {
+        run_id: run_id
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        thread_id: thread_id.to_string(),
+        model_profile_id: model_profile_id.to_string(),
+        model: model.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        segments,
+        totals: ModelInputTotals {
+            estimated_tokens,
+            ..ModelInputTotals::default()
+        },
+    })
+}
+
+fn append_message_model_input_segments(
+    segments: &mut Vec<ModelInputSegment>,
+    index: usize,
+    message: &Message,
+) {
+    if let Some(tool_calls) = message.tool_calls.as_ref() {
+        for (tool_index, call) in tool_calls.iter().enumerate() {
+            append_segment(
+                segments,
+                ModelInputSegmentCategory::ToolInput,
+                Some(role_name(&message.role)),
+                format!("Tool input {}.{}", index + 1, tool_index + 1),
+                serde_json::to_string_pretty(call).unwrap_or_else(|_| format!("{call:?}")),
+            );
+        }
+    }
+
+    let category = if message.tool_call_id.is_some() {
+        ModelInputSegmentCategory::ToolOutput
+    } else if message.role == Role::System {
+        let text = content_to_model_input_text(&message.content);
+        if text.starts_with("Skill `") && text.contains(" loaded for this turn from ") {
+            ModelInputSegmentCategory::SkillInjection
+        } else {
+            ModelInputSegmentCategory::SystemPrompt
+        }
+    } else {
+        ModelInputSegmentCategory::History
+    };
+
+    append_segment(
+        segments,
+        category,
+        Some(role_name(&message.role)),
+        message_segment_title(index, message),
+        content_to_model_input_text(&message.content),
+    );
+    if let Some(reasoning) = &message.reasoning_content {
+        append_segment(
+            segments,
+            ModelInputSegmentCategory::History,
+            Some(role_name(&message.role)),
+            format!("Reasoning {}", index + 1),
+            reasoning.clone(),
+        );
+    }
+    if let Some(metadata) = &message.metadata {
+        append_json_segment(
+            segments,
+            ModelInputSegmentCategory::Metadata,
+            &format!("Message metadata {}", index + 1),
+            metadata,
+        );
+    }
+}
+
+fn message_segment_title(index: usize, message: &Message) -> String {
+    if let Some(tool_call_id) = &message.tool_call_id {
+        return format!("Tool output {} ({tool_call_id})", index + 1);
+    }
+    format!("{} {}", role_name(&message.role), index + 1)
+}
+
+fn role_name(role: &Role) -> String {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+    .to_string()
+}
+
+fn append_json_segment(
+    segments: &mut Vec<ModelInputSegment>,
+    category: ModelInputSegmentCategory,
+    title: &str,
+    value: &serde_json::Value,
+) {
+    append_segment(
+        segments,
+        category,
+        None,
+        title.to_string(),
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    );
+}
+
+fn append_segment(
+    segments: &mut Vec<ModelInputSegment>,
+    category: ModelInputSegmentCategory,
+    role: Option<String>,
+    title: String,
+    content: String,
+) {
+    let id = format!("seg_{}", segments.len() + 1);
+    let token_estimate = estimate_model_input_tokens(&content);
+    segments.push(ModelInputSegment {
+        id,
+        category,
+        role,
+        title,
+        content,
+        token_estimate,
+    });
+}
+
+fn content_to_model_input_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .map(content_part_to_model_input_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn content_part_to_model_input_text(part: &ContentPart) -> String {
+    match part {
+        ContentPart::Text { text } => text.clone(),
+        ContentPart::ImageUrl { image_url } => {
+            format!("[image_url] {}", image_url.url)
+        }
+        ContentPart::ImageBase64 { media_type, data } => {
+            format!("[image_base64] {media_type}, {} bytes", data.len())
+        }
+        ContentPart::Audio { .. } => "[audio]".to_string(),
+        ContentPart::File { .. } => {
+            serde_json::to_string(part).unwrap_or_else(|_| "[file]".to_string())
+        }
+    }
+}
+
+fn estimate_model_input_tokens(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let units = text.chars().fold(0_f64, |sum, ch| {
+        sum + if ch.is_ascii() { 0.25 } else { 1.0 }
+    });
+    units.ceil().max(1.0) as u32
+}
+
 fn append_thread_todo_system_prompt(history: &mut Vec<Message>, user_state: &serde_json::Value) {
     if let Some(prompt) = todo::latest_unfinished_batch_system_prompt(user_state) {
         history.push(Message::system(prompt));
@@ -1872,6 +2210,124 @@ fn is_group_chat(chat_type: Option<&str>) -> bool {
     chat_type
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("group"))
+}
+
+fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "apply_patch",
+            "Apply a unified diff patch inside the workspace.",
+        ),
+        (
+            "bash",
+            "Execute a bash command in the configured workspace sandbox.",
+        ),
+        ("codex", "Open, resume, or poll a Codex ACP session."),
+        (
+            "fetch",
+            "Fetch content or IM bridge files into the workspace.",
+        ),
+        ("fs_create", "Create a new file in the workspace."),
+        ("fs_ls", "List workspace directory entries."),
+        ("fs_mkdir", "Create a workspace directory."),
+        ("fs_read", "Read a workspace file."),
+        ("fs_remove", "Remove a workspace file or directory."),
+        ("fs_write", "Write a workspace file."),
+        (
+            "manage_yourself",
+            "Run remi-cat CLI commands for self-management.",
+        ),
+        ("memory__get_detail", "Read a stored memory detail."),
+        ("memory__recall", "Search memory directly."),
+        ("memory__upsert_named", "Save or update a named memory."),
+        ("now", "Return the current time."),
+        ("search", "Search local memory/skills or web results."),
+        ("skill__get", "Read a skill document."),
+        ("skill__search", "Search installed skills."),
+        ("sleep", "Wait for a short duration."),
+        (
+            "ssh",
+            "Execute a command on a remote host via host OpenSSH.",
+        ),
+        ("todo__add", "Add todo items."),
+        ("todo__complete", "Complete a todo item."),
+        ("todo__list", "List todo items."),
+        ("todo__remove", "Remove a todo item."),
+        ("todo__update", "Update a todo item."),
+        ("trigger__delete", "Delete a semantic trigger."),
+        ("trigger__list", "List semantic triggers."),
+        ("trigger__upsert", "Create or update a semantic trigger."),
+        ("web_search", "Search the web with Exa."),
+    ]
+}
+
+fn tool_warnings(name: &str) -> Vec<String> {
+    match name {
+        "search" | "web_search" if !env_present("EXA_API_KEY") => {
+            vec!["web search is unavailable until EXA_API_KEY is set; local memory/skill search still works".to_string()]
+        }
+        "trigger__delete" | "trigger__list" | "trigger__upsert"
+            if !(env_present("REMI_APP_KEY") && env_present("REMI_PUBLIC_GRPC_ADDR")) =>
+        {
+            vec![
+                "remote trigger sync is disabled until REMI_APP_KEY and REMI_PUBLIC_GRPC_ADDR are both set; local-only triggers still work"
+                    .to_string(),
+            ]
+        }
+        "todo__add" | "todo__complete" | "todo__list" | "todo__remove" | "todo__update"
+            if !(env_present("REMI_APP_KEY") && env_present("REMI_PUBLIC_GRPC_ADDR")) =>
+        {
+            vec![
+                "remote todo sync is disabled until REMI_APP_KEY and REMI_PUBLIC_GRPC_ADDR are both set; local-only todos still work"
+                    .to_string(),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn tool_errors(name: &str, registered: bool) -> Vec<String> {
+    if registered {
+        return Vec::new();
+    }
+    match name {
+        "bash" => vec![
+            "bash is not registered because shell execution is disabled; enable shell.mode=local or a sandbox mode that allows bash"
+                .to_string(),
+        ],
+        "codex" => vec![
+            "codex is not registered because ACP Codex is not configured or the Codex binary is unavailable; run remi-cat codex setup and remi-cat codex doctor"
+                .to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn tool_runtime_errors(name: &str) -> Vec<String> {
+    match name {
+        "ssh" if !host_command_available("ssh") => vec![
+            "ssh is not usable because the host ssh executable was not found in PATH".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn host_command_available(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|path| {
+                let candidate = path.join(name);
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn env_present(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn is_direct_chat(chat_type: Option<&str>) -> bool {
@@ -2025,7 +2481,11 @@ impl LocalToolDeps {
         todo::register_todo_tools(&mut local_tools, Arc::clone(&self.todo_backend));
         trigger::register_trigger_tools(&mut local_tools, Arc::clone(&self.trigger_backend));
         if include_acp {
-            acp::register_acp_tools(&mut local_tools, Arc::clone(&self.acp_backend));
+            acp::register_acp_tools(
+                &mut local_tools,
+                Arc::clone(&self.acp_backend),
+                Arc::clone(&self.approval_manager),
+            );
         }
         register_delegate_agent_tools(
             &mut local_tools,
@@ -2059,6 +2519,7 @@ impl LocalToolDeps {
                 Arc::clone(&self.redactor),
             ));
         }
+        local_tools.register(WorkspaceSshTool::new(Arc::clone(&self.redactor)));
         local_tools.register(RootedFsReadTool {
             sandbox: Arc::clone(&self.sandbox),
             redactor: Arc::clone(&self.redactor),
@@ -2500,6 +2961,7 @@ impl CatBotBuilder {
                 Arc::clone(&redactor),
             ));
         }
+        acp_local_tools.register(WorkspaceSshTool::new(Arc::clone(&redactor)));
         acp_local_tools.register(RootedFsReadTool {
             sandbox: Arc::clone(&sandbox),
             redactor: Arc::clone(&redactor),
@@ -2622,6 +3084,494 @@ fn delegate_tool_name(agent_id: &str) -> String {
     format!("agent__{}", agent_id.trim().replace('-', "_"))
 }
 
+const SUBAGENT_APPROVAL_MARKER_AGENT: &str = "__remi_tool_approval__";
+const SUBAGENT_APPROVAL_REQUESTED_PREFIX: &str = "__remi_tool_approval_requested__:";
+const SUBAGENT_APPROVAL_UPDATED_PREFIX: &str = "__remi_tool_approval_updated__:";
+const SUBAGENT_APPROVAL_RESOLVED_PREFIX: &str = "__remi_tool_approval_resolved__:";
+
+struct RemiSubAgentTool {
+    name: String,
+    description: String,
+    parameters_schema: serde_json::Value,
+    agent_name: String,
+    model_name: String,
+    base_url: Option<String>,
+    api_key: String,
+    system_prompt: String,
+    extra_options: serde_json::Map<String, serde_json::Value>,
+    max_turns: usize,
+    data_dir: PathBuf,
+    deps: LocalToolDeps,
+    profile: AgentProfile,
+    tool_allowlist: Vec<String>,
+    overflow_bytes: usize,
+    persistent_sessions: bool,
+    session_locks: Arc<AsyncMutex<HashMap<String, ThreadRunLock>>>,
+}
+
+impl RemiSubAgentTool {
+    fn title_from_args(arguments: &serde_json::Value) -> Option<String> {
+        arguments
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    }
+
+    fn named_from_args(arguments: &serde_json::Value) -> Result<Option<String>, AgentError> {
+        let Some(named) = arguments
+            .get("named")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        if named.len() > 64 {
+            return Err(AgentError::tool(
+                "sub-agent",
+                "named sub-agent session must be at most 64 characters",
+            ));
+        }
+        if !named
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Err(AgentError::tool(
+                "sub-agent",
+                "named sub-agent session may only contain ASCII letters, numbers, '-' and '_'",
+            ));
+        }
+        Ok(Some(named.to_string()))
+    }
+
+    async fn session_lock(&self, thread_id: &str) -> ThreadRunLock {
+        let mut locks = self.session_locks.lock().await;
+        locks
+            .entry(thread_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+}
+
+impl Tool for RemiSubAgentTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.parameters_schema.clone()
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        let task = arguments
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if task.trim().is_empty() {
+            return Err(AgentError::tool("sub-agent", "missing task"));
+        }
+        let named = Self::named_from_args(&arguments)?;
+        if named.is_some() && !self.persistent_sessions {
+            return Err(AgentError::tool(
+                "sub-agent",
+                "named sub-agent sessions are not enabled for this agent profile",
+            ));
+        }
+
+        let title = Self::title_from_args(&arguments);
+        let agent_name = self.agent_name.clone();
+        let mut model = OpenAIClient::new(self.api_key.clone()).with_model(self.model_name.clone());
+        if let Some(url) = self.base_url.clone() {
+            model = model.with_base_url(url);
+        }
+        let mut builder = AgentBuilder::new()
+            .model(model)
+            .system(self.system_prompt.clone())
+            .max_turns(self.max_turns);
+        if !self.extra_options.is_empty() {
+            builder = builder.extra_options(self.extra_options.clone());
+        }
+        let agent = CatAgent {
+            inner: builder.build_loop(),
+            local_tools: build_subagent_tools(&self.deps, &self.profile),
+            data_dir: self.data_dir.clone(),
+            overflow_bytes: self.overflow_bytes,
+            im_bridge: None,
+            tool_allowlist: Some(self.tool_allowlist.clone()),
+            approval_manager: Arc::clone(&self.deps.approval_manager),
+        };
+        let sub_thread_id = ThreadId(match named.as_deref() {
+            Some(named) => format!("subagent:{}:{named}", self.agent_name),
+            None => format!("subagent:{}", uuid::Uuid::new_v4()),
+        });
+        let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
+        let sub_thread_id_for_memory = sub_thread_id.0.clone();
+        let metadata = subagent_metadata(ctx, &sub_thread_id_for_memory);
+        let memory = Arc::clone(&self.deps.memory);
+        let persistent = named.is_some();
+        let session_lock = if persistent {
+            Some(self.session_lock(&sub_thread_id_for_memory).await)
+        } else {
+            None
+        };
+
+        Ok(ToolResult::Output(stream! {
+            let _session_guard = match session_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            yield ToolOutput::SubSession(SubSessionEvent::new(
+                String::new(),
+                sub_thread_id.clone(),
+                sub_run_id.clone(),
+                agent_name.clone(),
+                title.clone(),
+                0,
+                SubSessionEventPayload::Start,
+            ));
+
+            let mut final_output = String::new();
+            let mut skip_count = 0usize;
+            let mut input = LoopInput::start(&task).metadata(metadata);
+            if persistent {
+                match memory.load_context(&sub_thread_id_for_memory).await {
+                    Ok(mut ctx) => {
+                        let history = build_injected_history(&ctx);
+                        skip_count = history.len();
+                        input = input
+                            .history(history)
+                            .user_state(std::mem::take(&mut ctx.user_state));
+                    }
+                    Err(err) => {
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::Error {
+                                message: format!("failed to load sub-agent session: {err}"),
+                            },
+                        ));
+                        yield ToolOutput::text(format!("Sub-agent failed: {err}"));
+                        return;
+                    }
+                }
+            }
+            let mut raw_history: Option<Vec<Message>> = None;
+            let mut raw_user_state: Option<serde_json::Value> = None;
+            let mut inner_stream = std::pin::pin!(agent.stream_with_input(input));
+            while let Some(event) = inner_stream.next().await {
+                match event {
+                    CatEvent::History(messages, user_state) => {
+                        if persistent {
+                            let next_skip_count = messages.len();
+                            let _ = persist_turn(
+                                &memory,
+                                &sub_thread_id_for_memory,
+                                Some(messages),
+                                Some(user_state),
+                                skip_count,
+                                &HashMap::new(),
+                            )
+                            .await;
+                            skip_count = next_skip_count;
+                        } else {
+                            raw_history = Some(messages);
+                            raw_user_state = Some(user_state);
+                        }
+                    }
+                    CatEvent::StateUpdate(user_state) => {
+                        if persistent {
+                            let _ = persist_turn(
+                                &memory,
+                                &sub_thread_id_for_memory,
+                                None,
+                                Some(user_state),
+                                skip_count,
+                                &HashMap::new(),
+                            )
+                            .await;
+                        } else {
+                            raw_user_state = Some(user_state);
+                        }
+                    }
+                    CatEvent::Text(content) => {
+                        final_output.push_str(&content);
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::Delta { content },
+                        ));
+                    }
+                    CatEvent::Thinking(content) => {
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::ThinkingEnd { content },
+                        ));
+                    }
+                    CatEvent::ToolCallStart { id, name } | CatEvent::ToolCall { id, name, .. } => {
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::ToolCallStart { id, name },
+                        ));
+                    }
+                    CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::ToolCallArgumentsDelta { id, delta },
+                        ));
+                    }
+                    CatEvent::ToolCallResult { id, name, result, .. } => {
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::ToolResult { id, name, result },
+                        ));
+                    }
+                    CatEvent::ToolApprovalRequested(request) => {
+                        yield subagent_approval_marker(
+                            &sub_thread_id,
+                            &sub_run_id,
+                            SUBAGENT_APPROVAL_REQUESTED_PREFIX,
+                            serde_json::to_string(&request).unwrap_or_default(),
+                        );
+                    }
+                    CatEvent::ToolApprovalUpdated(request) => {
+                        yield subagent_approval_marker(
+                            &sub_thread_id,
+                            &sub_run_id,
+                            SUBAGENT_APPROVAL_UPDATED_PREFIX,
+                            serde_json::to_string(&request).unwrap_or_default(),
+                        );
+                    }
+                    CatEvent::ToolApprovalResolved { request, decision } => {
+                        yield subagent_approval_marker(
+                            &sub_thread_id,
+                            &sub_run_id,
+                            SUBAGENT_APPROVAL_RESOLVED_PREFIX,
+                            serde_json::to_string(&serde_json::json!({
+                                "request": request,
+                                "decision": decision,
+                            }))
+                            .unwrap_or_default(),
+                        );
+                    }
+                    CatEvent::Done => {
+                        if persistent {
+                            let _ = persist_turn(
+                                &memory,
+                                &sub_thread_id_for_memory,
+                                raw_history.take(),
+                                raw_user_state.take(),
+                                skip_count,
+                                &HashMap::new(),
+                            )
+                            .await;
+                        }
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::Done {
+                                final_output: if final_output.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(final_output.clone())
+                                },
+                            },
+                        ));
+                        yield ToolOutput::text(final_output.clone());
+                        return;
+                    }
+                    CatEvent::Error(error) => {
+                        let message = error.to_string();
+                        if persistent {
+                            let _ = persist_turn(
+                                &memory,
+                                &sub_thread_id_for_memory,
+                                raw_history.take(),
+                                raw_user_state.take(),
+                                skip_count,
+                                &HashMap::new(),
+                            )
+                            .await;
+                        }
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(),
+                            sub_thread_id.clone(),
+                            sub_run_id.clone(),
+                            agent_name.clone(),
+                            title.clone(),
+                            0,
+                            SubSessionEventPayload::Error {
+                                message: message.clone(),
+                            },
+                        ));
+                        yield ToolOutput::text(format!("Sub-agent failed: {message}"));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            yield ToolOutput::text(final_output);
+        }))
+    }
+}
+
+fn subagent_metadata(ctx: &ToolContext, sub_thread_id: &str) -> serde_json::Value {
+    let mut metadata = ctx
+        .metadata
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    if let serde_json::Value::Object(map) = &mut metadata {
+        map.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(sub_thread_id.to_string()),
+        );
+        if !map.contains_key("parent_thread_id") {
+            if let Some(thread_id) = &ctx.thread_id {
+                map.insert(
+                    "parent_thread_id".to_string(),
+                    serde_json::Value::String(thread_id.0.clone()),
+                );
+            }
+        }
+        map.insert(
+            "subagent_run".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+    }
+    metadata
+}
+
+pub(crate) fn tool_approval_requested_marker(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    request: &ToolApprovalRequest,
+) -> ToolOutput {
+    subagent_approval_marker(
+        sub_thread_id,
+        sub_run_id,
+        SUBAGENT_APPROVAL_REQUESTED_PREFIX,
+        serde_json::to_string(request).unwrap_or_default(),
+    )
+}
+
+pub(crate) fn tool_approval_updated_marker(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    request: &ToolApprovalRequest,
+) -> ToolOutput {
+    subagent_approval_marker(
+        sub_thread_id,
+        sub_run_id,
+        SUBAGENT_APPROVAL_UPDATED_PREFIX,
+        serde_json::to_string(request).unwrap_or_default(),
+    )
+}
+
+pub(crate) fn tool_approval_resolved_marker(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    request: &ToolApprovalRequest,
+    decision: ToolApprovalDecision,
+) -> ToolOutput {
+    subagent_approval_marker(
+        sub_thread_id,
+        sub_run_id,
+        SUBAGENT_APPROVAL_RESOLVED_PREFIX,
+        serde_json::to_string(&serde_json::json!({
+            "request": request,
+            "decision": decision,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+fn subagent_approval_marker(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    prefix: &str,
+    payload: String,
+) -> ToolOutput {
+    ToolOutput::SubSession(SubSessionEvent::new(
+        String::new(),
+        sub_thread_id.clone(),
+        sub_run_id.clone(),
+        SUBAGENT_APPROVAL_MARKER_AGENT,
+        None,
+        0,
+        SubSessionEventPayload::Error {
+            message: format!("{prefix}{payload}"),
+        },
+    ))
+}
+
+pub(crate) fn cat_event_from_subagent_approval_marker(event: &SubSessionEvent) -> Option<CatEvent> {
+    if event.agent_name != SUBAGENT_APPROVAL_MARKER_AGENT {
+        return None;
+    }
+    let SubSessionEventPayload::Error { message } = &event.payload else {
+        return None;
+    };
+    if let Some(payload) = message.strip_prefix(SUBAGENT_APPROVAL_REQUESTED_PREFIX) {
+        let request = serde_json::from_str(payload).ok()?;
+        return Some(CatEvent::ToolApprovalRequested(request));
+    }
+    if let Some(payload) = message.strip_prefix(SUBAGENT_APPROVAL_UPDATED_PREFIX) {
+        let request = serde_json::from_str(payload).ok()?;
+        return Some(CatEvent::ToolApprovalUpdated(request));
+    }
+    if let Some(payload) = message.strip_prefix(SUBAGENT_APPROVAL_RESOLVED_PREFIX) {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let request = serde_json::from_value(value.get("request")?.clone()).ok()?;
+        let decision = serde_json::from_value(value.get("decision")?.clone()).ok()?;
+        return Some(CatEvent::ToolApprovalResolved { request, decision });
+    }
+    None
+}
+
 fn register_delegate_agent_tools(
     registry: &mut DefaultToolRegistry,
     deps: &LocalToolDeps,
@@ -2681,6 +3631,7 @@ fn register_delegate_agent_tools(
         let max_turns = profile.max_turns.unwrap_or(12);
         let tool_api_key = api_key.clone();
         let tool_extra_options = extra_options.clone();
+        let persistent_sessions = profile.persistent_sessions;
         let mut tool_allowlist = profile.tools.clone();
         for delegate in &profile.delegates {
             let name = delegate_tool_name(delegate);
@@ -2688,89 +3639,49 @@ fn register_delegate_agent_tools(
                 tool_allowlist.push(name);
             }
         }
-        let subagent_data_dir = deps.data_dir.clone();
-        let subagent_approval_manager = Arc::clone(&deps.approval_manager);
-        let subagent_deps = deps.clone_for_subagent();
-        let subagent_profile = profile.clone();
-        registry.register(SubAgentToolAdapter::new(
-            tool_name,
-            tool_description,
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "task": {
+        let mut parameters_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Complete, self-contained task for the sub-agent. Include all necessary context."
+                }
+            },
+            "required": ["task"]
+        });
+        if profile.persistent_sessions {
+            if let Some(properties) = parameters_schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                properties.insert(
+                    "named".to_string(),
+                    serde_json::json!({
                         "type": "string",
-                        "description": "Complete, self-contained task for the sub-agent. Include all necessary context."
-                    }
-                },
-                "required": ["task"]
-            }),
+                        "description": "Optional named persistent sub-agent session. Calls with the same name reuse the same sub-agent conversation and memory."
+                    }),
+                );
+            }
+        }
+        registry.register(RemiSubAgentTool {
+            name: tool_name,
+            description: tool_description,
+            parameters_schema,
             agent_name,
-            |arguments| {
-                arguments
-                    .get("task")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            },
-            move |arguments, _ctx| {
-                let task = arguments
-                    .get("task")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let api_key = tool_api_key.clone();
-                let model_name = model_name.clone();
-                let base_url = tool_base_url.clone();
-                let system_prompt = system_prompt.clone();
-                let extra_options = tool_extra_options.clone();
-                let data_dir = subagent_data_dir.clone();
-                let approval_manager = Arc::clone(&subagent_approval_manager);
-                let tool_allowlist = tool_allowlist.clone();
-                let deps = subagent_deps.clone_for_subagent();
-                let profile = subagent_profile.clone();
-                Box::pin(async move {
-                    if task.trim().is_empty() {
-                        return Err(AgentError::tool("sub-agent", "missing task"));
-                    }
-                    let mut model = OpenAIClient::new(api_key).with_model(model_name);
-                    if let Some(url) = base_url {
-                        model = model.with_base_url(url);
-                    }
-                    let mut builder = AgentBuilder::new()
-                        .model(model)
-                        .system(system_prompt)
-                        .max_turns(max_turns);
-                    if !extra_options.is_empty() {
-                        builder = builder.extra_options(extra_options);
-                    }
-                    let agent = CatAgent {
-                        inner: builder.build_loop(),
-                        local_tools: build_subagent_tools(&deps, &profile),
-                        data_dir,
-                        overflow_bytes,
-                        im_bridge: None,
-                        tool_allowlist: Some(tool_allowlist),
-                        approval_manager,
-                    };
-                    let sub_thread_id = ThreadId(format!("subagent:{}", uuid::Uuid::new_v4()));
-                    let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
-                    Ok(Box::pin(stream! {
-                        yield AgentEvent::RunStart {
-                            thread_id: sub_thread_id,
-                            run_id: sub_run_id,
-                            metadata: None,
-                        };
-                        let mut inner_stream = std::pin::pin!(agent.stream_with_input(LoopInput::start(&task)));
-                        while let Some(event) = inner_stream.next().await {
-                            match cat_event_to_agent_event(event) {
-                                Some(agent_event) => yield agent_event,
-                                None => {}
-                            }
-                        }
-                    }) as SubAgentEventStream)
-                })
-            },
-        ));
+            model_name,
+            base_url: tool_base_url,
+            api_key: tool_api_key,
+            system_prompt,
+            extra_options: tool_extra_options,
+            max_turns,
+            data_dir: deps.data_dir.clone(),
+            deps: deps.clone_for_subagent(),
+            profile,
+            tool_allowlist,
+            overflow_bytes,
+            persistent_sessions,
+            session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+        });
     }
 }
 
@@ -2801,6 +3712,7 @@ fn build_subagent_tools(deps: &LocalToolDeps, profile: &AgentProfile) -> Default
             Arc::clone(&deps.redactor),
         ));
     }
+    local_tools.register(WorkspaceSshTool::new(Arc::clone(&deps.redactor)));
     local_tools.register(RootedFsReadTool {
         sandbox: Arc::clone(&deps.sandbox),
         redactor: Arc::clone(&deps.redactor),
@@ -2833,40 +3745,26 @@ fn build_subagent_tools(deps: &LocalToolDeps, profile: &AgentProfile) -> Default
     local_tools
 }
 
-fn cat_event_to_agent_event(event: CatEvent) -> Option<AgentEvent> {
-    match event {
-        CatEvent::Text(text) => Some(AgentEvent::TextDelta(text)),
-        CatEvent::Thinking(content) => Some(AgentEvent::ThinkingEnd { content }),
-        CatEvent::ToolCallStart { id, name } => Some(AgentEvent::ToolCallStart { id, name }),
-        CatEvent::ToolCallArgumentsDelta { id, delta } => {
-            Some(AgentEvent::ToolCallArgumentsDelta { id, delta })
-        }
-        CatEvent::ToolCall { id, name, .. } => Some(AgentEvent::ToolCallStart { id, name }),
-        CatEvent::ToolCallResult {
-            id, name, result, ..
-        } => Some(AgentEvent::ToolResult { id, name, result }),
-        CatEvent::Error(error) => Some(AgentEvent::Error(error)),
-        CatEvent::Done => Some(AgentEvent::Done),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         append_thread_todo_system_prompt, context_percent_tokens, default_system_prompt,
-        insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
-        local_acp_thread_id,
+        estimate_model_input_tokens, insert_single_chat_sender_system_prompt,
+        install_embedded_model_profiles, local_acp_thread_id,
         memory::{build_injected_history, MemoryContext, MemoryIndex},
+        model_input_snapshot_from_loop_input,
         model_profile::ModelProfileConfig,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
-        GoalMaxRounds, Message, ModelProfileRegistry, PartialTurnRecorder, SandboxConfig,
-        StreamOptions, ThreadRunLocks, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        GoalMaxRounds, LoopInput, Message, ModelInputSegmentCategory, ModelProfileRegistry,
+        PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, ThreadRunLocks,
+        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::todo::tools::TodoItem;
     use futures::StreamExt as _;
     use remi_agentloop::prelude::Role;
+    use remi_agentloop::tool::registry::ToolRegistry;
+    use remi_agentloop::types::{FunctionCall, ToolCallMessage};
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
@@ -2894,6 +3792,64 @@ mod tests {
             auto_compress: true,
             extra_options: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn model_input_token_estimate_handles_ascii_and_cjk() {
+        assert_eq!(estimate_model_input_tokens(""), 0);
+        assert_eq!(estimate_model_input_tokens("abcd"), 1);
+        assert_eq!(estimate_model_input_tokens("abcde"), 2);
+        assert_eq!(estimate_model_input_tokens("你好"), 2);
+        assert_eq!(estimate_model_input_tokens("hi你"), 2);
+    }
+
+    #[test]
+    fn model_input_snapshot_classifies_core_segments() {
+        let mut assistant = Message::assistant("calling tool");
+        assistant.tool_calls = Some(vec![ToolCallMessage {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "fs_read".to_string(),
+                arguments: serde_json::to_string(&json!({"path": "README.md"})).unwrap(),
+            },
+        }]);
+        let mut tool = Message::assistant("file contents");
+        tool.role = Role::Tool;
+        tool.tool_call_id = Some("call_1".to_string());
+        let input = LoopInput::start("current")
+            .history(vec![
+                Message::system("system"),
+                Message::system("Skill `demo` loaded for this turn from test.\n\nbody"),
+                Message::user("previous"),
+                assistant,
+                tool,
+            ])
+            .metadata(json!({"thread_id": "thread"}))
+            .user_state(json!({"todos": []}));
+        let snapshot = model_input_snapshot_from_loop_input(
+            &input,
+            "thread",
+            Some("run_1"),
+            "default",
+            "gpt-test",
+        )
+        .expect("start input should produce a snapshot");
+        let categories = snapshot
+            .segments
+            .iter()
+            .map(|segment| segment.category.clone())
+            .collect::<Vec<_>>();
+        assert!(categories.contains(&ModelInputSegmentCategory::SystemPrompt));
+        assert!(categories.contains(&ModelInputSegmentCategory::SkillInjection));
+        assert!(categories.contains(&ModelInputSegmentCategory::History));
+        assert!(categories.contains(&ModelInputSegmentCategory::ToolInput));
+        assert!(categories.contains(&ModelInputSegmentCategory::ToolOutput));
+        assert!(categories.contains(&ModelInputSegmentCategory::CurrentUser));
+        assert!(categories.contains(&ModelInputSegmentCategory::Metadata));
+        assert!(categories.contains(&ModelInputSegmentCategory::UserState));
+        assert_eq!(snapshot.run_id, "run_1");
+        assert!(snapshot.totals.estimated_tokens > 0);
     }
 
     #[test]
@@ -2936,6 +3892,104 @@ mod tests {
             .iter()
             .any(|(name, _)| name == "agent__explorer"));
         assert!(agents_dir.join("explorer.md").exists());
+    }
+
+    #[test]
+    fn persistent_delegate_agent_exposes_named_parameter() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("coder.md"),
+            r#"---
+id: coder
+name: Coder
+description: Persistent coder
+tools:
+  - search
+persistent_sessions: true
+---
+You are Coder.
+"#,
+        )
+        .unwrap();
+
+        let root_profile = crate::profile::AgentProfile::from_markdown(
+            r#"---
+id: default
+name: Remi
+description: General assistant
+delegates:
+  - coder
+---
+You are Remi.
+"#,
+        )
+        .unwrap();
+
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile: test_model_profile(),
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            agents_dir,
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .agent_profile(root_profile)
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let definitions = bot.inner.local_tools.definitions(&serde_json::Value::Null);
+        let coder = definitions
+            .into_iter()
+            .find(|definition| definition.function.name == "agent__coder")
+            .expect("coder delegate should be registered");
+        assert!(
+            coder
+                .function
+                .parameters
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|properties| properties.contains_key("named")),
+            "persistent delegate schema should expose named"
+        );
+    }
+
+    #[test]
+    fn subagent_named_argument_is_validated() {
+        assert_eq!(
+            RemiSubAgentTool::named_from_args(&json!({"task": "work"})).unwrap(),
+            None
+        );
+        assert_eq!(
+            RemiSubAgentTool::named_from_args(&json!({"task": "work", "named": "build_1"}))
+                .unwrap(),
+            Some("build_1".to_string())
+        );
+        assert!(
+            RemiSubAgentTool::named_from_args(&json!({"task": "work", "named": "bad name"}))
+                .is_err()
+        );
     }
 
     #[test]

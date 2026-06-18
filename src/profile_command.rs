@@ -568,6 +568,7 @@ fn print_agent(agent: &AgentProfile) {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    println!("persistent_sessions: {}", agent.persistent_sessions);
     println!("system_prompt:\n{}", agent.system_prompt);
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bot_core::{
-    CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus, PrettyToolCall,
+    CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus, Message, PrettyToolCall,
     PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage,
     ToolApprovalDecision, ToolApprovalRequest, WorkflowReport,
 };
@@ -33,9 +33,9 @@ use remi_agentloop::prelude::{SubSessionEvent, SubSessionEventPayload};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::session::Session;
+use crate::session::{ChannelBinding, Session, SubSessionKind};
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
 #[cfg(test)]
 use crate::tui_text::contains_tui_control;
@@ -339,6 +339,16 @@ impl TerminalGuard {
         if self.restored {
             return Ok(());
         }
+        execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            ResetColor,
+            Show,
+            EnableLineWrap
+        )
+        .context("restore terminal modes")?;
+        drain_terminal_events();
         disable_raw_mode().context("disable raw mode")?;
         execute!(
             self.terminal.backend_mut(),
@@ -353,6 +363,14 @@ impl TerminalGuard {
         self.terminal.show_cursor().context("show cursor")?;
         self.restored = true;
         Ok(())
+    }
+}
+
+fn drain_terminal_events() {
+    while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
+        }
     }
 }
 
@@ -465,14 +483,12 @@ impl ComposerInput {
                         if index > 0 {
                             lines.push(Vec::new());
                         }
+                        let part = expand_tabs(part);
                         if !part.is_empty() {
                             lines
                                 .last_mut()
                                 .expect("composer line exists")
-                                .push(Span::styled(
-                                    part.to_string(),
-                                    Style::default().fg(Color::White),
-                                ));
+                                .push(Span::styled(part, Style::default().fg(Color::White)));
                         }
                     }
                 }
@@ -950,6 +966,7 @@ struct TuiApp {
     quit_hint_until: Option<Instant>,
     running: bool,
     run_started_at: Option<Instant>,
+    interrupt_requested: bool,
     cancel: Option<Arc<Notify>>,
     run_handle: Option<JoinHandle<()>>,
     queued_inputs: VecDeque<String>,
@@ -966,6 +983,7 @@ struct TuiApp {
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
+    opened_sub_session_panes: std::collections::HashSet<String>,
     supervisors: std::collections::HashMap<String, SupervisorUiState>,
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
@@ -1009,6 +1027,7 @@ impl TuiApp {
             quit_hint_until: None,
             running: false,
             run_started_at: None,
+            interrupt_requested: false,
             cancel: None,
             run_handle: None,
             queued_inputs: VecDeque::new(),
@@ -1025,6 +1044,7 @@ impl TuiApp {
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
+            opened_sub_session_panes: std::collections::HashSet::new(),
             supervisors: std::collections::HashMap::new(),
             pending_approval: None,
             approval_selected: 0,
@@ -1406,6 +1426,7 @@ impl TuiApp {
         self.sub_tool_args.clear();
         self.sub_tool_names.clear();
         self.sub_sessions.clear();
+        self.opened_sub_session_panes.clear();
         self.supervisors.clear();
         self.pending_approval = None;
         self.approval_selected = 0;
@@ -1431,6 +1452,7 @@ impl TuiApp {
         self.cancel = Some(Arc::clone(&cancel));
         self.running = true;
         self.run_started_at = Some(Instant::now());
+        self.interrupt_requested = false;
         self.status.state = "running".to_string();
         self.status.last_error = None;
         self.last_stats_snapshot = TokenStatsSnapshot::default();
@@ -1473,6 +1495,7 @@ impl TuiApp {
         self.cancel = Some(Arc::clone(&cancel));
         self.running = true;
         self.run_started_at = Some(Instant::now());
+        self.interrupt_requested = false;
         self.status.state = "running".to_string();
         self.status.last_error = None;
         self.last_stats_snapshot = TokenStatsSnapshot::default();
@@ -1698,7 +1721,7 @@ impl TuiApp {
             }
             BotEvent::SupervisorProgress(progress) => self.upsert_supervisor_progress(progress),
             BotEvent::SupervisorReport(report) => self.upsert_supervisor_report(report),
-            BotEvent::SubSession(event) => self.upsert_sub_session(event),
+            BotEvent::SubSession(event) => self.upsert_sub_session(event).await,
             BotEvent::ContextCompaction(event) => {
                 upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(event));
             }
@@ -1791,22 +1814,26 @@ impl TuiApp {
                 self.status.last_error = Some(message.clone());
                 self.cells.push(HistoryCell::error(message));
                 self.running = false;
+                self.interrupt_requested = false;
                 self.cancel = None;
                 self.run_handle = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
+                self.opened_sub_session_panes.clear();
                 self.supervisors.clear();
                 self.active_supervisor_id = None;
                 self.status.state = "error".to_string();
             }
             BotEvent::Done => {
                 self.running = false;
+                self.interrupt_requested = false;
                 self.cancel = None;
                 self.run_handle = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
+                self.opened_sub_session_panes.clear();
                 self.supervisors.clear();
                 self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
@@ -2038,19 +2065,33 @@ impl TuiApp {
     }
 
     fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut lines = Vec::new();
-        for cell in &self.cells {
-            lines.extend(cell.lines(area.width));
-        }
-        let start = history_scroll_offset(lines.len(), area.height as usize, self.scroll as usize);
-        let visible_lines = lines
-            .into_iter()
-            .skip(start)
-            .take(area.height as usize)
-            .collect::<Vec<_>>();
+        let visible_lines = self.visible_history_lines(area);
         let paragraph = Paragraph::new(visible_lines).style(Style::default().fg(Color::Gray));
         frame.render_widget(Clear, area);
         frame.render_widget(paragraph, area);
+    }
+
+    fn visible_history_lines(&self, area: Rect) -> Vec<Line<'static>> {
+        let height = area.height as usize;
+        if height == 0 {
+            return Vec::new();
+        }
+        let needed = height.saturating_add(self.scroll as usize);
+        let mut lines = Vec::with_capacity(needed.min(height.saturating_mul(2).max(1)));
+        for cell in self.cells.iter().rev() {
+            let cell_lines = cell.lines(area.width);
+            for line in cell_lines.into_iter().rev() {
+                lines.push(line);
+                if lines.len() >= needed {
+                    break;
+                }
+            }
+            if lines.len() >= needed {
+                break;
+            }
+        }
+        lines.reverse();
+        lines.into_iter().take(height).collect()
     }
 
     fn render_composer(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2077,9 +2118,9 @@ impl TuiApp {
                 ),
             ])]
         } else {
-            self.composer.display_lines()
+            composer_visual_lines(&self.composer, input_area.width)
         };
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, input_area);
         if !self.running {
             let (x, y) = self.cursor_position(input_area);
@@ -2328,6 +2369,10 @@ impl TuiApp {
             return false;
         }
         if self.running {
+            if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
+                self.status.state = "cancelling".to_string();
+                return false;
+            }
             if let Some(cancel) = &self.cancel {
                 cancel.notify_waiters();
             }
@@ -2338,12 +2383,12 @@ impl TuiApp {
             self.sub_tool_args.clear();
             self.sub_tool_names.clear();
             self.sub_sessions.clear();
+            self.opened_sub_session_panes.clear();
             self.supervisors.clear();
             self.pending_approval = None;
             self.approval_selected = 0;
             self.approval_state = "waiting";
             self.active_supervisor_id = None;
-            self.cells.push(HistoryCell::system("Interrupt requested."));
             self.refresh_command_catalog();
             return false;
         }
@@ -2644,7 +2689,7 @@ impl TuiApp {
         }
     }
 
-    fn upsert_sub_session(&mut self, event: SubSessionEvent) {
+    async fn upsert_sub_session(&mut self, event: SubSessionEvent) {
         let id = sub_session_id(&event);
         let status = sub_session_status(&event.payload);
         let state = self
@@ -2653,16 +2698,44 @@ impl TuiApp {
             .or_insert_with(|| SubSessionUiState::from_event(&event));
         state.update_context(&event);
         match &event.payload {
-            SubSessionEventPayload::Start
-            | SubSessionEventPayload::Delta { .. }
-            | SubSessionEventPayload::ThinkingStart
-            | SubSessionEventPayload::ThinkingEnd { .. }
-            | SubSessionEventPayload::TurnStart { .. } => {}
+            SubSessionEventPayload::Start => {}
+            SubSessionEventPayload::Delta { content } => {
+                state.push_activity(SubSessionActivity::message(
+                    "output",
+                    content,
+                    ToolVisualStatus::Running,
+                ));
+            }
+            SubSessionEventPayload::ThinkingStart => {
+                state.upsert_activity(SubSessionActivity::keyed(
+                    "thinking",
+                    "thinking",
+                    "thinking...",
+                    ToolVisualStatus::Running,
+                ));
+            }
+            SubSessionEventPayload::ThinkingEnd { content } => {
+                state.upsert_activity(SubSessionActivity::keyed(
+                    "thinking",
+                    "thinking",
+                    content,
+                    ToolVisualStatus::Running,
+                ));
+            }
+            SubSessionEventPayload::TurnStart { turn } => {
+                state.push_activity(SubSessionActivity::message(
+                    "turn",
+                    &format!("turn {turn}"),
+                    ToolVisualStatus::Running,
+                ));
+            }
             SubSessionEventPayload::ToolCallStart { id: call_id, name } => {
                 self.sub_tool_names.insert(call_id.clone(), name.clone());
                 self.sub_tool_args.entry(call_id.clone()).or_default();
                 let pretty = PrettyToolCall::started(call_id, name, &empty_tool_args());
-                state.upsert_tool(SubToolDisplay::from_pretty(call_id, &pretty, status));
+                let tool = SubToolDisplay::from_pretty(call_id, &pretty, status);
+                state.upsert_tool(tool.clone());
+                state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
             SubSessionEventPayload::ToolCallArgumentsDelta { id: call_id, delta } => {
                 let args = self.sub_tool_args.entry(call_id.clone()).or_default();
@@ -2674,7 +2747,9 @@ impl TuiApp {
                     .unwrap_or_else(|| call_id.clone());
                 let args_value = parse_tool_args(args).unwrap_or(serde_json::Value::Null);
                 let pretty = PrettyToolCall::started(call_id, &name, &args_value);
-                state.upsert_tool(SubToolDisplay::from_pretty(call_id, &pretty, status));
+                let tool = SubToolDisplay::from_pretty(call_id, &pretty, status);
+                state.upsert_tool(tool.clone());
+                state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
             SubSessionEventPayload::ToolDelta {
                 id: call_id,
@@ -2682,12 +2757,14 @@ impl TuiApp {
                 delta,
             } => {
                 self.sub_tool_names.insert(call_id.clone(), name.clone());
-                state.upsert_tool(SubToolDisplay {
+                let tool = SubToolDisplay {
                     id: call_id.clone(),
                     title: format!("调用 {name}"),
                     summary: truncate_chars(delta, MAX_TOOL_BODY_CHARS),
                     status,
-                });
+                };
+                state.upsert_tool(tool.clone());
+                state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
             SubSessionEventPayload::ToolResult {
                 id: call_id,
@@ -2700,11 +2777,13 @@ impl TuiApp {
                 let success = bot_core::tool_success(result);
                 let pretty =
                     PrettyToolCall::completed(call_id, name, &args_value, result, success, 0);
-                state.upsert_tool(SubToolDisplay::from_pretty(
+                let tool = SubToolDisplay::from_pretty(
                     call_id,
                     &pretty,
                     ToolVisualStatus::from_success(success),
-                ));
+                );
+                state.upsert_tool(tool.clone());
+                state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
             SubSessionEventPayload::Done { final_output } => {
                 state.done = true;
@@ -2712,11 +2791,23 @@ impl TuiApp {
                     .as_deref()
                     .filter(|text| !text.trim().is_empty())
                     .map(|output| truncate_chars(&single_line(output), MAX_TOOL_BODY_CHARS));
+                if let Some(output) = state.final_output.clone() {
+                    state.push_activity(SubSessionActivity::message(
+                        "final",
+                        &output,
+                        ToolVisualStatus::Success,
+                    ));
+                }
             }
             SubSessionEventPayload::Error { message } => {
                 state.failed = true;
                 state.final_output =
                     Some(truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS));
+                state.push_activity(SubSessionActivity::message(
+                    "error",
+                    message,
+                    ToolVisualStatus::Error,
+                ));
             }
         }
         let title = state.title();
@@ -2733,6 +2824,69 @@ impl TuiApp {
         } else {
             self.cells
                 .push(HistoryCell::sub_session(id, title, body, meta, status));
+        }
+        self.persist_and_maybe_open_sub_session(event).await;
+    }
+
+    async fn persist_and_maybe_open_sub_session(&mut self, event: SubSessionEvent) {
+        let kind = sub_session_kind(&event);
+        let status = sub_session_status_label(&event.payload);
+        if let Err(error) = self.runtime.sessions.lock().await.upsert_sub_session(
+            &self.session_id,
+            &event.sub_thread_id.0,
+            kind,
+            &event.agent_name,
+            event.title.clone(),
+            status,
+        ) {
+            self.cells.push(HistoryCell::error(format!(
+                "sub-session 记录失败: {error:#}"
+            )));
+            return;
+        }
+
+        let child_session_id =
+            match ensure_tui_sub_session_channel_session(&self.runtime, &self.session_id, &event)
+                .await
+            {
+                Some(session_id) => session_id,
+                None => return,
+            };
+
+        let messages = sub_session_history_messages(&event);
+        if !messages.is_empty() {
+            if let Err(error) = self
+                .runtime
+                .bot
+                .append_thread_messages(&child_session_id, messages)
+                .await
+            {
+                self.cells.push(HistoryCell::error(format!(
+                    "sub-session 历史写入失败: {error:#}"
+                )));
+            }
+        }
+
+        if !matches!(event.payload, SubSessionEventPayload::Start) {
+            return;
+        }
+        let pane_key = format!("{}:{}", self.session_id, event.sub_thread_id.0);
+        if !self.opened_sub_session_panes.insert(pane_key) {
+            return;
+        }
+        match open_tui_session_in_new_pane(&child_session_id, &self.cli) {
+            Ok(Some(kind)) => self.cells.push(HistoryCell::system(format!(
+                "sub-session 已在新的 {kind} pane 中打开。\nagent: {}\nsession: {}",
+                event.agent_name, child_session_id
+            ))),
+            Ok(None) => self.cells.push(HistoryCell::system(format!(
+                "sub-session 已创建独立 TUI session，可手动打开：\nremi-cat tui resume {}",
+                child_session_id
+            ))),
+            Err(error) => self.cells.push(HistoryCell::system(format!(
+                "sub-session 独立 TUI session 已创建，但自动打开 pane 失败。\nsession: {}\n错误: {error:#}",
+                child_session_id
+            ))),
         }
     }
 
@@ -2754,8 +2908,7 @@ impl TuiApp {
     }
 
     fn composer_height(&self, width: u16) -> u16 {
-        let display = sanitize_tui_text(&self.composer.display_text());
-        let rows = wrap_line_count(&display, width.saturating_sub(3)).max(1);
+        let rows = composer_visual_line_count(&self.composer, width).max(1);
         rows.clamp(1, 6).saturating_add(1)
     }
 
@@ -2776,24 +2929,82 @@ impl TuiApp {
     fn cursor_position(&self, area: Rect) -> (u16, u16) {
         let display = self.composer.display_text();
         let cursor = self.composer.cursor_display_byte().min(display.len());
-        let before = sanitize_tui_text(&display[..cursor]);
-        let inner_width = area.width.saturating_sub(3).max(1);
-        let mut row = 0_u16;
-        let mut col = 0_u16;
-        for line in before.split('\n') {
-            let width = UnicodeWidthStr::width(line) as u16;
-            row = row.saturating_add(width / inner_width);
-            col = width % inner_width;
-        }
-        if before.ends_with('\n') {
-            row = row.saturating_add(1);
-            col = 0;
-        }
+        let before = expand_tabs(&sanitize_tui_text(&display[..cursor]));
+        let (row, col) = composer_visual_position(&before, area.width);
         (
-            area.x + 3 + col.min(inner_width.saturating_sub(1)),
+            area.x + col.min(area.width.saturating_sub(1)),
             area.y + row.min(area.height.saturating_sub(1)),
         )
     }
+}
+
+async fn ensure_tui_sub_session_channel_session(
+    runtime: &Rc<Runtime>,
+    parent_session_id: &str,
+    event: &SubSessionEvent,
+) -> Option<String> {
+    let title = event.title.clone().or_else(|| {
+        Some(format!(
+            "{} {}",
+            event.agent_name,
+            event.sub_thread_id.0.trim()
+        ))
+    });
+    let existing_binding = runtime
+        .sessions
+        .lock()
+        .await
+        .sub_session_channel_binding(parent_session_id, &event.sub_thread_id.0);
+    let (session_platform, session_channel_id) = existing_binding
+        .as_ref()
+        .map(|binding| (binding.platform.as_str(), binding.channel_id.as_str()))
+        .unwrap_or((TUI_CHANNEL, event.sub_thread_id.0.as_str()));
+
+    let session = runtime.sessions.lock().await.create_channel(
+        session_platform,
+        session_channel_id,
+        &runtime.root_agent_id,
+        title,
+    );
+    let session = match session {
+        Ok(session) => session,
+        Err(_) => return None,
+    };
+
+    let mut sessions = runtime.sessions.lock().await;
+    if existing_binding.is_none() {
+        let _ = sessions.bind_sub_session_channel(
+            parent_session_id,
+            &event.sub_thread_id.0,
+            ChannelBinding {
+                platform: TUI_CHANNEL.to_string(),
+                channel_id: event.sub_thread_id.0.clone(),
+            },
+        );
+    }
+    let _ = sessions.set_metadata_string(
+        &session.id,
+        "sub_session_parent_session_id",
+        parent_session_id,
+    );
+    let _ =
+        sessions.set_metadata_string(&session.id, "sub_session_thread_id", &event.sub_thread_id.0);
+    let _ = sessions.set_metadata_string(&session.id, "sub_session_agent", &event.agent_name);
+    drop(sessions);
+    if event.agent_name == "acp" {
+        if let Some(acp_session_id) = runtime
+            .bot
+            .acp_session_id_for_sub_session(&event.sub_thread_id.0)
+            .await
+        {
+            let _ = runtime.sessions.lock().await.set_metadata_string(
+                &session.id,
+                "sub_session_acp_session_id",
+                &acp_session_id,
+            );
+        }
+    }
+    Some(session.id)
 }
 
 async fn next_trigger_dispatch(
@@ -2816,135 +3027,169 @@ async fn run_bot_turn(
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    match process_runtime_commands(&runtime, &session_id, text.trim()).await {
-        Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
-            if text.trim() == "/clear" {
-                let _ = tx.send(BotEvent::SessionCleared);
+    let (stream_thread_id, text, skill_injections) =
+        match crate::sub_session_input_target(&runtime, &session_id).await {
+            Some(crate::SubSessionInputTarget::Acp { acp_session_id, .. }) => {
+                match runtime
+                    .bot
+                    .acp_bound_message(&acp_session_id, text.trim())
+                    .await
+                {
+                    Ok(reply) => {
+                        crate::append_direct_sub_session_turn(
+                            &runtime,
+                            &session_id,
+                            text.trim(),
+                            &reply,
+                        )
+                        .await;
+                        let _ = tx.send(BotEvent::Text(reply));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(BotEvent::Error(error.to_string()));
+                    }
+                }
+                let _ = tx.send(BotEvent::Done);
+                return;
             }
-            let _ = tx.send(BotEvent::Prefix(reply));
-            let _ = tx.send(BotEvent::Done);
-            return;
-        }
-        Ok(RuntimeCommandPipelineResult::Continue {
-            text,
-            prefix,
+            Some(crate::SubSessionInputTarget::Agent { sub_thread_id, .. }) => {
+                (sub_thread_id, text, Vec::new())
+            }
+            None => match process_runtime_commands(&runtime, &session_id, text.trim()).await {
+                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                    if text.trim() == "/clear" {
+                        let _ = tx.send(BotEvent::SessionCleared);
+                    }
+                    let _ = tx.send(BotEvent::Prefix(reply));
+                    let _ = tx.send(BotEvent::Done);
+                    return;
+                }
+                Ok(RuntimeCommandPipelineResult::Continue {
+                    text,
+                    prefix,
+                    skill_injections,
+                }) => {
+                    if !prefix.is_empty() {
+                        let _ = tx.send(BotEvent::Prefix(prefix));
+                    }
+                    (session_id.clone(), text, skill_injections)
+                }
+                Err(error) => {
+                    let _ = tx.send(BotEvent::Error(error.to_string()));
+                    let _ = tx.send(BotEvent::Done);
+                    return;
+                }
+            },
+        };
+
+    {
+        let model_profile_id = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        let opts = StreamOptions {
+            model_profile_id,
             skill_injections,
-        }) => {
-            if !prefix.is_empty() {
-                let _ = tx.send(BotEvent::Prefix(prefix));
-            }
-            let model_profile_id = runtime
-                .sessions
-                .lock()
-                .await
-                .metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
-            let opts = StreamOptions {
-                model_profile_id,
-                skill_injections,
-                sender_user_id: Some(sender_user_id),
-                sender_username: Some(sender_username),
-                message_id: Some(format!("tui-msg-{}", uuid::Uuid::new_v4())),
-                chat_type: Some("p2p".to_string()),
-                platform: Some(TUI_CHANNEL.to_string()),
-                todo_create_via_sdk: true,
-                trigger_tools_enabled: true,
-                cancel: Some(cancel),
-                ..StreamOptions::default()
-            };
-            let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
-                &session_id,
-                Content::text(text),
-                opts
-            ));
-            while let Some(event) = stream.next().await {
-                match event {
-                    CatEvent::Text(delta) => {
-                        let _ = tx.send(BotEvent::Text(delta));
-                    }
-                    CatEvent::Thinking(delta) => {
-                        let _ = tx.send(BotEvent::Thinking(delta));
-                    }
-                    CatEvent::ToolCallStart { id, name } => {
-                        let _ = tx.send(BotEvent::ToolStart { id, name });
-                    }
-                    CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                        let _ = tx.send(BotEvent::ToolArgs { id, delta });
-                    }
-                    CatEvent::ToolCall { id, name, args } => {
-                        let _ = tx.send(BotEvent::ToolCall {
-                            id,
-                            name,
-                            args: args.to_string(),
-                        });
-                    }
-                    CatEvent::ToolCallResult {
+            sender_user_id: Some(sender_user_id),
+            sender_username: Some(sender_username),
+            message_id: Some(format!("tui-msg-{}", uuid::Uuid::new_v4())),
+            chat_type: Some("p2p".to_string()),
+            platform: Some(TUI_CHANNEL.to_string()),
+            todo_create_via_sdk: true,
+            trigger_tools_enabled: true,
+            cancel: Some(cancel),
+            ..StreamOptions::default()
+        };
+        let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
+            &stream_thread_id,
+            Content::text(text),
+            opts
+        ));
+        while let Some(event) = stream.next().await {
+            match event {
+                CatEvent::Text(delta) => {
+                    let _ = tx.send(BotEvent::Text(delta));
+                }
+                CatEvent::Thinking(delta) => {
+                    let _ = tx.send(BotEvent::Thinking(delta));
+                }
+                CatEvent::ToolCallStart { id, name } => {
+                    let _ = tx.send(BotEvent::ToolStart { id, name });
+                }
+                CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                    let _ = tx.send(BotEvent::ToolArgs { id, delta });
+                }
+                CatEvent::ToolCall { id, name, args } => {
+                    let _ = tx.send(BotEvent::ToolCall {
                         id,
                         name,
-                        args,
+                        args: args.to_string(),
+                    });
+                }
+                CatEvent::ToolCallResult {
+                    id,
+                    name,
+                    args,
+                    result,
+                    success,
+                    elapsed_ms,
+                } => {
+                    let _ = tx.send(BotEvent::ToolDone {
+                        id,
+                        name,
+                        args: args.to_string(),
                         result,
                         success,
                         elapsed_ms,
-                    } => {
-                        let _ = tx.send(BotEvent::ToolDone {
-                            id,
-                            name,
-                            args: args.to_string(),
-                            result,
-                            success,
-                            elapsed_ms,
-                        });
-                    }
-                    CatEvent::SubSession(event) => {
-                        let _ = tx.send(BotEvent::SubSession(event));
-                    }
-                    CatEvent::ContextCompaction(event) => {
-                        let _ = tx.send(BotEvent::ContextCompaction(event));
-                    }
-                    CatEvent::Supervisor(report) => {
-                        let _ = tx.send(BotEvent::SupervisorReport(report));
-                    }
-                    CatEvent::SupervisorProgress(progress) => {
-                        let _ = tx.send(BotEvent::SupervisorProgress(progress));
-                    }
-                    CatEvent::ToolApprovalRequested(request) => {
-                        let _ = tx.send(BotEvent::ApprovalRequested(request));
-                    }
-                    CatEvent::ToolApprovalUpdated(request) => {
-                        let _ = tx.send(BotEvent::ApprovalUpdated(request));
-                    }
-                    CatEvent::ToolApprovalResolved { request, decision } => {
-                        let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
-                    }
-                    CatEvent::StateUpdate(user_state) => {
-                        let items = bot_core::todo::todos_from_user_state(&user_state);
-                        let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
-                    }
-                    CatEvent::Stats {
+                    });
+                }
+                CatEvent::SubSession(event) => {
+                    let _ = tx.send(BotEvent::SubSession(event));
+                }
+                CatEvent::ContextCompaction(event) => {
+                    let _ = tx.send(BotEvent::ContextCompaction(event));
+                }
+                CatEvent::Supervisor(report) => {
+                    let _ = tx.send(BotEvent::SupervisorReport(report));
+                }
+                CatEvent::SupervisorProgress(progress) => {
+                    let _ = tx.send(BotEvent::SupervisorProgress(progress));
+                }
+                CatEvent::ToolApprovalRequested(request) => {
+                    let _ = tx.send(BotEvent::ApprovalRequested(request));
+                }
+                CatEvent::ToolApprovalUpdated(request) => {
+                    let _ = tx.send(BotEvent::ApprovalUpdated(request));
+                }
+                CatEvent::ToolApprovalResolved { request, decision } => {
+                    let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
+                }
+                CatEvent::StateUpdate(user_state) => {
+                    let items = bot_core::todo::todos_from_user_state(&user_state);
+                    let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
+                }
+                CatEvent::Stats {
+                    prompt_tokens,
+                    completion_tokens,
+                    max_prompt_tokens,
+                    elapsed_ms,
+                } => {
+                    let _ = tx.send(BotEvent::Stats {
                         prompt_tokens,
                         completion_tokens,
                         max_prompt_tokens,
                         elapsed_ms,
-                    } => {
-                        let _ = tx.send(BotEvent::Stats {
-                            prompt_tokens,
-                            completion_tokens,
-                            max_prompt_tokens,
-                            elapsed_ms,
-                        });
-                    }
-                    CatEvent::Error(error) => {
-                        let _ = tx.send(BotEvent::Error(error.to_string()));
-                    }
-                    CatEvent::Done => break,
-                    _ => {}
+                    });
                 }
+                CatEvent::Error(error) => {
+                    let _ = tx.send(BotEvent::Error(error.to_string()));
+                }
+                CatEvent::Done => break,
+                _ => {}
             }
-            let _ = tx.send(BotEvent::Done);
         }
-        Err(error) => {
-            let _ = tx.send(BotEvent::Error(error.to_string()));
-            let _ = tx.send(BotEvent::Done);
-        }
+        let _ = tx.send(BotEvent::Done);
     }
 }
 
@@ -3116,7 +3361,7 @@ async fn run_tui_fork_command(
 
     send_progress("fork: 上下文复制完成，正在打开新 pane...".to_string());
     let fork_id = fork.id.clone();
-    match open_fork_in_new_pane(&fork_id, &cli) {
+    match open_tui_session_in_new_pane(&fork_id, &cli) {
         Ok(Some(kind)) => {
             send_progress(format!(
                 "已 fork 当前 session，并在新的 {kind} pane 中打开。\n新 session: {}\n标题: {}",
@@ -3177,7 +3422,7 @@ async fn run_tui_new_command(
         session.id, shown_title
     ));
     let session_id = session.id.clone();
-    match open_fork_in_new_pane(&session_id, &cli) {
+    match open_tui_session_in_new_pane(&session_id, &cli) {
         Ok(Some(kind)) => {
             send_progress(format!(
                 "已创建空 session，并在新的 {kind} pane 中打开。\n新 session: {}\n标题: {}",
@@ -3415,6 +3660,7 @@ struct SubSessionUiState {
     thread_id: String,
     depth: u32,
     tools: Vec<SubToolDisplay>,
+    activities: Vec<SubSessionActivity>,
     done: bool,
     failed: bool,
     final_output: Option<String>,
@@ -3429,6 +3675,7 @@ impl SubSessionUiState {
             thread_id: event.sub_thread_id.0.clone(),
             depth: event.depth,
             tools: Vec::new(),
+            activities: Vec::new(),
             done: false,
             failed: false,
             final_output: None,
@@ -3452,6 +3699,22 @@ impl SubSessionUiState {
             *existing = tool;
         } else {
             self.tools.push(tool);
+        }
+    }
+
+    fn push_activity(&mut self, activity: SubSessionActivity) {
+        self.activities.push(activity);
+    }
+
+    fn upsert_activity(&mut self, activity: SubSessionActivity) {
+        if let Some(existing) = self
+            .activities
+            .iter_mut()
+            .find(|item| item.key.as_deref() == activity.key.as_deref() && item.key.is_some())
+        {
+            *existing = activity;
+        } else {
+            self.activities.push(activity);
         }
     }
 
@@ -3491,24 +3754,33 @@ impl SubSessionUiState {
         {
             lines.push(format!("{nested}input: {input}"));
         }
-        let recent_start = self.tools.len().saturating_sub(3);
-        for tool in self.tools.iter().skip(recent_start) {
-            let status = tool.status.label();
+        let recent_start = self.activities.len().saturating_sub(3);
+        for activity in self.activities.iter().skip(recent_start) {
+            let status = activity.status.label();
             let suffix = if status.is_empty() {
                 String::new()
             } else {
                 format!(" · {status}")
             };
-            lines.push(format!("{nested}↳ {}{suffix}", tool.title));
-            if !tool.summary.trim().is_empty() {
-                lines.push(format!("{nested}  {}", tool.summary));
+            lines.push(format!("{nested}↳ {}{suffix}", activity.label));
+            if !activity.body.trim().is_empty() {
+                lines.push(format!("{nested}  {}", activity.body));
             }
         }
-        if let Some(output) = self.final_output.as_deref() {
+        if self.activities.is_empty() {
+            if let Some(output) = self.final_output.as_deref() {
+                lines.push(format!("{nested}final: {output}"));
+            }
+        } else if self
+            .final_output
+            .as_deref()
+            .is_some_and(|output| !self.activities.iter().any(|item| item.body == output))
+        {
+            let output = self.final_output.as_deref().unwrap_or_default();
             lines.push(format!("{nested}final: {output}"));
         }
         if lines.is_empty() {
-            lines.push(format!("{nested}waiting for sub-agent tools"));
+            lines.push(format!("{nested}waiting for sub-agent activity"));
         }
         lines.join("\n")
     }
@@ -3520,6 +3792,48 @@ impl SubSessionUiState {
             ToolVisualStatus::Success
         } else {
             ToolVisualStatus::Running
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SubSessionActivity {
+    key: Option<String>,
+    label: String,
+    body: String,
+    status: ToolVisualStatus,
+}
+
+impl SubSessionActivity {
+    fn message(label: impl Into<String>, body: impl AsRef<str>, status: ToolVisualStatus) -> Self {
+        Self {
+            key: None,
+            label: label.into(),
+            body: truncate_chars(&single_line(body.as_ref()), MAX_TOOL_BODY_CHARS),
+            status,
+        }
+    }
+
+    fn keyed(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        body: impl AsRef<str>,
+        status: ToolVisualStatus,
+    ) -> Self {
+        Self {
+            key: Some(key.into()),
+            label: label.into(),
+            body: truncate_chars(&single_line(body.as_ref()), MAX_TOOL_BODY_CHARS),
+            status,
+        }
+    }
+
+    fn from_tool(id: &str, tool: &SubToolDisplay) -> Self {
+        Self {
+            key: Some(format!("tool:{id}")),
+            label: tool.title.clone(),
+            body: tool.summary.clone(),
+            status: tool.status,
         }
     }
 }
@@ -3612,7 +3926,7 @@ struct PaneLaunchCommand {
     args: Vec<OsString>,
 }
 
-fn open_fork_in_new_pane(
+fn open_tui_session_in_new_pane(
     session_id: &str,
     cli: &CliConfig,
 ) -> anyhow::Result<Option<&'static str>> {
@@ -4519,7 +4833,35 @@ fn format_sub_session_prefix(event: &SubSessionEvent) -> String {
 }
 
 fn sub_session_id(event: &SubSessionEvent) -> String {
-    format!("{}:{}", event.sub_thread_id.0, event.sub_run_id.0)
+    event.sub_thread_id.0.clone()
+}
+
+fn sub_session_kind(event: &SubSessionEvent) -> SubSessionKind {
+    if event.agent_name == "acp" {
+        SubSessionKind::Acp
+    } else {
+        SubSessionKind::Agent
+    }
+}
+
+fn sub_session_status_label(payload: &SubSessionEventPayload) -> &'static str {
+    match payload {
+        SubSessionEventPayload::Done { .. } => "done",
+        SubSessionEventPayload::Error { .. } => "error",
+        _ => "running",
+    }
+}
+
+fn push_interrupt_requested_once(
+    interrupt_requested: &mut bool,
+    cells: &mut Vec<HistoryCell>,
+) -> bool {
+    if *interrupt_requested {
+        return false;
+    }
+    *interrupt_requested = true;
+    cells.push(HistoryCell::system("Interrupt requested."));
+    true
 }
 
 fn sub_session_input(event: &SubSessionEvent) -> Option<String> {
@@ -4528,6 +4870,70 @@ fn sub_session_input(event: &SubSessionEvent) -> Option<String> {
         .as_deref()
         .filter(|title| !title.trim().is_empty() && *title != event.agent_name)
         .map(|title| truncate_chars(&single_line(title), 96))
+}
+
+fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<Message> {
+    match &event.payload {
+        SubSessionEventPayload::Start => {
+            let input = event
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Sub-session started: {} / {}",
+                        event.agent_name, event.sub_thread_id.0
+                    )
+                });
+            vec![Message::user(input)]
+        }
+        _ => sub_session_event_text(event)
+            .map(Message::assistant)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn sub_session_event_text(event: &SubSessionEvent) -> Option<String> {
+    let text = match &event.payload {
+        SubSessionEventPayload::Start => return None,
+        SubSessionEventPayload::Delta { content } => content.clone(),
+        SubSessionEventPayload::ThinkingStart => "Thinking...".to_string(),
+        SubSessionEventPayload::ThinkingEnd { content } => {
+            if content.trim().is_empty() {
+                "Thinking complete.".to_string()
+            } else {
+                format!("Thinking:\n{content}")
+            }
+        }
+        SubSessionEventPayload::TurnStart { turn } => format!("Turn {turn}"),
+        SubSessionEventPayload::ToolCallStart { id, name } => {
+            format!("Tool `{name}` started ({id}).")
+        }
+        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
+            format!("Tool arguments `{id}`:\n{delta}")
+        }
+        SubSessionEventPayload::ToolDelta { id, name, delta } => {
+            format!("Tool `{name}` output ({id}):\n{delta}")
+        }
+        SubSessionEventPayload::ToolResult { id, name, result } => {
+            format!("Tool `{name}` result ({id}):\n{result}")
+        }
+        SubSessionEventPayload::Done { final_output } => final_output
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "Done.".to_string()),
+        SubSessionEventPayload::Error { message } => format!("Error: {message}"),
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(test)]
@@ -4840,6 +5246,107 @@ fn wrap_line_count(text: &str, width: u16) -> u16 {
         .max(1)
 }
 
+fn composer_visual_lines(composer: &ComposerInput, width: u16) -> Vec<Line<'static>> {
+    wrap_composer_lines(composer.display_lines(), width)
+}
+
+fn composer_visual_line_count(composer: &ComposerInput, width: u16) -> u16 {
+    composer_visual_lines(composer, width).len().max(1) as u16
+}
+
+fn wrap_composer_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(4);
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let mut current = Vec::new();
+        let mut current_width = 0_u16;
+        let mut continuation = false;
+
+        for span in line.spans {
+            for ch in span.content.chars() {
+                if current.is_empty() {
+                    let prefix = if continuation { "   " } else { "" };
+                    if !prefix.is_empty() {
+                        push_styled_text(&mut current, prefix, Style::default().fg(CODEX_DIM));
+                        current_width = current_width.saturating_add(3);
+                    }
+                }
+
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if current_width > 0 && ch_width > 0 && current_width + ch_width > width {
+                    wrapped.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                    continuation = true;
+                    push_styled_text(&mut current, "   ", Style::default().fg(CODEX_DIM));
+                    current_width = current_width.saturating_add(3);
+                }
+                push_styled_char(&mut current, ch, span.style);
+                current_width = current_width.saturating_add(ch_width);
+            }
+        }
+        wrapped.push(Line::from(current));
+    }
+    if wrapped.is_empty() {
+        vec![Line::from("")]
+    } else {
+        wrapped
+    }
+}
+
+fn push_styled_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if last.style == style {
+            last.content.to_mut().push_str(text);
+            return;
+        }
+    }
+    spans.push(Span::styled(text.to_string(), style));
+}
+
+fn push_styled_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
+    let mut text = String::new();
+    text.push(ch);
+    push_styled_text(spans, &text, style);
+}
+
+fn composer_visual_position(text_before_cursor: &str, width: u16) -> (u16, u16) {
+    let width = width.max(4);
+    let mut row = 0_u16;
+    let mut col = 3_u16;
+    for ch in text_before_cursor.chars() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            col = 3;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if ch_width > 0 && col + ch_width > width {
+            row = row.saturating_add(1);
+            col = 3;
+        }
+        col = col.saturating_add(ch_width);
+    }
+    (row, col)
+}
+
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\t' {
+            output.push_str("    ");
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 fn context_usage_percent(prompt_tokens: u32, context_tokens: u32) -> Option<u32> {
     if context_tokens == 0 {
         return None;
@@ -4973,6 +5480,32 @@ mod tests {
     #[test]
     fn wraps_empty_input_to_one_row() {
         assert_eq!(wrap_line_count("", 80), 1);
+    }
+
+    #[test]
+    fn composer_visual_lines_wrap_to_available_width() {
+        let mut input = ComposerInput::default();
+        input.insert_text("abcdef");
+
+        let lines = composer_visual_lines(&input, 6);
+        assert_eq!(rendered_lines(&lines), vec!["›  abc", "   def"]);
+        assert_eq!(composer_visual_line_count(&input, 6), 2);
+        assert_eq!(composer_visual_position("abcdef", 6), (1, 6));
+    }
+
+    #[test]
+    fn composer_visual_position_tracks_newlines_and_wide_chars() {
+        assert_eq!(composer_visual_position("你a\nb", 7), (1, 4));
+        assert_eq!(composer_visual_position("你好吗", 7), (1, 5));
+    }
+
+    #[test]
+    fn composer_display_expands_tabs() {
+        let mut input = ComposerInput::default();
+        input.insert_text("a\tb");
+
+        assert_eq!(rendered_lines(&input.display_lines()), vec!["›  a    b"]);
+        assert_eq!(composer_visual_position(&expand_tabs("a\tb"), 20), (0, 9));
     }
 
     #[test]
@@ -5654,6 +6187,103 @@ mod tests {
     }
 
     #[test]
+    fn sub_session_cell_id_is_stable_across_poll_runs() {
+        let base = |run_id: &str| {
+            SubSessionEvent::new(
+                "parent-tool-call",
+                remi_agentloop::prelude::ThreadId("thread-1".to_string()),
+                remi_agentloop::prelude::RunId(run_id.to_string()),
+                "acp",
+                Some("Codex ACP".to_string()),
+                1,
+                SubSessionEventPayload::Start,
+            )
+        };
+
+        assert_eq!(
+            sub_session_id(&base("run-1")),
+            sub_session_id(&base("run-2"))
+        );
+    }
+
+    #[test]
+    fn sub_session_status_and_kind_are_persistable() {
+        let acp = SubSessionEvent::new(
+            "parent-tool-call",
+            remi_agentloop::prelude::ThreadId("thread-1".to_string()),
+            remi_agentloop::prelude::RunId("run-1".to_string()),
+            "acp",
+            Some("Codex ACP".to_string()),
+            1,
+            SubSessionEventPayload::Start,
+        );
+        let agent = SubSessionEvent::new(
+            "parent-tool-call",
+            remi_agentloop::prelude::ThreadId("thread-2".to_string()),
+            remi_agentloop::prelude::RunId("run-1".to_string()),
+            "coder",
+            None,
+            1,
+            SubSessionEventPayload::Error {
+                message: "failed".to_string(),
+            },
+        );
+
+        assert_eq!(sub_session_kind(&acp), SubSessionKind::Acp);
+        assert_eq!(sub_session_kind(&agent), SubSessionKind::Agent);
+        assert_eq!(sub_session_status_label(&acp.payload), "running");
+        assert_eq!(sub_session_status_label(&agent.payload), "error");
+    }
+
+    #[test]
+    fn sub_session_events_convert_to_child_history_messages() {
+        let base = |payload| {
+            SubSessionEvent::new(
+                "parent-tool-call",
+                remi_agentloop::prelude::ThreadId("thread-1".to_string()),
+                remi_agentloop::prelude::RunId("run-1".to_string()),
+                "coder",
+                Some("Investigate issue".to_string()),
+                1,
+                payload,
+            )
+        };
+
+        let start_messages = sub_session_history_messages(&base(SubSessionEventPayload::Start));
+        assert_eq!(start_messages.len(), 1);
+        assert_eq!(
+            start_messages[0].content.text_content(),
+            "Investigate issue"
+        );
+
+        let output_messages = sub_session_history_messages(&base(SubSessionEventPayload::Delta {
+            content: "progress".to_string(),
+        }));
+        assert_eq!(output_messages.len(), 1);
+        assert_eq!(output_messages[0].content.text_content(), "progress");
+
+        let done_messages = sub_session_history_messages(&base(SubSessionEventPayload::Done {
+            final_output: None,
+        }));
+        assert_eq!(done_messages[0].content.text_content(), "Done.");
+    }
+
+    #[test]
+    fn interrupt_requested_system_cell_is_not_duplicated() {
+        let mut requested = false;
+        let mut cells = Vec::new();
+
+        assert!(push_interrupt_requested_once(&mut requested, &mut cells));
+        assert!(!push_interrupt_requested_once(&mut requested, &mut cells));
+
+        let count = cells
+            .iter()
+            .filter(|cell| cell.title == "system" && cell.body == "Interrupt requested.")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn sub_session_only_renders_tools_and_final_output() {
         let base = |payload| {
             SubSessionEvent::new(
@@ -5707,6 +6337,11 @@ mod tests {
                 summary: format!("列出 {index} 项"),
                 status: ToolVisualStatus::Success,
             });
+            let tool = state.tools.last().expect("tool just inserted").clone();
+            state.upsert_activity(SubSessionActivity::from_tool(
+                &format!("call-{index}"),
+                &tool,
+            ));
         }
 
         assert_eq!(state.title(), "  sub-agent · explorer · calling 5 tools");
@@ -5806,5 +6441,17 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 }

@@ -66,6 +66,58 @@ export type DebugStats = {
   elapsed_ms?: number;
 };
 
+export type ModelInputCategory =
+  | "system_prompt"
+  | "skill_injection"
+  | "history"
+  | "tool_input"
+  | "tool_output"
+  | "current_user"
+  | "metadata"
+  | "user_state";
+
+export type ModelInputTotals = {
+  estimated_tokens: number;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  max_prompt_tokens?: number | null;
+  context_tokens?: number | null;
+};
+
+export type ModelInputSegment = {
+  id: string;
+  category: ModelInputCategory;
+  role?: string | null;
+  title: string;
+  content: string;
+  token_estimate: number;
+};
+
+export type ModelInputSnapshot = {
+  run_id: string;
+  thread_id: string;
+  model_profile_id: string;
+  model: string;
+  created_at: string;
+  segments: ModelInputSegment[];
+  totals: ModelInputTotals;
+};
+
+export type ModelInputSummary = {
+  run_id: string;
+  created_at: string;
+  model_profile_id: string;
+  model: string;
+  segment_count: number;
+  estimated_tokens: number;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  max_prompt_tokens?: number | null;
+  context_tokens?: number | null;
+};
+
 export type ContextCompactionEvent = {
   id: string;
   thread_id: string;
@@ -179,6 +231,12 @@ export const api = {
   },
   history: (id: string) =>
     json<HistoryMessage[]>(`/api/v1/chat/sessions/${id}/messages`),
+  modelInputs: (id: string) =>
+    json<ModelInputSummary[]>(`/api/v1/chat/sessions/${id}/model-inputs`),
+  modelInput: (id: string, runId: string) =>
+    json<ModelInputSnapshot>(
+      `/api/v1/chat/sessions/${id}/model-inputs/${encodeURIComponent(runId)}`,
+    ),
   activeRun: (id: string) =>
     json<ActiveRun | null>(`/api/v1/chat/sessions/${id}/runs/active`),
   todos: (id: string) =>

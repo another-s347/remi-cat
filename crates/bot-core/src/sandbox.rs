@@ -240,8 +240,9 @@ impl NoSandbox {
         tokio::fs::create_dir_all(&self.root)
             .await
             .context("creating sandbox root")?;
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(command);
+        let shell = user_shell();
+        let mut cmd = Command::new(&shell);
+        cmd.args(shell_command_args(&shell, command));
         cmd.current_dir(&self.root);
         run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
     }
@@ -485,7 +486,8 @@ impl DockerSandbox {
         if let Some(user) = self.config.user.as_deref() {
             cmd.args(["-u", user]);
         }
-        cmd.args([&self.config.container_name, "bash", "-lc", command]);
+        let command = format!("{}\n{command}", shell_startup_script("bash"));
+        cmd.args([&self.config.container_name, "bash", "-l", "-c", &command]);
         run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
     }
 
@@ -734,15 +736,18 @@ impl BashTaskRegistry {
 
 impl BashSession {
     async fn start_local(root: &Path) -> Result<Self> {
-        let child = Command::new("bash")
-            .args(["--noprofile", "--norc"])
+        let shell = user_shell();
+        let child = Command::new(&shell)
+            .args(shell_session_args(&shell))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .context("starting named bash session")?;
-        Self::from_child(child, "named bash session")
+        let mut session = Self::from_child(child, "named bash session")?;
+        session.discard_startup_output(&shell).await?;
+        Ok(session)
     }
 
     async fn start_docker(
@@ -759,15 +764,18 @@ impl BashSession {
             .args([
                 container_name,
                 "bash",
-                "-lc",
-                "exec 2>&1; exec bash --noprofile --norc",
+                "-l",
+                "-c",
+                "exec 2>&1; exec bash -l",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .context("starting named bash session")?;
-        Self::from_child(child, "named bash session")
+        let mut session = Self::from_child(child, "named bash session")?;
+        session.discard_startup_output("bash").await?;
+        Ok(session)
     }
 
     fn from_child(mut child: Child, label: &str) -> Result<Self> {
@@ -825,6 +833,90 @@ impl BashSession {
             }
             append_task_stdout(&task, &line).await;
         }
+    }
+
+    async fn discard_startup_output(&mut self, shell: &str) -> Result<()> {
+        let marker = format!("__REMI_BASH_READY_{}__", uuid::Uuid::new_v4().simple());
+        let probe = format!("{}\nprintf '\\n{marker}\\n'\n", shell_startup_script(shell));
+        self.stdin
+            .write_all(probe.as_bytes())
+            .await
+            .context("writing named bash startup probe")?;
+        self.stdin
+            .flush()
+            .await
+            .context("flushing named bash startup probe")?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .await
+                .context("reading named bash startup probe")?;
+            if n == 0 {
+                return Err(anyhow!("named bash session exited during startup"));
+            }
+            if line.trim_end() == marker {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn user_shell() -> String {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bash".to_string());
+    match shell_name(&shell) {
+        "bash" | "zsh" => shell,
+        _ => "bash".to_string(),
+    }
+}
+
+fn shell_name(shell: &str) -> &str {
+    Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+}
+
+fn shell_command_args(shell: &str, command: &str) -> Vec<String> {
+    let command = format!("{}\n{command}", shell_startup_script(shell));
+    match shell_name(shell) {
+        "bash" | "zsh" => vec!["-l".to_string(), "-c".to_string(), command],
+        _ => vec!["-c".to_string(), command],
+    }
+}
+
+fn shell_session_args(shell: &str) -> Vec<&'static str> {
+    match shell_name(shell) {
+        "bash" | "zsh" => vec!["-l"],
+        _ => Vec::new(),
+    }
+}
+
+fn shell_startup_script(shell: &str) -> &'static str {
+    match shell_name(shell) {
+        "zsh" => {
+            r#"if [ -f "$HOME/.zshrc" ]; then . "$HOME/.zshrc"; fi
+precmd_functions=()
+preexec_functions=()
+chpwd_functions=()
+periodic_functions=()
+PROMPT=
+RPROMPT=
+unsetopt xtrace 2>/dev/null || true"#
+        }
+        "bash" => {
+            r#"if [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+PROMPT_COMMAND=
+trap - DEBUG 2>/dev/null || true
+set +x"#
+        }
+        _ => "",
     }
 }
 

@@ -25,6 +25,7 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 - For background instances, use `profile status <name>` before `profile stop`, `profile restart`, or `profile delete`.
 - Use `manage_yourself` for Remi CLI commands. It only supports one argument shape: `{"command":"profile list"}`.
 - Use help through `manage_yourself` when unsure about syntax, for example `{"command":"help"}` or `{"command":"profile agent --help"}`.
+- Use `{"command":"tools --json"}` before adding tools to an agent profile. It lists all runtime-known tools, ignores the active allowlist, and includes configuration warnings/errors.
 - The `command` value is the arguments after `remi-cat`; do not include the binary name and do not wrap it in another `arguments` field.
 - `manage_yourself` runs the current host `remi-cat` binary directly, so it works even when sandboxed shell commands cannot see the binary.
 - Profile commands resolve `.remi-cat/profiles` relative to the Remi host process current directory.
@@ -37,6 +38,7 @@ Tool call example:
 
 ```json
 {"command":"profile list"}
+{"command":"tools --json"}
 {"command":"profile agent --help"}
 ```
 

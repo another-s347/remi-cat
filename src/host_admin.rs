@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use bot_core::skill::store::SkillStore;
 use bot_core::{
     remi_skill, trigger, AgentProfile, AgentRegistry, BuiltinSkillStore, FileSkillStore,
-    ToolApprovalDecision,
+    ModelInputSnapshot, ToolApprovalDecision,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use crate::runtime_config::SetupState;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::{Session, SessionRuntime};
-use crate::web_chat::{WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
+use crate::web_chat::{web_sdk_db_path, WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
 use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
@@ -71,6 +71,14 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/chat/sessions/{id}/messages",
             get(web_session_messages),
+        )
+        .route(
+            "/api/v1/chat/sessions/{id}/model-inputs",
+            get(list_web_model_inputs),
+        )
+        .route(
+            "/api/v1/chat/sessions/{id}/model-inputs/{run_id}",
+            get(get_web_model_input),
         )
         .route("/api/v1/chat/sessions/{id}/todos", get(web_session_todos))
         .route(
@@ -547,6 +555,7 @@ async fn delete_web_session(
 ) -> Result<StatusCode, AdminError> {
     require_web_session(&state, &id).await?;
     web_handle(&state)?.delete_thread(id.clone()).await?;
+    delete_web_model_inputs_for_session(&state, &id);
     state.sessions.lock().await.delete(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -591,6 +600,66 @@ async fn web_session_messages(
 ) -> Result<Json<Vec<bot_core::ThreadHistoryMessage>>, AdminError> {
     require_web_session(&state, &id).await?;
     Ok(Json(web_handle(&state)?.history(id).await?))
+}
+
+#[derive(Debug, Serialize)]
+struct ModelInputSummary {
+    run_id: String,
+    created_at: String,
+    model_profile_id: String,
+    model: String,
+    segment_count: usize,
+    estimated_tokens: u32,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    max_prompt_tokens: Option<u32>,
+    context_tokens: Option<u32>,
+}
+
+async fn list_web_model_inputs(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<ModelInputSummary>>, AdminError> {
+    require_web_session(&state, &id).await?;
+    let sdk = web_model_input_sdk(&state)?;
+    let items = sdk
+        .list_chat_model_input_json(&id, Some(100))?
+        .into_iter()
+        .filter_map(|json| serde_json::from_str::<ModelInputSnapshot>(&json).ok())
+        .map(model_input_summary)
+        .collect();
+    Ok(Json(items))
+}
+
+async fn get_web_model_input(
+    State(state): State<AdminState>,
+    AxumPath((id, run_id)): AxumPath<(String, String)>,
+) -> Result<Json<ModelInputSnapshot>, AdminError> {
+    require_web_session(&state, &id).await?;
+    let sdk = web_model_input_sdk(&state)?;
+    let json = sdk
+        .get_chat_model_input_json(&id, &run_id)?
+        .ok_or_else(|| AdminError::not_found("model input snapshot not found".into()))?;
+    let snapshot = serde_json::from_str::<ModelInputSnapshot>(&json)
+        .map_err(|err| AdminError::bad_request(format!("stored model input is invalid: {err}")))?;
+    Ok(Json(snapshot))
+}
+
+fn model_input_summary(snapshot: ModelInputSnapshot) -> ModelInputSummary {
+    ModelInputSummary {
+        run_id: snapshot.run_id,
+        created_at: snapshot.created_at,
+        model_profile_id: snapshot.model_profile_id,
+        model: snapshot.model,
+        segment_count: snapshot.segments.len(),
+        estimated_tokens: snapshot.totals.estimated_tokens,
+        prompt_tokens: snapshot.totals.prompt_tokens,
+        completion_tokens: snapshot.totals.completion_tokens,
+        total_tokens: snapshot.totals.total_tokens,
+        max_prompt_tokens: snapshot.totals.max_prompt_tokens,
+        context_tokens: snapshot.totals.context_tokens,
+    }
 }
 
 async fn web_session_todos(
@@ -855,6 +924,46 @@ fn web_handle(state: &AdminState) -> Result<&WebChatHandle, AdminError> {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "web chat runtime is not available in admin-only mode".into(),
     })
+}
+
+fn web_model_input_sdk(state: &AdminState) -> Result<remi_client_sdk::TriggerSdk, AdminError> {
+    let data_dir = admin_data_dir(state);
+    let db_path = web_sdk_db_path(&data_dir, WEB_USER_ID);
+    remi_client_sdk::TriggerSdk::initialize(&db_path).map_err(AdminError::from)
+}
+
+fn admin_data_dir(state: &AdminState) -> PathBuf {
+    match &state.setup_state {
+        SetupState::Initialized { config, .. } => PathBuf::from(&config.data_dir),
+        SetupState::Invalid { config_path, .. } => config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| state.workspace_dir.clone()),
+        SetupState::LegacyEnvCompatible { data_dir } | SetupState::Uninitialized { data_dir } => {
+            data_dir.clone()
+        }
+    }
+}
+
+fn delete_web_model_inputs_for_session(state: &AdminState, session_id: &str) {
+    match web_model_input_sdk(state) {
+        Ok(sdk) => {
+            if let Err(err) = sdk.delete_chat_model_inputs(session_id) {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to delete web model input snapshots"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err.message,
+                "failed to initialize sdk while deleting web model input snapshots"
+            );
+        }
+    }
 }
 
 fn find_agent_file(dir: &Path, id: &str) -> anyhow::Result<Option<PathBuf>> {

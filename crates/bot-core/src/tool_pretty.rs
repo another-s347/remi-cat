@@ -127,6 +127,7 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             (format!("搜索 {query}"), "查询外部或本地资料".to_string())
         }
         "workspace_bash" | "bash" => ("执行 bash".to_string(), bash_command_preview(args)),
+        "ssh" => ("执行 ssh".to_string(), ssh_command_preview(args)),
         "sleep" => ("等待".to_string(), "暂停一段时间".to_string()),
         "now" => ("读取当前时间".to_string(), "获取系统时间".to_string()),
         "manage_yourself" => {
@@ -156,9 +157,12 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
 fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> (String, String) {
     let (title, started) = describe_started(name, args);
     if !success {
-        if is_bash_tool(name) {
+        if is_shell_like_tool(name) {
             let detail = bash_output_preview(result).unwrap_or_else(|| "工具执行失败".to_string());
-            return (title, format!("{}\n{detail}", bash_command_preview(args)));
+            return (
+                title,
+                format!("{}\n{detail}", shell_command_preview(name, args)),
+            );
         }
         return (
             title,
@@ -179,6 +183,7 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
         }
         "fetch" => fetch_summary(result).unwrap_or(started),
         "workspace_bash" | "bash" => bash_summary(args, result),
+        "ssh" => ssh_summary(args, result),
         "manage_yourself" => remi_command_summary(args, result),
         "codex" => acp_chat_summary(result).unwrap_or_else(|| "Codex 子会话已完成".to_string()),
         value if value.starts_with("agent__") => "子会话已完成".to_string(),
@@ -407,6 +412,18 @@ fn is_bash_tool(name: &str) -> bool {
     matches!(name, "workspace_bash" | "bash")
 }
 
+fn is_shell_like_tool(name: &str) -> bool {
+    is_bash_tool(name) || name == "ssh"
+}
+
+fn shell_command_preview(name: &str, args: &Value) -> String {
+    if name == "ssh" {
+        ssh_command_preview(args)
+    } else {
+        bash_command_preview(args)
+    }
+}
+
 fn bash_command_preview(args: &Value) -> String {
     if let Some(command) = string_arg(args, "command") {
         return format!("$ {}", first_sentence(command, PRETTY_COMMAND_MAX_CHARS));
@@ -418,8 +435,48 @@ fn bash_command_preview(args: &Value) -> String {
     }
 }
 
+fn ssh_command_preview(args: &Value) -> String {
+    let target = ssh_target_preview(args);
+    if let Some(command) = string_arg(args, "command") {
+        return format!(
+            "ssh {target} $ {}",
+            first_sentence(command, PRETTY_COMMAND_MAX_CHARS)
+        );
+    }
+    match (string_arg(args, "action"), string_arg(args, "pid")) {
+        (Some(action), Some(pid)) => format!("ssh {action} pid={pid}"),
+        (None, Some(pid)) => format!("ssh poll pid={pid}"),
+        _ => format!("ssh {target}"),
+    }
+}
+
+fn ssh_target_preview(args: &Value) -> String {
+    let host = string_arg(args, "host").unwrap_or("host");
+    let user = string_arg(args, "user")
+        .map(|user| format!("{user}@"))
+        .unwrap_or_default();
+    let port = args
+        .get("port")
+        .and_then(Value::as_u64)
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{user}{host}{port}")
+}
+
 fn bash_summary(args: &Value, result: &str) -> String {
     let command = bash_command_preview(args);
+    let line_count = result.lines().count();
+    if line_count == 0 {
+        format!("{command}\n无输出")
+    } else if let Some(preview) = bash_output_preview(result) {
+        format!("{command}\n输出 {line_count} 行:\n{preview}")
+    } else {
+        format!("{command}\n输出 {line_count} 行")
+    }
+}
+
+fn ssh_summary(args: &Value, result: &str) -> String {
+    let command = ssh_command_preview(args);
     let line_count = result.lines().count();
     if line_count == 0 {
         format!("{command}\n无输出")

@@ -56,6 +56,8 @@ pub struct AgentProfile {
     pub delegates: Vec<String>,
     #[serde(default)]
     pub max_turns: Option<usize>,
+    #[serde(default, alias = "persistent")]
+    pub persistent_sessions: bool,
     #[serde(skip)]
     pub system_prompt: String,
 }
@@ -199,6 +201,7 @@ tools:
 delegates:
   - coder
 max_turns: 12
+persistent_sessions: true
 ---
 You are Remi.
 "#;
@@ -212,6 +215,35 @@ You are Remi.
         assert_eq!(profile.models.vision.as_deref(), Some("gpt-4o"));
         assert!(profile.allows_tool("codex"));
         assert!(!profile.allows_tool("bash"));
+        assert!(profile.persistent_sessions);
+    }
+
+    #[test]
+    fn persistent_sessions_defaults_to_false_and_accepts_alias() {
+        let defaulted = AgentProfile::from_markdown(
+            r#"---
+id: default
+name: Remi
+description: General assistant
+---
+You are Remi.
+"#,
+        )
+        .unwrap();
+        assert!(!defaulted.persistent_sessions);
+
+        let aliased = AgentProfile::from_markdown(
+            r#"---
+id: default
+name: Remi
+description: General assistant
+persistent: true
+---
+You are Remi.
+"#,
+        )
+        .unwrap();
+        assert!(aliased.persistent_sessions);
     }
 
     #[test]

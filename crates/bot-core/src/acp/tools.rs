@@ -9,22 +9,32 @@ use remi_agentloop::types::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::backend::{AcpBackend, AcpBoundChannel, AcpToolRequest, AcpToolTaskStatus};
+use crate::approval::{
+    ApprovalEvent, ApprovalResolution, ApprovalWait, ToolApprovalDecision, ToolApprovalManager,
+    ToolApprovalRequest,
+};
+
+use super::backend::{
+    AcpApprovalDecision, AcpBackend, AcpBoundChannel, AcpToolRequest, AcpToolTaskEvent,
+    AcpToolTaskStatus,
+};
 
 const DEFAULT_CODEX_WAIT_MS: u64 = 30_000;
 
 pub struct AcpChatTool {
     backend: Arc<AcpBackend>,
+    approval_manager: Arc<ToolApprovalManager>,
     name: &'static str,
     description: &'static str,
 }
 
 impl AcpChatTool {
-    pub fn codex(backend: Arc<AcpBackend>) -> Self {
+    pub fn codex(backend: Arc<AcpBackend>, approval_manager: Arc<ToolApprovalManager>) -> Self {
         Self {
             backend,
+            approval_manager,
             name: "codex",
-            description: "Open, resume, or poll a Codex ACP session. Provide `message` to start work; if the result is running, call again with `task_id` and `action=\"poll\"`. Optionally pass `session_id` to resume an ACP session or `title` for a new session.",
+            description: "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session or `title` for a new session.",
         }
     }
 }
@@ -61,9 +71,9 @@ impl Tool for AcpChatTool {
                 "message": { "type": "string", "description": "The user message to send to Codex/ACP." },
                 "session_id": { "type": "string", "description": "Optional ACP session id to resume. The tool result also returns the session_id to reuse later." },
                 "title": { "type": "string", "description": "Optional title for a newly created ACP session." },
-                "task_id": { "type": "string", "description": "Background Codex task id returned by a prior running result." },
-                "action": { "type": "string", "enum": ["poll"], "description": "Action for an existing task_id. Defaults to poll when task_id is provided." },
-                "wait_ms": { "type": "integer", "description": "How long to wait for initial completion before returning a running task_id. Defaults to 30000. This does not kill Codex." }
+                "task_id": { "type": "string", "description": "Compatibility-only: poll a background task created by an older running result." },
+                "action": { "type": "string", "enum": ["poll"], "description": "Compatibility-only action for an existing task_id." },
+                "wait_ms": { "type": "integer", "description": "Deprecated for initial Codex runs; the tool now streams until completion. Poll actions still return the current task status." }
             }
         })
     }
@@ -76,6 +86,7 @@ impl Tool for AcpChatTool {
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let backend = Arc::clone(&self.backend);
+        let approval_manager = Arc::clone(&self.approval_manager);
         let tool_name = self.name;
         let ctx = ctx.clone();
         async move {
@@ -120,12 +131,7 @@ impl Tool for AcpChatTool {
             let sub_thread_id = ThreadId(prepared.sub_session_id.clone());
             let sub_run_id = RunId(Uuid::new_v4().to_string());
             let title = prepared.title.clone();
-            let wait_ms = args.wait_ms.unwrap_or(DEFAULT_CODEX_WAIT_MS);
-            let status = backend
-                .spawn_prepared_tool_turn(prepared.clone(), wait_ms)
-                .await;
-            let preview = serde_json::to_string_pretty(&status)
-                .map_err(|err| AgentError::tool(tool_name, err.to_string()))?;
+            let _wait_ms = args.wait_ms.unwrap_or(DEFAULT_CODEX_WAIT_MS);
 
             Ok(ToolResult::Output(
                 stream! {
@@ -138,39 +144,76 @@ impl Tool for AcpChatTool {
                         1,
                         SubSessionEventPayload::Start,
                     ));
-                    if let Some(response) = status.response.clone() {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            "",
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            "acp",
-                            title.clone(),
-                            1,
-                            SubSessionEventPayload::Delta {
-                                content: response.reply.clone(),
-                            },
-                        ));
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            "",
-                            sub_thread_id,
-                            sub_run_id,
-                            "acp",
-                            title,
-                            1,
-                            SubSessionEventPayload::Done {
-                                final_output: Some(response.final_summary.clone()),
-                            },
-                        ));
-                    } else if let Some(error) = status.error.clone() {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            "",
-                            sub_thread_id,
-                            sub_run_id,
-                            "acp",
-                            title,
-                            1,
-                            SubSessionEventPayload::Error { message: error },
-                        ));
+                    yield ToolOutput::SubSession(SubSessionEvent::new(
+                        "",
+                        sub_thread_id.clone(),
+                        sub_run_id.clone(),
+                        "acp",
+                        title.clone(),
+                        1,
+                        SubSessionEventPayload::ThinkingStart,
+                    ));
+                    let mut spawned = backend
+                        .spawn_prepared_tool_turn_with_events(prepared.clone())
+                        .await;
+                    let decision_tx = spawned.decisions.clone();
+                    let mut saw_output = false;
+                    while let Some(event) = spawned.events.recv().await {
+                        if matches!(event, AcpToolTaskEvent::Delta(_)) {
+                            saw_output = true;
+                        }
+                        match event {
+                            AcpToolTaskEvent::ApprovalRequested(request) => {
+                                for output in handle_acp_approval_request(
+                                    request,
+                                    &approval_manager,
+                                    decision_tx.clone(),
+                                    &ctx,
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    title.clone(),
+                                ).await {
+                                    yield output;
+                                }
+                            }
+                            AcpToolTaskEvent::ApprovalUpdated(request) => {
+                                let request = normalize_acp_approval_request(request, &ctx);
+                                yield crate::tool_approval_updated_marker(
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    &request,
+                                );
+                            }
+                            AcpToolTaskEvent::ApprovalResolved { request, decision } => {
+                                let request = normalize_acp_approval_request(request, &ctx);
+                                yield crate::tool_approval_resolved_marker(
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    &request,
+                                    decision,
+                                );
+                            }
+                            event => {
+                                yield acp_task_event_output(
+                                    event,
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    title.clone(),
+                                );
+                            }
+                        }
+                    }
+                    let status = wait_for_finished_status(&backend, &spawned.task_id).await;
+                    let preview = serde_json::to_string_pretty(&status)
+                        .unwrap_or_else(|_| serde_json::to_string(&status).unwrap_or_else(|_| status.status.clone()));
+                    for output in status_sub_session_outputs(
+                        status.clone(),
+                        &sub_thread_id,
+                        &sub_run_id,
+                        title.clone(),
+                        !saw_output,
+                    ) {
+                        yield output;
                     }
                     yield ToolOutput::text(preview);
                 }
@@ -185,8 +228,35 @@ fn status_stream(status: AcpToolTaskStatus, preview: String) -> BoxStream<'stati
         let sub_thread_id = ThreadId(status.sub_session_id.clone());
         let sub_run_id = RunId(Uuid::new_v4().to_string());
         let title = Some("Codex ACP".to_string());
-        if let Some(response) = status.response.clone() {
-            yield ToolOutput::SubSession(SubSessionEvent::new(
+        for output in status_sub_session_outputs(status.clone(), &sub_thread_id, &sub_run_id, title, true) {
+            yield output;
+        }
+        yield ToolOutput::text(preview);
+    }
+    .boxed()
+}
+
+async fn wait_for_finished_status(backend: &Arc<AcpBackend>, task_id: &str) -> AcpToolTaskStatus {
+    loop {
+        let status = backend.poll_tool_task(task_id).await;
+        if status.status != "running" {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn status_sub_session_outputs(
+    status: AcpToolTaskStatus,
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    title: Option<String>,
+    include_response_delta: bool,
+) -> Vec<ToolOutput> {
+    let mut outputs = Vec::new();
+    if let Some(response) = status.response.clone() {
+        if include_response_delta {
+            outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
                 "",
                 sub_thread_id.clone(),
                 sub_run_id.clone(),
@@ -196,32 +266,242 @@ fn status_stream(status: AcpToolTaskStatus, preview: String) -> BoxStream<'stati
                 SubSessionEventPayload::Delta {
                     content: response.reply.clone(),
                 },
-            ));
-            yield ToolOutput::SubSession(SubSessionEvent::new(
-                "",
+            )));
+        }
+        outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
+            "",
+            sub_thread_id.clone(),
+            sub_run_id.clone(),
+            "acp",
+            title,
+            1,
+            SubSessionEventPayload::Done {
+                final_output: Some(response.final_summary.clone()),
+            },
+        )));
+    } else if let Some(error) = status.error.clone() {
+        outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
+            "",
+            sub_thread_id.clone(),
+            sub_run_id.clone(),
+            "acp",
+            title,
+            1,
+            SubSessionEventPayload::Error { message: error },
+        )));
+    } else if status.status == "running" {
+        outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
+            "",
+            sub_thread_id.clone(),
+            sub_run_id.clone(),
+            "acp",
+            title,
+            1,
+            SubSessionEventPayload::ThinkingEnd {
+                content: status
+                    .poll_hint
+                    .clone()
+                    .unwrap_or_else(|| "Codex ACP is still running.".to_string()),
+            },
+        )));
+    }
+    outputs
+}
+
+fn acp_task_event_output(
+    event: AcpToolTaskEvent,
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    title: Option<String>,
+) -> ToolOutput {
+    let payload = match event {
+        AcpToolTaskEvent::Delta(content) => SubSessionEventPayload::Delta { content },
+        AcpToolTaskEvent::Thinking(content) => SubSessionEventPayload::ThinkingEnd { content },
+        AcpToolTaskEvent::ToolCallStart { id, name } => {
+            SubSessionEventPayload::ToolCallStart { id, name }
+        }
+        AcpToolTaskEvent::ToolDelta { id, name, delta } => {
+            SubSessionEventPayload::ToolDelta { id, name, delta }
+        }
+        AcpToolTaskEvent::ToolResult { id, name, result } => {
+            SubSessionEventPayload::ToolResult { id, name, result }
+        }
+        AcpToolTaskEvent::ApprovalRequested(request)
+        | AcpToolTaskEvent::ApprovalUpdated(request)
+        | AcpToolTaskEvent::ApprovalResolved { request, .. } => SubSessionEventPayload::Error {
+            message: format!(
+                "ACP approval event was not handled before rendering: {}",
+                request.id
+            ),
+        },
+    };
+    ToolOutput::SubSession(SubSessionEvent::new(
+        "",
+        sub_thread_id.clone(),
+        sub_run_id.clone(),
+        "acp",
+        title,
+        1,
+        payload,
+    ))
+}
+
+async fn handle_acp_approval_request(
+    request: ToolApprovalRequest,
+    approval_manager: &Arc<ToolApprovalManager>,
+    decision_tx: Option<tokio::sync::mpsc::UnboundedSender<AcpApprovalDecision>>,
+    ctx: &ToolContext,
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    title: Option<String>,
+) -> Vec<ToolOutput> {
+    let request = normalize_acp_approval_request(request, ctx);
+    let mut outputs = Vec::new();
+
+    if decision_tx.is_none() {
+        outputs.push(crate::tool_approval_requested_marker(
+            sub_thread_id,
+            sub_run_id,
+            &request,
+        ));
+        outputs.push(crate::tool_approval_resolved_marker(
+            sub_thread_id,
+            sub_run_id,
+            &request,
+            ToolApprovalDecision::Deny,
+        ));
+        outputs.push(acp_sub_session_error(
+            sub_thread_id,
+            sub_run_id,
+            title,
+            "ACP approval requested, but this ACP backend does not expose a decision channel.",
+        ));
+        return outputs;
+    }
+
+    let (wait, events) = approval_manager.start_request(request.clone()).await;
+    let mut current_request = request;
+    for event in events {
+        match event {
+            ApprovalEvent::Requested(request) => {
+                current_request = request.clone();
+                outputs.push(crate::tool_approval_requested_marker(
+                    sub_thread_id,
+                    sub_run_id,
+                    &request,
+                ));
+            }
+            ApprovalEvent::Updated(request) => {
+                current_request = request.clone();
+                outputs.push(crate::tool_approval_updated_marker(
+                    sub_thread_id,
+                    sub_run_id,
+                    &request,
+                ));
+            }
+            ApprovalEvent::Resolved { request, decision } => {
+                current_request = request.clone();
+                outputs.push(crate::tool_approval_resolved_marker(
+                    sub_thread_id,
+                    sub_run_id,
+                    &request,
+                    decision,
+                ));
+            }
+        }
+    }
+
+    let decision = match wait {
+        ApprovalWait::Immediate(ApprovalResolution::Approved) => {
+            ToolApprovalDecision::AllowSessionModelAuto
+        }
+        ApprovalWait::Immediate(ApprovalResolution::Denied) => ToolApprovalDecision::Deny,
+        ApprovalWait::Pending(rx) => {
+            let should_wait = matches!(
+                current_request.platform.as_deref(),
+                Some("web" | "tui" | "feishu")
+            );
+            if should_wait {
+                rx.await.unwrap_or(ToolApprovalDecision::Deny)
+            } else {
+                ToolApprovalDecision::Deny
+            }
+        }
+    };
+
+    let (_, event) = approval_manager
+        .finish_request(&current_request, decision)
+        .await;
+    if let ApprovalEvent::Resolved { request, decision } = event {
+        current_request = request.clone();
+        outputs.push(crate::tool_approval_resolved_marker(
+            sub_thread_id,
+            sub_run_id,
+            &request,
+            decision,
+        ));
+    }
+
+    if let Some(tx) = decision_tx {
+        if tx
+            .send(AcpApprovalDecision {
+                approval_id: current_request.id.clone(),
+                decision,
+            })
+            .is_err()
+        {
+            outputs.push(acp_sub_session_error(
                 sub_thread_id,
                 sub_run_id,
-                "acp",
                 title,
-                1,
-                SubSessionEventPayload::Done {
-                    final_output: Some(response.final_summary.clone()),
-                },
-            ));
-        } else if let Some(error) = status.error.clone() {
-            yield ToolOutput::SubSession(SubSessionEvent::new(
-                "",
-                sub_thread_id,
-                sub_run_id,
-                "acp",
-                title,
-                1,
-                SubSessionEventPayload::Error { message: error },
+                "ACP approval decision could not be delivered; the ACP session is no longer accepting decisions.",
             ));
         }
-        yield ToolOutput::text(preview);
     }
-    .boxed()
+    outputs
+}
+
+fn normalize_acp_approval_request(
+    mut request: ToolApprovalRequest,
+    ctx: &ToolContext,
+) -> ToolApprovalRequest {
+    if let Some(thread_id) = &ctx.thread_id {
+        request.session_id = thread_id.0.clone();
+    }
+    if request.run_id.trim().is_empty() {
+        request.run_id = ctx.run_id.0.clone();
+    }
+    if request.platform.as_deref().is_none_or(str::is_empty) {
+        request.platform = ctx
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("platform"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("cli".to_string()));
+    }
+    request
+}
+
+fn acp_sub_session_error(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    title: Option<String>,
+    message: impl Into<String>,
+) -> ToolOutput {
+    ToolOutput::SubSession(SubSessionEvent::new(
+        "",
+        sub_thread_id.clone(),
+        sub_run_id.clone(),
+        "acp",
+        title,
+        1,
+        SubSessionEventPayload::Error {
+            message: message.into(),
+        },
+    ))
 }
 
 fn current_bound_channel(
@@ -252,6 +532,7 @@ fn current_bound_channel(
 mod tests {
     use super::{current_bound_channel, AcpChatTool};
     use crate::acp::backend::AcpBackend;
+    use crate::approval::ToolApprovalManager;
     use remi_agentloop::prelude::{AgentConfig, Tool, ToolContext};
     use std::sync::{Arc, RwLock};
 
@@ -290,10 +571,10 @@ mod tests {
     #[test]
     fn codex_tool_exposes_session_id_contract() {
         let tempdir = tempfile::tempdir().unwrap();
-        let tool = AcpChatTool::codex(Arc::new(AcpBackend::new(
-            tempdir.path().to_path_buf(),
-            None,
-        )));
+        let tool = AcpChatTool::codex(
+            Arc::new(AcpBackend::new(tempdir.path().to_path_buf(), None)),
+            ToolApprovalManager::new(),
+        );
         let schema = tool.parameters_schema();
 
         assert_eq!(tool.name(), "codex");

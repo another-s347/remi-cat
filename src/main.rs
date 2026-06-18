@@ -75,6 +75,7 @@ enum AppCommand {
     Run(CliConfig),
     Setup(Vec<String>),
     Doctor,
+    Tools(ToolsArgs),
     Secrets(SecretCommand),
     ConfigSet(Vec<String>),
     SandboxSet(Vec<String>),
@@ -205,6 +206,8 @@ enum CliCommand {
         about = "Inspect local runtime configuration and readiness"
     )]
     Doctor,
+    #[command(about = "List all runtime-registered tools with configuration diagnostics")]
+    Tools(ToolsArgs),
     #[command(alias = "secret", about = "List, read, set, or delete secrets")]
     Secrets(SecretsArgs),
     #[command(about = "Update runtime config")]
@@ -257,6 +260,12 @@ struct SetupArgs {
         help = "Non-interactive runtime config entries"
     )]
     entries: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+struct ToolsArgs {
+    #[arg(long, help = "Print machine-readable JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -829,6 +838,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
     match command {
         Some(CliCommand::Setup(args)) => Ok(AppCommand::Setup(args.entries)),
         Some(CliCommand::Doctor) => Ok(AppCommand::Doctor),
+        Some(CliCommand::Tools(args)) => Ok(AppCommand::Tools(args)),
         Some(CliCommand::Secrets(args)) => Ok(AppCommand::Secrets(secret_cli_to_command(args))),
         Some(CliCommand::Config(args)) => match args.command {
             ConfigCliCommand::Set(entries) => Ok(AppCommand::ConfigSet(entries.entries)),
@@ -1740,6 +1750,24 @@ impl ImFileBridge for LocalImFileBridge {
             }))
         })
     }
+
+    fn sub_session_send_text<'a>(
+        &'a self,
+        platform: &'a str,
+        channel_id: &'a str,
+        text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if platform != FEISHU_CHANNEL {
+                return Ok(());
+            }
+            let Some(gateway) = &self.gateway else {
+                return Ok(());
+            };
+            gateway.send_text(channel_id, text).await?;
+            Ok(())
+        })
+    }
 }
 
 struct Runtime {
@@ -1750,6 +1778,82 @@ struct Runtime {
     im_bridge: Arc<dyn ImFileBridge>,
     root_agent_id: String,
     data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubSessionInputTarget {
+    Acp {
+        acp_session_id: String,
+        sub_thread_id: String,
+    },
+    Agent {
+        sub_thread_id: String,
+        agent_name: String,
+    },
+}
+
+pub(crate) async fn sub_session_input_target(
+    runtime: &Runtime,
+    session_id: &str,
+) -> Option<SubSessionInputTarget> {
+    let (sub_thread_id, agent_name, acp_session_id) = {
+        let sessions = runtime.sessions.lock().await;
+        let sub_thread_id = sessions.metadata_string(session_id, "sub_session_thread_id")?;
+        let agent_name = sessions
+            .metadata_string(session_id, "sub_session_agent")
+            .unwrap_or_default();
+        let acp_session_id = sessions.metadata_string(session_id, "sub_session_acp_session_id");
+        (sub_thread_id, agent_name, acp_session_id)
+    };
+    if agent_name == "acp" {
+        let acp_session_id = match acp_session_id {
+            Some(id) if !id.trim().is_empty() => id,
+            _ => {
+                let id = runtime
+                    .bot
+                    .acp_session_id_for_sub_session(&sub_thread_id)
+                    .await?;
+                let _ = runtime.sessions.lock().await.set_metadata_string(
+                    session_id,
+                    "sub_session_acp_session_id",
+                    &id,
+                );
+                id
+            }
+        };
+        return Some(SubSessionInputTarget::Acp {
+            acp_session_id,
+            sub_thread_id,
+        });
+    }
+    if agent_name.trim().is_empty() {
+        return None;
+    }
+    Some(SubSessionInputTarget::Agent {
+        sub_thread_id,
+        agent_name,
+    })
+}
+
+pub(crate) async fn append_direct_sub_session_turn(
+    runtime: &Runtime,
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    if let Err(err) = runtime
+        .bot
+        .append_thread_messages(
+            session_id,
+            vec![
+                remi_agentloop::prelude::Message::user(user_text.to_string()),
+                remi_agentloop::prelude::Message::assistant(assistant_text.to_string()),
+            ],
+        )
+        .await
+    {
+        warn!("failed to append direct sub-session turn: {err:#}");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1913,14 +2017,54 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        AppCommand::Tools(_) => {
+            unsafe {
+                std::env::set_var("REMI_DATA_DIR", &data_dir);
+            }
+            if let SetupState::Initialized { config, .. } = detect_setup_state(&data_dir) {
+                config.apply_env_defaults();
+                data_dir = std::path::PathBuf::from(
+                    std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
+                );
+            }
+            if let Some(overflow_bytes) = tool_output_overflow_bytes {
+                unsafe {
+                    std::env::set_var(
+                        "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
+                        overflow_bytes.to_string(),
+                    );
+                }
+            }
+            if !matches!(
+                detect_setup_state(&data_dir),
+                SetupState::Initialized { .. }
+            ) && !has_legacy_env_credentials()
+            {
+                anyhow::bail!(
+                    "remi-cat is not initialized yet. Run `remi-cat setup` first, or provide legacy env config."
+                );
+            }
+        }
     }
 
     install_embedded_model_profiles(data_dir.join("models"))?;
     install_embedded_agent_profiles(data_dir.join("agents"))?;
     std::fs::create_dir_all(data_dir.join("workflows"))?;
 
-    let cli = match command {
-        AppCommand::Run(cli) => cli,
+    let cli = match &command {
+        AppCommand::Run(cli) => cli.clone(),
+        AppCommand::Tools(_) => CliConfig {
+            enabled: false,
+            tui: false,
+            resume: false,
+            resume_session_id: None,
+            once: None,
+            pure_prompt: false,
+            admin_only: false,
+            channel_id: CLI_CHAT_ID.to_string(),
+            user_id: CLI_USER_ID.to_string(),
+            username: CLI_USERNAME.to_string(),
+        },
         _ => unreachable!(),
     };
     let root_agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
@@ -1976,6 +2120,10 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     );
     bot.update_secret_redactor(&redaction_entries(&secret_store.lock().await.entries()?));
+    if let AppCommand::Tools(args) = &command {
+        print_registered_tools(&bot, args.json)?;
+        return Ok(());
+    }
     let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
     let runtime = Rc::new(Runtime {
         bot,
@@ -3180,6 +3328,42 @@ fn command_doctor_report(runtime: &Runtime) -> String {
     )
 }
 
+fn print_registered_tools(bot: &CatBot, json: bool) -> anyhow::Result<()> {
+    let tools = bot.registered_tool_statuses();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tools)?);
+        return Ok(());
+    }
+
+    for tool in tools {
+        let status = if !tool.registered {
+            "not_registered"
+        } else if !tool.enabled {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        println!(
+            "{}\t{}\tallowlist={}\t{}",
+            tool.name,
+            status,
+            if tool.in_active_allowlist {
+                "yes"
+            } else {
+                "no"
+            },
+            tool.description
+        );
+        for warning in tool.warnings {
+            println!("  warning: {warning}");
+        }
+        for error in tool.errors {
+            println!("  error: {error}");
+        }
+    }
+    Ok(())
+}
+
 async fn run_secret_command(
     store: Arc<Mutex<SecretStore>>,
     command: &SecretCommand,
@@ -4277,25 +4461,47 @@ async fn collect_bot_reply(
         .await;
         return Ok(reply);
     }
-    let (command_prefix, skill_injections) =
-        match process_runtime_commands(&runtime, &session_id, msg.text.trim()).await? {
-            RuntimeCommandPipelineResult::Reply(reply) => {
-                append_reply_chunk(
-                    &mut String::new(),
-                    &mut replies,
-                    FeishuReplyKind::Text,
-                    &reply,
-                )
-                .await;
-                return Ok(reply);
-            }
-            RuntimeCommandPipelineResult::Continue {
-                text,
-                prefix,
-                skill_injections: injections,
-            } => {
-                msg.text = text;
-                (prefix, injections)
+    let direct_sub_session_target = sub_session_input_target(&runtime, &session_id).await;
+    if let Some(SubSessionInputTarget::Acp { acp_session_id, .. }) = &direct_sub_session_target {
+        let reply = runtime
+            .bot
+            .acp_bound_message(acp_session_id, msg.text.trim())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        append_direct_sub_session_turn(&runtime, &session_id, msg.text.trim(), &reply).await;
+        append_reply_chunk(
+            &mut String::new(),
+            &mut replies,
+            FeishuReplyKind::Text,
+            &reply,
+        )
+        .await;
+        return Ok(reply);
+    }
+    let (command_prefix, skill_injections, stream_thread_id) =
+        if let Some(SubSessionInputTarget::Agent { sub_thread_id, .. }) = direct_sub_session_target
+        {
+            (String::new(), Vec::new(), sub_thread_id)
+        } else {
+            match process_runtime_commands(&runtime, &session_id, msg.text.trim()).await? {
+                RuntimeCommandPipelineResult::Reply(reply) => {
+                    append_reply_chunk(
+                        &mut String::new(),
+                        &mut replies,
+                        FeishuReplyKind::Text,
+                        &reply,
+                    )
+                    .await;
+                    return Ok(reply);
+                }
+                RuntimeCommandPipelineResult::Continue {
+                    text,
+                    prefix,
+                    skill_injections: injections,
+                } => {
+                    msg.text = text;
+                    (prefix, injections, session_id.clone())
+                }
             }
         };
 
@@ -4359,7 +4565,10 @@ async fn collect_bot_reply(
         }
     }
     let mut supervisor_execution_started = false;
-    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(&session_id, content, opts));
+    let mut stream =
+        std::pin::pin!(runtime
+            .bot
+            .stream_with_options(&stream_thread_id, content, opts));
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
     loop {
@@ -5925,7 +6134,23 @@ async fn record_sub_session_event(
         warn!("failed to record sub-session: {err:#}");
     }
 
+    let sub_session_id =
+        ensure_sub_session_channel_session(runtime, parent_session_id, platform, event).await;
+    if let Some(session_id) = sub_session_id.as_deref() {
+        let messages = sub_session_history_messages(event);
+        if let Err(err) = runtime
+            .bot
+            .append_thread_messages(session_id, messages)
+            .await
+        {
+            warn!("failed to append sub-session history: {err:#}");
+        }
+    }
+
     if !matches!(event.payload, SubSessionEventPayload::Start) {
+        if platform == FEISHU_CHANNEL {
+            forward_sub_session_event_to_bound_channel(runtime, parent_session_id, event).await;
+        }
         return;
     }
     if platform != FEISHU_CHANNEL {
@@ -5965,15 +6190,174 @@ async fn record_sub_session_event(
                 parent_session_id,
                 &event.sub_thread_id.0,
                 ChannelBinding {
-                    platform: binding.platform,
-                    channel_id: binding.channel_id,
+                    platform: binding.platform.clone(),
+                    channel_id: binding.channel_id.clone(),
                 },
             ) {
                 warn!("failed to persist sub-session IM binding: {err:#}");
             }
+            if let Some(session_id) = sub_session_id.as_deref() {
+                if let Err(err) = runtime.sessions.lock().await.set_channel_binding(
+                    session_id,
+                    &binding.platform,
+                    &binding.channel_id,
+                ) {
+                    warn!("failed to bind sub-session session channel: {err:#}");
+                }
+            }
         }
         Ok(None) => {}
         Err(err) => warn!("failed to create sub-session IM binding: {err:#}"),
+    }
+}
+
+async fn ensure_sub_session_channel_session(
+    runtime: &Runtime,
+    parent_session_id: &str,
+    platform: &str,
+    event: &SubSessionEvent,
+) -> Option<String> {
+    let title = event.title.clone().or_else(|| {
+        Some(format!(
+            "{} {}",
+            event.agent_name,
+            event.sub_thread_id.0.trim()
+        ))
+    });
+    let existing_binding = runtime
+        .sessions
+        .lock()
+        .await
+        .sub_session_channel_binding(parent_session_id, &event.sub_thread_id.0);
+    let (session_platform, session_channel_id) = existing_binding
+        .as_ref()
+        .map(|binding| (binding.platform.as_str(), binding.channel_id.as_str()))
+        .unwrap_or((platform, event.sub_thread_id.0.as_str()));
+    let session = runtime.sessions.lock().await.create_channel(
+        session_platform,
+        session_channel_id,
+        &runtime.root_agent_id,
+        title,
+    );
+    let session = match session {
+        Ok(session) => session,
+        Err(err) => {
+            warn!("failed to create sub-session channel session: {err:#}");
+            return None;
+        }
+    };
+    let mut sessions = runtime.sessions.lock().await;
+    let _ = sessions.set_metadata_string(
+        &session.id,
+        "sub_session_parent_session_id",
+        parent_session_id,
+    );
+    let _ =
+        sessions.set_metadata_string(&session.id, "sub_session_thread_id", &event.sub_thread_id.0);
+    let _ = sessions.set_metadata_string(&session.id, "sub_session_agent", &event.agent_name);
+    drop(sessions);
+    if event.agent_name == "acp" {
+        if let Some(acp_session_id) = runtime
+            .bot
+            .acp_session_id_for_sub_session(&event.sub_thread_id.0)
+            .await
+        {
+            let _ = runtime.sessions.lock().await.set_metadata_string(
+                &session.id,
+                "sub_session_acp_session_id",
+                &acp_session_id,
+            );
+        }
+    }
+    Some(session.id)
+}
+
+async fn forward_sub_session_event_to_bound_channel(
+    runtime: &Runtime,
+    parent_session_id: &str,
+    event: &SubSessionEvent,
+) {
+    let Some(text) = sub_session_event_text(event) else {
+        return;
+    };
+    let Some(binding) = runtime
+        .sessions
+        .lock()
+        .await
+        .sub_session_channel_binding(parent_session_id, &event.sub_thread_id.0)
+    else {
+        return;
+    };
+    if let Err(err) = runtime
+        .im_bridge
+        .sub_session_send_text(&binding.platform, &binding.channel_id, &text)
+        .await
+    {
+        warn!("failed to send sub-session event to IM channel: {err:#}");
+    }
+}
+
+fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<remi_agentloop::prelude::Message> {
+    match &event.payload {
+        SubSessionEventPayload::Start => {
+            let input = event
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Sub-session started: {} / {}",
+                        event.agent_name, event.sub_thread_id.0
+                    )
+                });
+            vec![remi_agentloop::prelude::Message::user(input)]
+        }
+        _ => sub_session_event_text(event)
+            .map(remi_agentloop::prelude::Message::assistant)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn sub_session_event_text(event: &SubSessionEvent) -> Option<String> {
+    let text = match &event.payload {
+        SubSessionEventPayload::Start => return None,
+        SubSessionEventPayload::Delta { content } => content.clone(),
+        SubSessionEventPayload::ThinkingStart => "Thinking...".to_string(),
+        SubSessionEventPayload::ThinkingEnd { content } => {
+            if content.trim().is_empty() {
+                "Thinking complete.".to_string()
+            } else {
+                format!("Thinking:\n{content}")
+            }
+        }
+        SubSessionEventPayload::TurnStart { turn } => format!("Turn {turn}"),
+        SubSessionEventPayload::ToolCallStart { id, name } => {
+            format!("Tool `{name}` started ({id}).")
+        }
+        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
+            format!("Tool arguments `{id}`:\n{delta}")
+        }
+        SubSessionEventPayload::ToolDelta { id, name, delta } => {
+            format!("Tool `{name}` output ({id}):\n{delta}")
+        }
+        SubSessionEventPayload::ToolResult { id, name, result } => {
+            format!("Tool `{name}` result ({id}):\n{result}")
+        }
+        SubSessionEventPayload::Done { final_output } => final_output
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "Done.".to_string()),
+        SubSessionEventPayload::Error { message } => format!("Error: {message}"),
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 

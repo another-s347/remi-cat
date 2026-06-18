@@ -1,13 +1,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use bot_core::{
-    todo::TodoItem, CatEvent, Content, StreamOptions, ThreadHistoryMessage, ToolApprovalDecision,
-    ToolApprovalRequest,
+    todo::TodoItem, CatEvent, Content, ModelInputSnapshot, StreamOptions, ThreadHistoryMessage,
+    ToolApprovalDecision, ToolApprovalRequest,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -18,6 +19,8 @@ use crate::{
     process_runtime_commands, Runtime, RuntimeCommandPipelineResult,
     SESSION_MODEL_PROFILE_METADATA_KEY,
 };
+
+const SDK_DB_FILE_NAME: &str = "todo-sdk.db";
 
 pub const WEB_CHANNEL: &str = "web";
 pub const WEB_USER_ID: &str = "web-local";
@@ -624,6 +627,77 @@ async fn send_event(sink: &WebRunEventSink, event: ChatEventV1) {
     let _ = sink.direct.send(event).await;
 }
 
+fn persist_model_input_snapshot(
+    runtime: &Runtime,
+    session_id: &str,
+    snapshot: &ModelInputSnapshot,
+) {
+    let snapshot_json = match serde_json::to_string(snapshot) {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                run_id = %snapshot.run_id,
+                error = %err,
+                "failed to serialize model input snapshot"
+            );
+            return;
+        }
+    };
+    let created_at_ms = chrono::DateTime::parse_from_rfc3339(&snapshot.created_at)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+    let db_path = web_sdk_db_path(&runtime.data_dir, WEB_USER_ID);
+    let sdk = match remi_client_sdk::TriggerSdk::initialize(&db_path) {
+        Ok(sdk) => sdk,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                run_id = %snapshot.run_id,
+                db_path = %db_path.display(),
+                error = %err,
+                "failed to initialize sdk storage for model input snapshot"
+            );
+            return;
+        }
+    };
+    if let Err(err) = sdk.upsert_chat_model_input_json(
+        session_id.to_string(),
+        snapshot.run_id.clone(),
+        created_at_ms,
+        snapshot_json,
+    ) {
+        tracing::warn!(
+            session_id,
+            run_id = %snapshot.run_id,
+            error = %err,
+            "failed to persist model input snapshot"
+        );
+    }
+}
+
+pub(crate) fn web_sdk_db_path(data_dir: &Path, user_key: &str) -> PathBuf {
+    data_dir
+        .join("sdk")
+        .join(sdk_user_key(user_key))
+        .join("todo")
+        .join(SDK_DB_FILE_NAME)
+}
+
+fn sdk_user_key(user_id: &str) -> String {
+    let raw = user_id.trim();
+    let raw = if raw.is_empty() { "anonymous" } else { raw };
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 async fn run_turn(
     runtime: Rc<Runtime>,
     session_id: &str,
@@ -638,6 +712,7 @@ async fn run_turn(
     let mut total_completion_tokens = 0_u32;
     let mut max_prompt_tokens = 0_u32;
     let mut model_elapsed_ms = 0_u64;
+    let mut model_input_snapshot: Option<ModelInputSnapshot> = None;
     let mut sequence = 0;
     let mut streaming_tools = HashMap::<String, StreamingToolCall>::new();
     send_event(
@@ -709,34 +784,18 @@ async fn run_turn(
         return;
     }
 
-    let skill_injections = match process_runtime_commands(&runtime, session_id, text.trim()).await {
-        Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
-            send_event(
-                &sink,
-                ChatEventV1::new(
-                    "text_delta",
-                    run_id,
-                    session_id,
-                    sequence,
-                    Some(serde_json::json!({"text": reply})),
-                ),
-            )
-            .await;
-            sequence += 1;
-            send_event(
-                &sink,
-                ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
-            )
-            .await;
-            return;
-        }
-        Ok(RuntimeCommandPipelineResult::Continue {
-            text: next_text,
-            prefix,
-            skill_injections: injections,
-        }) => {
-            text = next_text;
-            if !prefix.is_empty() {
+    let direct_sub_session_target = crate::sub_session_input_target(&runtime, session_id).await;
+    if let Some(crate::SubSessionInputTarget::Acp { acp_session_id, .. }) =
+        &direct_sub_session_target
+    {
+        match runtime
+            .bot
+            .acp_bound_message(acp_session_id, text.trim())
+            .await
+        {
+            Ok(reply) => {
+                crate::append_direct_sub_session_turn(&runtime, session_id, text.trim(), &reply)
+                    .await;
                 send_event(
                     &sink,
                     ChatEventV1::new(
@@ -744,35 +803,106 @@ async fn run_turn(
                         run_id,
                         session_id,
                         sequence,
-                        Some(serde_json::json!({"text": prefix})),
+                        Some(serde_json::json!({"text": reply})),
                     ),
                 )
                 .await;
                 sequence += 1;
             }
-            injections
+            Err(error) => {
+                send_event(
+                    &sink,
+                    ChatEventV1::new(
+                        "error",
+                        run_id,
+                        session_id,
+                        sequence,
+                        Some(serde_json::json!({"message": error.to_string()})),
+                    ),
+                )
+                .await;
+                sequence += 1;
+            }
         }
-        Err(error) => {
-            send_event(
-                &sink,
-                ChatEventV1::new(
-                    "error",
-                    run_id,
-                    session_id,
-                    sequence,
-                    Some(serde_json::json!({"message": error.to_string()})),
-                ),
-            )
-            .await;
-            sequence += 1;
-            send_event(
-                &sink,
-                ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
-            )
-            .await;
-            return;
-        }
-    };
+        send_event(
+            &sink,
+            ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+        )
+        .await;
+        return;
+    }
+
+    let (stream_thread_id, skill_injections) =
+        if let Some(crate::SubSessionInputTarget::Agent { sub_thread_id, .. }) =
+            direct_sub_session_target
+        {
+            (sub_thread_id, Vec::new())
+        } else {
+            match process_runtime_commands(&runtime, session_id, text.trim()).await {
+                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                    send_event(
+                        &sink,
+                        ChatEventV1::new(
+                            "text_delta",
+                            run_id,
+                            session_id,
+                            sequence,
+                            Some(serde_json::json!({"text": reply})),
+                        ),
+                    )
+                    .await;
+                    sequence += 1;
+                    send_event(
+                        &sink,
+                        ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(RuntimeCommandPipelineResult::Continue {
+                    text: next_text,
+                    prefix,
+                    skill_injections: injections,
+                }) => {
+                    text = next_text;
+                    if !prefix.is_empty() {
+                        send_event(
+                            &sink,
+                            ChatEventV1::new(
+                                "text_delta",
+                                run_id,
+                                session_id,
+                                sequence,
+                                Some(serde_json::json!({"text": prefix})),
+                            ),
+                        )
+                        .await;
+                        sequence += 1;
+                    }
+                    (session_id.to_string(), injections)
+                }
+                Err(error) => {
+                    send_event(
+                        &sink,
+                        ChatEventV1::new(
+                            "error",
+                            run_id,
+                            session_id,
+                            sequence,
+                            Some(serde_json::json!({"message": error.to_string()})),
+                        ),
+                    )
+                    .await;
+                    sequence += 1;
+                    send_event(
+                        &sink,
+                        ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
 
     let model_profile_id = runtime
         .sessions
@@ -795,10 +925,11 @@ async fn run_turn(
         cancel: Some(cancel),
         ..StreamOptions::default()
     };
-    let mut stream =
-        std::pin::pin!(runtime
-            .bot
-            .stream_with_options(session_id, Content::text(text), opts,));
+    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
+        &stream_thread_id,
+        Content::text(text),
+        opts,
+    ));
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
 
@@ -957,6 +1088,18 @@ async fn run_turn(
                     "items": bot_core::todo::todos_from_user_state(&user_state),
                 }),
             )),
+            CatEvent::ModelInputSnapshot(snapshot) => {
+                persist_model_input_snapshot(&runtime, session_id, &snapshot);
+                model_input_snapshot = Some(snapshot.clone());
+                Some((
+                    "model_input_snapshot",
+                    serde_json::json!({
+                        "run_id": snapshot.run_id,
+                        "estimated_tokens": snapshot.totals.estimated_tokens,
+                        "segment_count": snapshot.segments.len(),
+                    }),
+                ))
+            }
             CatEvent::Stats {
                 prompt_tokens,
                 completion_tokens,
@@ -967,6 +1110,15 @@ async fn run_turn(
                 total_completion_tokens = completion_tokens;
                 max_prompt_tokens = round_max_prompt_tokens;
                 model_elapsed_ms = elapsed_ms;
+                if let Some(snapshot) = &mut model_input_snapshot {
+                    snapshot.apply_usage(
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        max_prompt_tokens,
+                        context_tokens,
+                    );
+                    persist_model_input_snapshot(&runtime, session_id, snapshot);
+                }
                 let context_usage = if context_tokens == 0 {
                     0.0
                 } else {

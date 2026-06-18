@@ -145,6 +145,15 @@ pub trait ImFileBridge: Send + Sync {
     > {
         Box::pin(async move { Ok(None) })
     }
+
+    fn sub_session_send_text<'a>(
+        &'a self,
+        _platform: &'a str,
+        _channel_id: &'a str,
+        _text: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

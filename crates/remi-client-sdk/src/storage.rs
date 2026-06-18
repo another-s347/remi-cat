@@ -280,6 +280,14 @@ impl Storage {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS chat_model_inputs (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, run_id)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_versions (
                 version_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -380,6 +388,9 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session_time
                 ON chat_messages(session_id, created_at_ms ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_chat_model_inputs_session_time
+                ON chat_model_inputs(session_id, created_at_ms DESC);
 
             -- Things change log for tracking operations and enabling undo
             CREATE TABLE IF NOT EXISTS things_change_log (
@@ -561,6 +572,7 @@ impl Storage {
             "trigger_bindings",
             "chat_sessions",
             "chat_messages",
+            "chat_model_inputs",
             "things_change_log",
             "things_content_snapshots",
             "crdt_documents",
@@ -617,6 +629,7 @@ impl Storage {
             "trigger_bindings",
             "chat_sessions",
             "chat_messages",
+            "chat_model_inputs",
             "agent_versions",
             "eval_datasets",
             "eval_dataset_sessions",
@@ -2386,6 +2399,11 @@ impl Storage {
         )
         .context("Failed to delete chat runtime state")?;
         conn.execute(
+            "DELETE FROM chat_model_inputs WHERE session_id = ?1",
+            [session_id],
+        )
+        .context("Failed to delete chat model inputs")?;
+        conn.execute(
             "DELETE FROM chat_sessions WHERE session_id = ?1",
             [session_id],
         )
@@ -3025,6 +3043,82 @@ impl Storage {
             [session_id],
         )
         .context("Failed to delete chat runtime state")?;
+        Ok(())
+    }
+
+    /// Create or update a per-run model input snapshot.
+    pub fn upsert_chat_model_input_json(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        created_at_ms: i64,
+        snapshot_json: &str,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"INSERT INTO chat_model_inputs (session_id, run_id, created_at_ms, snapshot_json)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(session_id, run_id) DO UPDATE SET
+                   created_at_ms = excluded.created_at_ms,
+                   snapshot_json = excluded.snapshot_json"#,
+            params![session_id, run_id, created_at_ms, snapshot_json],
+        )
+        .context("Failed to upsert chat model input")?;
+        Ok(())
+    }
+
+    /// List model input snapshots for a session, newest first.
+    pub fn list_chat_model_input_json(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<String>> {
+        let conn = self.connection()?;
+        let mut items = Vec::new();
+        if let Some(limit) = limit {
+            let mut stmt = conn.prepare(
+                "SELECT snapshot_json FROM chat_model_inputs WHERE session_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![session_id, limit], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                items.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT snapshot_json FROM chat_model_inputs WHERE session_id = ?1 ORDER BY created_at_ms DESC",
+            )?;
+            let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                items.push(row?);
+            }
+        }
+        Ok(items)
+    }
+
+    /// Fetch one model input snapshot for a session/run.
+    pub fn get_chat_model_input_json(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT snapshot_json FROM chat_model_inputs WHERE session_id = ?1 AND run_id = ?2",
+            params![session_id, run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("Failed to fetch chat model input")
+    }
+
+    /// Delete model input snapshots for a session.
+    pub fn delete_chat_model_inputs(&self, session_id: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "DELETE FROM chat_model_inputs WHERE session_id = ?1",
+            [session_id],
+        )
+        .context("Failed to delete chat model inputs")?;
         Ok(())
     }
 
