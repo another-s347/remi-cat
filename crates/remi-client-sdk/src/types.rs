@@ -464,26 +464,6 @@ pub struct ResolvedEntityActionBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RepeatFrequency {
-    PerDay(u32),
-    PerWeek(u32),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", tag = "type")]
-pub enum TriggerTiming {
-    #[serde(rename = "cron")]
-    Cron { expression: String },
-    #[serde(rename = "location")]
-    Location,
-    #[serde(rename = "network-change")]
-    NetworkChange,
-    #[serde(rename = "repeat-frequency")]
-    RepeatFrequency { frequency: RepeatFrequency },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum TriggerRunType {
     Automatic,
     Manual,

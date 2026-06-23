@@ -12,11 +12,11 @@ use crate::things_events::{ThingsDocumentChangeKind, ThingsDocumentEvent, Things
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, EntityActionBinding,
-    EventPayload, NotificationResponseAction, NotificationSource, ResolvedEntityActionBinding,
-    StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType,
-    ThingsUndoConflict, ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
-    ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerInfo, TriggerLogLevel,
-    TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
+    EventPayload, NotificationResponseAction, ResolvedEntityActionBinding, StoredTrigger,
+    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
+    ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption,
+    TriggerExecutionSummary, TriggerInfo, TriggerLogLevel, TriggerRegistration,
+    TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -5577,6 +5577,7 @@ fn parse_cached_message_storage_json(message_json: &str) -> Result<CachedMessage
 mod tests {
     use super::*;
     use crate::things_crdt::ThingDatatype;
+    use crate::types::NotificationSource;
     use chrono::TimeZone;
     use std::io::{Read, Write};
     use std::net::TcpListener;

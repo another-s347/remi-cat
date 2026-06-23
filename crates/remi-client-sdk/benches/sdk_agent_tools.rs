@@ -102,6 +102,8 @@ fn build_registration(trigger_uuid: &str, index: usize) -> TriggerRegistration {
             description: "cron".to_string(),
         }],
         condition: Vec::new(),
+        action_uuid: None,
+        action_args: json!({}),
     }
 }
 

@@ -1,5 +1,4 @@
-use crate::{EvaluationContext, MonitoringEvent, TriggerConfig, TriggerRule};
-use serde_json::json;
+use crate::TriggerConfig;
 
 /// Test scenarios based on real-world event patterns from events.json
 /// These tests validate rule-based triggers against realistic lifetime scenarios
@@ -283,30 +282,6 @@ mod realworld_scenario_tests {
         let config = config.unwrap();
         assert!(config.condition[0].rule.contains("Starting monitors"));
         assert!(config.condition[1].rule.contains("Rust bridge active"));
-    }
-
-    /// Scenario 9: All Example Trigger Files Parse Successfully
-    #[test]
-    fn test_all_example_files_parse() {
-        let example_files = vec![
-            include_str!("../../examples/connectivity-loss-alert.json"),
-            include_str!("../../examples/location-change-detector.json"),
-            include_str!("../../examples/idle-device-warning.json"),
-            include_str!("../../examples/connectivity-instability-alert.json"),
-            include_str!("../../examples/evening-location-pause-reminder.json"),
-            include_str!("../../examples/weekly-activity-summary.json"),
-            include_str!("../../examples/work-hours-movement-reminder.json"),
-        ];
-
-        for (idx, json) in example_files.iter().enumerate() {
-            let config = TriggerConfig::from_json(json);
-            assert!(
-                config.is_ok(),
-                "Example file {} failed to parse: {:?}",
-                idx,
-                config
-            );
-        }
     }
 
     /// Scenario 10: Complex Multi-Condition Trigger

@@ -1,10 +1,7 @@
 use std::{env, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("proto");
+    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
 
     let public_api_proto = proto_dir.join("public_api.proto");
 

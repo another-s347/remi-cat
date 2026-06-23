@@ -5064,11 +5064,6 @@ fn history_gutter(prefix: &str) -> String {
     format!("{prefix}{}", " ".repeat(spaces as usize))
 }
 
-fn history_scroll_offset(total_lines: usize, visible_lines: usize, scroll_back: usize) -> usize {
-    let bottom_offset = total_lines.saturating_sub(visible_lines);
-    bottom_offset.saturating_sub(scroll_back.min(bottom_offset))
-}
-
 fn horizontal_rule(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(width as usize),
@@ -5903,15 +5898,6 @@ fn wrap_text(text: &str, width: u16) -> Vec<String> {
         .collect()
 }
 
-fn wrap_line_count(text: &str, width: u16) -> u16 {
-    let width = width.max(1) as usize;
-    let text = sanitize_tui_text(text);
-    text.lines()
-        .map(|line| (UnicodeWidthStr::width(line) / width).max(1) as u16)
-        .sum::<u16>()
-        .max(1)
-}
-
 fn composer_visual_lines(composer: &ComposerInput, width: u16) -> Vec<Line<'static>> {
     wrap_composer_lines(composer.display_lines(), width)
 }
@@ -6151,11 +6137,6 @@ fn recall_input_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wraps_empty_input_to_one_row() {
-        assert_eq!(wrap_line_count("", 80), 1);
-    }
 
     #[test]
     fn composer_visual_lines_wrap_to_available_width() {
@@ -6491,15 +6472,6 @@ mod tests {
     fn truncates_wide_text_with_ellipsis() {
         assert_eq!(truncate_for_width("abcdef", 4), "abc…");
         assert_eq!(truncate_for_width("你好世界", 5), "你好…");
-    }
-
-    #[test]
-    fn history_scroll_is_bottom_anchored() {
-        assert_eq!(history_scroll_offset(30, 10, 0), 20);
-        assert_eq!(history_scroll_offset(30, 10, 6), 14);
-        assert_eq!(history_scroll_offset(30, 10, 99), 0);
-        assert_eq!(history_scroll_offset(5, 10, 0), 0);
-        assert_eq!(history_scroll_offset(70_000, 20, 0), 69_980);
     }
 
     #[test]

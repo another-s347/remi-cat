@@ -18,16 +18,9 @@ bin-dir = "{ name }/{ bin }{ binary-ext }"
 [workspace]
 members = [
     ".",
-    "crates/im-gateway",
     "crates/im-feishu",
-    "crates/matcher",
     "crates/user-store",
     "crates/bot-core",
-    "crates/proto",
-    "crates/agent",
-    "crates/daemon",
-    "crates/mgmt-api",
-    "crates/admin-ui",
     "crates/remi-client-sdk",
     "crates/remi-things-crdt",
     "crates/rule-trigger-engine",

@@ -147,8 +147,8 @@ subscription settings.
 | `.remi-cat/workflows/*.json` | Supervisor workflow graph definitions. |
 | `.remi-cat/runtime.yaml` | Primary runtime config written by `remi-cat setup`. |
 
-The old daemon/agent split and Docker agent sandbox are no longer the default
-runtime architecture. Shell execution is host-local only when explicitly enabled
+The old daemon/agent split has been retired; `remi-cat` is the supported
+runtime boundary. Shell execution is host-local only when explicitly enabled
 with `REMI_SHELL_MODE=local` and the active agent profile allowlists `bash`.
 
 ## Web Chat

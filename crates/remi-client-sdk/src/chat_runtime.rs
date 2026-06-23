@@ -2213,10 +2213,9 @@ async fn handle_send_message(
     let (cache_version, previous_cancel, run_id) = {
         let mut s = state.write().await;
         let run_id = s.next_run_id();
-        let mut previous_cancel = None;
-        let version = {
+        let (version, previous_cancel) = {
             let sess = s.get_or_create_session(&session_id);
-            previous_cancel = sess.cancel_tx.take();
+            let previous_cancel = sess.cancel_tx.take();
             sess.current_run_id = Some(run_id);
             sess.run_state = ChatRunState::Running;
             sess.last_error = None;
@@ -2225,7 +2224,7 @@ async fn handle_send_message(
             m.references = references.clone();
             m.attachments = attachments.clone();
             sess.upsert(m);
-            sess.version
+            (sess.version, previous_cancel)
         };
         s.emit_session_status(&session_id);
         STATUS_VERSION.fetch_add(1, Ordering::SeqCst);

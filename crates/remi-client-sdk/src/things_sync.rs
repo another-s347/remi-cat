@@ -986,11 +986,11 @@ where
         .into_iter()
         .collect();
 
-    let mut owned_reachability = None;
+    let mut owned_reachability;
     let reachability = match reachability.as_deref_mut() {
         Some(filters) => filters,
         None => {
-            owned_reachability = Some(match build_local_reachability_filters(sdk, device_id) {
+            owned_reachability = match build_local_reachability_filters(sdk, device_id) {
                 Ok(filters) => filters,
                 Err(err) => {
                     tracing::warn!(
@@ -1000,10 +1000,8 @@ where
                     );
                     LocalReachabilityFilters::default()
                 }
-            });
-            owned_reachability
-                .as_mut()
-                .expect("owned reachability should be initialized")
+            };
+            &mut owned_reachability
         }
     };
 
