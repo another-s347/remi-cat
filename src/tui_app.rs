@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bot_core::{
     CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus, Message, PrettyToolCall,
-    PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage,
-    ToolApprovalDecision, ToolApprovalRequest, WorkflowReport,
+    PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage,
+    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
+    UserQuestionStatus, WorkflowReport,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -30,6 +31,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use remi_agentloop::prelude::{SubSessionEvent, SubSessionEventPayload};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -988,8 +990,13 @@ struct TuiApp {
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
     approval_state: &'static str,
+    pending_user_question: Option<UserQuestionRequest>,
+    user_question_selected: usize,
+    user_question_state: &'static str,
     active_supervisor_id: Option<String>,
     last_todo_body: Option<String>,
+    loaded_thread_history_len: usize,
+    sub_session_event_log_lines: usize,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
     trigger_rx:
@@ -1049,8 +1056,13 @@ impl TuiApp {
             pending_approval: None,
             approval_selected: 0,
             approval_state: "waiting",
+            pending_user_question: None,
+            user_question_selected: 0,
+            user_question_state: "waiting",
             active_supervisor_id: None,
             last_todo_body: None,
+            loaded_thread_history_len: 0,
+            sub_session_event_log_lines: 0,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
             trigger_rx: trigger_rx.map(UnboundedReceiverStream::new),
@@ -1099,6 +1111,7 @@ impl TuiApp {
                 }
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
+                    self.poll_sub_session_history().await;
                 }
             }
         }
@@ -1199,6 +1212,42 @@ impl TuiApp {
             }
         }
 
+        if self.pending_user_question.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_user_question_selection(-1);
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.move_user_question_selection(1);
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    self.answer_pending_user_question(false).await;
+                    return Ok(false);
+                }
+                KeyCode::Esc => {
+                    self.answer_pending_user_question(true).await;
+                    return Ok(false);
+                }
+                KeyCode::Char(ch) if ch.is_ascii_digit() && self.composer.is_empty() => {
+                    if let Some(index) = ch.to_digit(10).and_then(|digit| digit.checked_sub(1)) {
+                        let index = index as usize;
+                        if self
+                            .pending_user_question
+                            .as_ref()
+                            .is_some_and(|request| index < request.options.len())
+                        {
+                            self.user_question_selected = index;
+                            self.answer_pending_user_question(false).await;
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('d') => return Ok(self.handle_cancel_or_quit()),
@@ -1290,7 +1339,7 @@ impl TuiApp {
                     }
                     Some(PopupKind::File) => self.complete_selected_file(),
                     _ => {
-                        self.submit().await?;
+                        return self.submit().await;
                     }
                 }
                 Ok(false)
@@ -1299,10 +1348,7 @@ impl TuiApp {
                 self.insert_text("\n");
                 Ok(false)
             }
-            KeyCode::Enter => {
-                self.submit().await?;
-                Ok(false)
-            }
+            KeyCode::Enter => self.submit().await,
             KeyCode::Backspace => {
                 self.backspace();
                 Ok(false)
@@ -1339,10 +1385,14 @@ impl TuiApp {
         }
     }
 
-    async fn submit(&mut self) -> anyhow::Result<()> {
+    async fn submit(&mut self) -> anyhow::Result<bool> {
         let text = self.composer.to_text().trim().to_string();
         if text.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.pending_user_question.is_some() {
+            self.answer_pending_user_question(false).await;
+            return Ok(false);
         }
         self.composer.clear();
         self.history_index = None;
@@ -1352,20 +1402,24 @@ impl TuiApp {
         self.show_shortcuts = false;
         self.quit_hint_until = None;
         self.record_input_history(text.clone()).await;
+        if is_tui_exit_command(&text) {
+            self.cells.push(HistoryCell::user(text));
+            return Ok(true);
+        }
         if is_tui_fork_command(&text) {
             self.start_fork_command();
-            return Ok(());
+            return Ok(false);
         }
         if is_tui_new_command(&text) {
             self.start_new_command();
-            return Ok(());
+            return Ok(false);
         }
         if self.running {
             self.queued_inputs.push_back(text);
-            return Ok(());
+            return Ok(false);
         }
         self.start_turn(text);
-        Ok(())
+        Ok(false)
     }
 
     fn start_fork_command(&mut self) {
@@ -1433,6 +1487,8 @@ impl TuiApp {
         self.approval_state = "waiting";
         self.active_supervisor_id = None;
         self.last_todo_body = None;
+        self.loaded_thread_history_len = 0;
+        self.sub_session_event_log_lines = 0;
         self.load_input_history().await;
         self.cells.push(HistoryCell::system(message));
         self.cells.push(HistoryCell::system(format!(
@@ -1719,6 +1775,43 @@ impl TuiApp {
                     self.mark_token_cell(index);
                 }
             }
+            BotEvent::ToolDelta { id, name, delta } => {
+                self.active_tool_names.insert(id.clone(), name.clone());
+                self.active_tool_started_at
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| format_elapsed(started.elapsed().as_millis() as u64))
+                    .unwrap_or_else(|| format_elapsed(0));
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    cell.title = format!("调用 {name}");
+                    cell.body = truncate_chars(&delta, MAX_TOOL_BODY_CHARS);
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
+                    cell.status = ToolVisualStatus::Running;
+                } else {
+                    self.cells.push(HistoryCell::tool(
+                        id.clone(),
+                        format!("调用 {name}"),
+                        truncate_chars(&delta, MAX_TOOL_BODY_CHARS),
+                        meta,
+                        ToolVisualStatus::Running,
+                    ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
+                }
+            }
             BotEvent::SupervisorProgress(progress) => self.upsert_supervisor_progress(progress),
             BotEvent::SupervisorReport(report) => self.upsert_supervisor_report(report),
             BotEvent::SubSession(event) => self.upsert_sub_session(event).await,
@@ -1780,6 +1873,49 @@ impl TuiApp {
                     self.approval_selected,
                     Some(format!("decision: {decision:?}")),
                     Some(decision),
+                ));
+            }
+            BotEvent::UserQuestionRequested(request) => {
+                self.pending_user_question = Some(request.clone());
+                self.user_question_selected = 0;
+                self.user_question_state = "waiting";
+                self.upsert_user_question_cell(user_question_cell(
+                    &request,
+                    self.user_question_state,
+                    self.user_question_selected,
+                    None,
+                    None,
+                ));
+            }
+            BotEvent::UserQuestionUpdated(request) => {
+                self.pending_user_question = Some(request.clone());
+                self.user_question_selected = self
+                    .user_question_selected
+                    .min(request.options.len().saturating_sub(1));
+                self.user_question_state = "waiting";
+                self.upsert_user_question_cell(user_question_cell(
+                    &request,
+                    self.user_question_state,
+                    self.user_question_selected,
+                    None,
+                    None,
+                ));
+            }
+            BotEvent::UserQuestionResolved { request, response } => {
+                if self
+                    .pending_user_question
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == request.id)
+                {
+                    self.pending_user_question = None;
+                }
+                self.user_question_state = "resolved";
+                self.upsert_user_question_cell(user_question_cell(
+                    &request,
+                    "resolved",
+                    self.user_question_selected,
+                    response.answer_text.clone(),
+                    Some(response.status),
                 ));
             }
             BotEvent::Stats {
@@ -1876,10 +2012,14 @@ impl TuiApp {
     fn render_status(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.flush_status_elapsed();
         let mut meta = Vec::new();
+        let active_tools = self.active_tool_count();
+        let status_busy = self.running
+            || active_tools > 0
+            || matches!(self.status.state.as_str(), "running" | "thinking")
+            || self.status.state.starts_with("turn ");
         if self.running {
             meta.push(format_elapsed(self.status.elapsed_ms));
         }
-        let active_tools = self.active_tool_count();
         if active_tools > 0 {
             meta.push(format!("{active_tools} tools"));
         }
@@ -1900,7 +2040,7 @@ impl TuiApp {
             Span::styled(" · ", Style::default().fg(CODEX_DIM)),
             Span::styled(
                 self.status.state.clone(),
-                Style::default().fg(if self.running {
+                Style::default().fg(if status_busy {
                     Color::Yellow
                 } else {
                     CODEX_GREEN
@@ -1944,7 +2084,12 @@ impl TuiApp {
             Span::styled("· ", Style::default().fg(CODEX_DIM)),
             Span::styled(format!("sid {session}"), Style::default().fg(CODEX_DIM)),
         ];
-        if let Some(pct) = context_usage_percent(self.status.prompt_tokens, context_tokens) {
+        if let Some(pct) = context_usage_percent(
+            self.status.prompt_tokens,
+            self.status.completion_tokens,
+            self.status.max_prompt_tokens,
+            context_tokens,
+        ) {
             spans.push(Span::styled(" · ", Style::default().fg(CODEX_DIM)));
             spans.push(Span::styled(
                 format!("ctx {pct}%"),
@@ -2122,7 +2267,7 @@ impl TuiApp {
         };
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, input_area);
-        if !self.running {
+        if !self.running || self.pending_user_question.is_some() {
             let (x, y) = self.cursor_position(input_area);
             frame.set_cursor_position((x, y));
         }
@@ -2612,6 +2757,10 @@ impl TuiApp {
         upsert_approval_cell(&mut self.cells, cell);
     }
 
+    fn upsert_user_question_cell(&mut self, cell: HistoryCell) {
+        upsert_user_question_cell(&mut self.cells, cell);
+    }
+
     fn move_approval_selection(&mut self, direction: isize) {
         let len = approval_options_len();
         if len == 0 {
@@ -2631,6 +2780,92 @@ impl TuiApp {
                 None,
             ));
         }
+    }
+
+    fn move_user_question_selection(&mut self, direction: isize) {
+        let Some(request) = self.pending_user_question.clone() else {
+            return;
+        };
+        let len = request.options.len();
+        if len == 0 {
+            return;
+        }
+        if direction < 0 {
+            self.user_question_selected = self.user_question_selected.saturating_sub(1);
+        } else {
+            self.user_question_selected = (self.user_question_selected + 1).min(len - 1);
+        }
+        self.upsert_user_question_cell(user_question_cell(
+            &request,
+            self.user_question_state,
+            self.user_question_selected,
+            None,
+            None,
+        ));
+    }
+
+    async fn answer_pending_user_question(&mut self, cancel: bool) {
+        let Some(request) = self.pending_user_question.take() else {
+            return;
+        };
+        let free_text = self.composer.to_text().trim().to_string();
+        self.composer.clear();
+        let selected_option_ids = if !cancel && !request.options.is_empty() {
+            request
+                .options
+                .get(self.user_question_selected)
+                .map(|option| vec![option.id.clone()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let free_text = if !cancel && !free_text.is_empty() {
+            Some(free_text)
+        } else {
+            None
+        };
+        let status = if cancel {
+            UserQuestionStatus::Cancelled
+        } else {
+            UserQuestionStatus::Answered
+        };
+        let answer_text =
+            build_tui_user_question_answer_text(&selected_option_ids, free_text.as_deref(), status);
+        let response = UserQuestionResponse {
+            question_id: request.id.clone(),
+            status,
+            selected_option_ids,
+            free_text,
+            answer_text: Some(answer_text.clone()),
+            answered_at: None,
+            source: Some("tui".to_string()),
+        };
+        let answered = self
+            .runtime
+            .bot
+            .user_question_manager()
+            .answer(&request.id, response)
+            .await
+            .is_some();
+        tracing::info!(
+            question_id = %request.id,
+            session_id = %request.session_id,
+            source = "tui",
+            answered,
+            "user_question.answer"
+        );
+        let status_text = if answered {
+            answer_text
+        } else {
+            "question already resolved".to_string()
+        };
+        self.upsert_user_question_cell(user_question_cell(
+            &request,
+            "submitted",
+            self.user_question_selected,
+            Some(status_text),
+            Some(status),
+        ));
     }
 
     fn upsert_supervisor_progress(&mut self, progress: SupervisorTraceEvent) {
@@ -2690,7 +2925,12 @@ impl TuiApp {
     }
 
     async fn upsert_sub_session(&mut self, event: SubSessionEvent) {
-        let id = sub_session_id(&event);
+        self.render_sub_session_event(&event);
+        self.persist_and_maybe_open_sub_session(event).await;
+    }
+
+    fn render_sub_session_event(&mut self, event: &SubSessionEvent) {
+        let id = sub_session_id(event);
         let status = sub_session_status(&event.payload);
         let state = self
             .sub_sessions
@@ -2699,13 +2939,7 @@ impl TuiApp {
         state.update_context(&event);
         match &event.payload {
             SubSessionEventPayload::Start => {}
-            SubSessionEventPayload::Delta { content } => {
-                state.push_activity(SubSessionActivity::message(
-                    "output",
-                    content,
-                    ToolVisualStatus::Running,
-                ));
-            }
+            SubSessionEventPayload::Delta { .. } => {}
             SubSessionEventPayload::ThinkingStart => {
                 state.upsert_activity(SubSessionActivity::keyed(
                     "thinking",
@@ -2714,11 +2948,11 @@ impl TuiApp {
                     ToolVisualStatus::Running,
                 ));
             }
-            SubSessionEventPayload::ThinkingEnd { content } => {
+            SubSessionEventPayload::ThinkingEnd { .. } => {
                 state.upsert_activity(SubSessionActivity::keyed(
                     "thinking",
                     "thinking",
-                    content,
+                    "thinking complete",
                     ToolVisualStatus::Running,
                 ));
             }
@@ -2785,19 +3019,9 @@ impl TuiApp {
                 state.upsert_tool(tool.clone());
                 state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
-            SubSessionEventPayload::Done { final_output } => {
+            SubSessionEventPayload::Done { .. } => {
                 state.done = true;
-                state.final_output = final_output
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|output| truncate_chars(&single_line(output), MAX_TOOL_BODY_CHARS));
-                if let Some(output) = state.final_output.clone() {
-                    state.push_activity(SubSessionActivity::message(
-                        "final",
-                        &output,
-                        ToolVisualStatus::Success,
-                    ));
-                }
+                state.final_output = None;
             }
             SubSessionEventPayload::Error { message } => {
                 state.failed = true;
@@ -2825,7 +3049,6 @@ impl TuiApp {
             self.cells
                 .push(HistoryCell::sub_session(id, title, body, meta, status));
         }
-        self.persist_and_maybe_open_sub_session(event).await;
     }
 
     async fn persist_and_maybe_open_sub_session(&mut self, event: SubSessionEvent) {
@@ -2866,6 +3089,13 @@ impl TuiApp {
                 )));
             }
         }
+        if let Err(error) =
+            append_sub_session_event_log(&self.runtime.data_dir, &child_session_id, &event).await
+        {
+            self.cells.push(HistoryCell::error(format!(
+                "sub-session 事件写入失败: {error:#}"
+            )));
+        }
 
         if !matches!(event.payload, SubSessionEventPayload::Start) {
             return;
@@ -2892,6 +3122,7 @@ impl TuiApp {
 
     async fn load_thread_history(&mut self) {
         let history = self.runtime.bot.thread_history(&self.session_id).await;
+        self.loaded_thread_history_len = history.len();
         if history.is_empty() {
             self.cells.push(HistoryCell::system("no previous messages"));
             return;
@@ -2900,10 +3131,257 @@ impl TuiApp {
         self.cells.push(HistoryCell::system(format!(
             "loaded {loaded} previous messages"
         )));
-        self.cells
-            .extend(history.into_iter().filter_map(history_cell));
+        for message in history {
+            self.append_history_message(message);
+        }
         while self.cells.len() > MAX_HISTORY_CELLS {
             self.cells.remove(0);
+        }
+    }
+
+    async fn poll_sub_session_history(&mut self) {
+        if self.running {
+            return;
+        }
+        let is_sub_session = self
+            .runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(&self.session_id, "sub_session_thread_id")
+            .is_some();
+        if !is_sub_session {
+            return;
+        }
+        self.poll_sub_session_event_log().await;
+        while self.cells.len() > MAX_HISTORY_CELLS {
+            self.cells.remove(0);
+        }
+    }
+
+    async fn poll_sub_session_event_log(&mut self) {
+        let path = sub_session_event_log_path(&self.runtime.data_dir, &self.session_id);
+        let Ok(content) = tokio::fs::read_to_string(path).await else {
+            return;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() <= self.sub_session_event_log_lines {
+            return;
+        }
+        let previous_lines = self.sub_session_event_log_lines;
+        self.sub_session_event_log_lines = lines.len();
+        for line in lines.into_iter().skip(previous_lines) {
+            match serde_json::from_str::<SubSessionEvent>(line) {
+                Ok(event) => self.apply_sub_session_event_as_session_view(event),
+                Err(error) => self.cells.push(HistoryCell::error(format!(
+                    "sub-session 事件解析失败: {error:#}"
+                ))),
+            }
+        }
+    }
+
+    fn apply_sub_session_event_as_session_view(&mut self, event: SubSessionEvent) {
+        match event.payload {
+            SubSessionEventPayload::Start => {
+                self.status.state = "running".to_string();
+                self.status.elapsed_ms = 0;
+                self.status.last_error = None;
+            }
+            SubSessionEventPayload::Delta { content } => {
+                self.status.state = "running".to_string();
+                self.push_assistant_delta(&content);
+            }
+            SubSessionEventPayload::ThinkingStart => {
+                self.status.state = "thinking".to_string();
+            }
+            SubSessionEventPayload::ThinkingEnd { content } => {
+                self.status.state = "running".to_string();
+                if !content.trim().is_empty() {
+                    self.push_thinking_delta(&content);
+                }
+            }
+            SubSessionEventPayload::TurnStart { turn } => {
+                self.status.state = format!("turn {turn}");
+            }
+            SubSessionEventPayload::ToolCallStart { id, name } => {
+                self.status.state = "running".to_string();
+                self.handle_bot_event_sync(BotEvent::ToolStart { id, name });
+            }
+            SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
+                self.handle_bot_event_sync(BotEvent::ToolArgs { id, delta });
+            }
+            SubSessionEventPayload::ToolDelta { id, name, delta } => {
+                self.status.state = "running".to_string();
+                self.handle_bot_event_sync(BotEvent::ToolDelta { id, name, delta });
+            }
+            SubSessionEventPayload::ToolResult { id, name, result } => {
+                self.handle_bot_event_sync(BotEvent::ToolDone {
+                    id,
+                    name,
+                    args: String::new(),
+                    success: bot_core::tool_success(&result),
+                    result,
+                    elapsed_ms: 0,
+                });
+            }
+            SubSessionEventPayload::Done { final_output } => {
+                if let Some(output) = final_output
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let duplicate_last = self
+                        .cells
+                        .last()
+                        .filter(|cell| matches!(cell.kind, CellKind::Assistant))
+                        .is_some_and(|cell| cell.body.trim() == output);
+                    if !duplicate_last {
+                        self.push_assistant_delta(output);
+                    }
+                }
+                self.status.state = "idle".to_string();
+            }
+            SubSessionEventPayload::Error { message } => {
+                self.status.state = "error".to_string();
+                self.status.last_error = Some(message.clone());
+                self.cells.push(HistoryCell::error(message));
+            }
+        }
+    }
+
+    fn handle_bot_event_sync(&mut self, event: BotEvent) {
+        match event {
+            BotEvent::ToolStart { id, name } => {
+                self.active_tool_args.insert(id.clone(), String::new());
+                self.active_tool_names.insert(id.clone(), name.clone());
+                self.active_tool_started_at
+                    .insert(id.clone(), Instant::now());
+                let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
+                let body = tool_body(&pretty);
+                self.cells.push(HistoryCell::tool(
+                    id.clone(),
+                    pretty.title,
+                    body,
+                    format_elapsed(0),
+                    ToolVisualStatus::Running,
+                ));
+                self.mark_token_cell(self.cells.len().saturating_sub(1));
+            }
+            BotEvent::ToolArgs { id, delta } => {
+                let args = self.active_tool_args.entry(id.clone()).or_default();
+                args.push_str(&delta);
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    if let (Some(name), Some(args_value)) =
+                        (self.active_tool_names.get(&id), parse_tool_args(args))
+                    {
+                        let pretty = PrettyToolCall::started(&id, name, &args_value);
+                        let title = pretty.title.clone();
+                        let body = tool_body(&pretty);
+                        cell.title = title;
+                        cell.body = body;
+                    }
+                }
+            }
+            BotEvent::ToolDelta { id, name, delta } => {
+                self.active_tool_names.insert(id.clone(), name.clone());
+                self.active_tool_started_at
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| format_elapsed(started.elapsed().as_millis() as u64))
+                    .unwrap_or_else(|| format_elapsed(0));
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    cell.title = format!("调用 {name}");
+                    cell.body = truncate_chars(&delta, MAX_TOOL_BODY_CHARS);
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
+                    cell.status = ToolVisualStatus::Running;
+                } else {
+                    self.cells.push(HistoryCell::tool(
+                        id,
+                        format!("调用 {name}"),
+                        truncate_chars(&delta, MAX_TOOL_BODY_CHARS),
+                        meta,
+                        ToolVisualStatus::Running,
+                    ));
+                }
+            }
+            BotEvent::ToolDone {
+                id,
+                name,
+                args,
+                result,
+                success,
+                elapsed_ms,
+            } => {
+                let args = if args.trim().is_empty() {
+                    self.active_tool_args.remove(&id).unwrap_or_default()
+                } else {
+                    self.active_tool_args.remove(&id);
+                    args
+                };
+                self.active_tool_names.remove(&id);
+                self.active_tool_started_at.remove(&id);
+                let args_value = parse_tool_args(&args).unwrap_or(serde_json::Value::Null);
+                let pretty = PrettyToolCall::completed(
+                    &id,
+                    &name,
+                    &args_value,
+                    &result,
+                    success,
+                    elapsed_ms,
+                );
+                let status = ToolVisualStatus::from_pretty(&pretty.status);
+                let meta = tool_meta(&pretty);
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    let title = pretty.title.clone();
+                    let body = tool_body(&pretty);
+                    cell.title = title;
+                    cell.body = body;
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
+                    cell.status = status;
+                } else {
+                    let title = pretty.title.clone();
+                    let body = tool_body(&pretty);
+                    self.cells
+                        .push(HistoryCell::tool(id, title, body, meta, status));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn append_history_message(&mut self, message: ThreadHistoryMessage) {
+        if message.role == "assistant" && message.pretty.is_none() {
+            let text = message.text.trim();
+            if text.is_empty() {
+                return;
+            }
+            if let Some(cell) = self.cells.last_mut().filter(|cell| {
+                matches!(cell.kind, CellKind::Assistant) && cell.status == ToolVisualStatus::Neutral
+            }) {
+                cell.body.push_str(&message.text);
+                return;
+            }
+        }
+        if let Some(cell) = history_cell(message) {
+            self.cells.push(cell);
         }
     }
 
@@ -3018,6 +3496,32 @@ async fn next_trigger_dispatch(
     }
 }
 
+fn sub_session_event_log_path(data_dir: &Path, session_id: &str) -> PathBuf {
+    data_dir
+        .join("tui-subsession-events")
+        .join(format!("{session_id}.jsonl"))
+}
+
+async fn append_sub_session_event_log(
+    data_dir: &Path,
+    session_id: &str,
+    event: &SubSessionEvent,
+) -> anyhow::Result<()> {
+    let path = sub_session_event_log_path(data_dir, session_id);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(serde_json::to_string(event)?.as_bytes())
+        .await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
 async fn run_bot_turn(
     runtime: Rc<Runtime>,
     session_id: String,
@@ -3027,7 +3531,7 @@ async fn run_bot_turn(
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    let (stream_thread_id, text, skill_injections) =
+    let (stream_thread_id, text, skill_injections, persist_agent_child_turn) =
         match crate::sub_session_input_target(&runtime, &session_id).await {
             Some(crate::SubSessionInputTarget::Acp { acp_session_id, .. }) => {
                 match runtime
@@ -3053,7 +3557,7 @@ async fn run_bot_turn(
                 return;
             }
             Some(crate::SubSessionInputTarget::Agent { sub_thread_id, .. }) => {
-                (sub_thread_id, text, Vec::new())
+                (sub_thread_id, text, Vec::new(), true)
             }
             None => match process_runtime_commands(&runtime, &session_id, text.trim()).await {
                 Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
@@ -3072,7 +3576,7 @@ async fn run_bot_turn(
                     if !prefix.is_empty() {
                         let _ = tx.send(BotEvent::Prefix(prefix));
                     }
-                    (session_id.clone(), text, skill_injections)
+                    (session_id.clone(), text, skill_injections, false)
                 }
                 Err(error) => {
                     let _ = tx.send(BotEvent::Error(error.to_string()));
@@ -3101,6 +3605,8 @@ async fn run_bot_turn(
             cancel: Some(cancel),
             ..StreamOptions::default()
         };
+        let user_text_for_history = text.clone();
+        let mut assistant_text_for_history = String::new();
         let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
             &stream_thread_id,
             Content::text(text),
@@ -3109,6 +3615,9 @@ async fn run_bot_turn(
         while let Some(event) = stream.next().await {
             match event {
                 CatEvent::Text(delta) => {
+                    if persist_agent_child_turn {
+                        assistant_text_for_history.push_str(&delta);
+                    }
                     let _ = tx.send(BotEvent::Text(delta));
                 }
                 CatEvent::Thinking(delta) => {
@@ -3165,6 +3674,15 @@ async fn run_bot_turn(
                 CatEvent::ToolApprovalResolved { request, decision } => {
                     let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
                 }
+                CatEvent::UserQuestionRequested(request) => {
+                    let _ = tx.send(BotEvent::UserQuestionRequested(request));
+                }
+                CatEvent::UserQuestionUpdated(request) => {
+                    let _ = tx.send(BotEvent::UserQuestionUpdated(request));
+                }
+                CatEvent::UserQuestionResolved { request, response } => {
+                    let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
+                }
                 CatEvent::StateUpdate(user_state) => {
                     let items = bot_core::todo::todos_from_user_state(&user_state);
                     let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
@@ -3188,6 +3706,15 @@ async fn run_bot_turn(
                 CatEvent::Done => break,
                 _ => {}
             }
+        }
+        if persist_agent_child_turn {
+            crate::append_direct_sub_session_turn(
+                &runtime,
+                &session_id,
+                user_text_for_history.trim(),
+                &assistant_text_for_history,
+            )
+            .await;
         }
         let _ = tx.send(BotEvent::Done);
     }
@@ -3280,6 +3807,15 @@ async fn run_tui_trigger_turn(
             }
             CatEvent::ToolApprovalResolved { request, decision } => {
                 let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
+            }
+            CatEvent::UserQuestionRequested(request) => {
+                let _ = tx.send(BotEvent::UserQuestionRequested(request));
+            }
+            CatEvent::UserQuestionUpdated(request) => {
+                let _ = tx.send(BotEvent::UserQuestionUpdated(request));
+            }
+            CatEvent::UserQuestionResolved { request, response } => {
+                let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
             }
             CatEvent::StateUpdate(user_state) => {
                 let items = bot_core::todo::todos_from_user_state(&user_state);
@@ -3480,6 +4016,11 @@ enum BotEvent {
         success: bool,
         elapsed_ms: u64,
     },
+    ToolDelta {
+        id: String,
+        name: String,
+        delta: String,
+    },
     SubSession(SubSessionEvent),
     ContextCompaction(ContextCompactionEvent),
     SupervisorProgress(SupervisorTraceEvent),
@@ -3490,6 +4031,12 @@ enum BotEvent {
     ApprovalResolved {
         request: ToolApprovalRequest,
         decision: ToolApprovalDecision,
+    },
+    UserQuestionRequested(UserQuestionRequest),
+    UserQuestionUpdated(UserQuestionRequest),
+    UserQuestionResolved {
+        request: UserQuestionRequest,
+        response: UserQuestionResponse,
     },
     Stats {
         prompt_tokens: u32,
@@ -3767,18 +4314,6 @@ impl SubSessionUiState {
                 lines.push(format!("{nested}  {}", activity.body));
             }
         }
-        if self.activities.is_empty() {
-            if let Some(output) = self.final_output.as_deref() {
-                lines.push(format!("{nested}final: {output}"));
-            }
-        } else if self
-            .final_output
-            .as_deref()
-            .is_some_and(|output| !self.activities.iter().any(|item| item.body == output))
-        {
-            let output = self.final_output.as_deref().unwrap_or_default();
-            lines.push(format!("{nested}final: {output}"));
-        }
         if lines.is_empty() {
             lines.push(format!("{nested}waiting for sub-agent activity"));
         }
@@ -3875,6 +4410,8 @@ fn static_commands() -> Vec<CommandEntry> {
     [
         ("/fork", "fork 当前 session 到新 pane", false),
         ("/new", "创建空 session 到新 pane", false),
+        ("/exit", "退出 TUI", false),
+        ("/quit", "退出 TUI", false),
         ("/tools", "显示当前 Agent 可用的工具", false),
         ("/goal status", "查看当前会话目标", false),
         ("/goal set ", "设置目标；可嵌套 /skill:<name>", true),
@@ -4131,6 +4668,10 @@ fn is_tui_new_command(command: &str) -> bool {
     command == "/new"
 }
 
+fn is_tui_exit_command(command: &str) -> bool {
+    matches!(command, "/exit" | "/quit")
+}
+
 #[derive(Clone)]
 struct HistoryCell {
     kind: CellKind,
@@ -4196,6 +4737,7 @@ enum CellKind {
     SubSession { id: String },
     TodoState,
     Approval { id: String },
+    UserQuestion { id: String },
     ContextCompaction { id: String },
     Error,
 }
@@ -4233,6 +4775,21 @@ impl HistoryCell {
     ) -> Self {
         Self {
             kind: CellKind::Approval { id },
+            title,
+            body,
+            meta: String::new(),
+            status,
+        }
+    }
+
+    fn user_question_with_title(
+        id: String,
+        title: String,
+        body: String,
+        status: ToolVisualStatus,
+    ) -> Self {
+        Self {
+            kind: CellKind::UserQuestion { id },
             title,
             body,
             meta: String::new(),
@@ -4396,6 +4953,11 @@ impl HistoryCell {
                     .add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::White),
             ),
+            CellKind::UserQuestion { .. } => (
+                "?",
+                Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            ),
             CellKind::ContextCompaction { .. } => (
                 "◇",
                 self.status.style().add_modifier(Modifier::BOLD),
@@ -4427,7 +4989,9 @@ impl HistoryCell {
         if self.body.trim().is_empty()
             && matches!(
                 self.kind,
-                CellKind::Approval { .. } | CellKind::Supervisor { .. }
+                CellKind::Approval { .. }
+                    | CellKind::UserQuestion { .. }
+                    | CellKind::Supervisor { .. }
             )
         {
             lines.push(Line::from(""));
@@ -4521,6 +5085,22 @@ fn upsert_approval_cell(cells: &mut Vec<HistoryCell>, next: HistoryCell) {
         .iter_mut()
         .rev()
         .find(|cell| matches!(&cell.kind, CellKind::Approval { id } if id == &next_id))
+    {
+        *cell = next;
+    } else {
+        cells.push(next);
+    }
+}
+
+fn upsert_user_question_cell(cells: &mut Vec<HistoryCell>, next: HistoryCell) {
+    let next_id = match &next.kind {
+        CellKind::UserQuestion { id } => id.clone(),
+        _ => return,
+    };
+    if let Some(cell) = cells
+        .iter_mut()
+        .rev()
+        .find(|cell| matches!(&cell.kind, CellKind::UserQuestion { id } if id == &next_id))
     {
         *cell = next;
     } else {
@@ -4996,19 +5576,7 @@ fn format_sub_session_event(event: &SubSessionEvent) -> Option<String> {
             "tool result: {name}\ncall_id: {id}\n{}",
             truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS)
         )),
-        SubSessionEventPayload::Done { final_output } => {
-            if let Some(output) = final_output
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
-            {
-                Some(format!(
-                    "done\n{}",
-                    truncate_chars(&single_line(output), MAX_TOOL_BODY_CHARS)
-                ))
-            } else {
-                Some("done".to_string())
-            }
-        }
+        SubSessionEventPayload::Done { .. } => Some("done".to_string()),
         SubSessionEventPayload::Error { message } => Some(format!(
             "error\n{}",
             truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS)
@@ -5184,6 +5752,104 @@ fn approval_cell(
     )
 }
 
+fn user_question_cell(
+    request: &UserQuestionRequest,
+    state: &str,
+    selected: usize,
+    status: Option<String>,
+    resolved_status: Option<UserQuestionStatus>,
+) -> HistoryCell {
+    if state == "resolved" {
+        let label = match resolved_status {
+            Some(UserQuestionStatus::Answered) => "answered",
+            Some(UserQuestionStatus::Cancelled) => "cancelled",
+            None => "resolved",
+        };
+        return HistoryCell::user_question_with_title(
+            request.id.clone(),
+            format!("question · {label}"),
+            status.unwrap_or_default(),
+            if matches!(resolved_status, Some(UserQuestionStatus::Cancelled)) {
+                ToolVisualStatus::Error
+            } else {
+                ToolVisualStatus::Success
+            },
+        );
+    }
+
+    let mut lines = Vec::new();
+    lines.push(request.question.clone());
+    if let Some(reason) = request
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("reason: {reason}"));
+    }
+    if !request.options.is_empty() {
+        lines.push(String::new());
+        for (index, option) in request.options.iter().enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            let default = if request.default_option_id.as_deref() == Some(option.id.as_str()) {
+                " (recommended)"
+            } else {
+                ""
+            };
+            let mut line = format!("{marker} {}. {}{}", index + 1, option.label, default);
+            if let Some(description) = option
+                .description
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                line.push_str(&format!(" - {description}"));
+            }
+            lines.push(line);
+        }
+    }
+    if request.allow_free_text {
+        lines.push(String::new());
+        lines.push(request.placeholder.clone().unwrap_or_else(|| {
+            "Type an answer and press Enter. Use Shift+Enter for a newline.".to_string()
+        }));
+    }
+    lines.push("Esc cancels; Up/Down changes selected option.".to_string());
+    if let Some(status) = status {
+        lines.push(String::new());
+        lines.push(status);
+    }
+    HistoryCell::user_question_with_title(
+        request.id.clone(),
+        format!("question · {state}"),
+        lines.join("\n"),
+        ToolVisualStatus::Running,
+    )
+}
+
+fn build_tui_user_question_answer_text(
+    selected_option_ids: &[String],
+    free_text: Option<&str>,
+    status: UserQuestionStatus,
+) -> String {
+    if status == UserQuestionStatus::Cancelled {
+        return "User cancelled the question.".to_string();
+    }
+    let mut parts = Vec::new();
+    if !selected_option_ids.is_empty() {
+        parts.push(format!(
+            "Selected option ids: {}",
+            selected_option_ids.join(", ")
+        ));
+    }
+    if let Some(text) = free_text {
+        parts.push(format!("Free-text answer: {text}"));
+    }
+    if parts.is_empty() {
+        "User answered without additional text.".to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
 fn diff_lines(text: &str, width: u16) -> Vec<Span<'static>> {
     let width = width.max(16);
     let text = sanitize_tui_text(text);
@@ -5347,12 +6013,21 @@ fn expand_tabs(text: &str) -> String {
     output
 }
 
-fn context_usage_percent(prompt_tokens: u32, context_tokens: u32) -> Option<u32> {
-    if context_tokens == 0 {
-        return None;
-    }
-    let used = prompt_tokens.min(context_tokens);
-    Some((used as f64 / context_tokens as f64 * 100.0).round() as u32)
+fn context_usage_percent(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    max_prompt_tokens: u32,
+    context_tokens: u32,
+) -> Option<u32> {
+    bot_core::ContextMetrics::from_usage(
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            max_prompt_tokens,
+        },
+        context_tokens,
+    )
+    .rounded_percent()
 }
 
 fn truncate_for_width(text: &str, width: u16) -> String {
@@ -5513,12 +6188,20 @@ mod tests {
         let commands = static_commands();
         assert!(commands.iter().any(|command| command.value == "/fork"));
         assert!(commands.iter().any(|command| command.value == "/new"));
+        assert!(commands.iter().any(|command| command.value == "/exit"));
         assert!(commands
             .iter()
             .any(|command| command.value == "/skill list"));
         assert!(commands
             .iter()
             .any(|command| command.value == "/model status"));
+    }
+
+    #[test]
+    fn tui_exit_command_accepts_exit_and_quit() {
+        assert!(is_tui_exit_command("/exit"));
+        assert!(is_tui_exit_command("/quit"));
+        assert!(!is_tui_exit_command("/exit now"));
     }
 
     #[test]
@@ -5828,10 +6511,13 @@ mod tests {
 
     #[test]
     fn context_usage_uses_model_context_window() {
-        assert_eq!(context_usage_percent(16_000, 128_000), Some(13));
-        assert_eq!(context_usage_percent(128_000, 128_000), Some(100));
-        assert_eq!(context_usage_percent(130_000, 128_000), Some(100));
-        assert_eq!(context_usage_percent(1, 0), None);
+        assert_eq!(context_usage_percent(16_000, 0, 16_000, 128_000), Some(13));
+        assert_eq!(context_usage_percent(260_000, 0, 64_000, 128_000), Some(50));
+        assert_eq!(
+            context_usage_percent(130_000, 0, 130_000, 128_000),
+            Some(100)
+        );
+        assert_eq!(context_usage_percent(1, 0, 1, 0), None);
     }
 
     #[test]
@@ -6268,6 +6954,41 @@ mod tests {
         assert_eq!(done_messages[0].content.text_content(), "Done.");
     }
 
+    #[tokio::test]
+    async fn acp_sub_session_event_log_round_trips_structured_events() {
+        let dir = std::env::temp_dir().join(format!("remi-tui-acp-log-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let event = SubSessionEvent::new(
+            "call-acp",
+            remi_agentloop::prelude::ThreadId("acp-sub-1".to_string()),
+            remi_agentloop::prelude::RunId("run-acp-1".to_string()),
+            "acp",
+            Some("Codex ACP".to_string()),
+            1,
+            SubSessionEventPayload::ToolCallStart {
+                id: "tool-1".to_string(),
+                name: "bash".to_string(),
+            },
+        );
+
+        append_sub_session_event_log(&dir, "child-session", &event)
+            .await
+            .unwrap();
+        let raw = tokio::fs::read_to_string(sub_session_event_log_path(&dir, "child-session"))
+            .await
+            .unwrap();
+        let restored: SubSessionEvent = serde_json::from_str(raw.trim()).unwrap();
+
+        assert_eq!(restored.agent_name, "acp");
+        assert_eq!(restored.sub_thread_id.0, "acp-sub-1");
+        assert_eq!(restored.sub_run_id.0, "run-acp-1");
+        assert!(matches!(
+            restored.payload,
+            SubSessionEventPayload::ToolCallStart { ref name, .. } if name == "bash"
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[test]
     fn interrupt_requested_system_cell_is_not_duplicated() {
         let mut requested = false;
@@ -6284,7 +7005,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_session_only_renders_tools_and_final_output() {
+    fn sub_session_parent_summary_hides_model_output() {
         let base = |payload| {
             SubSessionEvent::new(
                 "parent-tool-call",
@@ -6311,11 +7032,12 @@ mod tests {
             }))
             .is_some_and(|body| body.contains("tool call: fs_ls"))
         );
-        assert!(
+        assert_eq!(
             format_sub_session_event(&base(SubSessionEventPayload::Done {
                 final_output: Some("final answer".to_string()),
             }))
-            .is_some_and(|body| body.contains("final answer"))
+            .as_deref(),
+            Some("done")
         );
     }
 
@@ -6350,6 +7072,25 @@ mod tests {
         assert!(!body.contains("path-1"));
         assert!(body.contains("path-2"));
         assert!(body.contains("path-4"));
+    }
+
+    #[test]
+    fn sub_session_parent_body_does_not_print_final_output() {
+        let mut state = SubSessionUiState::from_event(&SubSessionEvent::new(
+            "parent-tool-call",
+            remi_agentloop::prelude::ThreadId("thread-1".to_string()),
+            remi_agentloop::prelude::RunId("run-1".to_string()),
+            "explorer",
+            Some("Explore".to_string()),
+            0,
+            SubSessionEventPayload::Start,
+        ));
+        state.done = true;
+        state.final_output = Some("final answer".to_string());
+
+        let body = state.body();
+        assert!(!body.contains("final answer"));
+        assert!(body.contains("input: Explore"));
     }
 
     #[test]

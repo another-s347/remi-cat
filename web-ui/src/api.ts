@@ -166,6 +166,38 @@ export type ToolApprovalRequest = {
   review?: ToolRiskReview | null;
 };
 
+export type UserQuestionStatus = "answered" | "cancelled";
+
+export type UserQuestionOption = {
+  id: string;
+  label: string;
+  description?: string | null;
+};
+
+export type UserQuestionRequest = {
+  id: string;
+  session_id: string;
+  run_id: string;
+  tool_call_id: string;
+  question: string;
+  reason?: string | null;
+  options: UserQuestionOption[];
+  allow_free_text: boolean;
+  placeholder?: string | null;
+  default_option_id?: string | null;
+  created_at: string;
+};
+
+export type UserQuestionResponse = {
+  question_id: string;
+  status: UserQuestionStatus;
+  selected_option_ids: string[];
+  free_text?: string | null;
+  answer_text?: string | null;
+  answered_at?: string | null;
+  source?: string | null;
+};
+
 export type InputHistory = {
   items: string[];
 };
@@ -258,6 +290,20 @@ export const api = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ decision }),
+    }),
+  answerUserQuestion: (
+    id: string,
+    body: {
+      selected_option_ids?: string[];
+      free_text?: string | null;
+      source?: string;
+      cancel?: boolean;
+    },
+  ) =>
+    json<UserQuestionRequest>(`/api/v1/chat/user-questions/${id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
     }),
   listSecrets: () => json<SecretList>("/api/v1/secrets"),
   setSecret: (key: string, value: string) =>

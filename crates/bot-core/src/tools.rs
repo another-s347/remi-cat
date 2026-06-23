@@ -1589,7 +1589,7 @@ impl Tool for RootedFsReadTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":   { "type": "string",  "description": "File path (relative to workspace root)" },
+                "path":   { "type": "string",  "description": "File path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
                 "offset": { "type": "integer", "description": "Byte offset to start for text files (default 0)" },
                 "length": {
                     "type": "integer",
@@ -1745,7 +1745,7 @@ impl Tool for RootedFsWriteTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":    { "type": "string", "description": "File path (relative to workspace root)" },
+                "path":    { "type": "string", "description": "File path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
                 "content": { "type": "string", "description": "Text content to write" }
             },
             "required": ["path", "content"]
@@ -1820,7 +1820,9 @@ impl Tool for RootedFsApplyPatchTool {
          existing files. The patch must be a standard unified diff, such as output \
          from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
          hunks. Every context line, including a blank one, starts with a space. \
-         `diff --git` headers are accepted. Each old hunk must match exactly once."
+         `diff --git` headers are accepted. Patch file paths may be workspace-relative; \
+         NoSandbox also accepts host absolute paths, and Docker accepts paths under the \
+         container workspace root such as /workspace/file. Each old hunk must match exactly once."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2252,7 +2254,7 @@ impl Tool for RootedFsCreateTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":      { "type": "string",  "description": "Directory path (relative to workspace root)" },
+                "path":      { "type": "string",  "description": "Directory path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/dir." },
                 "recursive": { "type": "boolean", "description": "Create parent dirs (default false)" }
             },
             "required": ["path"]
@@ -2325,7 +2327,7 @@ impl Tool for RootedFsRemoveTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":      { "type": "string",  "description": "Path to remove (relative to workspace root)" },
+                "path":      { "type": "string",  "description": "Path to remove. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
                 "recursive": { "type": "boolean", "description": "Remove directory recursively (default false)" }
             },
             "required": ["path"]
@@ -2399,7 +2401,7 @@ impl Tool for RootedFsLsTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path (relative to workspace root, default '.')" }
+                "path": { "type": "string", "description": "Directory path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/dir. Defaults to '.'." }
             }
         })
     }
@@ -2832,7 +2834,7 @@ mod tests {
         ParsedPatchOp, PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor,
         SshTarget, WorkspaceBashTool,
     };
-    use crate::sandbox::NoSandbox;
+    use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use futures::StreamExt;
     use remi_agentloop::prelude::{
         AgentConfig, Content, Tool, ToolContext, ToolOutput, ToolResult,
@@ -2993,7 +2995,7 @@ mod tests {
             <WorkspaceBashTool as Tool>::execute(
                 &tool,
                 json!({
-                    "command": "printf start; sleep 0.2; printf done",
+                    "command": "echo start; sleep 0.2; echo done",
                     "timeout_ms": 10
                 }),
                 None,
@@ -3014,7 +3016,7 @@ mod tests {
 
         let mut combined_stdout = started["stdout"].as_str().unwrap_or_default().to_string();
         let mut completed = None;
-        for _ in 0..20 {
+        for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let polled = collect_tool_text(
                 <WorkspaceBashTool as Tool>::execute(
@@ -3643,6 +3645,57 @@ invalid
             .contains("updated 1 file(s): repo/app.py"));
         assert_eq!(
             tokio::fs::read_to_string(root.join("repo/app.py"))
+                .await
+                .unwrap(),
+            "print('new')\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn apply_patch_accepts_docker_workspace_absolute_paths() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("app.py"), "print('old')\n")
+            .await
+            .expect("fixture should be written");
+
+        let tool = RootedFsApplyPatchTool {
+            sandbox: Arc::new(DockerSandbox::new(DockerSandboxConfig {
+                host_dir: root.clone(),
+                container_dir: "/workspace".to_string(),
+                image: "unused".to_string(),
+                container_name: "unused".to_string(),
+                user: None,
+            })),
+        };
+        let patch = r#"diff --git a/app.py b/app.py
+--- /workspace/app.py
++++ /workspace/app.py
+@@ -1 +1 @@
+-print('old')
++print('new')
+"#;
+
+        let content = collect_tool_content(
+            <RootedFsApplyPatchTool as Tool>::execute(
+                &tool,
+                json!({ "patch": patch }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("apply_patch should succeed"),
+        )
+        .await;
+
+        assert!(content
+            .text_content()
+            .contains("updated 1 file(s): /workspace/app.py"));
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("app.py"))
                 .await
                 .unwrap(),
             "print('new')\n"

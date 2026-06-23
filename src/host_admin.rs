@@ -96,6 +96,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/chat/runs/{id}", delete(cancel_web_run))
         .route("/api/v1/chat/approvals/{id}", post(decide_web_approval))
         .route(
+            "/api/v1/chat/user-questions/{id}",
+            post(answer_web_user_question),
+        )
+        .route(
             "/api/v1/chat/assets/workspace/{*path}",
             get(workspace_image_asset),
         )
@@ -734,6 +738,18 @@ struct ApprovalDecisionRequest {
     decision: ToolApprovalDecision,
 }
 
+#[derive(Debug, Deserialize)]
+struct UserQuestionAnswerRequest {
+    #[serde(default)]
+    selected_option_ids: Vec<String>,
+    #[serde(default)]
+    free_text: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    cancel: bool,
+}
+
 async fn start_web_run(
     State(state): State<AdminState>,
     AxumPath(id): AxumPath<String>,
@@ -817,6 +833,63 @@ async fn decide_web_approval(
         .await?
         .ok_or_else(|| AdminError::not_found("approval not found".into()))?;
     Ok(Json(approval))
+}
+
+async fn answer_web_user_question(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UserQuestionAnswerRequest>,
+) -> Result<Json<bot_core::UserQuestionRequest>, AdminError> {
+    let status = if request.cancel {
+        bot_core::UserQuestionStatus::Cancelled
+    } else {
+        bot_core::UserQuestionStatus::Answered
+    };
+    let free_text = request
+        .free_text
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let answer_text =
+        build_user_question_answer_text(&request.selected_option_ids, free_text.as_deref(), status);
+    let answer = bot_core::UserQuestionResponse {
+        question_id: id.clone(),
+        status,
+        selected_option_ids: request.selected_option_ids,
+        free_text,
+        answer_text: Some(answer_text),
+        answered_at: None,
+        source: Some(request.source.unwrap_or_else(|| "web".to_string())),
+    };
+    let question = web_handle(&state)?
+        .answer_user_question(id, answer)
+        .await?
+        .ok_or_else(|| AdminError::not_found("user question not found".into()))?;
+    Ok(Json(question))
+}
+
+fn build_user_question_answer_text(
+    selected_option_ids: &[String],
+    free_text: Option<&str>,
+    status: bot_core::UserQuestionStatus,
+) -> String {
+    if status == bot_core::UserQuestionStatus::Cancelled {
+        return "User cancelled the question.".to_string();
+    }
+    let mut parts = Vec::new();
+    if !selected_option_ids.is_empty() {
+        parts.push(format!(
+            "Selected option ids: {}",
+            selected_option_ids.join(", ")
+        ));
+    }
+    if let Some(text) = free_text {
+        parts.push(format!("Free-text answer: {text}"));
+    }
+    if parts.is_empty() {
+        "User answered without additional text.".to_string()
+    } else {
+        parts.join("\n")
+    }
 }
 
 async fn workspace_image_asset(

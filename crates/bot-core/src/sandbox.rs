@@ -524,14 +524,24 @@ impl Sandbox for DockerSandbox {
 
     fn read<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.config.host_dir, path).await?;
+            let full = resolve_workspace_existing_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
             tokio::fs::read(full).await.context("reading sandbox file")
         })
     }
 
     fn metadata<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, SandboxMetadata> {
         Box::pin(async move {
-            let full = resolve_existing_path(&self.config.host_dir, path).await?;
+            let full = resolve_workspace_existing_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
             let metadata = tokio::fs::metadata(full)
                 .await
                 .context("reading sandbox file metadata")?;
@@ -541,7 +551,12 @@ impl Sandbox for DockerSandbox {
 
     fn write<'a>(&'a self, path: &'a str, content: &'a [u8]) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let full = resolve_writable_file_path(&self.config.host_dir, path).await?;
+            let full = resolve_workspace_writable_file_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
             tokio::fs::write(full, content)
                 .await
                 .context("writing sandbox file")
@@ -555,29 +570,94 @@ impl Sandbox for DockerSandbox {
         new: &'a str,
     ) -> SandboxFuture<'a, ReplaceResult> {
         Box::pin(async move {
-            let local = NoSandbox::new(self.config.host_dir.clone());
-            local.replace(path, old, new).await
+            let full = resolve_workspace_existing_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
+            let content = tokio::fs::read_to_string(&full)
+                .await
+                .context("reading sandbox file")?;
+            let count = content.matches(old).count();
+            if count == 0 {
+                return Ok(ReplaceResult::NotFound);
+            }
+            if count > 1 {
+                return Ok(ReplaceResult::MultipleMatches(count));
+            }
+            let replaced = content.replacen(old, new, 1);
+            tokio::fs::write(full, replaced.as_bytes())
+                .await
+                .context("writing sandbox file")?;
+            Ok(ReplaceResult::Replaced)
         })
     }
 
     fn mkdir<'a>(&'a self, path: &'a str, recursive: bool) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let local = NoSandbox::new(self.config.host_dir.clone());
-            local.mkdir(path, recursive).await
+            let full = resolve_workspace_writable_dir_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+                recursive,
+            )
+            .await?;
+            if recursive {
+                tokio::fs::create_dir_all(full).await
+            } else {
+                tokio::fs::create_dir(full).await
+            }
+            .context("creating sandbox directory")
         })
     }
 
     fn remove<'a>(&'a self, path: &'a str, recursive: bool) -> SandboxFuture<'a, ()> {
         Box::pin(async move {
-            let local = NoSandbox::new(self.config.host_dir.clone());
-            local.remove(path, recursive).await
+            let full = resolve_workspace_existing_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
+            if recursive {
+                tokio::fs::remove_dir_all(full).await
+            } else if tokio::fs::metadata(&full)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                tokio::fs::remove_dir(full).await
+            } else {
+                tokio::fs::remove_file(full).await
+            }
+            .context("removing sandbox path")
         })
     }
 
     fn list<'a>(&'a self, path: &'a str) -> SandboxFuture<'a, Vec<String>> {
         Box::pin(async move {
-            let local = NoSandbox::new(self.config.host_dir.clone());
-            local.list(path).await
+            let full = resolve_workspace_existing_path(
+                &self.config.host_dir,
+                &self.config.container_dir,
+                path,
+            )
+            .await?;
+            let mut rd = tokio::fs::read_dir(full)
+                .await
+                .context("listing sandbox directory")?;
+            let mut entries = Vec::new();
+            while let Some(entry) = rd.next_entry().await.context("reading sandbox directory")? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let suffix = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    "/"
+                } else {
+                    ""
+                };
+                entries.push(format!("{name}{suffix}"));
+            }
+            entries.sort();
+            Ok(entries)
         })
     }
 
@@ -1219,8 +1299,19 @@ async fn absolute_existing_dir(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalizing sandbox dir {}", path.display()))
 }
 
-fn clean_relative_path(path: &str) -> Result<PathBuf> {
-    let path = Path::new(path);
+fn clean_workspace_path(path: &str, workspace_root_label: &str) -> Result<PathBuf> {
+    let input = Path::new(path);
+    if input.is_absolute() {
+        let label = Path::new(workspace_root_label);
+        let stripped = input.strip_prefix(label).with_context(|| {
+            format!("absolute sandbox path must start with {}", label.display())
+        })?;
+        return clean_relative_components(stripped);
+    }
+    clean_relative_components(input)
+}
+
+fn clean_relative_components(path: &Path) -> Result<PathBuf> {
     let mut cleaned = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1287,22 +1378,46 @@ fn current_host_user_spec() -> Option<String> {
     Some(format!("{uid}:{gid}"))
 }
 
-async fn resolve_existing_path(root: &Path, path: &str) -> Result<PathBuf> {
+async fn resolve_workspace_existing_path(
+    root: &Path,
+    workspace_root_label: &str,
+    path: &str,
+) -> Result<PathBuf> {
     let root = canonical_root(root).await?;
-    let relative = clean_relative_path(path)?;
+    let relative = clean_workspace_path(path, workspace_root_label)?;
+    resolve_existing_relative_path(&root, &relative, path).await
+}
+
+async fn resolve_existing_relative_path(
+    root: &Path,
+    relative: &Path,
+    original_path: &str,
+) -> Result<PathBuf> {
     let full = root.join(relative);
     let canonical = tokio::fs::canonicalize(&full)
         .await
-        .with_context(|| format!("canonicalizing sandbox path {}", path))?;
+        .with_context(|| format!("canonicalizing sandbox path {}", original_path))?;
     if !canonical.starts_with(&root) {
         return Err(anyhow!("path escapes sandbox root"));
     }
     Ok(canonical)
 }
 
-async fn resolve_writable_file_path(root: &Path, path: &str) -> Result<PathBuf> {
+async fn resolve_workspace_writable_file_path(
+    root: &Path,
+    workspace_root_label: &str,
+    path: &str,
+) -> Result<PathBuf> {
     let root = canonical_root(root).await?;
-    let relative = clean_relative_path(path)?;
+    let relative = clean_workspace_path(path, workspace_root_label)?;
+    resolve_writable_file_relative_path(&root, &relative, path).await
+}
+
+async fn resolve_writable_file_relative_path(
+    root: &Path,
+    relative: &Path,
+    original_path: &str,
+) -> Result<PathBuf> {
     if relative == Path::new(".") {
         return Err(anyhow!("path must refer to a file"));
     }
@@ -1310,7 +1425,7 @@ async fn resolve_writable_file_path(root: &Path, path: &str) -> Result<PathBuf> 
     if tokio::fs::symlink_metadata(&full).await.is_ok() {
         let canonical = tokio::fs::canonicalize(&full)
             .await
-            .with_context(|| format!("canonicalizing sandbox path {}", path))?;
+            .with_context(|| format!("canonicalizing sandbox path {}", original_path))?;
         if !canonical.starts_with(&root) {
             return Err(anyhow!("path escapes sandbox root"));
         }
@@ -1321,11 +1436,57 @@ async fn resolve_writable_file_path(root: &Path, path: &str) -> Result<PathBuf> 
         .ok_or_else(|| anyhow!("path has no parent directory"))?;
     let parent = tokio::fs::canonicalize(parent)
         .await
-        .with_context(|| format!("canonicalizing parent for sandbox path {}", path))?;
+        .with_context(|| format!("canonicalizing parent for sandbox path {}", original_path))?;
     if !parent.starts_with(&root) {
         return Err(anyhow!("path escapes sandbox root"));
     }
     Ok(full)
+}
+
+async fn resolve_workspace_writable_dir_path(
+    root: &Path,
+    workspace_root_label: &str,
+    path: &str,
+    recursive: bool,
+) -> Result<PathBuf> {
+    let root = canonical_root(root).await?;
+    let relative = clean_workspace_path(path, workspace_root_label)?;
+    let full = root.join(&relative);
+    if tokio::fs::symlink_metadata(&full).await.is_ok() {
+        let canonical = tokio::fs::canonicalize(&full)
+            .await
+            .with_context(|| format!("canonicalizing sandbox path {}", path))?;
+        if !canonical.starts_with(&root) {
+            return Err(anyhow!("path escapes sandbox root"));
+        }
+        return Ok(canonical);
+    }
+
+    let ancestor = if recursive {
+        nearest_existing_ancestor(&full)
+    } else {
+        full.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("path has no parent directory"))?
+    };
+    let ancestor = tokio::fs::canonicalize(&ancestor)
+        .await
+        .with_context(|| format!("canonicalizing parent for sandbox path {}", path))?;
+    if !ancestor.starts_with(&root) {
+        return Err(anyhow!("path escapes sandbox root"));
+    }
+    Ok(full)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    current
 }
 
 #[cfg(test)]
@@ -1428,7 +1589,7 @@ mod tests {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
         let out = sandbox
-            .bash("printf start; sleep 0.2; printf done", None, 10)
+            .bash("echo start; sleep 0.2; echo done", None, 10)
             .await
             .unwrap();
         assert_eq!(out.status, SandboxBashStatus::Running);
@@ -1436,7 +1597,7 @@ mod tests {
         let pid = out.pid.clone().expect("timed out bash should return pid");
         let mut combined_stdout = out.stdout;
         let mut completed = None;
-        for _ in 0..20 {
+        for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let poll = sandbox.bash_poll(&pid).await.unwrap();
             combined_stdout.push_str(&poll.stdout);
@@ -1574,6 +1735,68 @@ mod tests {
             ReplaceResult::Replaced
         );
         assert_eq!(sandbox.read("note.txt").await.unwrap(), b"one 2 one");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn docker_sandbox_accepts_workspace_absolute_paths_for_fs_tools() {
+        let root = test_root();
+        let sandbox = DockerSandbox::new(DockerSandboxConfig {
+            host_dir: root.clone(),
+            container_dir: "/workspace".to_string(),
+            image: "unused".to_string(),
+            container_name: "unused".to_string(),
+            user: None,
+        });
+
+        sandbox
+            .mkdir("/workspace/dir", true)
+            .await
+            .expect("workspace absolute mkdir should succeed");
+        sandbox
+            .write("/workspace/dir/note.txt", b"hello")
+            .await
+            .expect("workspace absolute write should succeed");
+        assert_eq!(
+            sandbox.read("/workspace/dir/note.txt").await.unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            sandbox
+                .replace("/workspace/dir/note.txt", "hello", "world")
+                .await
+                .unwrap(),
+            ReplaceResult::Replaced
+        );
+        assert_eq!(
+            sandbox.list("/workspace/dir").await.unwrap(),
+            vec!["note.txt".to_string()]
+        );
+        sandbox
+            .remove("/workspace/dir/note.txt", false)
+            .await
+            .unwrap();
+        assert!(!root.join("dir/note.txt").exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn docker_sandbox_rejects_host_absolute_paths() {
+        let root = test_root();
+        let sandbox = DockerSandbox::new(DockerSandboxConfig {
+            host_dir: root.clone(),
+            container_dir: "/workspace".to_string(),
+            image: "unused".to_string(),
+            container_name: "unused".to_string(),
+            user: None,
+        });
+        let host_path = root.join("note.txt");
+
+        let err = sandbox.write(host_path.to_str().unwrap(), b"nope").await;
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("absolute sandbox path must start with /workspace"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

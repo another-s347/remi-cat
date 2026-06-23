@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::runtime_config::{detect_setup_state, RuntimeConfig, SetupState};
 
 pub const DEFAULT_DATA_DIR: &str = ".remi-cat";
+pub const TUI_HOME_DATA_DIR: &str = ".remi_cat";
+pub const TUI_HOME_COMPAT_DATA_DIR: &str = ".remi-cat";
 pub const DIAGNOSTIC_PROFILE_NAME: &str = "remi_diagnostics";
 const PROFILES_DIR: &str = "profiles";
 
@@ -28,6 +30,14 @@ impl InstanceProfile {
         Ok(Self {
             name: Some(name.to_string()),
             data_dir: profiles_root().join(name),
+        })
+    }
+
+    pub fn named_in_data_root(name: &str, data_root: &Path) -> Result<Self> {
+        validate_profile_name(name)?;
+        Ok(Self {
+            name: Some(name.to_string()),
+            data_dir: data_root.join(PROFILES_DIR).join(name),
         })
     }
 
@@ -76,6 +86,22 @@ pub struct ProfileRunMetadata {
 
 pub fn profiles_root() -> PathBuf {
     PathBuf::from(DEFAULT_DATA_DIR).join(PROFILES_DIR)
+}
+
+pub fn tui_home_data_dir() -> PathBuf {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return PathBuf::from(TUI_HOME_DATA_DIR);
+    };
+    let preferred = home.join(TUI_HOME_DATA_DIR);
+    if preferred.exists() {
+        return preferred;
+    }
+    let compat = home.join(TUI_HOME_COMPAT_DATA_DIR);
+    if compat.exists() {
+        compat
+    } else {
+        preferred
+    }
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {

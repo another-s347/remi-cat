@@ -2387,3 +2387,135 @@ pub fn build_tool_approval_resolved_card(
         }
     })
 }
+
+pub fn build_user_question_card(
+    question_id: &str,
+    question: &str,
+    reason: Option<&str>,
+    options: &[serde_json::Value],
+    allow_free_text: bool,
+    placeholder: Option<&str>,
+) -> serde_json::Value {
+    let mut elements = vec![serde_json::json!({
+        "tag": "markdown",
+        "content": format!("**Question**\n{}", question)
+    })];
+    if let Some(reason) = reason.filter(|value| !value.trim().is_empty()) {
+        elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": format!("**Why**\n{}", reason)
+        }));
+    }
+    if allow_free_text {
+        elements.push(serde_json::json!({
+            "tag": "input",
+            "name": "free_text",
+            "placeholder": {
+                "tag": "plain_text",
+                "content": placeholder.unwrap_or("Add details")
+            }
+        }));
+    }
+    if options.is_empty() {
+        elements.push(serde_json::json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "Submit" },
+            "type": "primary",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "user_question_answer",
+                    "question_id": question_id
+                }
+            }]
+        }));
+    } else {
+        let columns = options
+            .iter()
+            .map(|option| {
+                let id = option
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let label = option
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(id);
+                serde_json::json!({
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": label },
+                        "type": "primary",
+                        "behaviors": [{
+                            "type": "callback",
+                            "value": {
+                                "action": "user_question_answer",
+                                "question_id": question_id,
+                                "selected_option_ids": [id]
+                            }
+                        }]
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        elements.push(serde_json::json!({
+            "tag": "column_set",
+            "flex_mode": "stretch",
+            "columns": columns
+        }));
+    }
+    elements.push(serde_json::json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "Cancel" },
+        "type": "danger",
+        "behaviors": [{
+            "type": "callback",
+            "value": {
+                "action": "user_question_cancel",
+                "question_id": question_id
+            }
+        }]
+    }));
+
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": elements },
+        "header": {
+            "title": { "tag": "plain_text", "content": "Remi needs input" },
+            "template": "blue"
+        }
+    })
+}
+
+pub fn build_user_question_resolved_card(
+    question: &str,
+    status: &str,
+    answer_text: Option<&str>,
+) -> serde_json::Value {
+    let template = if status == "cancelled" {
+        "red"
+    } else {
+        "green"
+    };
+    serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": format!(
+                    "**Question**\n{}\n\n**Status:** `{}`\n\n{}",
+                    question,
+                    status,
+                    answer_text.unwrap_or("")
+                )
+            }]
+        },
+        "header": {
+            "title": { "tag": "plain_text", "content": "Remi input resolved" },
+            "template": template
+        }
+    })
+}

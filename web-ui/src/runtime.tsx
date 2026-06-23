@@ -18,6 +18,8 @@ import {
   type ToolApprovalDecision,
   type ToolApprovalRequest,
   type TodoItem,
+  type UserQuestionRequest,
+  type UserQuestionResponse,
 } from "./api";
 
 const TOOL_TICK_MS = 500;
@@ -113,6 +115,10 @@ function approvalToolCallId(request: ToolApprovalRequest) {
   return `approval-${request.id}`;
 }
 
+function userQuestionToolCallId(request: UserQuestionRequest) {
+  return `user-question-${request.id}`;
+}
+
 function upsertApprovalPart(
   parts: ThreadAssistantMessagePart[],
   indexes: Map<string, number>,
@@ -142,6 +148,38 @@ function upsertApprovalPart(
     args: payload as never,
     argsText: "",
     result: decision ? payload : undefined,
+  });
+}
+
+function upsertUserQuestionPart(
+  parts: ThreadAssistantMessagePart[],
+  indexes: Map<string, number>,
+  request: UserQuestionRequest,
+  response?: UserQuestionResponse,
+) {
+  const toolCallId = userQuestionToolCallId(request);
+  const payload = { request, response };
+  const index = indexes.get(toolCallId);
+  if (index !== undefined) {
+    const part = parts[index];
+    if (part?.type === "tool-call") {
+      parts[index] = {
+        ...part,
+        args: payload as never,
+        argsText: "",
+        result: response ? payload : undefined,
+      };
+    }
+    return;
+  }
+  indexes.set(toolCallId, parts.length);
+  parts.push({
+    type: "tool-call",
+    toolCallId,
+    toolName: "__remi_user_question",
+    args: payload as never,
+    argsText: "",
+    result: response ? payload : undefined,
   });
 }
 
@@ -275,6 +313,16 @@ function appendSubSessionEvent(
   sequence: number,
   data: Record<string, unknown>,
 ) {
+  const subType = String(data.sub_type ?? "");
+  if (subType === "delta") {
+    return;
+  }
+  const displayData =
+    subType === "thinking_end"
+      ? { ...data, content: undefined }
+      : subType === "done"
+        ? { ...data, final_output: undefined }
+        : data;
   const key = subSessionKey(data, `${runId}-sub-session-${sequence}`);
   const toolCallId = `${runId}-sub-session-${key}`;
   let index = indexes.get(toolCallId);
@@ -306,32 +354,18 @@ function appendSubSessionEvent(
     events?: Record<string, unknown>[];
   };
   const events = [...(args.events ?? [])];
-  const subType = String(data.sub_type ?? "");
-  if (subType === "delta") {
-    const text = String(data.content ?? "");
-    const last = events.at(-1);
-    if (last && String(last.sub_type ?? "") === "delta") {
-      events[events.length - 1] = {
-        ...last,
-        content: String(last.content ?? "") + text,
-      };
-    } else {
-      events.push({ ...data, content: text });
-    }
-  } else {
-    events.push(data);
-  }
+  events.push(displayData);
 
   parts[index] = {
     ...part,
     args: {
-      agentName: data.agent_name ?? args.agentName,
-      title: data.title ?? args.title,
-      threadId: data.sub_thread_id ?? data.thread_id ?? args.threadId,
-      runId: data.sub_run_id ?? data.run_id ?? args.runId,
+      agentName: displayData.agent_name ?? args.agentName,
+      title: displayData.title ?? args.title,
+      threadId: displayData.sub_thread_id ?? displayData.thread_id ?? args.threadId,
+      runId: displayData.sub_run_id ?? displayData.run_id ?? args.runId,
       events,
     } as never,
-    result: subType === "done" || subType === "error" ? data : part.result,
+    result: subType === "done" || subType === "error" ? displayData : part.result,
   };
 }
 
@@ -524,6 +558,24 @@ export function RemiRuntimeProvider({
                 toolIndexes,
                 data.request as ToolApprovalRequest,
                 data.decision as ToolApprovalDecision,
+              );
+              break;
+            }
+            case "user_question_requested":
+            case "user_question_updated": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data as unknown as UserQuestionRequest,
+              );
+              break;
+            }
+            case "user_question_resolved": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data.request as UserQuestionRequest,
+                data.response as UserQuestionResponse,
               );
               break;
             }
@@ -749,6 +801,24 @@ export function RemiRuntimeProvider({
                 toolIndexes,
                 data.request as ToolApprovalRequest,
                 data.decision as ToolApprovalDecision,
+              );
+              break;
+            }
+            case "user_question_requested":
+            case "user_question_updated": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data as unknown as UserQuestionRequest,
+              );
+              break;
+            }
+            case "user_question_resolved": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data.request as UserQuestionRequest,
+                data.response as UserQuestionResponse,
               );
               break;
             }

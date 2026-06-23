@@ -94,6 +94,7 @@ header { height: 62px; border-bottom: 1px solid #222722; display: flex; align-it
 .approval-card details { margin-top: 8px; }
 .approval-card summary { cursor: pointer; color: #a99873; font-size: 12px; }
 .approval-card pre { max-height: 260px; white-space: pre-wrap; }
+.user-question-card textarea { width: 100%; min-height: 84px; resize: vertical; border: 1px solid #394238; border-radius: 8px; background: #10130f; color: #edf0eb; padding: 9px; margin-top: 8px; outline: none; }
 .approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .approval-actions button { border: 1px solid #4d584d; border-radius: 8px; padding: 7px 10px; background: #202620; color: #edf0eb; cursor: pointer; }
 .approval-actions button:hover:not(:disabled) { border-color: #d8ff73; }

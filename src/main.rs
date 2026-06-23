@@ -28,15 +28,19 @@ use bot_core::im_tools::{
 use bot_core::{
     install_embedded_agent_profiles, install_embedded_model_profiles, AccountBalance, AccountUsage,
     AccountUsageStatus, AgentProfile, AgentRegistry, CatBot, CatBotBuilder, CatEvent, Content,
-    ContentPart, GoalMaxRounds, ImAttachment, ImDocument, ModelProfileRegistry, SkillDocument,
-    SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, StreamOptions, ToolApprovalDecision,
-    ToolApprovalRequest,
+    ContentPart, ContextMetrics, GoalMaxRounds, HookManager, ImAttachment, ImDocument,
+    ModelProfileRegistry, SkillDocument, SkillLoadDiagnostic, SkillLoadDiagnosticSeverity,
+    StreamOptions, TokenUsage, ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest,
+    UserQuestionResponse, UserQuestionStatus,
 };
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use im_feishu::client::{build_tool_approval_card, build_tool_approval_resolved_card};
+use im_feishu::client::{
+    build_tool_approval_card, build_tool_approval_resolved_card, build_user_question_card,
+    build_user_question_resolved_card,
+};
 use im_feishu::{FeishuEvent, FeishuEventHookConfig, FeishuGateway, FeishuMessage, StreamingCard};
-use instance_profile::{InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
+use instance_profile::{tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
 use profile_command::{
     apply_runtime_config_entries, available_container_name, configured_ports,
     ensure_builtin_diagnostic_profile, first_available_port, prefix_short_config_entry,
@@ -76,6 +80,7 @@ enum AppCommand {
     Setup(Vec<String>),
     Doctor,
     Tools(ToolsArgs),
+    Hooks(HooksCommand),
     Secrets(SecretCommand),
     ConfigSet(Vec<String>),
     SandboxSet(Vec<String>),
@@ -208,6 +213,8 @@ enum CliCommand {
     Doctor,
     #[command(about = "List all runtime-registered tools with configuration diagnostics")]
     Tools(ToolsArgs),
+    #[command(about = "List, trust, enable, or disable Codex-compatible hooks")]
+    Hooks(HooksArgs),
     #[command(alias = "secret", about = "List, read, set, or delete secrets")]
     Secrets(SecretsArgs),
     #[command(about = "Update runtime config")]
@@ -266,6 +273,35 @@ struct SetupArgs {
 struct ToolsArgs {
     #[arg(long, help = "Print machine-readable JSON")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HooksArgs {
+    #[command(subcommand)]
+    command: Option<HooksCliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCliCommand {
+    #[command(about = "List configured hooks")]
+    List {
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Trust one hook definition hash")]
+    Trust { hash: String },
+    #[command(about = "Enable one hook definition hash")]
+    Enable { hash: String },
+    #[command(about = "Disable one hook definition hash")]
+    Disable { hash: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HooksCommand {
+    List { json: bool },
+    Trust { hash: String },
+    Enable { hash: String },
+    Disable { hash: String },
 }
 
 #[derive(Debug, Args)]
@@ -437,6 +473,27 @@ enum TuiCliCommand {
     Resume {
         #[arg(value_name = "SESSION_ID")]
         session_id: Option<String>,
+        #[arg(
+            long = "cli-channel",
+            visible_alias = "channel",
+            value_name = "ID",
+            help = "Local CLI channel id; the same id resumes the same persisted session"
+        )]
+        channel_id: Option<String>,
+        #[arg(
+            long = "cli-user",
+            visible_alias = "user",
+            value_name = "ID",
+            help = "Local CLI user id used for message metadata"
+        )]
+        user_id: Option<String>,
+        #[arg(
+            long = "cli-name",
+            visible_alias = "name",
+            value_name = "NAME",
+            help = "Display name to include in local CLI message metadata"
+        )]
+        username: Option<String>,
     },
 }
 
@@ -839,6 +896,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Setup(args)) => Ok(AppCommand::Setup(args.entries)),
         Some(CliCommand::Doctor) => Ok(AppCommand::Doctor),
         Some(CliCommand::Tools(args)) => Ok(AppCommand::Tools(args)),
+        Some(CliCommand::Hooks(args)) => Ok(AppCommand::Hooks(hooks_cli_to_command(args))),
         Some(CliCommand::Secrets(args)) => Ok(AppCommand::Secrets(secret_cli_to_command(args))),
         Some(CliCommand::Config(args)) => match args.command {
             ConfigCliCommand::Set(entries) => Ok(AppCommand::ConfigSet(entries.entries)),
@@ -893,6 +951,18 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             username: CLI_USERNAME.to_string(),
         })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
+    }
+}
+
+fn hooks_cli_to_command(args: HooksArgs) -> HooksCommand {
+    match args
+        .command
+        .unwrap_or(HooksCliCommand::List { json: false })
+    {
+        HooksCliCommand::List { json } => HooksCommand::List { json },
+        HooksCliCommand::Trust { hash } => HooksCommand::Trust { hash },
+        HooksCliCommand::Enable { hash } => HooksCommand::Enable { hash },
+        HooksCliCommand::Disable { hash } => HooksCommand::Disable { hash },
     }
 }
 
@@ -1066,8 +1136,27 @@ fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
 }
 
 fn tui_args_to_config(args: TuiArgs) -> CliConfig {
+    let mut channel_id = args.common.channel_id;
+    let mut user_id = args.common.user_id;
+    let mut username = args.common.username;
     let (resume, resume_session_id) = match args.command {
-        Some(TuiCliCommand::Resume { session_id }) => (true, session_id),
+        Some(TuiCliCommand::Resume {
+            session_id,
+            channel_id: resume_channel_id,
+            user_id: resume_user_id,
+            username: resume_username,
+        }) => {
+            if let Some(value) = resume_channel_id {
+                channel_id = value;
+            }
+            if let Some(value) = resume_user_id {
+                user_id = value;
+            }
+            if let Some(value) = resume_username {
+                username = value;
+            }
+            (true, session_id)
+        }
         None => (false, None),
     };
     CliConfig {
@@ -1078,9 +1167,9 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         once: None,
         pure_prompt: false,
         admin_only: false,
-        channel_id: args.common.channel_id,
-        user_id: args.common.user_id,
-        username: args.common.username,
+        channel_id,
+        user_id,
+        username,
     }
 }
 
@@ -1562,6 +1651,7 @@ fn percent_encode_query(value: &str) -> String {
 
 struct LocalImFileBridge {
     gateway: Option<FeishuGateway>,
+    sub_session_cards: Mutex<HashMap<String, StreamingCard>>,
 }
 
 impl ImFileBridge for LocalImFileBridge {
@@ -1756,6 +1846,7 @@ impl ImFileBridge for LocalImFileBridge {
         platform: &'a str,
         channel_id: &'a str,
         text: &'a str,
+        done: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             if platform != FEISHU_CHANNEL {
@@ -1764,7 +1855,16 @@ impl ImFileBridge for LocalImFileBridge {
             let Some(gateway) = &self.gateway else {
                 return Ok(());
             };
-            gateway.send_text(channel_id, text).await?;
+            let mut cards = self.sub_session_cards.lock().await;
+            let card = cards
+                .entry(channel_id.to_string())
+                .or_insert_with(|| gateway.begin_streaming_reply(channel_id));
+            if done {
+                card.replace_final(text).await?;
+                cards.remove(channel_id);
+            } else {
+                card.replace(text).await?;
+            }
             Ok(())
         })
     }
@@ -1909,7 +2009,8 @@ async fn main() -> anyhow::Result<()> {
 
     let tool_output_overflow_bytes = parsed.tool_output_overflow_bytes;
     let command = parsed.command;
-    let selected_profile = resolve_instance_profile(parsed.profile, explicit_data_dir)?;
+    let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
+    let selected_profile = resolve_instance_profile(parsed.profile, explicit_data_dir, tui_mode)?;
     if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
         ensure_builtin_diagnostic_profile()?;
     }
@@ -1939,6 +2040,10 @@ async fn main() -> anyhow::Result<()> {
         }
         AppCommand::Doctor => {
             run_doctor(&selected_profile, &data_dir)?;
+            return Ok(());
+        }
+        AppCommand::Hooks(command) => {
+            run_hooks_command(&selected_profile, &data_dir, command).await?;
             return Ok(());
         }
         AppCommand::Secrets(command) => {
@@ -1996,6 +2101,13 @@ async fn main() -> anyhow::Result<()> {
                 data_dir = std::path::PathBuf::from(
                     std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
                 );
+            }
+            if cli.tui {
+                let workspace_dir =
+                    std::env::current_dir().context("resolving current workspace")?;
+                unsafe {
+                    std::env::set_var("REMI_SANDBOX_HOST_DIR", &workspace_dir);
+                }
             }
             if let Some(overflow_bytes) = tool_output_overflow_bytes {
                 unsafe {
@@ -2113,6 +2225,7 @@ async fn main() -> anyhow::Result<()> {
 
     let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge {
         gateway: gateway.clone(),
+        sub_session_cards: Mutex::new(HashMap::new()),
     });
     let bot = Rc::new(
         CatBotBuilder::from_env()?
@@ -2201,6 +2314,7 @@ async fn main() -> anyhow::Result<()> {
 fn resolve_instance_profile(
     cli_profile: Option<String>,
     explicit_data_dir: Option<PathBuf>,
+    tui_mode: bool,
 ) -> anyhow::Result<InstanceProfile> {
     if let Some(data_dir) = explicit_data_dir {
         return Ok(InstanceProfile {
@@ -2209,12 +2323,21 @@ fn resolve_instance_profile(
         });
     }
     if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
+        if tui_mode {
+            return InstanceProfile::named_in_data_root(&name, &tui_home_data_dir());
+        }
         return InstanceProfile::named(&name);
     }
     if let Some(data_dir) = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from) {
         return Ok(InstanceProfile {
             name: None,
             data_dir,
+        });
+    }
+    if tui_mode {
+        return Ok(InstanceProfile {
+            name: None,
+            data_dir: tui_home_data_dir(),
         });
     }
     Ok(InstanceProfile::default_instance())
@@ -3364,6 +3487,62 @@ fn print_registered_tools(bot: &CatBot, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_hooks_command(
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    command: HooksCommand,
+) -> anyhow::Result<()> {
+    unsafe {
+        std::env::set_var("REMI_DATA_DIR", data_dir);
+    }
+    let mut effective_data_dir = data_dir.to_path_buf();
+    if let SetupState::Initialized { config, .. } = detect_setup_state(data_dir) {
+        config.apply_env_defaults();
+        effective_data_dir = PathBuf::from(
+            std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
+        );
+    }
+    let workspace_root = std::env::var("REMI_SANDBOX_HOST_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| profile.data_dir.clone()));
+    let manager = HookManager::new(workspace_root, effective_data_dir);
+    match command {
+        HooksCommand::List { json } => {
+            let statuses = manager.statuses().await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else if statuses.is_empty() {
+                println!("No hooks configured.");
+            } else {
+                println!("{}", format_hook_statuses(&statuses));
+            }
+        }
+        HooksCommand::Trust { hash } => {
+            if manager.trust(&hash).await? {
+                println!("Trusted hook `{hash}`.");
+            } else {
+                println!("No hook found for `{hash}`.");
+            }
+        }
+        HooksCommand::Enable { hash } => {
+            if manager.set_enabled(&hash, true).await? {
+                println!("Enabled hook `{hash}`.");
+            } else {
+                println!("No hook found for `{hash}`.");
+            }
+        }
+        HooksCommand::Disable { hash } => {
+            if manager.set_enabled(&hash, false).await? {
+                println!("Disabled hook `{hash}`.");
+            } else {
+                println!("No hook found for `{hash}`.");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_secret_command(
     store: Arc<Mutex<SecretStore>>,
     command: &SecretCommand,
@@ -4195,6 +4374,66 @@ async fn process_feishu_card_action(
         .get("action")
         .and_then(|value| value.as_str())
         .unwrap_or("");
+    if action == "user_question_answer" || action == "user_question_cancel" {
+        let question_id = action_value
+            .get("question_id")
+            .and_then(|value| value.as_str())
+            .context("missing question_id in user question action")?;
+        let selected_option_ids = action_value
+            .get("selected_option_ids")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let free_text = action_value
+            .get("free_text")
+            .or_else(|| action_value.pointer("/form_value/free_text"))
+            .or_else(|| action_value.pointer("/form_values/free_text"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let status = if action == "user_question_cancel" {
+            UserQuestionStatus::Cancelled
+        } else {
+            UserQuestionStatus::Answered
+        };
+        let answer_text =
+            build_user_question_answer_text(&selected_option_ids, free_text.as_deref(), status);
+        let response = UserQuestionResponse {
+            question_id: question_id.to_string(),
+            status,
+            selected_option_ids,
+            free_text,
+            answer_text: Some(answer_text),
+            answered_at: None,
+            source: Some(format!("feishu:{user_open_id}")),
+        };
+        let resolved = runtime
+            .bot
+            .user_question_manager()
+            .answer(question_id, response)
+            .await;
+        if resolved.is_none() {
+            warn!(
+                question_id,
+                user = %user_open_id,
+                "user question card action did not match a pending request"
+            );
+            gateway
+                .update_card_raw(
+                    &card_message_id,
+                    build_tool_approval_notice_card("Question is no longer pending."),
+                )
+                .await
+                .ok();
+        }
+        return Ok(());
+    }
     if action != "approval_decide" {
         return Ok(());
     }
@@ -4622,11 +4861,20 @@ async fn collect_bot_reply(
                     }
                     CatEvent::SubSession(event) => {
                         record_sub_session_event(&runtime, &session_id, platform, &msg, &event).await;
-                        let chunk = format!(
-                            "\n\n**Sub-session** `{}` / `{}`\n",
-                            event.agent_name, event.sub_thread_id.0
-                        );
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::SubSession, &chunk).await;
+                        if let Some(line) = format_feishu_sub_session_line(&event) {
+                            let done = matches!(
+                                event.payload,
+                                SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
+                            );
+                            update_sub_session_reply(
+                                &mut output,
+                                &mut replies,
+                                &event.sub_thread_id.0,
+                                &line,
+                                done,
+                            )
+                            .await;
+                        }
                     }
                     CatEvent::SupervisorProgress(progress) => {
                         let reply_kind = supervisor_reply_kind(&progress);
@@ -4668,6 +4916,24 @@ async fn collect_bot_reply(
                         }
                         supervisor_execution_started = false;
                     }
+                    CatEvent::UserQuestionRequested(request) => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.user_question_requested(&request).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
+                    CatEvent::UserQuestionUpdated(request) => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.user_question_updated(&request).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
+                    CatEvent::UserQuestionResolved { request, response } => {
+                        if let Some(replies) = replies.as_deref_mut() {
+                            replies.user_question_resolved(&request, &response).await;
+                        }
+                        supervisor_execution_started = false;
+                    }
                     CatEvent::Stats {
                         prompt_tokens,
                         completion_tokens,
@@ -4685,13 +4951,17 @@ async fn collect_bot_reply(
                         let context_tokens = runtime
                             .bot
                             .model_context_tokens_for(model_profile_id.as_deref());
-                        let context_percent = if context_tokens == 0 {
-                            0.0
-                        } else {
-                            max_prompt_tokens as f64 / context_tokens as f64 * 100.0
-                        };
+                        let context = ContextMetrics::from_usage(
+                            TokenUsage {
+                                prompt_tokens,
+                                completion_tokens,
+                                max_prompt_tokens,
+                            },
+                            context_tokens,
+                        );
                         let chunk = format!(
-                            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({context_percent:.1}%)` `elapsed: {elapsed_ms}ms`"
+                            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({:.1}%)` `elapsed: {elapsed_ms}ms`",
+                            context.percent
                         );
                         append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Stats, &chunk).await;
                     }
@@ -4934,6 +5204,10 @@ pub(crate) async fn handle_runtime_command(
         let reply = handle_permissions_command(runtime, session_id, command).await?;
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
+    if command == "/hooks" || command.starts_with("/hooks ") {
+        let reply = handle_hooks_command(runtime, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
     if command == "/compact" {
         let n = runtime.bot.compact_memory(session_id).await?;
         return Ok(Some(RuntimeCommandResult::Reply(format!(
@@ -4983,6 +5257,7 @@ fn runtime_command_help() -> String {
         "- `/doctor` - show runtime readiness for the current session",
         "- `/model` or `/model list` - inspect or select model profiles for this session",
         "- `/permissions` - inspect or change tool approval mode for this session",
+        "- `/hooks` - list/trust/enable/disable Codex-compatible hooks",
         "- `/goal ...` - inspect or manage the current goal workflow",
         "- `/workflow ...` - inspect or manage supervisor workflow state",
         "- `/<workflow-id> ...` - start a supervisor workflow directly",
@@ -4990,6 +5265,74 @@ fn runtime_command_help() -> String {
         "- `/clear` - clear chat memory for this session",
     ]
     .join("\n")
+}
+
+async fn handle_hooks_command(runtime: &Runtime, command: &str) -> anyhow::Result<String> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    let manager = runtime.bot.hook_manager();
+    match parts.as_slice() {
+        ["/hooks"] | ["/hooks", "list"] => {
+            let statuses = manager.statuses().await;
+            if statuses.is_empty() {
+                return Ok("No hooks configured.".to_string());
+            }
+            Ok(format_hook_statuses(&statuses))
+        }
+        ["/hooks", "trust", hash] => {
+            if manager.trust(hash).await? {
+                Ok(format!("Trusted hook `{hash}`."))
+            } else {
+                Ok(format!("No hook found for `{hash}`."))
+            }
+        }
+        ["/hooks", "enable", hash] => {
+            if manager.set_enabled(hash, true).await? {
+                Ok(format!("Enabled hook `{hash}`."))
+            } else {
+                Ok(format!("No hook found for `{hash}`."))
+            }
+        }
+        ["/hooks", "disable", hash] => {
+            if manager.set_enabled(hash, false).await? {
+                Ok(format!("Disabled hook `{hash}`."))
+            } else {
+                Ok(format!("No hook found for `{hash}`."))
+            }
+        }
+        _ => Ok(
+            "Usage: `/hooks`, `/hooks trust <hash>`, `/hooks enable <hash>`, `/hooks disable <hash>`."
+                .to_string(),
+        ),
+    }
+}
+
+fn format_hook_statuses(statuses: &[bot_core::HookStatus]) -> String {
+    let mut lines = vec!["**hooks**".to_string()];
+    for status in statuses {
+        let trusted = if status.trusted {
+            "trusted"
+        } else {
+            "untrusted"
+        };
+        let enabled = if status.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let matcher = status.matcher.as_deref().unwrap_or("*");
+        let command = status.command.as_deref().unwrap_or("");
+        let mut line = format!(
+            "- `{}` matcher `{matcher}` {trusted}/{enabled}: {command}",
+            status.event
+        );
+        if let Some(warning) = &status.warning {
+            line.push_str(&format!(" warning: {warning}"));
+        }
+        line.push_str(&format!("\n  hash: `{}`", status.hash));
+        line.push_str(&format!("\n  source: `{}`", status.source));
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 async fn handle_permissions_command(
@@ -5709,7 +6052,6 @@ enum FeishuReplyKind {
     Thinking,
     ToolCall,
     ToolResult,
-    SubSession,
     Supervisor,
     Stats,
     Error,
@@ -5717,7 +6059,7 @@ enum FeishuReplyKind {
 
 impl FeishuReplyKind {
     fn is_standalone(self) -> bool {
-        matches!(self, Self::SubSession | Self::Stats | Self::Error)
+        matches!(self, Self::Stats | Self::Error)
     }
 
     fn starts_new_message(self, active: Option<Self>) -> bool {
@@ -5729,10 +6071,7 @@ impl FeishuReplyKind {
     }
 
     fn finishes_message(self) -> bool {
-        matches!(
-            self,
-            Self::ToolResult | Self::SubSession | Self::Stats | Self::Error
-        )
+        matches!(self, Self::ToolResult | Self::Stats | Self::Error)
     }
 }
 
@@ -5743,7 +6082,9 @@ struct FeishuReplyStream {
     active_card: Option<StreamingCard>,
     tool_cards: HashMap<String, StreamingCard>,
     compaction_cards: HashMap<String, StreamingCard>,
+    sub_session_cards: HashMap<String, StreamingCard>,
     approval_cards: HashMap<String, String>,
+    question_cards: HashMap<String, String>,
 }
 
 impl FeishuReplyStream {
@@ -5755,7 +6096,9 @@ impl FeishuReplyStream {
             active_card: None,
             tool_cards: HashMap::new(),
             compaction_cards: HashMap::new(),
+            sub_session_cards: HashMap::new(),
             approval_cards: HashMap::new(),
+            question_cards: HashMap::new(),
         }
     }
 
@@ -5781,6 +6124,9 @@ impl FeishuReplyStream {
             card.finish().await.ok();
         }
         for (_, mut card) in self.compaction_cards.drain() {
+            card.finish().await.ok();
+        }
+        for (_, mut card) in self.sub_session_cards.drain() {
             card.finish().await.ok();
         }
     }
@@ -5819,6 +6165,22 @@ impl FeishuReplyStream {
         if done {
             card.replace_final(line).await.ok();
             self.compaction_cards.remove(id);
+        } else {
+            card.replace(line).await.ok();
+        }
+    }
+
+    async fn update_sub_session(&mut self, id: &str, line: &str, done: bool) {
+        self.finish_active().await;
+        let gateway = self.gateway.clone();
+        let parent_message_id = self.parent_message_id.clone();
+        let card = self
+            .sub_session_cards
+            .entry(id.to_string())
+            .or_insert_with(|| gateway.begin_streaming_reply(&parent_message_id));
+        if done {
+            card.replace_final(line).await.ok();
+            self.sub_session_cards.remove(id);
         } else {
             card.replace(line).await.ok();
         }
@@ -5882,6 +6244,76 @@ impl FeishuReplyStream {
             warn!("resolve approval card failed: {err:#}");
         }
     }
+
+    async fn user_question_requested(&mut self, request: &UserQuestionRequest) {
+        self.finish_active().await;
+        let options = request
+            .options
+            .iter()
+            .map(|option| serde_json::to_value(option).unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        let card = build_user_question_card(
+            &request.id,
+            &request.question,
+            request.reason.as_deref(),
+            &options,
+            request.allow_free_text,
+            request.placeholder.as_deref(),
+        );
+        match self
+            .gateway
+            .reply_card_raw(&self.parent_message_id, card)
+            .await
+        {
+            Ok(card_message_id) => {
+                self.question_cards
+                    .insert(request.id.clone(), card_message_id);
+            }
+            Err(err) => warn!("send user question card failed: {err:#}"),
+        }
+    }
+
+    async fn user_question_updated(&mut self, request: &UserQuestionRequest) {
+        self.finish_active().await;
+        let Some(card_message_id) = self.question_cards.get(&request.id) else {
+            return;
+        };
+        let options = request
+            .options
+            .iter()
+            .map(|option| serde_json::to_value(option).unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        let card = build_user_question_card(
+            &request.id,
+            &request.question,
+            request.reason.as_deref(),
+            &options,
+            request.allow_free_text,
+            request.placeholder.as_deref(),
+        );
+        if let Err(err) = self.gateway.update_card_raw(card_message_id, card).await {
+            warn!("update user question card failed: {err:#}");
+        }
+    }
+
+    async fn user_question_resolved(
+        &mut self,
+        request: &UserQuestionRequest,
+        response: &UserQuestionResponse,
+    ) {
+        self.finish_active().await;
+        let Some(card_message_id) = self.question_cards.remove(&request.id) else {
+            return;
+        };
+        let card = build_user_question_resolved_card(
+            &request.question,
+            user_question_status_value(response.status),
+            response.answer_text.as_deref(),
+        );
+        if let Err(err) = self.gateway.update_card_raw(&card_message_id, card).await {
+            warn!("resolve user question card failed: {err:#}");
+        }
+    }
 }
 
 fn parse_tool_approval_decision(value: &str) -> Option<ToolApprovalDecision> {
@@ -5900,6 +6332,38 @@ fn tool_approval_decision_value(decision: ToolApprovalDecision) -> &'static str 
         ToolApprovalDecision::AllowOnce => "allow_once",
         ToolApprovalDecision::AllowSession => "allow_session",
         ToolApprovalDecision::AllowSessionModelAuto => "allow_session_model_auto",
+    }
+}
+
+fn user_question_status_value(status: UserQuestionStatus) -> &'static str {
+    match status {
+        UserQuestionStatus::Answered => "answered",
+        UserQuestionStatus::Cancelled => "cancelled",
+    }
+}
+
+fn build_user_question_answer_text(
+    selected_option_ids: &[String],
+    free_text: Option<&str>,
+    status: UserQuestionStatus,
+) -> String {
+    if status == UserQuestionStatus::Cancelled {
+        return "User cancelled the question.".to_string();
+    }
+    let mut parts = Vec::new();
+    if !selected_option_ids.is_empty() {
+        parts.push(format!(
+            "Selected option ids: {}",
+            selected_option_ids.join(", ")
+        ));
+    }
+    if let Some(text) = free_text {
+        parts.push(format!("Free-text answer: {text}"));
+    }
+    if parts.is_empty() {
+        "User answered without additional text.".to_string()
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -5998,6 +6462,25 @@ async fn update_context_compaction_reply(
     }
 }
 
+async fn update_sub_session_reply(
+    output: &mut String,
+    replies: &mut Option<&mut FeishuReplyStream>,
+    id: &str,
+    line: &str,
+    done: bool,
+) {
+    if let Some(replies) = replies.as_deref_mut() {
+        replies.update_sub_session(id, line, done).await;
+        if done {
+            output.push_str(line);
+            output.push('\n');
+        }
+    } else {
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
 fn format_context_compaction_line(event: &bot_core::ContextCompactionEvent) -> String {
     match event.status {
         bot_core::ContextCompactionStatus::Started => format!(
@@ -6013,6 +6496,37 @@ fn format_context_compaction_line(event: &bot_core::ContextCompactionEvent) -> S
             event.error.as_deref().unwrap_or("unknown error")
         ),
     }
+}
+
+fn format_feishu_sub_session_line(event: &SubSessionEvent) -> Option<String> {
+    let (status, detail) = match &event.payload {
+        SubSessionEventPayload::Start => ("running", "started".to_string()),
+        SubSessionEventPayload::Delta { .. } => return None,
+        SubSessionEventPayload::ThinkingStart => ("running", "thinking".to_string()),
+        SubSessionEventPayload::ThinkingEnd { .. } => ("running", "thinking complete".to_string()),
+        SubSessionEventPayload::TurnStart { turn } => ("running", format!("turn {turn}")),
+        SubSessionEventPayload::ToolCallStart { name, .. } => {
+            ("running", format!("calling tool `{name}`"))
+        }
+        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => (
+            "running",
+            format!("tool arguments `{id}`: {}", single_line(delta)),
+        ),
+        SubSessionEventPayload::ToolDelta { name, delta, .. } => (
+            "running",
+            format!("tool `{name}` output: {}", single_line(delta)),
+        ),
+        SubSessionEventPayload::ToolResult { name, result, .. } => (
+            "running",
+            format!("tool `{name}` result: {}", single_line(result)),
+        ),
+        SubSessionEventPayload::Done { .. } => ("done", "done".to_string()),
+        SubSessionEventPayload::Error { message } => ("error", single_line(message)),
+    };
+    Some(truncate_tool_line(&format!(
+        "**Sub-session** `{}` / `{}` · {status} · {detail}",
+        event.agent_name, event.sub_thread_id.0
+    )))
 }
 
 fn format_feishu_tool_line(pretty: &bot_core::PrettyToolCall) -> String {
@@ -6288,9 +6802,13 @@ async fn forward_sub_session_event_to_bound_channel(
     else {
         return;
     };
+    let done = matches!(
+        event.payload,
+        SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
+    );
     if let Err(err) = runtime
         .im_bridge
-        .sub_session_send_text(&binding.platform, &binding.channel_id, &text)
+        .sub_session_send_text(&binding.platform, &binding.channel_id, &text, done)
         .await
     {
         warn!("failed to send sub-session event to IM channel: {err:#}");
@@ -6443,7 +6961,7 @@ mod cli_tests {
         prefix_short_config_entry, redact_known_secrets, run_streaming_command,
         run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
         try_parse_cli_args, update_available, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest,
+        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand,
         ProfileCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
@@ -6518,6 +7036,23 @@ mod cli_tests {
     }
 
     #[test]
+    fn tui_resume_subcommand_accepts_user_options_after_session_id() {
+        let command = parse_command(&args(&[
+            "tui", "resume", "abc123", "--user", "u1", "--name", "Alice",
+        ]))
+        .unwrap();
+        let AppCommand::Run(config) = command else {
+            panic!("expected run command");
+        };
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.resume);
+        assert_eq!(config.resume_session_id.as_deref(), Some("abc123"));
+        assert_eq!(config.user_id, "u1");
+        assert_eq!(config.username, "Alice");
+    }
+
+    #[test]
     fn tui_resume_accepts_missing_selector_for_menu() {
         let config = CliConfig::from_args(&args(&["tui", "resume"])).unwrap();
         assert!(config.enabled);
@@ -6569,6 +7104,30 @@ mod cli_tests {
         assert!(matches!(
             parse_command(&args(&["setup"])).unwrap(),
             AppCommand::Setup(entries) if entries.is_empty()
+        ));
+    }
+
+    #[test]
+    fn hooks_management_commands_are_recognized() {
+        assert!(matches!(
+            parse_command(&args(&["hooks"])).unwrap(),
+            AppCommand::Hooks(HooksCommand::List { json: false })
+        ));
+        assert!(matches!(
+            parse_command(&args(&["hooks", "list", "--json"])).unwrap(),
+            AppCommand::Hooks(HooksCommand::List { json: true })
+        ));
+        assert!(matches!(
+            parse_command(&args(&["hooks", "trust", "abc123"])).unwrap(),
+            AppCommand::Hooks(HooksCommand::Trust { hash }) if hash == "abc123"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["hooks", "enable", "abc123"])).unwrap(),
+            AppCommand::Hooks(HooksCommand::Enable { hash }) if hash == "abc123"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["hooks", "disable", "abc123"])).unwrap(),
+            AppCommand::Hooks(HooksCommand::Disable { hash }) if hash == "abc123"
         ));
     }
 

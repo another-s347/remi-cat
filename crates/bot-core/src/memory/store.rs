@@ -28,6 +28,7 @@ use chrono::{DateTime, Utc};
 use remi_agentloop::prelude::{AgentError, Message, Role};
 use uuid::Uuid;
 
+use crate::token_usage::estimate_memory_message_tokens;
 use crate::tool_pretty::{tool_success, PrettyToolCall};
 use crate::{ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus};
 
@@ -132,14 +133,6 @@ fn emit_compaction_event(
 }
 
 const MEMORY_RECALL_SNIPPET_CHARS: usize = 2_000;
-
-// ── Token estimation ──────────────────────────────────────────────────────────
-
-fn token_estimate(msgs: &[Message]) -> usize {
-    msgs.iter()
-        .map(|m| m.content.text_content().len() / 4 + 10)
-        .sum()
-}
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -633,7 +626,9 @@ impl MemoryStore {
         all_msgs.append(&mut new_msgs);
 
         if self.auto_compress {
-            while token_estimate(&all_msgs) > self.short_term_tokens && all_msgs.len() > 1 {
+            while estimate_memory_message_tokens(&all_msgs) > self.short_term_tokens
+                && all_msgs.len() > 1
+            {
                 let attempt = self.plan_mid_term_compression(&all_msgs);
                 let event_id = Uuid::new_v4().to_string();
                 emit_compaction_event(
@@ -896,6 +891,20 @@ impl MemoryStore {
             updated_at: now,
             bytes: body.len(),
         })
+    }
+
+    pub async fn get_named_memory(
+        &self,
+        agent_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, AgentError> {
+        let file_name = normalize_named_memory_name(name)?;
+        let path = self.named_memory_dir(agent_id).join(file_name);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(AgentError::Io(err.to_string())),
+        }
     }
 
     pub async fn recall(

@@ -151,6 +151,7 @@ pub trait ImFileBridge: Send + Sync {
         _platform: &'a str,
         _channel_id: &'a str,
         _text: &'a str,
+        _done: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move { Ok(()) })
     }
@@ -187,7 +188,9 @@ struct FetchCompletion {
 
 #[derive(Debug, Clone)]
 struct CompletedFetchResult {
-    workspace_path: String,
+    workspace_path: Option<String>,
+    absolute_path: String,
+    display_path: String,
     file_name: String,
     mime_type: String,
     size_bytes: u64,
@@ -407,10 +410,16 @@ pub fn decode_agent_file_key(value: &str) -> Option<DecodedAgentFileKey> {
 pub fn register_fetch_tool(
     registry: &mut DefaultToolRegistry,
     root: PathBuf,
+    workspace_root_label: String,
+    allow_host_absolute: bool,
     bridge: Option<Arc<dyn ImFileBridge>>,
 ) {
     registry.register(FetchTool {
         root,
+        path_rules: WorkspacePathRules {
+            workspace_root_label,
+            allow_host_absolute,
+        },
         bridge,
         tasks: FetchTaskRegistry::new(),
     });
@@ -419,13 +428,23 @@ pub fn register_fetch_tool(
 pub fn register_im_tools(
     registry: &mut DefaultToolRegistry,
     root: PathBuf,
+    workspace_root_label: String,
+    allow_host_absolute: bool,
     bridge: Arc<dyn ImFileBridge>,
 ) {
-    registry.register(ImUploadTool { root, bridge });
+    registry.register(ImUploadTool {
+        root,
+        path_rules: WorkspacePathRules {
+            workspace_root_label,
+            allow_host_absolute,
+        },
+        bridge,
+    });
 }
 
 struct FetchTool {
     root: PathBuf,
+    path_rules: WorkspacePathRules,
     bridge: Option<Arc<dyn ImFileBridge>>,
     tasks: FetchTaskRegistry,
 }
@@ -461,7 +480,7 @@ impl Tool for FetchTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional workspace-relative destination path. Defaults to fetch/downloads/<suggested_name>."
+                    "description": "Optional destination path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file. Defaults to fetch/downloads/<suggested_name>."
                 },
                 "overwrite": {
                     "type": "boolean",
@@ -484,6 +503,7 @@ impl Tool for FetchTool {
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
+        let path_rules = self.path_rules.clone();
         let bridge = self.bridge.clone();
         let metadata = ctx.metadata.clone();
         let tasks = self.tasks.clone();
@@ -556,6 +576,7 @@ impl Tool for FetchTool {
                     .await;
                 let progress = FetchProgressReporter::new(task_id.clone(), tasks.clone());
                 let task_root = root.clone();
+                let task_path_rules = path_rules.clone();
                 let task_bridge = bridge.clone();
                 let task_metadata = metadata.clone();
                 let task_source = source.clone();
@@ -564,6 +585,7 @@ impl Tool for FetchTool {
                 tokio::spawn(async move {
                     run_fetch_task(
                         task_root,
+                        task_path_rules,
                         task_bridge,
                         task_metadata,
                         task_source,
@@ -627,6 +649,7 @@ impl Tool for FetchTool {
 
 struct ImUploadTool {
     root: PathBuf,
+    path_rules: WorkspacePathRules,
     bridge: Arc<dyn ImFileBridge>,
 }
 
@@ -645,7 +668,7 @@ impl Tool for ImUploadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative path of the local file to upload."
+                    "description": "Local file path to upload. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file."
                 },
                 "file_name": {
                     "type": "string",
@@ -669,6 +692,7 @@ impl Tool for ImUploadTool {
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
+        let path_rules = self.path_rules.clone();
         let bridge = Arc::clone(&self.bridge);
         let metadata = ctx.metadata.clone();
         async move {
@@ -690,7 +714,13 @@ impl Tool for ImUploadTool {
                     yield ToolOutput::text("error: path is required");
                     return;
                 };
-                let source_path = rooted_path(&root, path_arg);
+                let source_path = match resolve_input_path(&root, &path_rules, path_arg) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        yield ToolOutput::text(format!("error: {err:#}"));
+                        return;
+                    }
+                };
                 let content = match tokio::fs::read(&source_path).await {
                     Ok(content) => content,
                     Err(err) => {
@@ -724,13 +754,18 @@ impl Tool for ImUploadTool {
                     }
                 };
 
-                let result = serde_json::json!({
-                    "workspace_path": relative_workspace_path(&root, &source_path),
+                let path_info = path_result_fields(&root, &path_rules, &source_path);
+                let mut result = serde_json::json!({
                     "file_name": uploaded.file_name,
                     "mime_type": mime_type,
                     "file_key": encode_agent_file_key(&uploaded.message_id, &uploaded.file_key),
                     "resource_url": uploaded.resource_url,
+                    "absolute_path": path_info.absolute_path,
+                    "display_path": path_info.display_path,
                 });
+                if let Some(workspace_path) = path_info.workspace_path {
+                    result["workspace_path"] = serde_json::Value::String(workspace_path);
+                }
                 yield ToolOutput::text(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
             }))
         }
@@ -811,11 +846,12 @@ fn has_fetch_start_arguments(arguments: &serde_json::Value) -> bool {
 
 async fn choose_fetch_target(
     root: &Path,
+    path_rules: &WorkspacePathRules,
     requested_path: Option<&str>,
     suggested_name: &str,
 ) -> anyhow::Result<PathBuf> {
     let desired = match requested_path {
-        Some(path) if !path.trim().is_empty() => rooted_path(root, path),
+        Some(path) if !path.trim().is_empty() => resolve_input_path(root, path_rules, path)?,
         _ => rooted_path(
             root,
             &format!("fetch/downloads/{}", sanitize_file_name(suggested_name)),
@@ -904,14 +940,18 @@ fn fetch_terminal_value(task_id: Option<&str>, task: FetchTaskState) -> serde_js
         FetchTaskStatus::Completed(result) => {
             let mut value = serde_json::json!({
                 "status": "completed",
-                "workspace_path": result.workspace_path,
                 "file_name": result.file_name,
                 "mime_type": result.mime_type,
                 "size_bytes": result.size_bytes,
                 "source": result.source,
                 "mode": result.mode,
                 "elapsed_seconds": task.started_at.elapsed().as_secs_f64(),
+                "absolute_path": result.absolute_path,
+                "display_path": result.display_path,
             });
+            if let Some(workspace_path) = result.workspace_path {
+                value["workspace_path"] = serde_json::Value::String(workspace_path);
+            }
             if let Some(task_id) = task_id {
                 value["task_id"] = serde_json::Value::String(task_id.to_string());
             }
@@ -937,6 +977,7 @@ fn fetch_terminal_value(task_id: Option<&str>, task: FetchTaskState) -> serde_js
 
 async fn run_fetch_task(
     root: PathBuf,
+    path_rules: WorkspacePathRules,
     bridge: Option<Arc<dyn ImFileBridge>>,
     metadata: Option<serde_json::Value>,
     source: FetchSource,
@@ -959,6 +1000,7 @@ async fn run_fetch_task(
         .await?;
         let target = choose_fetch_target(
             &root,
+            &path_rules,
             requested_path.as_deref(),
             &completion.fetched.file_name,
         )
@@ -979,9 +1021,12 @@ async fn run_fetch_task(
             .await
             .context("write fetched file")?;
 
+        let path_info = path_result_fields(&root, &path_rules, &target);
         Ok::<_, anyhow::Error>((
             CompletedFetchResult {
-                workspace_path: relative_workspace_path(&root, &target),
+                workspace_path: path_info.workspace_path,
+                absolute_path: path_info.absolute_path,
+                display_path: path_info.display_path,
                 file_name: completion.fetched.file_name,
                 mime_type: completion.fetched.mime_type,
                 size_bytes: completion.fetched.content.len() as u64,
@@ -1376,15 +1421,105 @@ fn is_html_content_type(content_type: &str) -> bool {
     matches!(content_type, "text/html" | "application/xhtml+xml")
 }
 
-fn rooted_path(root: &Path, path: &str) -> PathBuf {
-    root.join(path.trim_start_matches('/'))
+#[derive(Debug, Clone)]
+struct WorkspacePathRules {
+    workspace_root_label: String,
+    allow_host_absolute: bool,
 }
 
-fn relative_workspace_path(root: &Path, full: &Path) -> String {
-    full.strip_prefix(root)
-        .unwrap_or(full)
-        .to_string_lossy()
-        .replace('\\', "/")
+#[derive(Debug, Clone)]
+struct PathResultFields {
+    workspace_path: Option<String>,
+    absolute_path: String,
+    display_path: String,
+}
+
+fn rooted_path(root: &Path, path: &str) -> PathBuf {
+    root.join(path)
+}
+
+fn resolve_input_path(
+    root: &Path,
+    rules: &WorkspacePathRules,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
+    let input = Path::new(path);
+    if input.is_absolute() {
+        if rules.allow_host_absolute {
+            return Ok(input.to_path_buf());
+        }
+        let label = Path::new(&rules.workspace_root_label);
+        let stripped = input.strip_prefix(label).with_context(|| {
+            format!(
+                "absolute workspace path must start with {}",
+                rules.workspace_root_label
+            )
+        })?;
+        let relative = clean_workspace_relative_path(stripped)?;
+        return Ok(root.join(relative));
+    }
+    if rules.allow_host_absolute {
+        return Ok(root.join(input));
+    }
+    Ok(root.join(clean_workspace_relative_path(input)?))
+}
+
+fn clean_workspace_relative_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => cleaned.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => anyhow::bail!("path may not contain '..'"),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("path must be relative to the workspace root")
+            }
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(cleaned)
+    }
+}
+
+fn path_result_fields(root: &Path, rules: &WorkspacePathRules, full: &Path) -> PathResultFields {
+    let workspace_path = relative_workspace_path(root, full);
+    let display_path = workspace_path
+        .as_deref()
+        .map(|path| display_workspace_path(&rules.workspace_root_label, path))
+        .unwrap_or_else(|| full.display().to_string());
+    PathResultFields {
+        workspace_path,
+        absolute_path: full.display().to_string(),
+        display_path,
+    }
+}
+
+fn display_workspace_path(workspace_root_label: &str, relative: &str) -> String {
+    let label = workspace_root_label.trim_end_matches('/');
+    if relative == "." {
+        label.to_string()
+    } else if label.is_empty() {
+        relative.to_string()
+    } else {
+        format!("{label}/{relative}")
+    }
+}
+
+fn relative_workspace_path(root: &Path, full: &Path) -> Option<String> {
+    let relative = full.strip_prefix(root).ok()?;
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    if relative.as_os_str().is_empty() {
+        Some(".".to_string())
+    } else {
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    }
 }
 
 fn sanitize_file_name(name: &str) -> String {
@@ -1443,12 +1578,61 @@ fn extension_for_content_type(content_type: &str) -> &'static str {
 mod tests {
     use super::{
         classify_url_source, decode_agent_file_key, encode_agent_file_key, fetch_generic_url,
-        file_key_matches, markdown_file_name, select_fetch_source, FetchSource, FetchTaskRegistry,
-        FetchTool, ImAttachment, ImDocument,
+        file_key_matches, markdown_file_name, path_result_fields, resolve_input_path,
+        select_fetch_source, FetchSource, FetchTaskRegistry, FetchTool, ImAttachment, ImDocument,
+        WorkspacePathRules,
     };
     use futures::StreamExt;
+    use std::path::Path;
     use std::sync::{Arc, RwLock};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_path_rules(root: &Path) -> WorkspacePathRules {
+        WorkspacePathRules {
+            workspace_root_label: root.display().to_string(),
+            allow_host_absolute: true,
+        }
+    }
+
+    #[test]
+    fn no_sandbox_path_rules_accept_host_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("remi-fetch-test-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("remi-fetch-out-{}", uuid::Uuid::new_v4()));
+        let rules = test_path_rules(&root);
+
+        let resolved = resolve_input_path(&root, &rules, outside.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, outside);
+        let fields = path_result_fields(&root, &rules, &resolved);
+        assert!(fields.workspace_path.is_none());
+        assert_eq!(fields.absolute_path, resolved.display().to_string());
+    }
+
+    #[test]
+    fn docker_path_rules_accept_workspace_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("remi-fetch-test-{}", uuid::Uuid::new_v4()));
+        let rules = WorkspacePathRules {
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute: false,
+        };
+
+        let resolved = resolve_input_path(&root, &rules, "/workspace/dir/note.txt").unwrap();
+        assert_eq!(resolved, root.join("dir/note.txt"));
+        let fields = path_result_fields(&root, &rules, &resolved);
+        assert_eq!(fields.workspace_path.as_deref(), Some("dir/note.txt"));
+        assert_eq!(fields.display_path, "/workspace/dir/note.txt");
+    }
+
+    #[test]
+    fn docker_path_rules_reject_host_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("remi-fetch-test-{}", uuid::Uuid::new_v4()));
+        let rules = WorkspacePathRules {
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute: false,
+        };
+
+        let err = resolve_input_path(&root, &rules, "/Users/me/file.txt").unwrap_err();
+        assert!(err.to_string().contains("absolute workspace path"));
+    }
 
     #[test]
     fn encodes_agent_file_key_with_backslash_separator() {
@@ -1517,6 +1701,7 @@ mod tests {
     fn fetch_schema_does_not_expose_legacy_download_aliases() {
         let tool = FetchTool {
             root: std::path::PathBuf::new(),
+            path_rules: test_path_rules(std::path::Path::new(".")),
             bridge: None,
             tasks: FetchTaskRegistry::new(),
         };
@@ -1620,6 +1805,7 @@ mod tests {
             .expect("test root should be created");
         let tool = FetchTool {
             root: root.clone(),
+            path_rules: test_path_rules(&root),
             bridge: None,
             tasks: FetchTaskRegistry::new(),
         };
@@ -1655,6 +1841,7 @@ mod tests {
             .expect("existing fixture should be written");
         let tool = FetchTool {
             root: root.clone(),
+            path_rules: test_path_rules(&root),
             bridge: None,
             tasks: FetchTaskRegistry::new(),
         };
@@ -1703,6 +1890,7 @@ mod tests {
             .expect("test root should be created");
         let tool = FetchTool {
             root: root.clone(),
+            path_rules: test_path_rules(&root),
             bridge: None,
             tasks: FetchTaskRegistry::new(),
         };

@@ -9,17 +9,20 @@ use futures::Stream;
 use remi_agentloop::prelude::{AgentError, Content, Tool, ToolContext, ToolOutput, ToolResult};
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::store::MemoryStore;
 
 pub struct MemoryGetDetailTool {
     pub store: Arc<MemoryStore>,
+    pub agent_id: String,
 }
 
 pub struct MemoryUpsertNamedTool {
     pub store: Arc<MemoryStore>,
     pub agent_id: String,
+    pub workspace_root: PathBuf,
 }
 
 pub struct MemoryRecallTool {
@@ -45,9 +48,21 @@ impl Tool for MemoryGetDetailTool {
                 "uuid": {
                     "type": "string",
                     "description": "The UUID of the memory block to retrieve"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional named memory file name to retrieve instead of a UUID"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional agent id for named memory or named session memory. Defaults to the current agent."
+                },
+                "named": {
+                    "type": "string",
+                    "description": "Optional named persistent sub-agent session whose thread memory should be searched for uuid."
                 }
             },
-            "required": ["uuid"]
+            "required": []
         })
     }
 
@@ -58,24 +73,31 @@ impl Tool for MemoryGetDetailTool {
         ctx: &ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let uuid = args["uuid"].as_str().unwrap_or("").to_string();
-        let thread_id = ctx
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("thread_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let thread_id = memory_thread_id_from_args_or_context(
+            &args,
+            ctx,
+            &self.agent_id,
+            "memory__get_detail",
+        )?;
+        let agent_id = memory_agent_from_args(&args, &self.agent_id, "memory__get_detail")?;
         let store = Arc::clone(&self.store);
 
         Ok(ToolResult::Output(stream! {
-            if uuid.is_empty() {
-                yield ToolOutput::Result(Content::text("Error: uuid parameter is required"));
+            if uuid.trim().is_empty() && name.trim().is_empty() {
+                yield ToolOutput::Result(Content::text("Error: uuid or name parameter is required"));
                 return;
             }
-            if thread_id.is_empty() {
-                yield ToolOutput::Result(Content::text(
-                    "Error: thread_id not found in context metadata",
-                ));
+            if !name.trim().is_empty() {
+                match store.get_named_memory(&agent_id, &name).await {
+                    Ok(Some(text)) => yield ToolOutput::Result(Content::text(text)),
+                    Ok(None) => yield ToolOutput::Result(Content::text(format!(
+                        "No named memory found for name: {name}"
+                    ))),
+                    Err(e) => yield ToolOutput::Result(Content::text(format!(
+                        "Error reading named memory: {e}"
+                    ))),
+                }
                 return;
             }
             match store.get_detail(&thread_id, &uuid).await {
@@ -137,6 +159,7 @@ impl Tool for MemoryUpsertNamedTool {
             .to_string();
         let store = Arc::clone(&self.store);
         let agent_id = self.agent_id.clone();
+        let workspace_root = self.workspace_root.clone();
 
         Ok(ToolResult::Output(stream! {
             if name.trim().is_empty() {
@@ -149,13 +172,27 @@ impl Tool for MemoryUpsertNamedTool {
             }
             match store.upsert_named_memory(&agent_id, &name, &content).await {
                 Ok(saved) => {
-                    yield ToolOutput::Result(Content::text(serde_json::to_string_pretty(&json!({
+                    let fs_read_path = workspace_relative_path(&workspace_root, &saved.path);
+                    let path = fs_read_path
+                        .clone()
+                        .unwrap_or_else(|| saved.path.display().to_string());
+                    let mut payload = json!({
                         "name": saved.name,
-                        "path": saved.path.display().to_string(),
+                        "path": path,
+                        "absolute_path": saved.path.display().to_string(),
                         "created_at": saved.created_at.to_rfc3339(),
                         "updated_at": saved.updated_at.to_rfc3339(),
                         "bytes": saved.bytes,
-                    })).unwrap_or_else(|_| "saved named memory".to_string())));
+                    });
+                    if let Some(fs_read_path) = fs_read_path {
+                        payload["fs_read_path"] = json!(fs_read_path);
+                    } else {
+                        payload["fs_read_note"] = json!(
+                            "memory file is outside the workspace root and cannot be read with fs_read"
+                        );
+                    }
+                    yield ToolOutput::Result(Content::text(serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "saved named memory".to_string())));
                 }
                 Err(err) => {
                     yield ToolOutput::Result(Content::text(format!("Error saving named memory: {err}")));
@@ -187,6 +224,14 @@ impl Tool for MemoryRecallTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum results to return; defaults to 8 and caps at 20"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional agent id for named session memory. Defaults to the current agent."
+                },
+                "named": {
+                    "type": "string",
+                    "description": "Optional named persistent sub-agent session whose thread memory should be searched."
                 }
             },
             "required": ["query"]
@@ -208,15 +253,10 @@ impl Tool for MemoryRecallTool {
             .get("limit")
             .and_then(|value| value.as_u64())
             .unwrap_or(8) as usize;
-        let thread_id = ctx
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("thread_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let thread_id =
+            memory_thread_id_from_args_or_context(&args, ctx, &self.agent_id, "memory__recall")?;
+        let recall_agent_id = memory_agent_from_args(&args, &self.agent_id, "memory__recall")?;
         let store = Arc::clone(&self.store);
-        let agent_id = self.agent_id.clone();
 
         Ok(ToolResult::Output(stream! {
             if query.trim().is_empty() {
@@ -229,7 +269,7 @@ impl Tool for MemoryRecallTool {
                 ));
                 return;
             }
-            match store.recall(&agent_id, &thread_id, &query, limit).await {
+            match store.recall(&recall_agent_id, &thread_id, &query, limit).await {
                 Ok(results) => {
                     let rows: Vec<_> = results
                         .into_iter()
@@ -254,11 +294,97 @@ impl Tool for MemoryRecallTool {
     }
 }
 
+pub(crate) fn memory_agent_from_args(
+    args: &serde_json::Value,
+    default_agent_id: &str,
+    tool_name: &str,
+) -> Result<String, AgentError> {
+    let agent = args
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_agent_id);
+    validate_memory_identifier(tool_name, "agent", agent)?;
+    Ok(agent.to_string())
+}
+
+pub(crate) fn memory_thread_id_from_args_or_context(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    default_agent_id: &str,
+    tool_name: &str,
+) -> Result<String, AgentError> {
+    if let Some(named) = args
+        .get("named")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_memory_identifier(tool_name, "named", named)?;
+        let agent = memory_agent_from_args(args, default_agent_id, tool_name)?;
+        return Ok(named_memory_thread_id(&agent, named));
+    }
+
+    ctx.metadata
+        .as_ref()
+        .and_then(|m| m.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| ctx.thread_id.as_ref().map(ToString::to_string))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AgentError::tool(tool_name, "thread_id not found in context metadata"))
+}
+
+pub(crate) fn named_memory_thread_id(agent_id: &str, named: &str) -> String {
+    format!("subagent:{agent_id}:{named}")
+}
+
+fn validate_memory_identifier(tool_name: &str, field: &str, value: &str) -> Result<(), AgentError> {
+    if value.len() > 64 {
+        return Err(AgentError::tool(
+            tool_name,
+            format!("{field} must be at most 64 characters"),
+        ));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(AgentError::tool(
+            tool_name,
+            format!("{field} may only contain ASCII letters, numbers, '-' and '_'"),
+        ));
+    }
+    Ok(())
+}
+
+fn workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<String> {
+    let workspace_root = absolute_lexical_path(workspace_root);
+    let path = absolute_lexical_path(path);
+    let relative = path.strip_prefix(workspace_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        Some(".".to_string())
+    } else {
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+fn absolute_lexical_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{AgentConfig, Tool};
+    use remi_agentloop::prelude::{AgentConfig, Message, Tool};
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
 
@@ -293,6 +419,17 @@ mod tests {
         }
     }
 
+    fn tool_context_without_thread() -> ToolContext {
+        ToolContext {
+            config: AgentConfig::default(),
+            thread_id: None,
+            run_id: serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            metadata: None,
+            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
+        }
+    }
+
     async fn collect_text(result: ToolResult<impl Stream<Item = ToolOutput>>) -> String {
         match result {
             ToolResult::Interrupt(_) => "interrupted".to_string(),
@@ -315,6 +452,7 @@ mod tests {
         let tool = MemoryUpsertNamedTool {
             store: test_store(tmp.path().to_path_buf()),
             agent_id: "default".to_string(),
+            workspace_root: tmp.path().to_path_buf(),
         };
 
         let text = collect_text(
@@ -365,18 +503,18 @@ mod tests {
         .await;
         assert!(text.contains("query parameter is required"));
 
-        let text = collect_text(
-            <MemoryRecallTool as Tool>::execute(
-                &tool,
-                json!({ "query": "alpha" }),
-                None,
-                &tool_context(None),
-            )
-            .await
-            .unwrap(),
+        let err = match <MemoryRecallTool as Tool>::execute(
+            &tool,
+            json!({ "query": "alpha" }),
+            None,
+            &tool_context_without_thread(),
         )
-        .await;
-        assert!(text.contains("thread_id not found"));
+        .await
+        {
+            Ok(_) => panic!("missing thread id should fail before streaming"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("thread_id not found"));
     }
 
     #[tokio::test]
@@ -386,6 +524,7 @@ mod tests {
         let upsert = MemoryUpsertNamedTool {
             store: Arc::clone(&store),
             agent_id: "planner".to_string(),
+            workspace_root: tmp.path().to_path_buf(),
         };
         let planner_recall = MemoryRecallTool {
             store: Arc::clone(&store),
@@ -434,5 +573,125 @@ mod tests {
         )
         .await;
         assert_eq!(coder.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn recall_tool_can_target_named_subagent_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        store
+            .save_turn(
+                "subagent:coder:feature_a",
+                vec![Message::user("named session contains alpha")],
+            )
+            .await
+            .unwrap();
+        store
+            .save_turn(
+                "thread-1",
+                vec![Message::user("ordinary thread contains beta")],
+            )
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool {
+            store,
+            agent_id: "default".to_string(),
+        };
+
+        let text = collect_text(
+            <MemoryRecallTool as Tool>::execute(
+                &tool,
+                json!({ "query": "alpha", "agent": "coder", "named": "feature_a" }),
+                None,
+                &tool_context(Some("thread-1")),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(text.contains("alpha"));
+        assert!(!text.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn get_detail_tool_reads_named_memory_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        store
+            .upsert_named_memory("coder", "project", "alpha named memory")
+            .await
+            .unwrap();
+        let tool = MemoryGetDetailTool {
+            store,
+            agent_id: "default".to_string(),
+        };
+
+        let text = collect_text(
+            <MemoryGetDetailTool as Tool>::execute(
+                &tool,
+                json!({ "name": "project", "agent": "coder" }),
+                None,
+                &tool_context(Some("thread-1")),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(text.contains("alpha named memory"));
+    }
+
+    #[tokio::test]
+    async fn upsert_named_tool_returns_fs_read_path_relative_to_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join(".remi-cat");
+        let tool = MemoryUpsertNamedTool {
+            store: test_store(data_dir),
+            agent_id: "default".to_string(),
+            workspace_root: tmp.path().to_path_buf(),
+        };
+
+        let text = collect_text(
+            <MemoryUpsertNamedTool as Tool>::execute(
+                &tool,
+                json!({ "name": "project", "content": "alpha" }),
+                None,
+                &tool_context(Some("thread-1")),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            payload["fs_read_path"],
+            ".remi-cat/memory/named/default/project.md"
+        );
+        assert_eq!(payload["path"], ".remi-cat/memory/named/default/project.md");
+    }
+
+    #[tokio::test]
+    async fn upsert_named_tool_avoids_double_data_dir_when_workspace_is_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = MemoryUpsertNamedTool {
+            store: test_store(tmp.path().to_path_buf()),
+            agent_id: "default".to_string(),
+            workspace_root: tmp.path().to_path_buf(),
+        };
+
+        let text = collect_text(
+            <MemoryUpsertNamedTool as Tool>::execute(
+                &tool,
+                json!({ "name": "project", "content": "alpha" }),
+                None,
+                &tool_context(Some("thread-1")),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["fs_read_path"], "memory/named/default/project.md");
+        assert_eq!(payload["path"], "memory/named/default/project.md");
     }
 }

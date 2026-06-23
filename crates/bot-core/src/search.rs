@@ -6,6 +6,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::memory::tool::{memory_agent_from_args, memory_thread_id_from_args_or_context};
 use crate::memory::MemoryStore;
 use crate::skill::SkillStore;
 
@@ -100,6 +101,14 @@ impl<S: SkillStore + 'static> Tool for SearchTool<S> {
                 "limit": {
                     "type": "integer",
                     "description": "Max results per scope. Default 8, maximum 20."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional agent id for named session memory. Defaults to the current agent."
+                },
+                "named": {
+                    "type": "string",
+                    "description": "Optional named persistent sub-agent session whose thread memory should be searched."
                 }
             },
             "required": ["query"]
@@ -132,18 +141,13 @@ impl<S: SkillStore + 'static> Tool for SearchTool<S> {
         let mut errors = Vec::new();
 
         if scope.includes_memory() {
-            let thread_id = ctx
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("thread_id"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .or_else(|| ctx.thread_id.as_ref().map(ToString::to_string))
-                .ok_or_else(|| AgentError::tool("search", "missing metadata.thread_id"))?;
+            let thread_id =
+                memory_thread_id_from_args_or_context(&arguments, ctx, &self.agent_id, "search")?;
+            let memory_agent_id = memory_agent_from_args(&arguments, &self.agent_id, "search")?;
 
             for item in self
                 .memory_store
-                .recall(&self.agent_id, &thread_id, &query, limit)
+                .recall(&memory_agent_id, &thread_id, &query, limit)
                 .await?
             {
                 results.push(json!({
@@ -293,7 +297,9 @@ mod tests {
     use crate::memory::{LlmCompressor, MemoryStore};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};
     use futures::StreamExt;
-    use remi_agentloop::prelude::{AgentConfig, Tool, ToolContext, ToolOutput, ToolResult};
+    use remi_agentloop::prelude::{
+        AgentConfig, Message, Tool, ToolContext, ToolOutput, ToolResult,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
@@ -426,6 +432,56 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item["scope"] == "memory"));
+    }
+
+    #[tokio::test]
+    async fn memory_scope_can_target_named_subagent_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = memory_store(tmp.path().to_path_buf());
+        memory
+            .save_turn(
+                "subagent:coder:feature_a",
+                vec![Message::user("alpha exists in named session")],
+            )
+            .await
+            .unwrap();
+        memory
+            .save_turn(
+                "thread-1",
+                vec![Message::user("beta exists in current thread")],
+            )
+            .await
+            .unwrap();
+        let tool = SearchTool {
+            skill_store: skill_store(),
+            memory_store: memory,
+            agent_id: "default".to_string(),
+        };
+
+        let text = collect_text(
+            <SearchTool<_> as Tool>::execute(
+                &tool,
+                json!({
+                    "query": "alpha",
+                    "scope": "memory",
+                    "agent": "coder",
+                    "named": "feature_a"
+                }),
+                None,
+                &tool_context(Some("thread-1")),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let results = value["results"].as_array().unwrap();
+        assert!(results.iter().any(|item| item["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("alpha"))));
+        assert!(!results.iter().any(|item| item["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("beta"))));
     }
 
     #[tokio::test]

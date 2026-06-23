@@ -662,6 +662,14 @@ impl AcpBackend {
         Ok(response.reply)
     }
 
+    pub async fn abort_tool_task(&self, task_id: &str) -> bool {
+        let Some(task) = self.tool_tasks.lock().await.remove(task_id) else {
+            return false;
+        };
+        task.handle.abort();
+        true
+    }
+
     pub async fn session_id_for_sub_session(&self, sub_session_id: &str) -> Option<String> {
         let store = self.store.lock().await;
         store

@@ -158,11 +158,19 @@ impl Tool for AcpChatTool {
                         .await;
                     let decision_tx = spawned.decisions.clone();
                     let mut saw_output = false;
+                    let mut accumulated_output = String::new();
                     while let Some(event) = spawned.events.recv().await {
-                        if matches!(event, AcpToolTaskEvent::Delta(_)) {
-                            saw_output = true;
-                        }
                         match event {
+                            AcpToolTaskEvent::Delta(content) => {
+                                saw_output = true;
+                                accumulated_output.push_str(&content);
+                                yield acp_task_event_output(
+                                    AcpToolTaskEvent::Delta(content),
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    title.clone(),
+                                );
+                            }
                             AcpToolTaskEvent::ApprovalRequested(request) => {
                                 for output in handle_acp_approval_request(
                                     request,
@@ -192,6 +200,19 @@ impl Tool for AcpChatTool {
                                     &request,
                                     decision,
                                 );
+                                if decision == ToolApprovalDecision::Deny {
+                                    backend.abort_tool_task(&spawned.task_id).await;
+                                    yield ToolOutput::SubSession(SubSessionEvent::new(
+                                        "",
+                                        sub_thread_id.clone(),
+                                        sub_run_id.clone(),
+                                        "acp",
+                                        title.clone(),
+                                        1,
+                                        SubSessionEventPayload::Done { final_output: None },
+                                    ));
+                                    return;
+                                }
                             }
                             event => {
                                 yield acp_task_event_output(
@@ -212,6 +233,11 @@ impl Tool for AcpChatTool {
                         &sub_run_id,
                         title.clone(),
                         !saw_output,
+                        if accumulated_output.trim().is_empty() {
+                            None
+                        } else {
+                            Some(accumulated_output.clone())
+                        },
                     ) {
                         yield output;
                     }
@@ -228,7 +254,7 @@ fn status_stream(status: AcpToolTaskStatus, preview: String) -> BoxStream<'stati
         let sub_thread_id = ThreadId(status.sub_session_id.clone());
         let sub_run_id = RunId(Uuid::new_v4().to_string());
         let title = Some("Codex ACP".to_string());
-        for output in status_sub_session_outputs(status.clone(), &sub_thread_id, &sub_run_id, title, true) {
+        for output in status_sub_session_outputs(status.clone(), &sub_thread_id, &sub_run_id, title, true, None) {
             yield output;
         }
         yield ToolOutput::text(preview);
@@ -252,6 +278,7 @@ fn status_sub_session_outputs(
     sub_run_id: &RunId,
     title: Option<String>,
     include_response_delta: bool,
+    final_output_override: Option<String>,
 ) -> Vec<ToolOutput> {
     let mut outputs = Vec::new();
     if let Some(response) = status.response.clone() {
@@ -276,7 +303,7 @@ fn status_sub_session_outputs(
             title,
             1,
             SubSessionEventPayload::Done {
-                final_output: Some(response.final_summary.clone()),
+                final_output: Some(final_output_override.unwrap_or(response.final_summary.clone())),
             },
         )));
     } else if let Some(error) = status.error.clone() {
@@ -530,10 +557,13 @@ fn current_bound_channel(
 
 #[cfg(test)]
 mod tests {
-    use super::{current_bound_channel, AcpChatTool};
-    use crate::acp::backend::AcpBackend;
+    use super::{current_bound_channel, status_sub_session_outputs, AcpChatTool};
+    use crate::acp::backend::{AcpBackend, AcpToolResponse, AcpToolTaskStatus};
     use crate::approval::ToolApprovalManager;
-    use remi_agentloop::prelude::{AgentConfig, Tool, ToolContext};
+    use remi_agentloop::prelude::{
+        AgentConfig, SubSessionEventPayload, ThreadId, Tool, ToolContext, ToolOutput,
+    };
+    use remi_agentloop::types::RunId;
     use std::sync::{Arc, RwLock};
 
     fn tool_context(metadata: Option<serde_json::Value>) -> ToolContext {
@@ -580,5 +610,40 @@ mod tests {
         assert_eq!(tool.name(), "codex");
         assert!(tool.description().contains("session_id"));
         assert!(schema["properties"].get("session_id").is_some());
+    }
+
+    #[test]
+    fn status_outputs_use_accumulated_stream_as_final_output() {
+        let outputs = status_sub_session_outputs(
+            AcpToolTaskStatus {
+                status: "completed".to_string(),
+                task_id: "task-1".to_string(),
+                session_id: "session-1".to_string(),
+                sub_session_id: "sub-1".to_string(),
+                poll_hint: None,
+                response: Some(AcpToolResponse {
+                    session_id: "session-1".to_string(),
+                    reply: "fallback reply".to_string(),
+                    final_summary: "fallback summary".to_string(),
+                }),
+                error: None,
+            },
+            &ThreadId("sub-1".to_string()),
+            &RunId("run-1".to_string()),
+            Some("Codex ACP".to_string()),
+            false,
+            Some("part one, part two".to_string()),
+        );
+
+        let final_output = outputs.into_iter().find_map(|output| {
+            let ToolOutput::SubSession(event) = output else {
+                return None;
+            };
+            match event.payload {
+                SubSessionEventPayload::Done { final_output } => final_output,
+                _ => None,
+            }
+        });
+        assert_eq!(final_output.as_deref(), Some("part one, part two"));
     }
 }

@@ -25,13 +25,18 @@ use tokio::sync::mpsc;
 
 use crate::approval::{
     classify_tool_risk, summarize_tool_args, ApprovalEvent, ApprovalResolution, ApprovalWait,
-    ToolApprovalManager, ToolApprovalRequest,
+    ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
 };
 use crate::events::CatEvent;
+use crate::hooks::{
+    remi_tool_input_from_hook_update, HookContext, HookEventName, HookManager,
+    HookPermissionDecision, ToolHookContext,
+};
 use crate::im_tools::{register_im_tools, ImFileBridge};
 use crate::skill;
 use crate::todo;
 use crate::trigger;
+use crate::user_question::UserQuestionManager;
 
 const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
     &["trigger__upsert", "trigger__list", "trigger__delete"];
@@ -103,6 +108,16 @@ fn log_tool_call_finished(
     }
 }
 
+fn is_denied_approval_event(event: &CatEvent) -> bool {
+    matches!(
+        event,
+        CatEvent::ToolApprovalResolved {
+            decision: ToolApprovalDecision::Deny,
+            ..
+        }
+    )
+}
+
 // ── CatAgent ─────────────────────────────────────────────────────────────────
 
 /// Drives an inner agent loop, handling skill and todo tools locally.
@@ -113,6 +128,12 @@ pub struct CatAgent<I> {
     pub local_tools: DefaultToolRegistry,
     /// Workspace root — oversized tool outputs are spilled here.
     pub data_dir: PathBuf,
+    /// Workspace root used by workspace file tools.
+    pub workspace_root: PathBuf,
+    /// User/container-facing workspace root label.
+    pub workspace_root_label: String,
+    /// Whether local file tools may accept host absolute paths.
+    pub allow_host_absolute_paths: bool,
     /// Tool-output byte threshold above which output is spilled to a temp file.
     /// Configured from the model profile; can be overridden per-builder.
     pub overflow_bytes: usize,
@@ -122,6 +143,10 @@ pub struct CatAgent<I> {
     pub tool_allowlist: Option<Vec<String>>,
     /// Shared in-memory approval manager for risky tool calls.
     pub approval_manager: Arc<ToolApprovalManager>,
+    /// Shared in-memory user-question manager for interactive clarification.
+    pub user_question_manager: Arc<UserQuestionManager>,
+    /// Codex-compatible hook runner.
+    pub hook_manager: Arc<HookManager>,
 }
 
 impl<I> CatAgent<I>
@@ -137,8 +162,12 @@ where
     /// Called by `CatBot::stream()` in lib.rs after injecting memory context.
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
+        let workspace_root = self.workspace_root.clone();
+        let workspace_root_label = self.workspace_root_label.clone();
+        let allow_host_absolute_paths = self.allow_host_absolute_paths;
         let overflow_bytes = self.overflow_bytes;
         let tool_allowlist = self.tool_allowlist.clone();
+        let hook_manager = Arc::clone(&self.hook_manager);
         let tool_def_ctx = build_tool_definition_ctx(&input);
         let supervisor_run =
             crate::metadata_flag_enabled(tool_def_ctx.metadata.as_ref(), "supervisor_run");
@@ -154,7 +183,9 @@ where
             .unwrap_or_default();
         let dynamic_tools = build_dynamic_tools(
             tool_def_ctx.metadata.clone(),
-            data_dir.clone(),
+            workspace_root.clone(),
+            workspace_root_label,
+            allow_host_absolute_paths,
             self.im_bridge.clone(),
         );
         let dynamic_tool_count = dynamic_tools.definitions_with_context(&tool_def_ctx).len();
@@ -263,20 +294,64 @@ where
 
                             if !local.is_empty() {
                                 let mut approved_local = Vec::new();
-                                for tc in &local {
+                                for original_tc in &local {
+                                    let mut tc = original_tc.clone();
                                     log_tool_call_started(
                                         "local",
                                         &state.thread_id.0,
                                         &state.run_id.0,
-                                        tc,
+                                        &tc,
                                     );
                                     yield CatEvent::ToolCall {
                                         id: tc.id.clone(),
                                         name: tc.name.clone(),
                                         args: tc.arguments.clone(),
                                     };
+                                    let hook_context = hook_context_from_state(
+                                        &state,
+                                        &workspace_root,
+                                    );
+                                    let pre_hook = hook_manager
+                                        .run_tool(
+                                            HookEventName::PreToolUse,
+                                            &hook_context,
+                                            &tool_hook_context(&tc, None),
+                                        )
+                                        .await;
+                                    if let Some(updated_input) = pre_hook.updated_input {
+                                        tc.arguments = remi_tool_input_from_hook_update(
+                                            &tc.name,
+                                            &tc.arguments,
+                                            updated_input,
+                                        );
+                                    }
+                                    if pre_hook.blocked || pre_hook.permission_decision == Some(HookPermissionDecision::Deny) {
+                                        let result = pre_hook
+                                            .reason
+                                            .unwrap_or_else(|| "error: tool execution blocked by hook".to_string());
+                                        yield CatEvent::ToolCallResult {
+                                            id: tc.id.clone(),
+                                            name: tc.name.clone(),
+                                            args: tc.arguments.clone(),
+                                            result: result.clone(),
+                                            success: false,
+                                            elapsed_ms: 0,
+                                        };
+                                        yield stats_event(
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                            max_prompt_tokens,
+                                            run_start,
+                                        );
+                                        all_outcomes.push(ToolCallOutcome::Error {
+                                            tool_call_id: tc.id.clone(),
+                                            tool_name: tc.name.clone(),
+                                            error: result,
+                                        });
+                                        continue;
+                                    }
                                     let mut approval_request = approval_request_for_tool(
-                                        tc,
+                                        &tc,
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
@@ -314,6 +389,40 @@ where
                                             resolution
                                         }
                                         ApprovalWait::Pending(rx) => {
+                                            let permission_hook = hook_manager
+                                                .run_tool(
+                                                    HookEventName::PermissionRequest,
+                                                    &hook_context,
+                                                    &tool_hook_context(&tc, None),
+                                                )
+                                                .await;
+                                            if permission_hook.permission_decision == Some(HookPermissionDecision::Allow) {
+                                                let (resolution, event) = self
+                                                    .approval_manager
+                                                    .finish_request(
+                                                        &approval_request,
+                                                        crate::approval::ToolApprovalDecision::AllowOnce,
+                                                    )
+                                                    .await;
+                                                if let ApprovalEvent::Resolved { request, decision } = event {
+                                                    yield CatEvent::ToolApprovalResolved { request, decision };
+                                                }
+                                                resolution
+                                            } else if permission_hook.permission_decision == Some(HookPermissionDecision::Deny)
+                                                || permission_hook.blocked
+                                            {
+                                                let (resolution, event) = self
+                                                    .approval_manager
+                                                    .finish_request(
+                                                        &approval_request,
+                                                        crate::approval::ToolApprovalDecision::Deny,
+                                                    )
+                                                    .await;
+                                                if let ApprovalEvent::Resolved { request, decision } = event {
+                                                    yield CatEvent::ToolApprovalResolved { request, decision };
+                                                }
+                                                resolution
+                                            } else {
                                             let should_wait = matches!(
                                                 approval_request.platform.as_deref(),
                                                 Some("web" | "tui" | "feishu")
@@ -352,31 +461,27 @@ where
                                                 yield CatEvent::ToolApprovalResolved { request, decision };
                                             }
                                             resolution
+                                            }
                                         }
                                     };
                                     if approval_resolution == ApprovalResolution::Approved {
                                         approved_local.push(tc.clone());
                                     } else {
-                                        let result = "error: user denied tool execution".to_string();
-                                        yield CatEvent::ToolCallResult {
-                                            id: tc.id.clone(),
-                                            name: tc.name.clone(),
-                                            args: tc.arguments.clone(),
-                                            result,
-                                            success: false,
-                                            elapsed_ms: 0,
-                                        };
+                                        tracing::info!(
+                                            thread_id = %state.thread_id.0,
+                                            run_id = %state.run_id.0,
+                                            tool_call_id = %tc.id,
+                                            tool_name = %tc.name,
+                                            "tool_approval.denied_abort"
+                                        );
                                         yield stats_event(
                                             total_prompt_tokens,
                                             total_completion_tokens,
                                             max_prompt_tokens,
                                             run_start,
                                         );
-                                        all_outcomes.push(ToolCallOutcome::Error {
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            error: "user denied tool execution".to_string(),
-                                        });
+                                        yield CatEvent::Done;
+                                        return;
                                     }
                                 }
 
@@ -423,7 +528,24 @@ where
                                 let collected_results = loop {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
+                                            let denied = is_denied_approval_event(&side_event);
                                             yield side_event;
+                                            if denied {
+                                                tracing::info!(
+                                                    thread_id = %state.thread_id.0,
+                                                    run_id = %state.run_id.0,
+                                                    tool_kind = "local",
+                                                    "tool_approval.denied_side_event_abort"
+                                                );
+                                                yield stats_event(
+                                                    total_prompt_tokens,
+                                                    total_completion_tokens,
+                                                    max_prompt_tokens,
+                                                    run_start,
+                                                );
+                                                yield CatEvent::Done;
+                                                return;
+                                            }
                                         }
                                         collected = &mut collect_fut => {
                                             break collected;
@@ -431,13 +553,33 @@ where
                                     }
                                 };
 
-                                for (call_id, collected) in collected_results {
+                                for (call_id, mut collected) in collected_results {
                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
                                     let elapsed_ms = started_at
                                         .get(&call_id)
                                         .map(|instant| instant.elapsed().as_millis() as u64)
                                         .unwrap_or(0);
-                                    let success = crate::tool_pretty::tool_success(&collected.preview);
+                                    let hook_context = hook_context_from_state(
+                                        &state,
+                                        &workspace_root,
+                                    );
+                                    let post_hook = hook_manager
+                                        .run_tool(
+                                            HookEventName::PostToolUse,
+                                            &hook_context,
+                                            &tool_hook_context(
+                                                tc,
+                                                Some(serde_json::Value::String(collected.preview.clone())),
+                                            ),
+                                        )
+                                        .await;
+                                    if post_hook.blocked {
+                                        let blocked = post_hook
+                                            .reason
+                                            .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
+                                        collected = CollectedToolResult::text(blocked);
+                                    }
+                                    let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
                                     log_tool_call_finished(
                                         "local",
                                         &state.thread_id.0,
@@ -482,20 +624,64 @@ where
 
                             if !dynamic.is_empty() {
                                 let mut approved_dynamic = Vec::new();
-                                for tc in &dynamic {
+                                for original_tc in &dynamic {
+                                    let mut tc = original_tc.clone();
                                     log_tool_call_started(
                                         "dynamic",
                                         &state.thread_id.0,
                                         &state.run_id.0,
-                                        tc,
+                                        &tc,
                                     );
                                     yield CatEvent::ToolCall {
                                         id: tc.id.clone(),
                                         name: tc.name.clone(),
                                         args: tc.arguments.clone(),
                                     };
+                                    let hook_context = hook_context_from_state(
+                                        &state,
+                                        &workspace_root,
+                                    );
+                                    let pre_hook = hook_manager
+                                        .run_tool(
+                                            HookEventName::PreToolUse,
+                                            &hook_context,
+                                            &tool_hook_context(&tc, None),
+                                        )
+                                        .await;
+                                    if let Some(updated_input) = pre_hook.updated_input {
+                                        tc.arguments = remi_tool_input_from_hook_update(
+                                            &tc.name,
+                                            &tc.arguments,
+                                            updated_input,
+                                        );
+                                    }
+                                    if pre_hook.blocked || pre_hook.permission_decision == Some(HookPermissionDecision::Deny) {
+                                        let result = pre_hook
+                                            .reason
+                                            .unwrap_or_else(|| "error: tool execution blocked by hook".to_string());
+                                        yield CatEvent::ToolCallResult {
+                                            id: tc.id.clone(),
+                                            name: tc.name.clone(),
+                                            args: tc.arguments.clone(),
+                                            result: result.clone(),
+                                            success: false,
+                                            elapsed_ms: 0,
+                                        };
+                                        yield stats_event(
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                            max_prompt_tokens,
+                                            run_start,
+                                        );
+                                        all_outcomes.push(ToolCallOutcome::Error {
+                                            tool_call_id: tc.id.clone(),
+                                            tool_name: tc.name.clone(),
+                                            error: result,
+                                        });
+                                        continue;
+                                    }
                                     let mut approval_request = approval_request_for_tool(
-                                        tc,
+                                        &tc,
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
@@ -533,6 +719,40 @@ where
                                             resolution
                                         }
                                         ApprovalWait::Pending(rx) => {
+                                            let permission_hook = hook_manager
+                                                .run_tool(
+                                                    HookEventName::PermissionRequest,
+                                                    &hook_context,
+                                                    &tool_hook_context(&tc, None),
+                                                )
+                                                .await;
+                                            if permission_hook.permission_decision == Some(HookPermissionDecision::Allow) {
+                                                let (resolution, event) = self
+                                                    .approval_manager
+                                                    .finish_request(
+                                                        &approval_request,
+                                                        crate::approval::ToolApprovalDecision::AllowOnce,
+                                                    )
+                                                    .await;
+                                                if let ApprovalEvent::Resolved { request, decision } = event {
+                                                    yield CatEvent::ToolApprovalResolved { request, decision };
+                                                }
+                                                resolution
+                                            } else if permission_hook.permission_decision == Some(HookPermissionDecision::Deny)
+                                                || permission_hook.blocked
+                                            {
+                                                let (resolution, event) = self
+                                                    .approval_manager
+                                                    .finish_request(
+                                                        &approval_request,
+                                                        crate::approval::ToolApprovalDecision::Deny,
+                                                    )
+                                                    .await;
+                                                if let ApprovalEvent::Resolved { request, decision } = event {
+                                                    yield CatEvent::ToolApprovalResolved { request, decision };
+                                                }
+                                                resolution
+                                            } else {
                                             let should_wait = matches!(
                                                 approval_request.platform.as_deref(),
                                                 Some("web" | "tui" | "feishu")
@@ -571,31 +791,27 @@ where
                                                 yield CatEvent::ToolApprovalResolved { request, decision };
                                             }
                                             resolution
+                                            }
                                         }
                                     };
                                     if approval_resolution == ApprovalResolution::Approved {
                                         approved_dynamic.push(tc.clone());
                                     } else {
-                                        let result = "error: user denied tool execution".to_string();
-                                        yield CatEvent::ToolCallResult {
-                                            id: tc.id.clone(),
-                                            name: tc.name.clone(),
-                                            args: tc.arguments.clone(),
-                                            result,
-                                            success: false,
-                                            elapsed_ms: 0,
-                                        };
+                                        tracing::info!(
+                                            thread_id = %state.thread_id.0,
+                                            run_id = %state.run_id.0,
+                                            tool_call_id = %tc.id,
+                                            tool_name = %tc.name,
+                                            "tool_approval.denied_abort"
+                                        );
                                         yield stats_event(
                                             total_prompt_tokens,
                                             total_completion_tokens,
                                             max_prompt_tokens,
                                             run_start,
                                         );
-                                        all_outcomes.push(ToolCallOutcome::Error {
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            error: "user denied tool execution".to_string(),
-                                        });
+                                        yield CatEvent::Done;
+                                        return;
                                     }
                                 }
 
@@ -641,7 +857,24 @@ where
                                 let collected_results = loop {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
+                                            let denied = is_denied_approval_event(&side_event);
                                             yield side_event;
+                                            if denied {
+                                                tracing::info!(
+                                                    thread_id = %state.thread_id.0,
+                                                    run_id = %state.run_id.0,
+                                                    tool_kind = "dynamic",
+                                                    "tool_approval.denied_side_event_abort"
+                                                );
+                                                yield stats_event(
+                                                    total_prompt_tokens,
+                                                    total_completion_tokens,
+                                                    max_prompt_tokens,
+                                                    run_start,
+                                                );
+                                                yield CatEvent::Done;
+                                                return;
+                                            }
                                         }
                                         collected = &mut collect_fut => {
                                             break collected;
@@ -649,13 +882,33 @@ where
                                     }
                                 };
 
-                                for (call_id, collected) in collected_results {
+                                for (call_id, mut collected) in collected_results {
                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
                                     let elapsed_ms = started_at
                                         .get(&call_id)
                                         .map(|instant| instant.elapsed().as_millis() as u64)
                                         .unwrap_or(0);
-                                    let success = crate::tool_pretty::tool_success(&collected.preview);
+                                    let hook_context = hook_context_from_state(
+                                        &state,
+                                        &workspace_root,
+                                    );
+                                    let post_hook = hook_manager
+                                        .run_tool(
+                                            HookEventName::PostToolUse,
+                                            &hook_context,
+                                            &tool_hook_context(
+                                                tc,
+                                                Some(serde_json::Value::String(collected.preview.clone())),
+                                            ),
+                                        )
+                                        .await;
+                                    if post_hook.blocked {
+                                        let blocked = post_hook
+                                            .reason
+                                            .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
+                                        collected = CollectedToolResult::text(blocked);
+                                    }
+                                    let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
                                     log_tool_call_finished(
                                         "dynamic",
                                         &state.thread_id.0,
@@ -969,6 +1222,36 @@ fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
     }
 }
 
+fn hook_context_from_state(state: &remi_agentloop::prelude::AgentState, cwd: &Path) -> HookContext {
+    HookContext {
+        session_id: state
+            .config
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("thread_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&state.thread_id.0)
+            .to_string(),
+        transcript_path: None,
+        cwd: cwd.to_path_buf(),
+        model: None,
+        turn_id: Some(state.run_id.0.clone()),
+        permission_mode: None,
+    }
+}
+
+fn tool_hook_context(
+    tc: &ParsedToolCall,
+    tool_response: Option<serde_json::Value>,
+) -> ToolHookContext {
+    ToolHookContext {
+        tool_name: tc.name.clone(),
+        tool_use_id: tc.id.clone(),
+        tool_input: tc.arguments.clone(),
+        tool_response,
+    }
+}
+
 fn approval_request_for_tool(
     tc: &ParsedToolCall,
     session_id: &str,
@@ -1003,7 +1286,9 @@ fn approval_request_for_tool(
 
 fn build_dynamic_tools(
     metadata: Option<serde_json::Value>,
-    data_dir: PathBuf,
+    workspace_root: PathBuf,
+    workspace_root_label: String,
+    allow_host_absolute_paths: bool,
     im_bridge: Option<Arc<dyn ImFileBridge>>,
 ) -> DefaultToolRegistry {
     let mut registry = DefaultToolRegistry::new();
@@ -1015,7 +1300,13 @@ fn build_dynamic_tools(
         .and_then(|value| value.get("platform"))
         .and_then(|value| value.as_str());
     if platform == Some("feishu") {
-        register_im_tools(&mut registry, data_dir, bridge);
+        register_im_tools(
+            &mut registry,
+            workspace_root,
+            workspace_root_label,
+            allow_host_absolute_paths,
+            bridge,
+        );
     }
     registry
 }
@@ -1145,9 +1436,34 @@ async fn collect_result(
             while let Some(out) = s.next().await {
                 match out {
                     ToolOutput::Result(c) => last = c,
+                    ToolOutput::Delta(delta) => {
+                        let event = CatEvent::Text(delta);
+                        if let Some(tx) = &side_event_tx {
+                            let _ = tx.send(event);
+                        } else {
+                            side_events.push(event);
+                        }
+                    }
                     ToolOutput::SubSession(mut event) => {
-                        if let Some(event) = crate::cat_event_from_subagent_approval_marker(&event)
+                        if let Some(mut event) =
+                            crate::cat_event_from_subagent_approval_marker(&event)
                         {
+                            if let Some(parent) = parent_tool_call_id {
+                                match &mut event {
+                                    CatEvent::UserQuestionRequested(request)
+                                    | CatEvent::UserQuestionUpdated(request) => {
+                                        if request.tool_call_id.is_empty() {
+                                            request.tool_call_id = parent.to_string();
+                                        }
+                                    }
+                                    CatEvent::UserQuestionResolved { request, .. } => {
+                                        if request.tool_call_id.is_empty() {
+                                            request.tool_call_id = parent.to_string();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if let Some(tx) = &side_event_tx {
                                 let _ = tx.send(event);
                             } else {
@@ -1167,7 +1483,6 @@ async fn collect_result(
                             side_events.push(event);
                         }
                     }
-                    _ => {}
                 }
             }
             CollectedToolResult {
@@ -1233,7 +1548,7 @@ fn fs_read_safe_retry_length(overflow_bytes: usize) -> usize {
 
 #[derive(Debug, Clone)]
 struct ToolOutputChunkSpill {
-    dir_name: String,
+    spill_dir: PathBuf,
     part_count: usize,
     chunk_bytes: usize,
 }
@@ -1243,19 +1558,19 @@ impl ToolOutputChunkSpill {
         let width = part_number_width(self.part_count);
         let first = chunk_filename(1, self.part_count);
         let last = chunk_filename(self.part_count, self.part_count);
+        let first_path = self.spill_dir.join(&first);
+        let last_path = self.spill_dir.join(&last);
         format!(
-            "[Output too large ({total} bytes) — split into {} chunk files under tmp/{}]\n\
+            "[Output too large ({total} bytes) — split into {} chunk files under {}]\n\
              Each chunk is at most {} bytes; there is no complete single output file.\n\
-             Read one chunk at a time with fs_read, for example path=\"tmp/{}/{}\".\n\
-             Continue in order through path=\"tmp/{}/{}\". Do not concatenate or read the whole directory at once.\n\
+             Read one chunk at a time with fs_read, for example path=\"{}\".\n\
+             Continue in order through path=\"{}\". Do not concatenate or read the whole directory at once.\n\
              Filename pattern: part_<n>_of_<total>.txt with zero-padded {width}-digit numbers.",
             self.part_count,
-            self.dir_name,
+            self.spill_dir.display(),
             self.chunk_bytes,
-            self.dir_name,
-            first,
-            self.dir_name,
-            last
+            first_path.display(),
+            last_path.display()
         )
     }
 }
@@ -1278,7 +1593,7 @@ async fn spill_tool_output_chunks(
     }
 
     Ok(ToolOutputChunkSpill {
-        dir_name,
+        spill_dir,
         part_count,
         chunk_bytes,
     })
@@ -1341,6 +1656,7 @@ mod tests {
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
+    use crate::user_question::UserQuestionManager;
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, Checkpoint, CheckpointStatus, Content, ContentPart,
@@ -1352,11 +1668,18 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
+    use crate::hooks::HookManager;
+
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("remi-agent-result-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn test_hook_manager() -> Arc<HookManager> {
+        HookManager::new(test_root(), test_root())
     }
 
     #[test]
@@ -1472,6 +1795,8 @@ mod tests {
             parts[63].file_name().and_then(|name| name.to_str()),
             Some("part_0064_of_0064.txt")
         );
+        assert!(preview.contains(&format!("path=\"{}\"", parts[0].display())));
+        assert!(preview.contains(&format!("path=\"{}\"", parts[63].display())));
 
         let mut reconstructed = String::new();
         for part in parts {
@@ -1606,6 +1931,37 @@ mod tests {
         assert!(results[0].1.side_events.is_empty());
     }
 
+    #[tokio::test]
+    async fn tool_output_delta_streams_as_text_side_event() {
+        let root = test_root();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let output = futures::stream::iter(vec![
+            ToolOutput::Delta("part 1".to_string()),
+            ToolOutput::Delta("part 2".to_string()),
+            ToolOutput::text("part 1part 2"),
+        ]);
+        let collected = collect_result_with_overflow(
+            Ok(ToolResult::Output(output)),
+            &root,
+            8_192,
+            Some(tx),
+            Some("call"),
+            "agent__worker",
+        )
+        .await;
+
+        assert_eq!(collected.preview, "part 1part 2");
+        assert!(collected.side_events.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CatEvent::Text(text)) if text == "part 1"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CatEvent::Text(text)) if text == "part 2"
+        ));
+    }
+
     struct ParallelToolInnerAgent;
 
     impl Agent for ParallelToolInnerAgent {
@@ -1699,6 +2055,74 @@ mod tests {
                     Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
                 }
             }
+        }
+    }
+
+    struct ApprovalDeniedInnerAgent;
+
+    impl Agent for ApprovalDeniedInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::NeedToolExecution {
+                        state: AgentState::new(StepConfig::new("test-model")),
+                        tool_calls: vec![ParsedToolCall {
+                            id: "send-call".to_string(),
+                            name: "danger_send".to_string(),
+                            arguments: serde_json::json!({ "message": "hello" }),
+                        }],
+                        completed_results: vec![],
+                    },
+                ])),
+                LoopInput::Resume { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::TextDelta(
+                        "resumed after denial".to_string(),
+                    ),
+                    remi_agentloop::types::AgentEvent::Done,
+                ])),
+                LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
+        }
+    }
+
+    struct RiskySendTool;
+
+    impl Tool for RiskySendTool {
+        fn name(&self) -> &str {
+            "danger_send"
+        }
+
+        fn description(&self) -> &str {
+            "A high-risk test send tool."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _resume: Option<remi_agentloop::types::ResumePayload>,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
+                "should not execute",
+            )])))
         }
     }
 
@@ -1857,10 +2281,15 @@ mod tests {
             inner: UsageThenDoneInnerAgent,
             local_tools: DefaultToolRegistry::new(),
             data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
         };
 
         let events = agent
@@ -1894,10 +2323,15 @@ mod tests {
             inner: CancelledWithCheckpointInnerAgent,
             local_tools: DefaultToolRegistry::new(),
             data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
         };
 
         let events = agent
@@ -1930,10 +2364,15 @@ mod tests {
             inner: ParallelToolInnerAgent,
             local_tools,
             data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
         };
 
         let started = Instant::now();
@@ -1954,10 +2393,15 @@ mod tests {
             inner: UnhandledExternalToolInnerAgent,
             local_tools: DefaultToolRegistry::new(),
             data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
         };
 
         let events = agent
@@ -1994,6 +2438,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_denial_aborts_without_tool_result_or_resume() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(RiskySendTool);
+        let agent = CatAgent {
+            inner: ApprovalDeniedInnerAgent,
+            local_tools,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("call risky send"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CatEvent::ToolApprovalRequested(request) if request.tool_call_id == "send-call")));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::ToolApprovalResolved { request, decision }
+                    if request.tool_call_id == "send-call"
+                        && *decision == crate::approval::ToolApprovalDecision::Deny
+            )
+        }));
+        assert!(!events.iter().any(
+            |event| matches!(event, CatEvent::ToolCallResult { id, .. } if id == "send-call")
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, CatEvent::Text(text) if text.contains("resumed after denial"))
+        ));
+        assert!(events.iter().any(|event| matches!(event, CatEvent::Done)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Error(_))));
+    }
+
+    #[tokio::test]
     async fn supervisor_run_stops_after_bounded_tool_rounds() {
         let mut local_tools = DefaultToolRegistry::new();
         local_tools.register(InstantTool);
@@ -2001,10 +2492,15 @@ mod tests {
             inner: EndlessToolInnerAgent,
             local_tools,
             data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
         };
 
         let events = agent

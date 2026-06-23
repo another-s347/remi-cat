@@ -3,6 +3,7 @@ use remi_agentloop::types::SubSessionEvent;
 
 use crate::approval::{ToolApprovalDecision, ToolApprovalRequest};
 use crate::supervisor_workflow::{SupervisorTraceEvent, WorkflowReport};
+use crate::user_question::{UserQuestionRequest, UserQuestionResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +179,15 @@ pub enum CatEvent {
     ToolApprovalResolved {
         request: ToolApprovalRequest,
         decision: ToolApprovalDecision,
+    },
+    /// A tool call is waiting for a user answer.
+    UserQuestionRequested(UserQuestionRequest),
+    /// A pending user question was updated.
+    UserQuestionUpdated(UserQuestionRequest),
+    /// A user question was answered or cancelled.
+    UserQuestionResolved {
+        request: UserQuestionRequest,
+        response: UserQuestionResponse,
     },
     /// A tool returned its result.
     ToolCallResult {

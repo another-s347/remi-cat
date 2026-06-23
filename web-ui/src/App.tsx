@@ -46,6 +46,8 @@ import {
   type ToolApprovalDecision,
   type ToolApprovalRequest,
   type TodoItem,
+  type UserQuestionRequest,
+  type UserQuestionResponse,
   type WorkspaceFileMatch,
 } from "./api";
 import {
@@ -327,6 +329,79 @@ function ApprovalPart({ args, result }: ToolCallMessagePartProps) {
   );
 }
 
+function UserQuestionPart({ args, result }: ToolCallMessagePartProps) {
+  const payload = (result ?? args) as {
+    request?: UserQuestionRequest;
+    response?: UserQuestionResponse;
+  };
+  const request = payload.request;
+  const response = payload.response;
+  const [text, setText] = useState("");
+  const [pending, setPending] = useState(false);
+  if (!request) return null;
+  const disabled = Boolean(response || pending);
+  const submit = async (selectedOptionIds: string[] = [], cancel = false) => {
+    setPending(true);
+    try {
+      await api.answerUserQuestion(request.id, {
+        selected_option_ids: selectedOptionIds,
+        free_text: text.trim() || null,
+        source: "web",
+        cancel,
+      });
+    } catch {
+      setPending(false);
+    }
+  };
+  return (
+    <section className="approval-card user-question-card">
+      <header>
+        <Wrench size={15} />
+        <strong>Question</strong>
+        <small>{response?.status ?? "waiting"}</small>
+      </header>
+      <p>{request.question}</p>
+      {request.reason ? <p>{request.reason}</p> : null}
+      {response ? (
+        <div className="approval-status">
+          {response.answer_text ?? response.status}
+        </div>
+      ) : (
+        <>
+          {request.allow_free_text ? (
+            <textarea
+              value={text}
+              disabled={disabled}
+              placeholder={request.placeholder ?? "Add details"}
+              onChange={(event) => setText(event.target.value)}
+            />
+          ) : null}
+          <div className="approval-actions">
+            {request.options.map((option) => (
+              <button
+                type="button"
+                disabled={disabled}
+                key={option.id}
+                onClick={() => submit([option.id])}
+              >
+                {option.label}
+              </button>
+            ))}
+            {request.allow_free_text ? (
+              <button type="button" disabled={disabled} onClick={() => submit()}>
+                Submit
+              </button>
+            ) : null}
+            <button type="button" disabled={disabled} className="danger" onClick={() => submit([], true)}>
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function ContextCompactionPart({ args, result }: ToolCallMessagePartProps) {
   const event = (result ?? args) as ContextCompactionEvent | undefined;
   if (!event) return null;
@@ -592,6 +667,7 @@ const partComponents = {
       __remi_supervisor: SupervisorPart,
       __remi_sub_session: SubSessionPart,
       __remi_approval: ApprovalPart,
+      __remi_user_question: UserQuestionPart,
       __remi_context_compaction: ContextCompactionPart,
     },
     Fallback: ToolPart,

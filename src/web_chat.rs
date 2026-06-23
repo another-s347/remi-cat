@@ -7,8 +7,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bot_core::{
-    todo::TodoItem, CatEvent, Content, ModelInputSnapshot, StreamOptions, ThreadHistoryMessage,
-    ToolApprovalDecision, ToolApprovalRequest,
+    todo::TodoItem, CatEvent, Content, ContextMetrics, ModelInputSnapshot, StreamOptions,
+    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
+    UserQuestionRequest, UserQuestionResponse,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -90,6 +91,11 @@ pub(crate) enum WebChatCommand {
         approval_id: String,
         decision: ToolApprovalDecision,
         response: oneshot::Sender<Option<ToolApprovalRequest>>,
+    },
+    AnswerUserQuestion {
+        question_id: String,
+        answer: UserQuestionResponse,
+        response: oneshot::Sender<Option<UserQuestionRequest>>,
     },
 }
 
@@ -294,6 +300,24 @@ impl WebChatHandle {
             .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("web chat runtime dropped approval response"))
+    }
+
+    pub async fn answer_user_question(
+        &self,
+        question_id: String,
+        answer: UserQuestionResponse,
+    ) -> anyhow::Result<Option<UserQuestionRequest>> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::AnswerUserQuestion {
+                question_id,
+                answer,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped user question response"))
     }
 }
 
@@ -507,6 +531,25 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 );
                 let _ = response.send(request);
             }
+            WebChatCommand::AnswerUserQuestion {
+                question_id,
+                answer,
+                response,
+            } => {
+                let request = runtime
+                    .bot
+                    .user_question_manager()
+                    .answer(&question_id, answer)
+                    .await;
+                tracing::info!(
+                    question_id = %question_id,
+                    source = "web_chat",
+                    answered = request.is_some(),
+                    session_id = request.as_ref().map(|request| request.session_id.as_str()).unwrap_or(""),
+                    "user_question.decision"
+                );
+                let _ = response.send(request);
+            }
         }
     }
 }
@@ -674,6 +717,27 @@ fn persist_model_input_snapshot(
             "failed to persist model input snapshot"
         );
     }
+}
+
+fn stats_payload(
+    usage: TokenUsage,
+    context_tokens: u32,
+    first_response_at: Option<Duration>,
+    model_elapsed_ms: u64,
+    elapsed_ms: u128,
+) -> serde_json::Value {
+    let context = ContextMetrics::from_usage(usage, context_tokens);
+    serde_json::json!({
+        "ttft_ms": first_response_at.map(|elapsed| elapsed.as_millis() as u64),
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens(),
+        "max_prompt_tokens": usage.max_prompt_tokens,
+        "context_tokens": context.context_tokens,
+        "context_usage": context.ratio,
+        "model_elapsed_ms": model_elapsed_ms,
+        "elapsed_ms": elapsed_ms,
+    })
 }
 
 pub(crate) fn web_sdk_db_path(data_dir: &Path, user_key: &str) -> PathBuf {
@@ -1056,6 +1120,21 @@ async fn run_turn(
                     "decision": decision,
                 }),
             )),
+            CatEvent::UserQuestionRequested(request) => Some((
+                "user_question_requested",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            )),
+            CatEvent::UserQuestionUpdated(request) => Some((
+                "user_question_updated",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            )),
+            CatEvent::UserQuestionResolved { request, response } => Some((
+                "user_question_resolved",
+                serde_json::json!({
+                    "request": request,
+                    "response": response,
+                }),
+            )),
             CatEvent::SubSession(event) => Some(("sub_session", {
                 let mut value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(map) = &mut value {
@@ -1119,24 +1198,19 @@ async fn run_turn(
                     );
                     persist_model_input_snapshot(&runtime, session_id, snapshot);
                 }
-                let context_usage = if context_tokens == 0 {
-                    0.0
-                } else {
-                    max_prompt_tokens as f64 / context_tokens as f64
-                };
                 Some((
                     "stats",
-                    serde_json::json!({
-                        "ttft_ms": first_response_at.map(|elapsed| elapsed.as_millis() as u64),
-                        "prompt_tokens": total_prompt_tokens,
-                        "completion_tokens": total_completion_tokens,
-                        "total_tokens": total_prompt_tokens.saturating_add(total_completion_tokens),
-                        "max_prompt_tokens": max_prompt_tokens,
-                        "context_tokens": context_tokens,
-                        "context_usage": context_usage,
-                        "model_elapsed_ms": model_elapsed_ms,
-                        "elapsed_ms": run_started_at.elapsed().as_millis() as u64,
-                    }),
+                    stats_payload(
+                        TokenUsage {
+                            prompt_tokens: total_prompt_tokens,
+                            completion_tokens: total_completion_tokens,
+                            max_prompt_tokens,
+                        },
+                        context_tokens,
+                        first_response_at,
+                        model_elapsed_ms,
+                        run_started_at.elapsed().as_millis(),
+                    ),
                 ))
             }
             CatEvent::Error(error) => {
@@ -1155,11 +1229,6 @@ async fn run_turn(
         }
     }
 
-    let context_usage = if context_tokens == 0 {
-        0.0
-    } else {
-        max_prompt_tokens as f64 / context_tokens as f64
-    };
     send_event(
         &sink,
         ChatEventV1::new(
@@ -1167,17 +1236,17 @@ async fn run_turn(
             run_id,
             session_id,
             sequence,
-            Some(serde_json::json!({
-                "ttft_ms": first_response_at.map(|elapsed| elapsed.as_millis() as u64),
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": total_prompt_tokens.saturating_add(total_completion_tokens),
-                "max_prompt_tokens": max_prompt_tokens,
-                "context_tokens": context_tokens,
-                "context_usage": context_usage,
-                "model_elapsed_ms": model_elapsed_ms,
-                "elapsed_ms": run_started_at.elapsed().as_millis() as u64,
-            })),
+            Some(stats_payload(
+                TokenUsage {
+                    prompt_tokens: total_prompt_tokens,
+                    completion_tokens: total_completion_tokens,
+                    max_prompt_tokens,
+                },
+                context_tokens,
+                first_response_at,
+                model_elapsed_ms,
+                run_started_at.elapsed().as_millis(),
+            )),
         ),
     )
     .await;
