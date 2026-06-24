@@ -346,6 +346,7 @@ fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Res
             workflow
                 .validate()
                 .map_err(|err| anyhow::anyhow!("invalid workflow: {err}"))?;
+            validate_workflow_agents(&profile.data_dir, &workflow)?;
             validate_file_id(&workflow.id)?;
             if workflow.id == "goal" {
                 anyhow::bail!("embedded workflow `goal` cannot be overwritten");
@@ -383,6 +384,30 @@ fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Res
                 profile.label()
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_workflow_agents(data_dir: &Path, workflow: &WorkflowDefinition) -> anyhow::Result<()> {
+    let agents_dir = data_dir.join("agents");
+    install_embedded_agent_profiles(&agents_dir)?;
+    let registry = AgentRegistry::load(&agents_dir)?;
+    for node in &workflow.nodes {
+        let Some(agent) = node
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if registry.get(agent).is_some() {
+            continue;
+        }
+        anyhow::bail!(
+            "workflow node `{}` references unknown agent `{agent}`",
+            node.id
+        );
     }
     Ok(())
 }
@@ -846,6 +871,9 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "acp_codex_bin" | "acp.codex_bin" | "codex.bin" | "codex_bin" => {
             config.acp.codex_bin = nonempty_optional(value)
         }
+        "acp_codex_args" | "acp.codex_args" | "codex.args" | "codex_args" => {
+            config.acp.codex_args = parse_string_array(value)?
+        }
         "im_mode" | "im.mode" => config.im.mode = parse_im_mode(value)?,
         "feishu_transport" | "im_transport" | "im.transport" | "feishu.transport" => {
             config.im.transport = parse_feishu_transport(value)?
@@ -977,6 +1005,11 @@ fn parse_acp_client(value: &str) -> anyhow::Result<AcpClient> {
         "remi" | "stub" | "local" => Ok(AcpClient::Remi),
         other => anyhow::bail!("unknown ACP client `{other}`"),
     }
+}
+
+fn parse_string_array(value: &str) -> anyhow::Result<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(value)
+        .with_context(|| "expected a JSON string array, for example [\"--config\",\"key=value\"]")
 }
 
 fn nonempty_optional(value: &str) -> Option<String> {

@@ -2,10 +2,9 @@
 id: default
 name: Remi
 description: General assistant
-models:
-  primary: default
-  helper: deepseek-v4-flash
-  vision: gpt-4o
+model: ""
+helper_model: deepseek-v4-flash
+vision_model: gpt-4o
 tools:
   - search
   - skill__get
@@ -31,9 +30,12 @@ tools:
   - now
   - codex
   - manage_yourself
+  - ask_user_question
+  - agent__explorer
 delegates:
   - explorer
-max_turns: null
+max_turns: 0
+persistent_sessions: false
 ---
 You are Remi, a helpful assistant.
 

@@ -26,6 +26,30 @@ const EMBEDDED_MODEL_PROFILES: &[(&str, &str)] = &[
         "deepseek-v4-pro.yaml",
         include_str!("../../../.remi-cat/models/deepseek-v4-pro.yaml"),
     ),
+    (
+        "mimo-v2.5-pro.yaml",
+        include_str!("../../../.remi-cat/models/mimo-v2.5-pro.yaml"),
+    ),
+    (
+        "mimo-v2.5.yaml",
+        include_str!("../../../.remi-cat/models/mimo-v2.5.yaml"),
+    ),
+    (
+        "kimi-k2.7-code.yaml",
+        include_str!("../../../.remi-cat/models/kimi-k2.7-code.yaml"),
+    ),
+    (
+        "kimi-k2.6.yaml",
+        include_str!("../../../.remi-cat/models/kimi-k2.6.yaml"),
+    ),
+    (
+        "glm-5.2.yaml",
+        include_str!("../../../.remi-cat/models/glm-5.2.yaml"),
+    ),
+    (
+        "glm-5v-turbo.yaml",
+        include_str!("../../../.remi-cat/models/glm-5v-turbo.yaml"),
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +334,65 @@ pub struct ResolvedModelProfile {
     pub profile: ModelProfileConfig,
     pub extra_options: serde_json::Map<String, serde_json::Value>,
     pub source: ModelProfileSource,
+}
+
+pub fn api_key_from_env(profile: &ModelProfileConfig) -> Result<String> {
+    let mut keys = Vec::new();
+    let provider = profile
+        .provider
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if provider == "mimo"
+        || profile.model.to_ascii_lowercase().contains("mimo")
+        || profile
+            .base_url
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("xiaomimimo.com")
+    {
+        keys.push("MIMO_API_KEY");
+    } else if provider == "kimi"
+        || provider == "moonshot"
+        || profile.model.to_ascii_lowercase().contains("kimi")
+        || profile
+            .base_url
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("moonshot.cn")
+    {
+        keys.push("MOONSHOT_API_KEY");
+        keys.push("KIMI_API_KEY");
+    } else if provider == "glm"
+        || provider == "zhipu"
+        || provider == "bigmodel"
+        || profile.model.to_ascii_lowercase().contains("glm")
+        || profile
+            .base_url
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("bigmodel.cn")
+    {
+        keys.push("GLM_API_KEY");
+        keys.push("ZHIPU_API_KEY");
+        keys.push("BIGMODEL_API_KEY");
+    }
+    keys.extend(["OPENAI_API_KEY", "REMI_API_KEY"]);
+
+    for key in &keys {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+
+    bail!("{} must be set", keys.join(" or "))
 }
 
 fn thinking_override_from_env() -> Result<Option<ThinkingMode>> {
@@ -661,5 +744,115 @@ auto_compress: true
         assert!(dir.join("gpt-4o.yaml").exists());
         assert!(dir.join("deepseek-v4-flash.yaml").exists());
         assert!(dir.join("deepseek-v4-pro.yaml").exists());
+        assert!(dir.join("mimo-v2.5-pro.yaml").exists());
+        assert!(dir.join("mimo-v2.5.yaml").exists());
+        assert!(dir.join("kimi-k2.7-code.yaml").exists());
+        assert!(dir.join("kimi-k2.6.yaml").exists());
+        assert!(dir.join("glm-5.2.yaml").exists());
+        assert!(dir.join("glm-5v-turbo.yaml").exists());
+    }
+
+    #[test]
+    fn mimo_profiles_prefer_mimo_api_key() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::capture(&["MIMO_API_KEY", "OPENAI_API_KEY", "REMI_API_KEY"]);
+        let profile = ModelProfileConfig {
+            id: "mimo-v2.5-pro".into(),
+            name: "MiMo".into(),
+            description: None,
+            provider: Some("mimo".into()),
+            model: "mimo-v2.5-pro".into(),
+            base_url: Some("https://api.xiaomimimo.com/v1".into()),
+            thinking: None,
+            max_output_tokens: 131072,
+            context_tokens: 1000000,
+            supports_images: false,
+            short_term_tokens: 24000,
+            overflow_bytes: 32000,
+            auto_compress: true,
+            extra_options: serde_json::Map::new(),
+        };
+
+        unsafe {
+            std::env::set_var("MIMO_API_KEY", "mimo-key");
+            std::env::set_var("OPENAI_API_KEY", "openai-key");
+            std::env::remove_var("REMI_API_KEY");
+        }
+
+        assert_eq!(api_key_from_env(&profile).unwrap(), "mimo-key");
+    }
+
+    #[test]
+    fn kimi_profiles_prefer_moonshot_api_key() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::capture(&[
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "OPENAI_API_KEY",
+            "REMI_API_KEY",
+        ]);
+        let profile = ModelProfileConfig {
+            id: "kimi-k2.7-code".into(),
+            name: "Kimi".into(),
+            description: None,
+            provider: Some("kimi".into()),
+            model: "kimi-k2.7-code".into(),
+            base_url: Some("https://api.moonshot.cn/v1".into()),
+            thinking: None,
+            max_output_tokens: 131072,
+            context_tokens: 256000,
+            supports_images: false,
+            short_term_tokens: 24000,
+            overflow_bytes: 32000,
+            auto_compress: true,
+            extra_options: serde_json::Map::new(),
+        };
+
+        unsafe {
+            std::env::set_var("MOONSHOT_API_KEY", "moonshot-key");
+            std::env::set_var("KIMI_API_KEY", "kimi-key");
+            std::env::set_var("OPENAI_API_KEY", "openai-key");
+            std::env::remove_var("REMI_API_KEY");
+        }
+
+        assert_eq!(api_key_from_env(&profile).unwrap(), "moonshot-key");
+    }
+
+    #[test]
+    fn glm_profiles_prefer_glm_api_key() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::capture(&[
+            "GLM_API_KEY",
+            "ZHIPU_API_KEY",
+            "BIGMODEL_API_KEY",
+            "OPENAI_API_KEY",
+            "REMI_API_KEY",
+        ]);
+        let profile = ModelProfileConfig {
+            id: "glm-5.2".into(),
+            name: "GLM".into(),
+            description: None,
+            provider: Some("glm".into()),
+            model: "glm-5.2".into(),
+            base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
+            thinking: None,
+            max_output_tokens: 131072,
+            context_tokens: 1000000,
+            supports_images: false,
+            short_term_tokens: 24000,
+            overflow_bytes: 32000,
+            auto_compress: true,
+            extra_options: serde_json::Map::new(),
+        };
+
+        unsafe {
+            std::env::set_var("GLM_API_KEY", "glm-key");
+            std::env::set_var("ZHIPU_API_KEY", "zhipu-key");
+            std::env::set_var("OPENAI_API_KEY", "openai-key");
+            std::env::remove_var("BIGMODEL_API_KEY");
+            std::env::remove_var("REMI_API_KEY");
+        }
+
+        assert_eq!(api_key_from_env(&profile).unwrap(), "glm-key");
     }
 }

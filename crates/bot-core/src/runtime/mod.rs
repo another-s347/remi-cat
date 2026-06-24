@@ -19,7 +19,7 @@ use crate::sandbox::SandboxConfig;
 use crate::skill::store::SkillStore;
 use crate::tools::{BashMode, SecretRedactor};
 use crate::{
-    acp, embedded_agent_profile, goal, install_embedded_agent_profiles,
+    acp, api_key_from_env, embedded_agent_profile, goal, install_embedded_agent_profiles,
     install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
     sandbox, skill, supervisor_workflow, todo, trigger, AccountUsage, AgentModelBindings,
     AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
@@ -94,6 +94,8 @@ pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) 
 pub struct StreamOptions {
     /// Optional session-persisted model profile override.
     pub model_profile_id: Option<String>,
+    /// Optional session-persisted root agent override.
+    pub agent_id: Option<String>,
     /// Skill documents explicitly loaded by slash-command preprocessing for this turn.
     pub skill_injections: Vec<SkillDocument>,
     /// UUID of the sender (stored in metadata; injected as a
@@ -215,6 +217,9 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
 pub struct CatBot {
     inner: CatAgent<InnerAgent>,
     model_agents: HashMap<String, CatAgent<InnerAgent>>,
+    agent_runtimes: HashMap<String, HashMap<String, CatAgent<InnerAgent>>>,
+    agent_profiles: HashMap<String, AgentProfile>,
+    default_agent_profile: AgentProfile,
     skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
@@ -244,6 +249,20 @@ pub struct RegisteredToolStatus {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EffectiveAgentProfile {
+    pub profile: AgentProfile,
+    pub source: EffectiveAgentSource,
+    pub invalid_session_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveAgentSource {
+    Workflow,
+    Session,
+    Default,
+}
+
 impl CatBot {
     pub fn model_context_tokens(&self) -> u32 {
         self.model_profile.context_tokens
@@ -267,8 +286,31 @@ impl CatBot {
             .context_tokens
     }
 
+    pub fn model_context_tokens_for_agent(
+        &self,
+        session_model_profile_id: Option<&str>,
+        session_agent_id: Option<&str>,
+    ) -> u32 {
+        let effective_agent = self.effective_agent_profile(session_agent_id);
+        self.effective_model_profile_for_agent(session_model_profile_id, &effective_agent.profile)
+            .profile
+            .context_tokens
+    }
+
     pub fn model_profiles(&self) -> Vec<&ModelProfileConfig> {
         self.model_registry.list()
+    }
+
+    pub fn agent_profiles(&self) -> Vec<&AgentProfile> {
+        self.agent_profiles.values().collect()
+    }
+
+    pub fn default_agent_profile(&self) -> &AgentProfile {
+        &self.default_agent_profile
+    }
+
+    pub fn get_agent_profile(&self, id: &str) -> Option<&AgentProfile> {
+        self.agent_profiles.get(id)
     }
 
     pub fn skill_summaries(&self) -> Vec<SkillSummary> {
@@ -311,6 +353,118 @@ impl CatBot {
         )
     }
 
+    pub fn effective_agent_profile(&self, session_agent_id: Option<&str>) -> EffectiveAgentProfile {
+        self.effective_agent_profile_for_workflow(session_agent_id, None)
+    }
+
+    pub fn effective_agent_profile_for_workflow(
+        &self,
+        session_agent_id: Option<&str>,
+        workflow_agent_id: Option<&str>,
+    ) -> EffectiveAgentProfile {
+        if let Some(id) = workflow_agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(profile) = self.agent_profiles.get(id) {
+                return EffectiveAgentProfile {
+                    profile: profile.clone(),
+                    source: EffectiveAgentSource::Workflow,
+                    invalid_session_agent: None,
+                };
+            }
+            return EffectiveAgentProfile {
+                profile: self.default_agent_profile.clone(),
+                source: EffectiveAgentSource::Default,
+                invalid_session_agent: Some(id.to_string()),
+            };
+        }
+        if let Some(id) = session_agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(profile) = self.agent_profiles.get(id) {
+                return EffectiveAgentProfile {
+                    profile: profile.clone(),
+                    source: EffectiveAgentSource::Session,
+                    invalid_session_agent: None,
+                };
+            }
+            return EffectiveAgentProfile {
+                profile: self.default_agent_profile.clone(),
+                source: EffectiveAgentSource::Default,
+                invalid_session_agent: Some(id.to_string()),
+            };
+        }
+        EffectiveAgentProfile {
+            profile: self.default_agent_profile.clone(),
+            source: EffectiveAgentSource::Default,
+            invalid_session_agent: None,
+        }
+    }
+
+    fn workflow_node_agent<'a>(&self, instance: &'a WorkflowInstance) -> Option<&'a str> {
+        if instance.status != WorkflowStatus::Active {
+            return None;
+        }
+        instance.definition.node_agent(&instance.current_node)
+    }
+
+    fn validate_workflow_agents(&self, definition: &WorkflowDefinition) -> Result<(), AgentError> {
+        for node in &definition.nodes {
+            let Some(agent) = node
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if self.agent_profiles.contains_key(agent) {
+                continue;
+            }
+            return Err(AgentError::other(format!(
+                "workflow node `{}` references unknown agent `{agent}`",
+                node.id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn effective_model_profile_for_agent(
+        &self,
+        session_model_profile_id: Option<&str>,
+        agent: &AgentProfile,
+    ) -> EffectiveModelProfile {
+        if let Some(id) = session_model_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self.effective_model_profile(Some(id));
+        }
+        let mut effective = self.effective_model_profile(agent.models.primary.as_deref());
+        if matches!(effective.source, EffectiveModelSource::Default) {
+            effective.invalid_session_model = None;
+        }
+        if let Some(model) = agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            effective.profile.model = model.to_string();
+        }
+        if let Some(base_url) = agent
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            effective.profile.base_url = Some(base_url.to_string());
+        }
+        effective
+    }
+
     pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
         model_usage::query_account_usage(&self.model_profile, &self.api_key).await
     }
@@ -329,6 +483,20 @@ impl CatBot {
         } else {
             self.model_agents.get(profile_id).unwrap_or(&self.inner)
         }
+    }
+
+    fn runtime_for_agent_and_model(
+        &self,
+        agent_id: &str,
+        model_profile_id: &str,
+    ) -> &CatAgent<InnerAgent> {
+        if agent_id == self.default_agent_profile.id {
+            return self.agent_for_model_profile(model_profile_id);
+        }
+        self.agent_runtimes
+            .get(agent_id)
+            .and_then(|by_model| by_model.get(model_profile_id))
+            .unwrap_or_else(|| self.agent_for_model_profile(model_profile_id))
     }
 
     fn hook_context(
@@ -551,6 +719,7 @@ impl CatBot {
         max_rounds: WorkflowMaxRounds,
     ) -> Result<WorkflowInstance, AgentError> {
         definition.validate().map_err(AgentError::other)?;
+        self.validate_workflow_agents(&definition)?;
         if !context.is_object() {
             return Err(AgentError::other("workflow context must be a JSON object"));
         }
@@ -792,6 +961,26 @@ impl CatBot {
             .into_iter()
             .filter(|d| {
                 self.inner
+                    .tool_allowlist
+                    .as_ref()
+                    .map(|allowlist| allowlist.iter().any(|tool| tool == &d.function.name))
+                    .unwrap_or(true)
+            })
+            .map(|d| (d.function.name, d.function.description))
+            .collect()
+    }
+
+    pub fn tool_list_for_agent(&self, session_agent_id: Option<&str>) -> Vec<(String, String)> {
+        use remi_agentloop::tool::registry::ToolRegistry;
+        let effective_agent = self.effective_agent_profile(session_agent_id);
+        let active_agent =
+            self.runtime_for_agent_and_model(&effective_agent.profile.id, &self.model_profile.id);
+        active_agent
+            .local_tools
+            .definitions(&serde_json::Value::Null)
+            .into_iter()
+            .filter(|d| {
+                active_agent
                     .tool_allowlist
                     .as_ref()
                     .map(|allowlist| allowlist.iter().any(|tool| tool == &d.function.name))
@@ -1073,18 +1262,54 @@ impl CatBot {
         stream! {
             let run_lock = self.thread_run_lock(&thread_id_owned).await;
             let _run_guard = run_lock.lock().await;
-            let effective_model = self.effective_model_profile(opts.model_profile_id.as_deref());
-            let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
             let mut next_content = content;
             let mut supervisor_round: u32 = 0;
             let mut continuation_from_supervisor = false;
             let mut stop_hook_active = false;
             let turn_started = Instant::now();
+
+            'workflow_loop: loop {
+            let workflow_agent_id = self
+                .workflow_status(&thread_id_owned)
+                .await
+                .and_then(|instance| {
+                    self.workflow_node_agent(&instance)
+                        .map(ToOwned::to_owned)
+                });
+            let effective_agent = self.effective_agent_profile_for_workflow(
+                opts.agent_id.as_deref(),
+                workflow_agent_id.as_deref(),
+            );
+            if effective_agent.invalid_session_agent.is_some() && workflow_agent_id.is_some() {
+                let invalid = effective_agent.invalid_session_agent.clone().unwrap_or_default();
+                let err = AgentError::other(format!(
+                    "active workflow node references unknown agent `{invalid}`"
+                ));
+                tracing::warn!(
+                    thread_id = %thread_id_owned,
+                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "agent_turn.failed"
+                );
+                yield CatEvent::Error(err);
+                return;
+            }
+            let effective_model = self.effective_model_profile_for_agent(
+                opts.model_profile_id.as_deref(),
+                &effective_agent.profile,
+            );
+            let active_agent = self.runtime_for_agent_and_model(
+                &effective_agent.profile.id,
+                &effective_model.profile.id,
+            );
             tracing::info!(
                 thread_id = %thread_id_owned,
                 model_profile = %effective_model.profile.id,
                 model = %effective_model.profile.model,
                 model_source = ?effective_model.source,
+                agent_id = %effective_agent.profile.id,
+                agent_source = ?effective_agent.source,
+                workflow_agent_id = workflow_agent_id.as_deref().unwrap_or(""),
                 platform = opts.platform.as_deref().unwrap_or(""),
                 chat_type = opts.chat_type.as_deref().unwrap_or(""),
                 message_id = opts.message_id.as_deref().unwrap_or(""),
@@ -1093,8 +1318,6 @@ impl CatBot {
                 trigger_run = opts.trigger_run,
                 "agent_turn.start"
             );
-
-            'workflow_loop: loop {
             // 1. Load memory context (triggers mid->long-term promotion if needed).
             let mut ctx = match self.memory.load_context(&thread_id_owned).await {
                 Ok(c) => c,
@@ -1879,9 +2102,6 @@ pub struct CatBotBuilder {
 
 impl CatBotBuilder {
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("REMI_API_KEY"))
-            .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY or REMI_API_KEY must be set"))?;
         let memory_days = std::env::var("REMI_MEMORY_DAYS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1906,6 +2126,7 @@ impl CatBotBuilder {
         install_embedded_model_profiles(&models_dir)?;
         let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
         let resolved_model = resolve_model_profile_from_env(&models_dir)?;
+        let api_key = api_key_from_env(&resolved_model.profile)?;
         let runtime_model_locked = std::env::var("REMI_MODEL_PROFILE")
             .ok()
             .map(|value| !value.trim().is_empty())
@@ -2248,6 +2469,93 @@ impl CatBotBuilder {
             );
         }
 
+        let agent_registry = AgentRegistry::load(&agents_dir)?;
+        let mut agent_profiles = agent_registry
+            .profiles()
+            .cloned()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect::<HashMap<_, _>>();
+        agent_profiles
+            .entry(active_agent_id.clone())
+            .or_insert_with(|| AgentProfile {
+                id: active_agent_id.clone(),
+                name: active_agent_id.clone(),
+                description: "Runtime default agent".to_string(),
+                model: None,
+                base_url: None,
+                models: self.model_bindings.clone(),
+                tools: self.tool_allowlist.clone().unwrap_or_default(),
+                delegates: self.delegate_ids.clone(),
+                max_turns: self.max_turns,
+                persistent_sessions: false,
+                system_prompt: system_prompt.clone(),
+            });
+        let default_agent_profile = agent_profiles
+            .get(&active_agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("active agent `{active_agent_id}` is unavailable"))?;
+        let mut agent_runtimes = HashMap::<String, HashMap<String, CatAgent<InnerAgent>>>::new();
+        for agent_profile in agent_profiles.values() {
+            if agent_profile.id == active_agent_id {
+                continue;
+            }
+            let agent_tool_deps = LocalToolDeps {
+                skill_store: Arc::clone(&skill_store),
+                memory: Arc::clone(&memory),
+                todo_backend: Arc::clone(&todo_backend),
+                trigger_backend: Arc::clone(&trigger_backend),
+                acp_backend: Arc::clone(&acp_backend),
+                sandbox: Arc::clone(&sandbox),
+                bash_enabled: self.sandbox_config.bash_enabled(),
+                redactor: Arc::clone(&redactor),
+                data_dir: data_dir.clone(),
+                workspace_root: workspace_root.clone(),
+                agents_dir: agents_dir.clone(),
+                delegate_ids: agent_profile.delegates.clone(),
+                api_key: self.api_key.clone(),
+                im_bridge: self.im_bridge.clone(),
+                active_agent_id: agent_profile.id.clone(),
+                approval_manager: Arc::clone(&approval_manager),
+                user_question_manager: Arc::clone(&user_question_manager),
+                hook_manager: Arc::clone(&hook_manager),
+                overflow_bytes,
+            };
+            let mut by_model = HashMap::new();
+            for model_profile in self.model_registry.list() {
+                let model_extra_options = model_profile.merged_extra_options(None)?;
+                let model_inner = build_inner_agent(
+                    &self.api_key,
+                    model_profile,
+                    agent_profile.system_prompt.clone(),
+                    agent_profile.max_turns,
+                    model_extra_options.clone(),
+                );
+                let model_tools =
+                    agent_tool_deps.build_tools(model_profile, model_extra_options, true);
+                let agent_tool_allowlist = agent_tool_allowlist(agent_profile);
+                let model_overflow_bytes =
+                    self.overflow_bytes.unwrap_or(model_profile.overflow_bytes);
+                by_model.insert(
+                    model_profile.id.clone(),
+                    CatAgent {
+                        inner: model_inner,
+                        local_tools: model_tools,
+                        data_dir: memory.data_dir.clone(),
+                        workspace_root: workspace_root.clone(),
+                        workspace_root_label: sandbox.workspace_root_label(),
+                        allow_host_absolute_paths: sandbox.kind() != "docker",
+                        overflow_bytes: model_overflow_bytes,
+                        im_bridge: self.im_bridge.clone(),
+                        tool_allowlist: Some(agent_tool_allowlist),
+                        approval_manager: Arc::clone(&approval_manager),
+                        user_question_manager: Arc::clone(&user_question_manager),
+                        hook_manager: Arc::clone(&hook_manager),
+                    },
+                );
+            }
+            agent_runtimes.insert(agent_profile.id.clone(), by_model);
+        }
+
         Ok(CatBot {
             inner: CatAgent {
                 inner: inner_loop,
@@ -2264,6 +2572,9 @@ impl CatBotBuilder {
                 hook_manager: Arc::clone(&hook_manager),
             },
             model_agents,
+            agent_runtimes,
+            agent_profiles,
+            default_agent_profile,
             skill_store,
             memory,
             todo_backend,
@@ -2283,6 +2594,20 @@ impl CatBotBuilder {
 
 fn delegate_tool_name(agent_id: &str) -> String {
     format!("agent__{}", agent_id.trim().replace('-', "_"))
+}
+
+fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
+    let mut tools = profile.tools.clone();
+    if !tools.iter().any(|tool| tool == "ask_user_question") {
+        tools.push("ask_user_question".to_string());
+    }
+    for delegate in &profile.delegates {
+        let name = delegate_tool_name(delegate);
+        if !tools.iter().any(|tool| tool == &name) {
+            tools.push(name);
+        }
+    }
+    tools
 }
 
 const SUBAGENT_APPROVAL_MARKER_AGENT: &str = "__remi_tool_approval__";

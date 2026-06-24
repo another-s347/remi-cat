@@ -58,8 +58,8 @@ pub use hooks::{HookEventName, HookManager, HookOutcome, HookPermissionDecision,
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use memory::{MemoryStore, ThreadHistoryMessage};
 pub use model_profile::{
-    install_embedded_model_profiles, resolve_model_profile_from_env, ModelProfileConfig,
-    ModelProfileRegistry, ModelProfileSource, ThinkingMode,
+    api_key_from_env, install_embedded_model_profiles, resolve_model_profile_from_env,
+    ModelProfileConfig, ModelProfileRegistry, ModelProfileSource, ThinkingMode,
 };
 pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{

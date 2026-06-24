@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::sync::Mutex;
 
-use crate::app::{sandbox_doctor_report, sdk_doctor_report};
 use crate::cli::{FeedbackCommand, GitHubIssueCreateRequest, GitHubIssueCreateResponse};
+use crate::command::{sandbox_doctor_report, sdk_doctor_report};
 use crate::config::{detect_setup_state, SetupState};
 use crate::instance_profile::InstanceProfile;
 use crate::secret_store::{redaction_entries, SecretStore};

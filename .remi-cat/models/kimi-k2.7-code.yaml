@@ -1,0 +1,12 @@
+id: kimi-k2.7-code
+name: Kimi K2.7 Code
+description: Moonshot Kimi coding profile for agentic software engineering tasks.
+provider: kimi
+model: kimi-k2.7-code
+base_url: https://api.moonshot.cn/v1
+max_output_tokens: 131072
+context_tokens: 256000
+supports_images: false
+short_term_tokens: 24000
+overflow_bytes: 32000
+auto_compress: true

@@ -34,7 +34,7 @@ impl AcpChatTool {
             backend,
             approval_manager,
             name: "codex",
-            description: "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session or `title` for a new session.",
+            description: "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session, `title` for a new session, or `startup_args` for local Codex CLI global arguments inserted before `exec`.",
         }
     }
 }
@@ -53,6 +53,8 @@ struct AcpChatArguments {
     action: Option<String>,
     #[serde(default)]
     wait_ms: Option<u64>,
+    #[serde(default)]
+    startup_args: Vec<String>,
 }
 
 impl Tool for AcpChatTool {
@@ -73,7 +75,12 @@ impl Tool for AcpChatTool {
                 "title": { "type": "string", "description": "Optional title for a newly created ACP session." },
                 "task_id": { "type": "string", "description": "Compatibility-only: poll a background task created by an older running result." },
                 "action": { "type": "string", "enum": ["poll"], "description": "Compatibility-only action for an existing task_id." },
-                "wait_ms": { "type": "integer", "description": "Deprecated for initial Codex runs; the tool now streams until completion. Poll actions still return the current task status." }
+                "wait_ms": { "type": "integer", "description": "Deprecated for initial Codex runs; the tool now streams until completion. Poll actions still return the current task status." },
+                "startup_args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Extra local Codex CLI global argv inserted before `exec` for this call. Only supported for local Codex ACP."
+                }
             }
         })
     }
@@ -93,7 +100,7 @@ impl Tool for AcpChatTool {
             let args: AcpChatArguments = serde_json::from_value(arguments).map_err(|_| {
                 AgentError::tool(
                     tool_name,
-                    "expected {message?, session_id?, title?, task_id?, action?, wait_ms?}",
+                    "expected {message?, session_id?, title?, task_id?, action?, wait_ms?, startup_args?}",
                 )
             })?;
             if let Some(task_id) = args
@@ -124,6 +131,7 @@ impl Tool for AcpChatTool {
                     session_id: args.session_id,
                     title: args.title,
                     current_channel: Some(current_channel),
+                    codex_startup_args: args.startup_args,
                 })
                 .await
                 .map_err(|err| AgentError::tool(tool_name, err.to_string()))?;

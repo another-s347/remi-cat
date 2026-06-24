@@ -156,10 +156,11 @@ profile workflow list <profile>
 ```bash
 codex setup
 codex setup --bin /path/to/codex --agent default
+codex setup --arg=--config --arg=model=\"gpt-5-codex\"
 codex doctor
 ```
 
-`codex setup` writes the ACP runtime settings for the selected profile. `codex doctor` verifies the runtime config, Codex binary availability, and whether the `codex` tool is available to the root agent.
+`codex setup` writes the ACP runtime settings for the selected profile. Repeated `--arg` values are stored as Codex global startup args and inserted before `exec`. `codex doctor` verifies the runtime config, Codex binary availability, and whether the `codex` tool is available to the root agent.
 
 ## Feishu/Lark Commands
 

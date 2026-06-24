@@ -36,6 +36,8 @@ pub struct WorkflowDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowNode {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub prompt: String,
 }
 
@@ -151,6 +153,9 @@ impl WorkflowDefinition {
             if node.id.trim().is_empty() || node.prompt.trim().is_empty() {
                 return Err("node id and prompt may not be empty".into());
             }
+            if let Some(agent) = node.agent.as_deref() {
+                validate_agent_id(agent)?;
+            }
             if !node_ids.insert(node.id.as_str()) {
                 return Err(format!("duplicate node id `{}`", node.id));
             }
@@ -194,12 +199,34 @@ impl WorkflowDefinition {
     pub fn node(&self, id: &str) -> Option<&WorkflowNode> {
         self.nodes.iter().find(|node| node.id == id)
     }
+    pub fn node_agent(&self, id: &str) -> Option<&str> {
+        self.node(id)
+            .and_then(|node| node.agent.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
     pub fn edge(&self, id: &str) -> Option<&WorkflowEdge> {
         self.edges.iter().find(|edge| edge.id == id)
     }
     pub fn outgoing(&self, node: &str) -> Vec<&WorkflowEdge> {
         self.edges.iter().filter(|edge| edge.from == node).collect()
     }
+}
+
+fn validate_agent_id(agent: &str) -> Result<(), String> {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        return Err("node agent may not be empty".into());
+    }
+    if !agent
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(format!(
+            "node agent `{agent}` may only contain ASCII letters, numbers, '-' and '_'"
+        ));
+    }
+    Ok(())
 }
 
 pub fn embedded_goal_definition() -> WorkflowDefinition {
@@ -421,14 +448,17 @@ pub fn supervisor_prompt(
     let outgoing: Vec<_> = definition
         .outgoing(&node.id)
         .into_iter()
-        .map(|edge| serde_json::json!({"id": edge.id, "to": edge.to, "prompt": edge.prompt}))
+        .map(|edge| {
+            let to_agent = definition.node_agent(&edge.to);
+            serde_json::json!({"id": edge.id, "to": edge.to, "to_agent": to_agent, "prompt": edge.prompt})
+        })
         .collect();
     let payload = serde_json::json!({
         "workflow_prompt": definition.prompt,
         "context": instance.context,
         "previous_node_message": instance.node_message,
         "incoming_edge": incoming,
-        "current_node": {"id": node.id, "prompt": node.prompt},
+        "current_node": {"id": node.id, "agent": node.agent, "prompt": node.prompt},
         "allowed_outgoing_edges": outgoing,
         "todo": todo_prompt,
         "main_agent_history": history,
@@ -516,10 +546,12 @@ mod tests {
             nodes: vec![
                 WorkflowNode {
                     id: "review".into(),
+                    agent: None,
                     prompt: "review".into(),
                 },
                 WorkflowNode {
                     id: "done".into(),
+                    agent: None,
                     prompt: "done".into(),
                 },
             ],
@@ -554,6 +586,34 @@ mod tests {
             prompt: "bad".into(),
         });
         assert!(graph.validate().unwrap_err().contains("terminal"));
+    }
+
+    #[test]
+    fn workflow_node_agent_is_optional_and_validated() {
+        let definition: WorkflowDefinition = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "id": "agent-workflow",
+                "name": "Agent Workflow",
+                "description": "",
+                "prompt": "supervise",
+                "start_prompt": "start",
+                "initial_node": "explore",
+                "terminal_node": "done",
+                "nodes": [
+                    {"id": "explore", "agent": "explorer", "prompt": "explore"},
+                    {"id": "done", "prompt": "done"}
+                ],
+                "edges": [
+                    {"id": "complete", "from": "explore", "to": "done", "prompt": "complete"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        definition.validate().unwrap();
+        assert_eq!(definition.node_agent("explore"), Some("explorer"));
+        assert_eq!(definition.node_agent("done"), None);
     }
 
     #[test]
@@ -608,14 +668,17 @@ mod tests {
             nodes: vec![
                 WorkflowNode {
                     id: "review".into(),
+                    agent: None,
                     prompt: "review".into(),
                 },
                 WorkflowNode {
                     id: "verify".into(),
+                    agent: Some("explorer".into()),
                     prompt: "verify".into(),
                 },
                 WorkflowNode {
                     id: "stop".into(),
+                    agent: None,
                     prompt: "stop".into(),
                 },
             ],

@@ -1,13 +1,31 @@
 use anyhow::Context;
 
+mod doctor;
 mod feedback;
+mod feishu;
+mod hooks;
+mod secrets;
+mod setup;
 mod update;
 
+pub(crate) use doctor::{
+    command_doctor_report, print_registered_tools, run_codex_command, run_doctor,
+    sandbox_doctor_report, sdk_doctor_report,
+};
 pub(crate) use feedback::run_feedback_command;
 #[cfg(test)]
 pub(crate) use feedback::{
     feedback_repo, github_new_issue_url, percent_encode_query, redact_known_secrets,
 };
+#[cfg(test)]
+pub(crate) use feishu::{
+    extract_first_url, extract_lark_cli_config_from_json, feishu_doctor_message,
+    run_streaming_command, run_streaming_command_with_stdin, AuthStatusSummary, FeishuDoctorStatus,
+};
+pub(crate) use feishu::{run_feishu_doctor, run_feishu_init};
+pub(crate) use hooks::{format_hook_statuses, run_hooks_command};
+pub(crate) use secrets::{handle_runtime_secret_command, run_secret_command};
+pub(crate) use setup::run_setup;
 pub(crate) use update::run_update_command;
 #[cfg(test)]
 pub(crate) use update::{
@@ -15,8 +33,8 @@ pub(crate) use update::{
 };
 
 use crate::app::{
-    command_doctor_report, handle_runtime_secret_command, MAX_COMMAND_PREPROCESS_DEPTH,
-    SESSION_DEBUG_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
+    MAX_COMMAND_PREPROCESS_DEPTH, SESSION_AGENT_ID_METADATA_KEY, SESSION_DEBUG_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 use crate::cli::parse_secret_command;
 use crate::core::Runtime;
@@ -92,9 +110,23 @@ pub(crate) async fn handle_runtime_command(
         return Ok(Some(RuntimeCommandResult::Reply(runtime_command_help())));
     }
     if command == "/tools" {
+        let session_agent_id = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY);
+        let workflow_agent_id = runtime
+            .bot
+            .workflow_status(session_id)
+            .await
+            .and_then(|instance| workflow_node_agent(&instance).map(ToOwned::to_owned));
+        let effective = runtime.bot.effective_agent_profile_for_workflow(
+            session_agent_id.as_deref(),
+            workflow_agent_id.as_deref(),
+        );
         let reply = runtime
             .bot
-            .tool_list()
+            .tool_list_for_agent(Some(&effective.profile.id))
             .into_iter()
             .map(|(name, desc)| format!("- `{name}`: {desc}"))
             .collect::<Vec<_>>()
@@ -142,6 +174,10 @@ pub(crate) async fn handle_runtime_command(
     }
     if command == "/model" || command.starts_with("/model ") {
         let reply = handle_model_command(runtime, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
+    if command == "/agent" || command.starts_with("/agent ") {
+        let reply = handle_agent_command(runtime, session_id, command).await?;
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
     if command == "/permissions"
@@ -204,6 +240,7 @@ fn runtime_command_help() -> String {
         "- `/skill:<name> <task>` - load a skill for the same message and run the task",
         "- `/doctor` - show runtime readiness for the current session",
         "- `/model` or `/model list` - inspect or select model profiles for this session",
+        "- `/agent` or `/agent list` - inspect or select the main agent for this session",
         "- `/permissions` - inspect or change tool approval mode for this session",
         "- `/hooks` - list/trust/enable/disable Codex-compatible hooks",
         "- `/goal ...` - inspect or manage the current goal workflow",
@@ -213,6 +250,194 @@ fn runtime_command_help() -> String {
         "- `/clear` - clear chat memory for this session",
     ]
     .join("\n")
+}
+
+pub(crate) async fn handle_agent_command(
+    runtime: &Runtime,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let rest = command.trim().strip_prefix("/agent").unwrap_or("").trim();
+    if rest.is_empty() || rest == "status" {
+        let stored = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY);
+        let stored_model = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        return Ok(format_agent_status(
+            &runtime.bot,
+            stored.as_deref(),
+            stored_model.as_deref(),
+            runtime.bot.workflow_status(session_id).await.as_ref(),
+            session_id,
+        ));
+    }
+    if rest == "list" {
+        let stored = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY);
+        return Ok(format_agent_list(&runtime.bot, stored.as_deref()));
+    }
+    if rest == "reset" {
+        runtime
+            .sessions
+            .lock()
+            .await
+            .remove_metadata(session_id, SESSION_AGENT_ID_METADATA_KEY)?;
+        let stored_model = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        return Ok(format!(
+            "已清除当前 session 的 agent override。\n\n{}",
+            format_agent_status(
+                &runtime.bot,
+                None,
+                stored_model.as_deref(),
+                runtime.bot.workflow_status(session_id).await.as_ref(),
+                session_id,
+            )
+        ));
+    }
+    if let Some(id) = rest.strip_prefix("use").map(str::trim) {
+        if id.is_empty() {
+            anyhow::bail!("用法：/agent use <agent_id>");
+        }
+        let Some(profile) = runtime.bot.get_agent_profile(id) else {
+            anyhow::bail!("unknown agent `{id}`. Use `/agent list` to see available agents.");
+        };
+        let agent_id = profile.id.clone();
+        runtime.sessions.lock().await.set_metadata_string(
+            session_id,
+            SESSION_AGENT_ID_METADATA_KEY,
+            &agent_id,
+        )?;
+        let stored_model = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        return Ok(format!(
+            "已切换当前 session agent 为 `{}`。\n\n{}",
+            agent_id,
+            format_agent_status(
+                &runtime.bot,
+                Some(&agent_id),
+                stored_model.as_deref(),
+                runtime.bot.workflow_status(session_id).await.as_ref(),
+                session_id
+            )
+        ));
+    }
+    Ok("用法：/agent status，/agent list，/agent use <agent_id>，/agent reset".to_string())
+}
+
+pub(crate) fn format_agent_status(
+    bot: &CatBot,
+    stored_agent_id: Option<&str>,
+    stored_model_profile_id: Option<&str>,
+    workflow: Option<&bot_core::WorkflowInstance>,
+    session_id: &str,
+) -> String {
+    let workflow_agent_id = workflow.and_then(workflow_node_agent);
+    let effective = bot.effective_agent_profile_for_workflow(stored_agent_id, workflow_agent_id);
+    let model = bot.effective_model_profile_for_agent(stored_model_profile_id, &effective.profile);
+    let source = if workflow_agent_id.is_some() && effective.invalid_session_agent.is_none() {
+        "workflow"
+    } else if effective.invalid_session_agent.is_none()
+        && stored_agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    {
+        "session"
+    } else {
+        "default"
+    };
+    let model_source = if stored_model_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "session"
+    } else if effective.profile.models.primary.is_some() {
+        "agent"
+    } else {
+        "default"
+    };
+    let mut lines = vec![
+        "**agent status**".to_string(),
+        String::new(),
+        format!("session_id: `{session_id}`"),
+        format!("effective_agent: `{}`", effective.profile.id),
+        format!("source: `{source}`"),
+        format!("name: {}", effective.profile.name),
+        format!("description: {}", effective.profile.description),
+        format!("effective_model_profile: `{}`", model.profile.id),
+        format!("model_source: `{model_source}`"),
+        format!("model: `{}`", model.profile.model),
+    ];
+    if let Some(instance) = workflow {
+        if let Some(agent) = workflow_agent_id {
+            lines.push(format!(
+                "workflow_override: `{}` node `{}` -> agent `{agent}`",
+                instance.definition.id, instance.current_node
+            ));
+        }
+    }
+    if let Some(stored) = stored_agent_id {
+        lines.push(format!("session_override: `{stored}`"));
+    } else {
+        lines.push("session_override: none".to_string());
+    }
+    if let Some(invalid) = effective.invalid_session_agent {
+        lines.push(format!(
+            "warning: stored session override `{invalid}` is invalid; using fallback `{}`",
+            effective.profile.id
+        ));
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn format_agent_list(bot: &CatBot, stored_agent_id: Option<&str>) -> String {
+    let effective = bot.effective_agent_profile(stored_agent_id);
+    let default_id = &bot.default_agent_profile().id;
+    let mut profiles = bot.agent_profiles();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut lines = vec!["**agents**".to_string(), String::new()];
+    for profile in profiles {
+        let mut markers = Vec::new();
+        if profile.id == effective.profile.id {
+            markers.push("current");
+        }
+        if &profile.id == default_id {
+            markers.push("default");
+        }
+        let marker = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", markers.join(", "))
+        };
+        lines.push(format!(
+            "- `{}`{}: {}",
+            profile.id, marker, profile.description
+        ));
+    }
+    if let Some(invalid) = effective.invalid_session_agent {
+        lines.push(format!(
+            "\nwarning: stored session override `{invalid}` is invalid; using fallback `{}`",
+            effective.profile.id
+        ));
+    }
+    lines.join("\n")
 }
 
 async fn handle_hooks_command(runtime: &Runtime, command: &str) -> anyhow::Result<String> {
@@ -252,35 +477,6 @@ async fn handle_hooks_command(runtime: &Runtime, command: &str) -> anyhow::Resul
                 .to_string(),
         ),
     }
-}
-
-pub(crate) fn format_hook_statuses(statuses: &[bot_core::HookStatus]) -> String {
-    let mut lines = vec!["**hooks**".to_string()];
-    for status in statuses {
-        let trusted = if status.trusted {
-            "trusted"
-        } else {
-            "untrusted"
-        };
-        let enabled = if status.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        let matcher = status.matcher.as_deref().unwrap_or("*");
-        let command = status.command.as_deref().unwrap_or("");
-        let mut line = format!(
-            "- `{}` matcher `{matcher}` {trusted}/{enabled}: {command}",
-            status.event
-        );
-        if let Some(warning) = &status.warning {
-            line.push_str(&format!(" warning: {warning}"));
-        }
-        line.push_str(&format!("\n  hash: `{}`", status.hash));
-        line.push_str(&format!("\n  source: `{}`", status.source));
-        lines.push(line);
-    }
-    lines.join("\n")
 }
 
 async fn handle_permissions_command(
@@ -843,11 +1039,13 @@ fn format_workflow_status(instance: &bot_core::WorkflowInstance) -> String {
         bot_core::WorkflowMaxRounds::Limited(value) => value.to_string(),
         bot_core::WorkflowMaxRounds::Unlimited => "unlimited".to_string(),
     };
+    let node_agent = workflow_node_agent(instance).unwrap_or("-");
     let mut text = format!(
-        "workflow: {}\nstatus: {:?}\nnode: {}\nmax_rounds: {}\ncontext: {}",
+        "workflow: {}\nstatus: {:?}\nnode: {}\nnode_agent: {}\nmax_rounds: {}\ncontext: {}",
         instance.definition.id,
         instance.status,
         instance.current_node,
+        node_agent,
         max_rounds,
         serde_json::to_string(&instance.context).unwrap_or_else(|_| "{}".into())
     );
@@ -871,6 +1069,13 @@ fn format_workflow_status(instance: &bot_core::WorkflowInstance) -> String {
         }
     }
     text
+}
+
+fn workflow_node_agent(instance: &bot_core::WorkflowInstance) -> Option<&str> {
+    if instance.status != bot_core::WorkflowStatus::Active {
+        return None;
+    }
+    instance.definition.node_agent(&instance.current_node)
 }
 
 async fn handle_goal_command(

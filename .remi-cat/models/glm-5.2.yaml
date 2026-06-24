@@ -1,0 +1,12 @@
+id: glm-5.2
+name: GLM-5.2
+description: Z.ai GLM flagship text profile with 1M context for long-horizon coding and reasoning.
+provider: glm
+model: glm-5.2
+base_url: https://open.bigmodel.cn/api/paas/v4
+max_output_tokens: 131072
+context_tokens: 1000000
+supports_images: false
+short_term_tokens: 24000
+overflow_bytes: 32000
+auto_compress: true

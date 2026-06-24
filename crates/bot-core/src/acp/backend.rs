@@ -61,6 +61,7 @@ enum AcpConfig {
     Local {
         client: AcpRemoteClient,
         agent_name: String,
+        codex_args: Vec<String>,
     },
     Remote {
         base_url: String,
@@ -114,7 +115,11 @@ impl AcpConfig {
             .to_ascii_lowercase();
         let client = AcpRemoteClient::from_env();
         if mode == "local" || mode == "stub" {
-            return Self::Local { client, agent_name };
+            return Self::Local {
+                client,
+                agent_name,
+                codex_args: local_codex_args_from_env(),
+            };
         }
 
         if let Ok(base_url) = std::env::var("REMI_ACP_BASE_URL") {
@@ -136,7 +141,11 @@ impl AcpConfig {
             }
         }
 
-        Self::Local { client, agent_name }
+        Self::Local {
+            client,
+            agent_name,
+            codex_args: local_codex_args_from_env(),
+        }
     }
 
     fn agent_name(&self) -> &str {
@@ -152,6 +161,7 @@ pub struct AcpToolRequest {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub current_channel: Option<AcpBoundChannel>,
+    pub codex_startup_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +232,7 @@ pub struct PreparedToolTurn {
     pub title: Option<String>,
     pub prompt: String,
     pub message: String,
+    pub codex_startup_args: Vec<String>,
 }
 
 pub trait AcpLocalRunner: Send + Sync {
@@ -308,6 +319,15 @@ impl AcpBackend {
         if message.is_empty() {
             anyhow::bail!("missing ACP message");
         }
+        if !request.codex_startup_args.is_empty() {
+            match &self.config {
+                AcpConfig::Local {
+                    client: AcpRemoteClient::Codex,
+                    ..
+                } => {}
+                _ => anyhow::bail!("startup_args are only supported for local Codex ACP"),
+            }
+        }
         tracing::info!(
             acp_session_id = request.session_id.as_deref().unwrap_or(""),
             title_present = request
@@ -389,6 +409,7 @@ impl AcpBackend {
             title: record.title,
             prompt,
             message,
+            codex_startup_args: request.codex_startup_args,
         })
     }
 
@@ -424,7 +445,12 @@ impl AcpBackend {
             "acp.run.start"
         );
         let reply = match self
-            .invoke_remote(&prepared.session_id, &prepared.message, &prepared.prompt)
+            .invoke_remote(
+                &prepared.session_id,
+                &prepared.message,
+                &prepared.prompt,
+                &prepared.codex_startup_args,
+            )
             .await
         {
             Ok(reply) => reply,
@@ -483,6 +509,7 @@ impl AcpBackend {
             .invoke_codex(
                 &prepared.session_id,
                 &prepared.prompt,
+                &prepared.codex_startup_args,
                 event_tx,
                 decision_rx,
             )
@@ -656,6 +683,7 @@ impl AcpBackend {
                 session_id: Some(session_id.to_string()),
                 title: None,
                 current_channel: None,
+                codex_startup_args: Vec::new(),
             })
             .await?;
         let response = self.run_prepared_tool_turn(prepared).await?;
@@ -757,10 +785,18 @@ impl AcpBackend {
         save_store(&self.store_path, &store)
     }
 
-    async fn invoke_remote(&self, session_id: &str, message: &str, prompt: &str) -> Result<String> {
+    async fn invoke_remote(
+        &self,
+        session_id: &str,
+        message: &str,
+        prompt: &str,
+        codex_startup_args: &[String],
+    ) -> Result<String> {
         match &self.config {
             AcpConfig::Local {
-                client, agent_name, ..
+                client,
+                agent_name,
+                codex_args,
             } => match client {
                 AcpRemoteClient::Remi => {
                     tracing::info!(
@@ -791,9 +827,19 @@ impl AcpBackend {
                         acp_session_id = session_id,
                         acp_client = "codex",
                         prompt_len = prompt.len(),
+                        configured_startup_args_count = codex_args.len(),
+                        request_startup_args_count = codex_startup_args.len(),
                         "acp.invoke.start"
                     );
-                    invoke_local_codex(session_id, prompt, None, None).await
+                    invoke_local_codex(
+                        session_id,
+                        prompt,
+                        codex_args,
+                        codex_startup_args,
+                        None,
+                        None,
+                    )
+                    .await
                 }
             },
             AcpConfig::Remote {
@@ -872,21 +918,33 @@ impl AcpBackend {
         &self,
         session_id: &str,
         prompt: &str,
+        codex_startup_args: &[String],
         event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
         decision_rx: Option<mpsc::UnboundedReceiver<AcpApprovalDecision>>,
     ) -> Result<String> {
         match &self.config {
             AcpConfig::Local {
                 client: AcpRemoteClient::Codex,
+                codex_args,
                 ..
             } => {
                 tracing::info!(
                     acp_session_id = session_id,
                     acp_client = "codex",
                     prompt_len = prompt.len(),
+                    configured_startup_args_count = codex_args.len(),
+                    request_startup_args_count = codex_startup_args.len(),
                     "acp.invoke.start"
                 );
-                invoke_local_codex(session_id, prompt, event_tx, decision_rx).await
+                invoke_local_codex(
+                    session_id,
+                    prompt,
+                    codex_args,
+                    codex_startup_args,
+                    event_tx,
+                    decision_rx,
+                )
+                .await
             }
             AcpConfig::Remote {
                 base_url,
@@ -957,6 +1015,26 @@ fn local_codex_binary_available() -> bool {
         .unwrap_or(false)
 }
 
+fn local_codex_args_from_env() -> Vec<String> {
+    let Ok(value) = std::env::var("REMI_ACP_CODEX_ARGS") else {
+        return Vec::new();
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<String>>(value) {
+        Ok(args) => args,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "ignoring invalid REMI_ACP_CODEX_ARGS; expected JSON string array"
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn local_codex_approval_stdin_enabled() -> bool {
     std::env::var("REMI_ACP_CODEX_APPROVAL_STDIN")
         .ok()
@@ -966,15 +1044,28 @@ fn local_codex_approval_stdin_enabled() -> bool {
 async fn invoke_local_codex(
     session_id: &str,
     prompt: &str,
+    configured_startup_args: &[String],
+    request_startup_args: &[String],
     event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
     decision_rx: Option<mpsc::UnboundedReceiver<AcpApprovalDecision>>,
 ) -> Result<String> {
     let program = local_codex_binary();
-    invoke_local_codex_with_program(&program, session_id, prompt, event_tx, decision_rx).await
+    invoke_local_codex_with_program(
+        &program,
+        configured_startup_args,
+        request_startup_args,
+        session_id,
+        prompt,
+        event_tx,
+        decision_rx,
+    )
+    .await
 }
 
 async fn invoke_local_codex_with_program(
     program: &str,
+    configured_startup_args: &[String],
+    request_startup_args: &[String],
     session_id: &str,
     prompt: &str,
     event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
@@ -988,11 +1079,15 @@ async fn invoke_local_codex_with_program(
         cwd = %cwd.display(),
         output_path = %output_path.display(),
         prompt_len = prompt.len(),
+        configured_startup_args_count = configured_startup_args.len(),
+        request_startup_args_count = request_startup_args.len(),
         "acp.codex.start"
     );
     let approval_stdin = local_codex_approval_stdin_enabled() && decision_rx.is_some();
     let mut command = Command::new(program);
     command
+        .args(configured_startup_args)
+        .args(request_startup_args)
         .arg("exec")
         .arg("--json")
         .arg("--cd")
@@ -1714,6 +1809,7 @@ mod tests {
                 session_id: None,
                 title: Some("demo".to_string()),
                 current_channel: None,
+                codex_startup_args: Vec::new(),
             })
             .await
             .unwrap();
@@ -1728,6 +1824,7 @@ mod tests {
                 session_id: Some(first_session.clone()),
                 title: None,
                 current_channel: None,
+                codex_startup_args: Vec::new(),
             })
             .await
             .unwrap();
@@ -1750,6 +1847,7 @@ mod tests {
                 session_id: None,
                 title: Some("runner test".to_string()),
                 current_channel: None,
+                codex_startup_args: Vec::new(),
             })
             .await
             .unwrap();
@@ -1760,6 +1858,36 @@ mod tests {
         assert!(response.reply.contains("runner session="));
         assert!(response.reply.contains("message=use real runner"));
         assert!(!response.reply.contains("[local-acp:"));
+    }
+
+    #[tokio::test]
+    async fn startup_args_are_rejected_for_non_local_codex() {
+        let _guard = ACP_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("REMI_ACP_MODE", "remote");
+            std::env::set_var("REMI_ACP_CLIENT", "codex");
+            std::env::set_var("REMI_ACP_BASE_URL", "http://127.0.0.1:9");
+        }
+        let dir = tempdir().unwrap();
+        let backend = AcpBackend::new(dir.path().to_path_buf(), None);
+        let err = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "hello".to_string(),
+                session_id: None,
+                title: None,
+                current_channel: None,
+                codex_startup_args: vec!["--config".to_string()],
+            })
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("startup_args are only supported for local Codex ACP"));
+        unsafe {
+            std::env::remove_var("REMI_ACP_MODE");
+            std::env::remove_var("REMI_ACP_CLIENT");
+            std::env::remove_var("REMI_ACP_BASE_URL");
+        }
     }
 
     #[test]
@@ -1807,6 +1935,8 @@ printf '{{"output_text":"json fallback"}}\n'
 
         let reply = invoke_local_codex_with_program(
             bin_path.to_str().unwrap(),
+            &[],
+            &[],
             "acp-session-1",
             "ACP agent: default\n\nCurrent user message:\nhello codex",
             None,
@@ -1822,6 +1952,63 @@ printf '{{"output_text":"json fallback"}}\n'
         assert!(args.contains(" --sandbox workspace-write "));
         assert!(args.contains(" --output-last-message "));
         assert!(args.ends_with(" -\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_codex_inserts_startup_args_before_exec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("codex.log");
+        let bin_path = dir.path().join("codex");
+        let mut file = std::fs::File::create(&bin_path).unwrap();
+        writeln!(
+            file,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "{log}"
+out=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--output-last-message" ]]; then
+    out="$arg"
+    break
+  fi
+  prev="$arg"
+done
+printf 'done\n' > "$out"
+"#,
+            log = log_path.display()
+        )
+        .unwrap();
+        drop(file);
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        let configured_args = vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()];
+        let request_args = vec!["--profile".to_string(), "work".to_string()];
+        let reply = invoke_local_codex_with_program(
+            bin_path.to_str().unwrap(),
+            &configured_args,
+            &request_args,
+            "acp-session-1",
+            "hello codex",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        let args = std::fs::read_to_string(log_path).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[0], "--config");
+        assert_eq!(lines[1], "model=\"gpt-5-codex\"");
+        assert_eq!(lines[2], "--profile");
+        assert_eq!(lines[3], "work");
+        assert_eq!(lines[4], "exec");
     }
 
     #[test]
@@ -1898,6 +2085,8 @@ printf 'final reply: %s\n' "$prompt" > "$out"
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let reply = invoke_local_codex_with_program(
             bin_path.to_str().unwrap(),
+            &[],
+            &[],
             "acp-session-1",
             "ACP agent: default\n\nCurrent user message:\nhello codex",
             Some(tx),
@@ -1962,6 +2151,8 @@ printf 'decision: %s\n' "$decision" > "$out"
         let task = tokio::spawn(async move {
             invoke_local_codex_with_program(
                 &program,
+                &[],
+                &[],
                 "acp-session-1",
                 "ACP agent: default\n\nCurrent user message:\nhello codex",
                 Some(event_tx),
@@ -2036,6 +2227,7 @@ printf 'slow codex saw: %s\n' "$prompt" > "$out"
                 session_id: None,
                 title: Some("slow codex".to_string()),
                 current_channel: None,
+                codex_startup_args: Vec::new(),
             })
             .await
             .unwrap();

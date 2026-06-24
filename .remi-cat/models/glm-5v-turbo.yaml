@@ -1,0 +1,12 @@
+id: glm-5v-turbo
+name: GLM-5V-Turbo
+description: Z.ai GLM multimodal coding profile with image input support.
+provider: glm
+model: glm-5v-turbo
+base_url: https://open.bigmodel.cn/api/paas/v4
+max_output_tokens: 131072
+context_tokens: 200000
+supports_images: true
+short_term_tokens: 24000
+overflow_bytes: 32000
+auto_compress: true

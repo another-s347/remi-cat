@@ -284,6 +284,17 @@ seeded into `REMI_DATA_DIR/models` on first start. Set
 all come from that file. If `supports_images` is `false`, image or document
 inputs fail fast with a clear error instead of being silently dropped.
 
+Additional OpenAI-compatible built-in profiles include:
+
+| Profile | Provider | API key env |
+| --- | --- | --- |
+| `mimo-v2.5-pro`, `mimo-v2.5` | Xiaomi MiMo | `MIMO_API_KEY` |
+| `kimi-k2.7-code`, `kimi-k2.6` | Moonshot Kimi | `MOONSHOT_API_KEY` or `KIMI_API_KEY` |
+| `glm-5.2`, `glm-5v-turbo` | Z.ai GLM | `GLM_API_KEY`, `ZHIPU_API_KEY`, or `BIGMODEL_API_KEY` |
+
+All provider-specific keys fall back to `OPENAI_API_KEY` and then
+`REMI_API_KEY`, so existing OpenAI-compatible deployments continue to work.
+
 `auto_compress` controls whether short-term memory is compacted automatically.
 When it is `false`, turns are still saved, but only explicit compaction paths
 will summarize older history.
@@ -300,8 +311,13 @@ sub-session channel binding. Parent agent context receives the final tool
 result; intermediate child output stays observable as sub-session progress.
 By default, local ACP uses the installed Codex CLI (`codex exec`) when
 `acp.client` is `codex`; set `REMI_ACP_CODEX_BIN` to override the binary path,
-or run `remi-cat codex setup --bin /path/to/codex`. The model only sees the
-`codex` tool when the Codex binary is configured and executable.
+or run `remi-cat codex setup --bin /path/to/codex`. Extra Codex global startup
+arguments can be configured with `remi-cat codex setup --arg=--config
+--arg=model=\"gpt-5-codex\"`, `acp.codex_args: ["--config", "key=value"]`, or
+`REMI_ACP_CODEX_ARGS='["--config","key=value"]'`; they are inserted before
+`exec` as `codex <args> exec ...`. A single `codex` tool call can also pass
+`startup_args: ["--profile", "work"]` for that invocation. The model only sees
+the `codex` tool when the Codex binary is configured and executable.
 
 ## Admin API
 

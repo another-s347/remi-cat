@@ -642,8 +642,24 @@ pub fn summarize_tool_args(args: &serde_json::Value) -> String {
     if text.len() <= MAX {
         text
     } else {
-        format!("{}… [truncated {} bytes]", &text[..MAX], text.len() - MAX)
+        let split = safe_utf8_prefix_len(&text, MAX);
+        format!(
+            "{}… [truncated {} bytes]",
+            &text[..split],
+            text.len() - split
+        )
     }
+}
+
+fn safe_utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut index = max_bytes;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn redact_json_value(value: &mut serde_json::Value) {
@@ -1040,6 +1056,17 @@ mod tests {
     fn review_parse_failure_is_high() {
         let review = parse_review_json("not json");
         assert_eq!(review.risk, ToolRiskLevel::High);
+    }
+
+    #[test]
+    fn summarize_tool_args_truncates_multibyte_text_without_panicking() {
+        let summary = summarize_tool_args(&serde_json::json!({
+            "comment": "审批通过".repeat(600),
+        }));
+
+        assert!(summary.contains("审批"));
+        assert!(summary.contains("[truncated "));
+        assert!(summary.is_char_boundary(summary.len()));
     }
 
     #[tokio::test]

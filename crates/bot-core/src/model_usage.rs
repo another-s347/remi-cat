@@ -67,12 +67,19 @@ fn infer_provider(profile: &ModelProfileConfig) -> String {
         .to_ascii_lowercase();
     if model.contains("deepseek") || base_url.contains("deepseek.com") {
         "deepseek".to_string()
+    } else if model.contains("mimo") || base_url.contains("xiaomimimo.com") {
+        "mimo".to_string()
     } else if model.contains("kimi")
         || model.contains("moonshot")
         || base_url.contains("moonshot.cn")
         || base_url.contains("kimi.com")
     {
         "kimi".to_string()
+    } else if model.contains("glm")
+        || base_url.contains("bigmodel.cn")
+        || base_url.contains("zhipu")
+    {
+        "glm".to_string()
     } else {
         "unknown".to_string()
     }
@@ -230,6 +237,22 @@ mod tests {
         assert_eq!(
             infer_provider(&profile(None, "gpt-4o", Some("https://api.openai.com/v1"))),
             "unknown"
+        );
+        assert_eq!(
+            infer_provider(&profile(
+                None,
+                "mimo-v2.5-pro",
+                Some("https://api.xiaomimimo.com/v1")
+            )),
+            "mimo"
+        );
+        assert_eq!(
+            infer_provider(&profile(
+                None,
+                "glm-5.2",
+                Some("https://open.bigmodel.cn/api/paas/v4")
+            )),
+            "glm"
         );
     }
 

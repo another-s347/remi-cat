@@ -1,7 +1,7 @@
 use crate::app::{CLI_CHAT_ID, CLI_USERNAME};
 use crate::instance_profile::{self, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
 use crate::profile_command::{self, ProfileCommand};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 pub(crate) const CLI_USER_ID: &str = "local-user";
 
@@ -307,13 +307,21 @@ enum FeishuCliCommand {
 enum CodexCliCommand {
     #[command(
         about = "Configure local Codex as the ACP client",
-        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n\nThis writes `acp.mode=local`, `acp.client=codex`, and optional Codex binary/agent settings to the selected profile runtime config."
+        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n  remi-cat codex setup --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThis writes `acp.mode=local`, `acp.client=codex`, and optional Codex binary/agent settings to the selected profile runtime config."
     )]
     Setup {
         #[arg(long = "bin", value_name = "PATH", help = "Path to the codex binary")]
         bin: Option<String>,
         #[arg(long, value_name = "NAME", help = "ACP agent name")]
         agent: Option<String>,
+        #[arg(
+            long = "arg",
+            value_name = "ARG",
+            action = ArgAction::Append,
+            allow_hyphen_values = true,
+            help = "Extra Codex startup arg inserted before `exec`; repeat to pass multiple args"
+        )]
+        args: Vec<String>,
     },
     #[command(about = "Inspect Codex ACP configuration")]
     Doctor,
@@ -596,6 +604,7 @@ pub(crate) enum CodexCommand {
     Setup {
         bin: Option<String>,
         agent: Option<String>,
+        args: Vec<String>,
     },
     Doctor,
 }
@@ -843,7 +852,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             FeishuCliCommand::Doctor => FeishuCommand::Doctor,
         })),
         Some(CliCommand::Codex { command }) => Ok(AppCommand::Codex(match command {
-            CodexCliCommand::Setup { bin, agent } => CodexCommand::Setup { bin, agent },
+            CodexCliCommand::Setup { bin, agent, args } => CodexCommand::Setup { bin, agent, args },
             CodexCliCommand::Doctor => CodexCommand::Doctor,
         })),
         Some(CliCommand::Update { command }) => Ok(AppCommand::Update(match command {

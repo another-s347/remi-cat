@@ -97,6 +97,14 @@ impl RuntimeConfig {
         {
             set_env_if_absent("REMI_ACP_CODEX_BIN", codex_bin);
         }
+        if !self.acp.codex_args.is_empty() {
+            match serde_json::to_string(&self.acp.codex_args) {
+                Ok(value) => set_env_if_absent("REMI_ACP_CODEX_ARGS", &value),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to serialize Codex startup args")
+                }
+            }
+        }
     }
 }
 
@@ -310,6 +318,8 @@ pub struct AcpConfig {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_args: Vec<String>,
 }
 
 impl Default for AcpConfig {
@@ -319,6 +329,7 @@ impl Default for AcpConfig {
             client: AcpClient::Codex,
             agent_name: None,
             codex_bin: None,
+            codex_args: Vec::new(),
         }
     }
 }
@@ -444,7 +455,13 @@ pub fn detect_setup_state(data_dir: &Path) -> SetupState {
 }
 
 pub fn has_legacy_env_credentials() -> bool {
-    std::env::var("OPENAI_API_KEY")
+    std::env::var("MIMO_API_KEY")
+        .or_else(|_| std::env::var("MOONSHOT_API_KEY"))
+        .or_else(|_| std::env::var("KIMI_API_KEY"))
+        .or_else(|_| std::env::var("GLM_API_KEY"))
+        .or_else(|_| std::env::var("ZHIPU_API_KEY"))
+        .or_else(|_| std::env::var("BIGMODEL_API_KEY"))
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .or_else(|_| std::env::var("REMI_API_KEY"))
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
@@ -495,12 +512,15 @@ mod tests {
         detect_setup_state, load_runtime_config, runtime_config_path, write_runtime_config,
         AcpClient, AdminConfig, ImMode, RuntimeConfig, SetupState,
     };
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn runtime_config_round_trip() {
         let dir =
             std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
-        let cfg = RuntimeConfig {
+        let mut cfg = RuntimeConfig {
             data_dir: dir.display().to_string(),
             root_agent_id: "default".into(),
             model_profile: "deepseek-v4-flash".into(),
@@ -513,6 +533,7 @@ mod tests {
             shell: Default::default(),
             acp: Default::default(),
         };
+        cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
         write_runtime_config(&dir, &cfg).unwrap();
         let loaded = load_runtime_config(&dir).unwrap().unwrap();
         assert_eq!(loaded, cfg);
@@ -564,6 +585,24 @@ model_profile: default
     fn default_acp_client_is_codex() {
         let cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
         assert_eq!(cfg.acp.client, AcpClient::Codex);
+    }
+
+    #[test]
+    fn apply_env_defaults_sets_codex_args_as_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+        }
+        let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
+        cfg.apply_env_defaults();
+        assert_eq!(
+            std::env::var("REMI_ACP_CODEX_ARGS").unwrap(),
+            r#"["--config","model=\"gpt-5-codex\""]"#
+        );
+        unsafe {
+            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+        }
     }
 
     #[test]
