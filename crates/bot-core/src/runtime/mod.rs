@@ -2598,9 +2598,6 @@ fn delegate_tool_name(agent_id: &str) -> String {
 
 fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
     let mut tools = profile.tools.clone();
-    if !tools.iter().any(|tool| tool == "ask_user_question") {
-        tools.push("ask_user_question".to_string());
-    }
     for delegate in &profile.delegates {
         let name = delegate_tool_name(delegate);
         if !tools.iter().any(|tool| tool == &name) {
