@@ -5,51 +5,50 @@ use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ReqwestTransport,
-    ResumePayload, Role, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool,
-    ToolContext, ToolOutput, ToolResult,
+    AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ResumePayload, Role,
+    RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool, ToolContext, ToolOutput,
+    ToolResult,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::hooks::HookContext;
-use crate::im_tools::register_fetch_tool;
-use crate::memory::{
-    build_injected_history, LlmCompressor, MemoryGetDetailTool, MemoryRecallTool,
-    MemoryUpsertNamedTool,
-};
+use crate::memory::{build_injected_history, LlmCompressor};
 use crate::sandbox::SandboxConfig;
-use crate::search::SearchTool;
 use crate::skill::store::SkillStore;
-use crate::tools::{
-    BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RootedFsApplyPatchTool,
-    RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
-    SecretRedactor, SleepTool, WorkspaceBashTool, WorkspaceSshTool,
-};
+use crate::tools::{BashMode, SecretRedactor};
 use crate::{
-    acp, context_budget_tokens, embedded_agent_profile, goal, install_embedded_agent_profiles,
+    acp, embedded_agent_profile, goal, install_embedded_agent_profiles,
     install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
     sandbox, skill, supervisor_workflow, todo, trigger, AccountUsage, AgentModelBindings,
-    AgentProfile, AgentRegistry, AskUserQuestionTool, BuiltinSkillStore, CatAgent, CatEvent,
-    Content, ContentPart, FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager,
-    ImAttachment, ImDocument, ImFileBridge, MemoryStore, Message, ModelProfileConfig,
-    ModelProfileRegistry, SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary,
-    SupervisorTraceEvent, ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager,
-    WorkflowDecision, WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport,
-    WorkflowStatus,
+    AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
+    FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument,
+    ImFileBridge, MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, SharedRedactor,
+    SkillDocument, SkillLoadDiagnostic, SkillSummary, SupervisorTraceEvent, ThreadHistoryMessage,
+    ToolApprovalManager, UserQuestionManager, WorkflowDecision, WorkflowDefinition,
+    WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
 };
 
 mod approval_markers;
+mod memory_runtime;
+mod model_provider;
 mod partial_turn;
 mod prompting;
+mod supervisor_agent;
+mod tool_registry;
 mod tool_status;
 pub(crate) use approval_markers::{
     cat_event_from_subagent_approval_marker, subagent_approval_marker,
     tool_approval_requested_marker, tool_approval_resolved_marker, tool_approval_updated_marker,
     user_question_requested_marker, user_question_resolved_marker, user_question_updated_marker,
 };
+use memory_runtime::{persist_intermediate_user_state, persist_turn};
+use model_provider::{
+    auto_compress_context_percent, build_inner_agent, context_percent_tokens,
+    resolve_effective_model_profile, tool_output_overflow_bytes_from_env, InnerAgent,
+};
+pub use model_provider::{EffectiveModelProfile, EffectiveModelSource};
 pub(crate) use partial_turn::PartialTurnRecorder;
 pub(crate) use prompting::{
     append_thread_todo_system_prompt, apply_skill_injections,
@@ -57,6 +56,10 @@ pub(crate) use prompting::{
     model_input_snapshot_from_loop_input, prepend_group_sender_username, route_thread_todo_prompt,
     single_chat_sender_system_prompt, truncate_user_name,
 };
+use supervisor_agent::{
+    hook_context_message, workflow_round_allows_continue, WorkflowRoundOutcome,
+};
+use tool_registry::{build_subagent_tools, register_runtime_tools};
 pub(crate) use tool_status::{
     builtin_tool_catalog, tool_errors, tool_runtime_errors, tool_warnings,
 };
@@ -128,7 +131,6 @@ pub struct StreamOptions {
 
 // -- Type aliases -------------------------------------------------------------
 
-type InnerAgent = AgentLoop<OpenAIClient<ReqwestTransport>>;
 type ThreadRunLock = Arc<AsyncMutex<()>>;
 type ThreadRunLocks = Arc<AsyncMutex<HashMap<String, ThreadRunLock>>>;
 
@@ -242,19 +244,6 @@ pub struct RegisteredToolStatus {
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct EffectiveModelProfile {
-    pub profile: ModelProfileConfig,
-    pub source: EffectiveModelSource,
-    pub invalid_session_model: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectiveModelSource {
-    Session,
-    Default,
-}
-
 impl CatBot {
     pub fn model_context_tokens(&self) -> u32 {
         self.model_profile.context_tokens
@@ -315,28 +304,11 @@ impl CatBot {
         &self,
         session_model_profile_id: Option<&str>,
     ) -> EffectiveModelProfile {
-        if let Some(id) = session_model_profile_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if let Some(profile) = self.model_registry.get(id) {
-                return EffectiveModelProfile {
-                    profile: profile.clone(),
-                    source: EffectiveModelSource::Session,
-                    invalid_session_model: None,
-                };
-            }
-            return EffectiveModelProfile {
-                profile: self.model_profile.clone(),
-                source: EffectiveModelSource::Default,
-                invalid_session_model: Some(id.to_string()),
-            };
-        }
-        EffectiveModelProfile {
-            profile: self.model_profile.clone(),
-            source: EffectiveModelSource::Default,
-            invalid_session_model: None,
-        }
+        resolve_effective_model_profile(
+            &self.model_profile,
+            &self.model_registry,
+            session_model_profile_id,
+        )
     }
 
     pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
@@ -1704,125 +1676,7 @@ impl CatBot {
     }
 }
 
-enum WorkflowRoundOutcome {
-    NoWorkflow,
-    Report(WorkflowReport),
-    Continue {
-        report: WorkflowReport,
-        message: String,
-    },
-}
-
-fn workflow_round_allows_continue(
-    max_rounds: &WorkflowMaxRounds,
-    completed_continuations: u32,
-) -> bool {
-    match max_rounds {
-        GoalMaxRounds::Limited(max) => completed_continuations < *max,
-        GoalMaxRounds::Unlimited => true,
-    }
-}
-
-fn hook_context_message(event: &str, content: String) -> Message {
-    Message {
-        id: MessageId::new(),
-        role: Role::System,
-        content: Content::text(format!(
-            "Hook {event} provided additional context:\n{content}"
-        )),
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-        reasoning_content: None,
-        metadata: None,
-    }
-}
-
 // -- Helpers ------------------------------------------------------------------
-
-/// Save new turn messages and user_state to the memory store.
-///
-/// Strips the first `skip_count` messages (the injected history prefix) from
-/// `history` before persisting, so only the new user + assistant messages are
-/// appended to short-term storage.
-async fn persist_turn(
-    memory: &MemoryStore,
-    thread_id: &str,
-    history: Option<Vec<Message>>,
-    user_state: Option<serde_json::Value>,
-    skip_count: usize,
-    tool_elapsed_ms: &HashMap<String, u64>,
-) -> Vec<CatEvent> {
-    let mut events = Vec::new();
-    if let Some(all_msgs) = history {
-        let mut new_msgs: Vec<Message> = all_msgs.into_iter().skip(skip_count).collect();
-        annotate_tool_elapsed_ms(&mut new_msgs, tool_elapsed_ms);
-        tracing::debug!(
-            thread_id,
-            skip_count,
-            total_msgs = new_msgs.len(),
-            msgs_with_metadata = new_msgs.iter().filter(|m| m.metadata.is_some()).count(),
-            "persist_turn: saving messages"
-        );
-        for (i, m) in new_msgs.iter().enumerate() {
-            tracing::debug!(
-                i, role = ?m.role, has_metadata = m.metadata.is_some(), metadata = ?m.metadata,
-                "persist_turn: message[{}]", i
-            );
-        }
-        if !new_msgs.is_empty() {
-            let mut sink = |event| events.push(CatEvent::ContextCompaction(event));
-            if let Err(e) = memory
-                .save_turn_with_compaction_events(thread_id, new_msgs, Some(&mut sink))
-                .await
-            {
-                tracing::warn!(thread_id, error = %e, "memory.persist.failed");
-            }
-        }
-    }
-    if let Some(us) = user_state {
-        if let Err(e) = memory.save_user_state(thread_id, &us).await {
-            tracing::warn!(thread_id, error = %e, "memory.user_state.persist.failed");
-        }
-    }
-    events
-}
-
-fn annotate_tool_elapsed_ms(messages: &mut [Message], tool_elapsed_ms: &HashMap<String, u64>) {
-    for message in messages {
-        let Some(call_id) = message.tool_call_id.as_deref() else {
-            continue;
-        };
-        let Some(elapsed_ms) = tool_elapsed_ms.get(call_id) else {
-            continue;
-        };
-        let metadata = message
-            .metadata
-            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let serde_json::Value::Object(map) = metadata {
-            map.insert(
-                "tool_elapsed_ms".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(*elapsed_ms)),
-            );
-        }
-    }
-}
-
-async fn persist_intermediate_user_state(
-    memory: &MemoryStore,
-    thread_id: &str,
-    user_state: serde_json::Value,
-) -> CatEvent {
-    if let Err(e) = memory.save_user_state(thread_id, &user_state).await {
-        tracing::warn!(
-            thread_id,
-            intermediate = true,
-            error = %e,
-            "memory.user_state.persist.failed"
-        );
-    }
-    CatEvent::StateUpdate(user_state)
-}
 
 fn summarize_content_for_log(content: &Content) -> String {
     match content {
@@ -1989,132 +1843,9 @@ impl LocalToolDeps {
             extra_options,
             self.overflow_bytes,
         );
-        local_tools.register(MemoryGetDetailTool {
-            store: Arc::clone(&self.memory),
-            agent_id: self.active_agent_id.clone(),
-        });
-        local_tools.register(MemoryUpsertNamedTool {
-            store: Arc::clone(&self.memory),
-            agent_id: self.active_agent_id.clone(),
-            workspace_root: self.workspace_root.clone(),
-        });
-        local_tools.register(MemoryRecallTool {
-            store: Arc::clone(&self.memory),
-            agent_id: self.active_agent_id.clone(),
-        });
-        local_tools.register(SearchTool {
-            skill_store: Arc::clone(&self.skill_store),
-            memory_store: Arc::clone(&self.memory),
-            agent_id: self.active_agent_id.clone(),
-        });
-        if self.bash_enabled {
-            local_tools.register(WorkspaceBashTool::new(
-                Arc::clone(&self.sandbox),
-                Arc::clone(&self.redactor),
-            ));
-        }
-        local_tools.register(WorkspaceSshTool::new(Arc::clone(&self.redactor)));
-        local_tools.register(RootedFsReadTool {
-            sandbox: Arc::clone(&self.sandbox),
-            redactor: Arc::clone(&self.redactor),
-        });
-        local_tools.register(RootedFsWriteTool {
-            sandbox: Arc::clone(&self.sandbox),
-        });
-        local_tools.register(RootedFsApplyPatchTool {
-            sandbox: Arc::clone(&self.sandbox),
-        });
-        local_tools.register(RootedFsCreateTool {
-            sandbox: Arc::clone(&self.sandbox),
-        });
-        local_tools.register(RootedFsRemoveTool {
-            sandbox: Arc::clone(&self.sandbox),
-        });
-        local_tools.register(RootedFsLsTool {
-            sandbox: Arc::clone(&self.sandbox),
-            redactor: Arc::clone(&self.redactor),
-        });
-        register_fetch_tool(
-            &mut local_tools,
-            self.workspace_root.clone(),
-            self.sandbox.workspace_root_label(),
-            self.sandbox.kind() != "docker",
-            self.im_bridge.clone(),
-        );
-        local_tools.register(ExaSearchTool::new());
-        local_tools.register(NowTool);
-        local_tools.register(SleepTool);
-        local_tools.register(ManageYourselfTool);
-        local_tools.register(AskUserQuestionTool::new(Arc::clone(
-            &self.user_question_manager,
-        )));
+        register_runtime_tools(&mut local_tools, self, &self.active_agent_id, true);
         local_tools
     }
-}
-
-fn build_inner_agent(
-    api_key: &str,
-    profile: &ModelProfileConfig,
-    system_prompt: String,
-    max_turns: Option<usize>,
-    extra_options: serde_json::Map<String, serde_json::Value>,
-) -> InnerAgent {
-    let mut model = OpenAIClient::new(api_key.to_string()).with_model(profile.model.clone());
-    if let Some(url) = profile.base_url.clone() {
-        model = model.with_base_url(url);
-    }
-    let mut builder = AgentBuilder::new()
-        .model(model)
-        .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
-        .system(system_prompt)
-        .max_turns(max_turns.unwrap_or(usize::MAX));
-    if !extra_options.is_empty() {
-        builder = builder.extra_options(extra_options);
-    }
-    builder.build_loop()
-}
-
-fn auto_compress_context_percent() -> anyhow::Result<usize> {
-    let Some(raw) = std::env::var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT);
-    };
-    let percent = raw.parse::<usize>().map_err(|err| {
-        anyhow::anyhow!("invalid REMI_AUTO_COMPRESS_CONTEXT_PERCENT `{raw}`: {err}")
-    })?;
-    if !(1..=100).contains(&percent) {
-        anyhow::bail!("REMI_AUTO_COMPRESS_CONTEXT_PERCENT must be between 1 and 100");
-    }
-    Ok(percent)
-}
-
-fn tool_output_overflow_bytes_from_env() -> anyhow::Result<Option<usize>> {
-    let Some((key, raw)) = ["REMI_TOOL_OUTPUT_OVERFLOW_BYTES", "REMI_OVERFLOW_BYTES"]
-        .into_iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(|value| (key, value))
-        })
-    else {
-        return Ok(None);
-    };
-    let bytes = raw
-        .parse::<usize>()
-        .map_err(|err| anyhow::anyhow!("invalid {key} `{raw}`: {err}"))?;
-    if bytes == 0 {
-        anyhow::bail!("{key} must be greater than 0");
-    }
-    Ok(Some(bytes))
-}
-
-fn context_percent_tokens(profile: &ModelProfileConfig, percent: usize) -> usize {
-    context_budget_tokens(profile.context_tokens, percent)
 }
 
 // -- CatBotBuilder ------------------------------------------------------------
@@ -2441,63 +2172,7 @@ impl CatBotBuilder {
             self.extra_options.clone(),
             overflow_bytes,
         );
-        acp_local_tools.register(MemoryGetDetailTool {
-            store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-        });
-        acp_local_tools.register(MemoryUpsertNamedTool {
-            store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-            workspace_root: self.sandbox_config.host_dir().to_path_buf(),
-        });
-        acp_local_tools.register(MemoryRecallTool {
-            store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-        });
-        acp_local_tools.register(SearchTool {
-            skill_store: Arc::clone(&skill_store),
-            memory_store: Arc::clone(&memory),
-            agent_id: active_agent_id.clone(),
-        });
-        if self.sandbox_config.bash_enabled() {
-            acp_local_tools.register(WorkspaceBashTool::new(
-                Arc::clone(&sandbox),
-                Arc::clone(&redactor),
-            ));
-        }
-        acp_local_tools.register(WorkspaceSshTool::new(Arc::clone(&redactor)));
-        acp_local_tools.register(RootedFsReadTool {
-            sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&redactor),
-        });
-        acp_local_tools.register(RootedFsWriteTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        acp_local_tools.register(RootedFsApplyPatchTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        acp_local_tools.register(RootedFsCreateTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        acp_local_tools.register(RootedFsRemoveTool {
-            sandbox: Arc::clone(&sandbox),
-        });
-        acp_local_tools.register(RootedFsLsTool {
-            sandbox: Arc::clone(&sandbox),
-            redactor: Arc::clone(&redactor),
-        });
-        register_fetch_tool(
-            &mut acp_local_tools,
-            workspace_root.clone(),
-            sandbox.workspace_root_label(),
-            sandbox.kind() != "docker",
-            self.im_bridge.clone(),
-        );
-        acp_local_tools.register(ExaSearchTool::new());
-        acp_local_tools.register(NowTool);
-        acp_local_tools.register(SleepTool);
-        acp_local_tools.register(ManageYourselfTool);
-        acp_local_tools.register(AskUserQuestionTool::new(Arc::clone(&user_question_manager)));
+        register_runtime_tools(&mut acp_local_tools, &acp_tool_deps, &active_agent_id, true);
         let run_locks: ThreadRunLocks = Arc::new(AsyncMutex::new(HashMap::new()));
         acp_backend.set_local_runner(Arc::new(LocalAcpAgentRunner {
             agent: CatAgent {
@@ -3298,70 +2973,6 @@ fn register_delegate_agent_tools(
     }
 }
 
-fn build_subagent_tools(deps: &LocalToolDeps, profile: &AgentProfile) -> DefaultToolRegistry {
-    let mut local_tools = DefaultToolRegistry::new();
-    skill::register_skill_tools(&mut local_tools, Arc::clone(&deps.skill_store));
-    todo::register_todo_tools(&mut local_tools, Arc::clone(&deps.todo_backend));
-    trigger::register_trigger_tools(&mut local_tools, Arc::clone(&deps.trigger_backend));
-    local_tools.register(MemoryGetDetailTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: profile.id.clone(),
-    });
-    local_tools.register(MemoryUpsertNamedTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: profile.id.clone(),
-        workspace_root: deps.workspace_root.clone(),
-    });
-    local_tools.register(MemoryRecallTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: profile.id.clone(),
-    });
-    local_tools.register(SearchTool {
-        skill_store: Arc::clone(&deps.skill_store),
-        memory_store: Arc::clone(&deps.memory),
-        agent_id: profile.id.clone(),
-    });
-    if deps.bash_enabled {
-        local_tools.register(WorkspaceBashTool::new(
-            Arc::clone(&deps.sandbox),
-            Arc::clone(&deps.redactor),
-        ));
-    }
-    local_tools.register(WorkspaceSshTool::new(Arc::clone(&deps.redactor)));
-    local_tools.register(RootedFsReadTool {
-        sandbox: Arc::clone(&deps.sandbox),
-        redactor: Arc::clone(&deps.redactor),
-    });
-    local_tools.register(RootedFsWriteTool {
-        sandbox: Arc::clone(&deps.sandbox),
-    });
-    local_tools.register(RootedFsApplyPatchTool {
-        sandbox: Arc::clone(&deps.sandbox),
-    });
-    local_tools.register(RootedFsCreateTool {
-        sandbox: Arc::clone(&deps.sandbox),
-    });
-    local_tools.register(RootedFsRemoveTool {
-        sandbox: Arc::clone(&deps.sandbox),
-    });
-    local_tools.register(RootedFsLsTool {
-        sandbox: Arc::clone(&deps.sandbox),
-        redactor: Arc::clone(&deps.redactor),
-    });
-    register_fetch_tool(
-        &mut local_tools,
-        deps.workspace_root.clone(),
-        deps.sandbox.workspace_root_label(),
-        deps.sandbox.kind() != "docker",
-        deps.im_bridge.clone(),
-    );
-    local_tools.register(ExaSearchTool::new());
-    local_tools.register(NowTool);
-    local_tools.register(SleepTool);
-    local_tools.register(ManageYourselfTool);
-    local_tools
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3374,10 +2985,10 @@ mod tests {
         PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, ThreadRunLocks,
         DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
-    use crate::{estimate_model_input_tokens, ModelInputSegmentCategory};
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
     use crate::todo::tools::TodoItem;
+    use crate::{estimate_model_input_tokens, ModelInputSegmentCategory};
     use futures::StreamExt as _;
     use remi_agentloop::prelude::Role;
     use remi_agentloop::tool::registry::ToolRegistry;
