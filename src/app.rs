@@ -8,19 +8,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::channel::Channel;
+#[cfg(test)]
+pub(crate) use crate::cli::UpdateCommand;
 pub(crate) use crate::cli::{
-    parse_cli_args, try_parse_cli_args, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-    FeishuCommand, GitHubIssueCreateRequest, GitHubIssueCreateResponse, GitHubRelease,
-    HooksCommand, SecretCommand, UpdateCommand, UpdateStatus, CLI_USER_ID,
+    parse_cli_args, try_parse_cli_args, AppCommand, CliConfig, CodexCommand, FeishuCommand,
+    HooksCommand, SecretCommand, CLI_USER_ID,
 };
 #[cfg(test)]
 pub(crate) use crate::cli::{parse_command, parse_global_args};
+#[cfg(test)]
+pub(crate) use crate::cli::{FeedbackCommand, GitHubIssueCreateRequest};
+#[cfg(test)]
+pub(crate) use crate::command::{
+    build_cargo_install_args, feedback_repo, github_new_issue_url, normalize_release_tag,
+    parse_release_version, percent_encode_query, redact_known_secrets, update_available,
+};
 #[cfg(test)]
 pub(crate) use crate::command::{
     direct_workflow_options, is_goal_set_command, parse_goal_max_rounds,
 };
 pub(crate) use crate::command::{
-    format_hook_statuses, process_runtime_commands, RuntimeCommandPipelineResult,
+    format_hook_statuses, process_runtime_commands, run_feedback_command, run_update_command,
+    RuntimeCommandPipelineResult,
 };
 use crate::config::{
     detect_setup_state, has_legacy_env_credentials, load_dotenv_pairs, upsert_dotenv_value,
@@ -70,373 +79,6 @@ pub(crate) const SESSION_DEBUG_METADATA_KEY: &str = "debug";
 pub(crate) const SESSION_MODEL_PROFILE_METADATA_KEY: &str = "model_profile_id";
 pub(crate) const SESSION_INPUT_HISTORY_METADATA_KEY: &str = "input_history";
 pub(crate) const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
-const DEFAULT_UPDATE_REPO: &str = "another-s347/remi-cat";
-const DEFAULT_UPDATE_GIT_URL: &str = "https://github.com/another-s347/remi-cat.git";
-const DEFAULT_FEEDBACK_REPO: &str = "another-s347/remi-cat";
-const GITHUB_API_VERSION: &str = "2026-03-10";
-
-fn update_repo() -> String {
-    std::env::var("REMI_UPDATE_REPO")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string())
-}
-
-fn update_git_url(repo: &str) -> String {
-    std::env::var("REMI_UPDATE_GIT_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if repo == DEFAULT_UPDATE_REPO {
-                DEFAULT_UPDATE_GIT_URL.to_string()
-            } else {
-                format!("https://github.com/{repo}.git")
-            }
-        })
-}
-
-fn parse_release_version(value: &str) -> anyhow::Result<semver::Version> {
-    let version = value.trim().trim_start_matches('v');
-    semver::Version::parse(version).with_context(|| format!("invalid release version `{value}`"))
-}
-
-fn normalize_release_tag(value: &str) -> anyhow::Result<String> {
-    let version = parse_release_version(value)?;
-    Ok(format!("v{version}"))
-}
-
-#[cfg(test)]
-fn update_available(current: &str, latest: &str) -> anyhow::Result<bool> {
-    Ok(parse_release_version(latest)? > parse_release_version(current)?)
-}
-
-fn build_cargo_install_args(git_url: &str, tag: &str) -> Vec<String> {
-    vec![
-        "install".to_string(),
-        "--git".to_string(),
-        git_url.to_string(),
-        "--tag".to_string(),
-        tag.to_string(),
-        "remi-cat".to_string(),
-        "--locked".to_string(),
-        "--force".to_string(),
-    ]
-}
-
-async fn fetch_latest_github_release(repo: &str) -> anyhow::Result<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let response = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "remi-cat")
-        .send()
-        .await
-        .with_context(|| format!("failed to query {url}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub release check failed with HTTP {status}: {body}");
-    }
-
-    response
-        .json::<GitHubRelease>()
-        .await
-        .context("failed to parse GitHub release response")
-}
-
-async fn build_update_status() -> anyhow::Result<UpdateStatus> {
-    let repo = update_repo();
-    let git_url = update_git_url(&repo);
-    let release = fetch_latest_github_release(&repo).await?;
-    let latest = parse_release_version(&release.tag_name)?;
-    let current = parse_release_version(env!("CARGO_PKG_VERSION"))?;
-    Ok(UpdateStatus {
-        current_version: current.to_string(),
-        latest_version: latest.to_string(),
-        latest_tag: release.tag_name,
-        update_available: latest > current,
-        repo,
-        git_url,
-    })
-}
-
-async fn run_update_command(command: UpdateCommand) -> anyhow::Result<()> {
-    match command {
-        UpdateCommand::Check { json } => {
-            let status = build_update_status().await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                println!("current: {}", status.current_version);
-                println!("latest: {} ({})", status.latest_version, status.latest_tag);
-                println!(
-                    "update_available: {}",
-                    if status.update_available { "yes" } else { "no" }
-                );
-                if status.update_available {
-                    println!("Run: remi-cat update self");
-                }
-            }
-            Ok(())
-        }
-        UpdateCommand::SelfUpdate {
-            version,
-            force,
-            dry_run,
-        } => {
-            let repo = update_repo();
-            let git_url = update_git_url(&repo);
-            let target_tag = match version {
-                Some(value) => normalize_release_tag(&value)?,
-                None => build_update_status().await?.latest_tag,
-            };
-            let target_version = parse_release_version(&target_tag)?;
-            let current_version = parse_release_version(env!("CARGO_PKG_VERSION"))?;
-            if target_version <= current_version && !force {
-                println!(
-                    "remi-cat is already at {}. Use --force to reinstall {}.",
-                    current_version, target_tag
-                );
-                return Ok(());
-            }
-
-            let install_args = build_cargo_install_args(&git_url, &target_tag);
-            if dry_run {
-                println!("cargo {}", install_args.join(" "));
-                return Ok(());
-            }
-
-            println!(
-                "Installing remi-cat {} from {} via cargo install...",
-                target_tag, git_url
-            );
-            let status = TokioCommand::new("cargo")
-                .args(&install_args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .await
-                .context("failed to run cargo install")?;
-            if !status.success() {
-                anyhow::bail!("cargo install failed with status {status}");
-            }
-            println!("remi-cat updated to {target_tag}.");
-            println!("Restart any running remi-cat profile processes to use the new binary.");
-            Ok(())
-        }
-    }
-}
-
-async fn run_feedback_command(
-    store: Arc<Mutex<SecretStore>>,
-    profile: &InstanceProfile,
-    data_dir: &Path,
-    command: FeedbackCommand,
-) -> anyhow::Result<()> {
-    let repo = feedback_repo(command.repo.as_deref())?;
-    let secret_entries = store.lock().await.entries()?;
-    let redactions = redaction_entries(&secret_entries);
-    let body = build_feedback_issue_body(
-        &command.body,
-        profile,
-        data_dir,
-        command.include_logs,
-        &redactions,
-    );
-    let payload = GitHubIssueCreateRequest {
-        title: command.title,
-        body,
-        labels: command.labels,
-    };
-
-    if command.dry_run {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        println!("repo: {repo}");
-        return Ok(());
-    }
-
-    let Some(token) = github_issue_token(&secret_entries) else {
-        let url = github_new_issue_url(&repo, &payload);
-        println!("GitHub token not found; open this URL to create the issue:");
-        println!("{url}");
-        println!(
-            "To submit directly, set GITHUB_TOKEN, GH_TOKEN, or REMI_GITHUB_TOKEN with Issues: write permission."
-        );
-        return Ok(());
-    };
-
-    let response = create_github_issue(&repo, &token, &payload).await?;
-    println!(
-        "Created GitHub issue #{}: {}",
-        response.number, response.html_url
-    );
-    Ok(())
-}
-
-fn feedback_repo(override_repo: Option<&str>) -> anyhow::Result<String> {
-    let repo = override_repo
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("REMI_FEEDBACK_REPO").ok())
-        .unwrap_or_else(|| DEFAULT_FEEDBACK_REPO.to_string());
-    let repo = repo.trim().trim_start_matches('/').trim_end_matches('/');
-    let parts = repo.split('/').collect::<Vec<_>>();
-    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
-        anyhow::bail!("invalid GitHub repo `{repo}`; expected owner/repo");
-    }
-    Ok(repo.to_string())
-}
-
-fn github_issue_token(secrets: &std::collections::BTreeMap<String, String>) -> Option<String> {
-    ["GITHUB_TOKEN", "GH_TOKEN", "REMI_GITHUB_TOKEN"]
-        .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .or_else(|| secrets.get(*key).cloned())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-}
-
-fn build_feedback_issue_body(
-    user_body: &str,
-    profile: &InstanceProfile,
-    data_dir: &Path,
-    include_logs: bool,
-    redactions: &HashMap<String, String>,
-) -> String {
-    let setup_state = detect_setup_state(data_dir);
-    let setup_label = match &setup_state {
-        SetupState::Initialized { .. } => "initialized",
-        SetupState::Invalid { .. } => "invalid",
-        SetupState::LegacyEnvCompatible { .. } => "legacy-env-compatible",
-        SetupState::Uninitialized { .. } => "uninitialized",
-    };
-    let mut body = format!(
-        "{}\n\n---\n\n### Diagnostics\n\n```text\nremi-cat_version: {}\nos: {}\narch: {}\nprofile: {}\nsetup_state: {}\n{}\n{}\n```\n",
-        user_body.trim(),
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        profile.label(),
-        setup_label,
-        sdk_doctor_report(data_dir),
-        sandbox_doctor_report(data_dir, &setup_state),
-    );
-    if include_logs {
-        let logs = collect_feedback_logs(profile, redactions);
-        if logs.trim().is_empty() {
-            body.push_str("\n### Logs\n\nNo log files found.\n");
-        } else {
-            body.push_str("\n### Logs\n\n```text\n");
-            body.push_str(&logs.replace("```", "'''"));
-            body.push_str("\n```\n");
-        }
-    } else {
-        body.push_str(
-            "\nLogs omitted. Re-run with `--include-logs` to attach recent local logs.\n",
-        );
-    }
-    body
-}
-
-fn collect_feedback_logs(
-    profile: &InstanceProfile,
-    redactions: &HashMap<String, String>,
-) -> String {
-    let mut sections = Vec::new();
-    for path in [profile.log_file(), profile.log_dir().join("tui.log")] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let redacted = redact_known_secrets(&text, redactions);
-            sections.push(format!(
-                "== {} ==\n{}",
-                path.display(),
-                tail_lines(&redacted, 200)
-            ));
-        }
-    }
-    sections.join("\n\n")
-}
-
-fn redact_known_secrets(text: &str, redactions: &HashMap<String, String>) -> String {
-    redactions.values().fold(text.to_string(), |acc, secret| {
-        if secret.is_empty() {
-            acc
-        } else {
-            acc.replace(secret, "***REDACTED***")
-        }
-    })
-}
-
-fn tail_lines(text: &str, max_lines: usize) -> String {
-    let lines = text.lines().collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
-}
-
-async fn create_github_issue(
-    repo: &str,
-    token: &str,
-    payload: &GitHubIssueCreateRequest,
-) -> anyhow::Result<GitHubIssueCreateResponse> {
-    let url = format!("https://api.github.com/repos/{repo}/issues");
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .header(reqwest::header::USER_AGENT, "remi-cat")
-        .bearer_auth(token)
-        .json(payload)
-        .send()
-        .await
-        .with_context(|| format!("failed to create GitHub issue at {url}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub issue creation failed with HTTP {status}: {body}");
-    }
-
-    response
-        .json::<GitHubIssueCreateResponse>()
-        .await
-        .context("failed to parse GitHub issue response")
-}
-
-fn github_new_issue_url(repo: &str, payload: &GitHubIssueCreateRequest) -> String {
-    let mut url = format!(
-        "https://github.com/{repo}/issues/new?title={}&body={}",
-        percent_encode_query(&payload.title),
-        percent_encode_query(&payload.body)
-    );
-    if !payload.labels.is_empty() {
-        url.push_str("&labels=");
-        url.push_str(&percent_encode_query(&payload.labels.join(",")));
-    }
-    url
-}
-
-fn percent_encode_query(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            b' ' => out.push('+'),
-            byte => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FeishuCredentialChoice {
     ReuseExisting,
@@ -1523,7 +1165,7 @@ fn has_all_tools(tools: &[String], required: &[&str]) -> bool {
         .all(|required| tools.iter().any(|tool| tool == required))
 }
 
-fn sandbox_doctor_report(data_dir: &Path, setup_state: &SetupState) -> String {
+pub(crate) fn sandbox_doctor_report(data_dir: &Path, setup_state: &SetupState) -> String {
     let config = match setup_state {
         SetupState::Initialized { config, .. } => config.clone(),
         _ => {
@@ -1871,7 +1513,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn sdk_doctor_report(data_dir: &Path) -> String {
+pub(crate) fn sdk_doctor_report(data_dir: &Path) -> String {
     let remote_ready = env_var_present("REMI_APP_KEY") && env_var_present("REMI_PUBLIC_GRPC_ADDR");
     let partial_remote = env_var_present("REMI_APP_KEY") ^ env_var_present("REMI_PUBLIC_GRPC_ADDR");
     let mode = if remote_ready {

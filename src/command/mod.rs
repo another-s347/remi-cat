@@ -1,5 +1,19 @@
 use anyhow::Context;
 
+mod feedback;
+mod update;
+
+pub(crate) use feedback::run_feedback_command;
+#[cfg(test)]
+pub(crate) use feedback::{
+    feedback_repo, github_new_issue_url, percent_encode_query, redact_known_secrets,
+};
+pub(crate) use update::run_update_command;
+#[cfg(test)]
+pub(crate) use update::{
+    build_cargo_install_args, normalize_release_tag, parse_release_version, update_available,
+};
+
 use crate::app::{
     command_doctor_report, handle_runtime_secret_command, MAX_COMMAND_PREPROCESS_DEPTH,
     SESSION_DEBUG_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
