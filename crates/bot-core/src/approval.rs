@@ -359,6 +359,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRisk
     match tool_name {
         "fs_read"
         | "fs_ls"
+        | "rg"
         | "search"
         | "skill__get"
         | "skill__search"

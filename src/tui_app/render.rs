@@ -31,21 +31,12 @@ impl TuiApp {
 
     fn render_status(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.flush_status_elapsed();
-        let mut meta = Vec::new();
         let active_tools = self.active_tool_count();
         let status_busy = self.running
             || active_tools > 0
             || matches!(self.status.state.as_str(), "running" | "thinking")
             || self.status.state.starts_with("turn ");
-        if self.running {
-            meta.push(format_elapsed(self.status.elapsed_ms));
-        }
-        if active_tools > 0 {
-            meta.push(format!("{active_tools} tools"));
-        }
-        if !self.queued_inputs.is_empty() {
-            meta.push(format!("{} queued", self.queued_inputs.len()));
-        }
+        let meta = self.status_meta_parts(active_tools);
         let error = self
             .status
             .last_error
@@ -78,6 +69,52 @@ impl TuiApp {
         ]);
         let lines = vec![line, horizontal_rule(area.width)];
         frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn status_meta_parts(&self, active_tools: usize) -> Vec<String> {
+        let mut meta = Vec::new();
+        meta.push(self.supervisor_status_label());
+        meta.push(
+            self.latest_active_todo_label
+                .clone()
+                .unwrap_or_else(|| "todo none".to_string()),
+        );
+        meta.push(format!(
+            "cwd {}",
+            compact_workspace_label(&self.workspace_root_label)
+        ));
+        if let Some(branch) = &self.git_branch {
+            meta.push(format!("git {branch}"));
+        }
+        if self.running {
+            meta.push(format_elapsed(self.status.elapsed_ms));
+        }
+        if active_tools > 0 {
+            meta.push(format!("{active_tools} tools"));
+        }
+        if !self.queued_inputs.is_empty() {
+            meta.push(format!("{} queued", self.queued_inputs.len()));
+        }
+        meta
+    }
+
+    fn supervisor_status_label(&self) -> String {
+        let Some(id) = self.active_supervisor_id.as_ref() else {
+            return "supervisor idle".to_string();
+        };
+        let Some(state) = self.supervisors.get(id) else {
+            return "supervisor running".to_string();
+        };
+        if let Some(edge) = state.edge.as_deref().filter(|value| !value.is_empty()) {
+            return format!("supervisor {edge}");
+        }
+        if let Some(status) = state.status.as_deref().filter(|value| !value.is_empty()) {
+            return format!("supervisor {status}");
+        }
+        if let Some(event) = state.events.last() {
+            return format!("supervisor {}", event.label);
+        }
+        "supervisor running".to_string()
     }
 
     fn footer_context_line(&self) -> Line<'static> {

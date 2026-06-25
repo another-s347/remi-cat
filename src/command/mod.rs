@@ -110,11 +110,13 @@ pub(crate) async fn handle_runtime_command(
         return Ok(Some(RuntimeCommandResult::Reply(runtime_command_help())));
     }
     if command == "/tools" {
-        let session_agent_id = runtime
-            .sessions
-            .lock()
-            .await
-            .metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY);
+        let (session_agent_id, session_model_profile_id) = {
+            let sessions = runtime.sessions.lock().await;
+            (
+                sessions.metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY),
+                sessions.metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            )
+        };
         let workflow_agent_id = runtime
             .bot
             .workflow_status(session_id)
@@ -126,7 +128,10 @@ pub(crate) async fn handle_runtime_command(
         );
         let reply = runtime
             .bot
-            .tool_list_for_agent(Some(&effective.profile.id))
+            .tool_list_for_agent_and_model(
+                Some(&effective.profile.id),
+                session_model_profile_id.as_deref(),
+            )
             .into_iter()
             .map(|(name, desc)| format!("- `{name}`: {desc}"))
             .collect::<Vec<_>>()

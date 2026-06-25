@@ -6,9 +6,9 @@ use crate::im_tools::register_fetch_tool;
 use crate::memory::{MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
 use crate::search::SearchTool;
 use crate::tools::{
-    ExaSearchTool, ManageYourselfTool, NowTool, RootedFsApplyPatchTool, RootedFsCreateTool,
-    RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool, SleepTool,
-    WorkspaceBashTool, WorkspaceSshTool,
+    ExaSearchTool, ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool,
+    RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
+    SleepTool, WorkspaceBashTool, WorkspaceSshTool,
 };
 use crate::{skill, todo, trigger, AgentProfile, AskUserQuestionTool};
 
@@ -62,6 +62,10 @@ pub(super) fn register_runtime_tools(
         sandbox: Arc::clone(&deps.sandbox),
     });
     local_tools.register(RootedFsLsTool {
+        sandbox: Arc::clone(&deps.sandbox),
+        redactor: Arc::clone(&deps.redactor),
+    });
+    local_tools.register(RipgrepTool {
         sandbox: Arc::clone(&deps.sandbox),
         redactor: Arc::clone(&deps.redactor),
     });

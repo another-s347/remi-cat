@@ -26,6 +26,7 @@ tools:
   - fs_mkdir
   - fs_remove
   - fs_ls
+  - rg
   - fetch
   - now
   - codex

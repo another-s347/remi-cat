@@ -196,6 +196,10 @@ where
             &[],
             tool_allowlist.as_deref(),
         );
+        let tool_names = extra_defs
+            .iter()
+            .map(|definition| definition.function.name.clone())
+            .collect::<Vec<_>>();
 
         stream! {
             let run_start = Instant::now();
@@ -204,6 +208,9 @@ where
                 run_id = %log_run_id,
                 supervisor_run,
                 dynamic_tools = dynamic_tool_count,
+                tool_count = tool_names.len(),
+                tools = ?tool_names,
+                allowlist = ?tool_allowlist,
                 "agent_run.start"
             );
             let mut total_prompt_tokens: u32 = 0;

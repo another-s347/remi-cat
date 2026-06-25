@@ -59,7 +59,6 @@ use crate::{
 };
 
 const TUI_CHANNEL: &str = "tui";
-const DEFAULT_TUI_SESSION: &str = "local-tui";
 const MAX_HISTORY_CELLS: usize = 400;
 const CODEX_CYAN: Color = Color::Rgb(109, 209, 255);
 const CODEX_DIM: Color = Color::Rgb(118, 124, 134);
@@ -90,22 +89,27 @@ pub(crate) async fn run_tui(
             select_resume_session_id(&runtime, &mut terminal.terminal).await?
         }
     } else {
-        let session_channel = if cli.channel_id == crate::CLI_CHAT_ID {
-            DEFAULT_TUI_SESSION
-        } else {
-            &cli.channel_id
-        };
-        runtime.sessions.lock().await.resolve_channel(
-            TUI_CHANNEL,
-            session_channel,
-            &runtime.root_agent_id,
-        )?
+        let session_channel = tui_start_channel_id(&cli.channel_id);
+        runtime
+            .sessions
+            .lock()
+            .await
+            .create_channel(TUI_CHANNEL, &session_channel, &runtime.root_agent_id, None)?
+            .id
     };
 
     let mut app = TuiApp::new(runtime, cli, session_id, trigger_rx).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
     result
+}
+
+fn tui_start_channel_id(cli_channel_id: &str) -> String {
+    if cli_channel_id == crate::CLI_CHAT_ID {
+        format!("tui:{}", uuid::Uuid::new_v4())
+    } else {
+        cli_channel_id.to_string()
+    }
 }
 
 async fn select_resume_session_id(
@@ -411,6 +415,41 @@ fn current_workspace_root_label(workspace_dir: &std::path::Path) -> String {
     }
 }
 
+fn compact_workspace_label(label: &str) -> String {
+    let sanitized = sanitize_tui_text(label);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return ".".to_string();
+    }
+    let path = std::path::Path::new(trimmed);
+    if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        if !name.trim().is_empty() {
+            return name.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn current_git_branch(workspace_dir: &std::path::Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
 struct TuiApp {
     runtime: Rc<Runtime>,
     cli: CliConfig,
@@ -421,6 +460,7 @@ struct TuiApp {
     command_catalog: Vec<CommandEntry>,
     workspace_dir: std::path::PathBuf,
     workspace_root_label: String,
+    git_branch: Option<String>,
     file_query: Option<String>,
     file_matches: Vec<WorkspaceFileMatch>,
     popup_selected: usize,
@@ -455,6 +495,7 @@ struct TuiApp {
     user_question_state: &'static str,
     active_supervisor_id: Option<String>,
     last_todo_body: Option<String>,
+    latest_active_todo_label: Option<String>,
     loaded_thread_history_len: usize,
     sub_session_event_log_lines: usize,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
@@ -477,6 +518,7 @@ impl TuiApp {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
+        let git_branch = current_git_branch(&workspace_dir);
         let mut app = Self {
             runtime,
             cli,
@@ -487,6 +529,7 @@ impl TuiApp {
             command_catalog: Vec::new(),
             workspace_dir,
             workspace_root_label,
+            git_branch,
             file_query: None,
             file_matches: Vec::new(),
             popup_selected: 0,
@@ -521,6 +564,7 @@ impl TuiApp {
             user_question_state: "waiting",
             active_supervisor_id: None,
             last_todo_body: None,
+            latest_active_todo_label: None,
             loaded_thread_history_len: 0,
             sub_session_event_log_lines: 0,
             bot_tx,
@@ -992,6 +1036,7 @@ impl TuiApp {
         self.approval_state = "waiting";
         self.active_supervisor_id = None;
         self.last_todo_body = None;
+        self.latest_active_todo_label = None;
         self.loaded_thread_history_len = 0;
         self.sub_session_event_log_lines = 0;
         self.load_input_history().await;
@@ -1323,10 +1368,15 @@ impl TuiApp {
             BotEvent::ContextCompaction(event) => {
                 upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(event));
             }
-            BotEvent::TodoState(body) => {
+            BotEvent::TodoState {
+                body,
+                latest_active,
+            } => {
                 if self.last_todo_body.as_deref() == Some(body.as_str()) {
+                    self.latest_active_todo_label = latest_active;
                     return;
                 }
+                self.latest_active_todo_label = latest_active;
                 self.last_todo_body = Some(body.clone());
                 if let Some(cell) = self
                     .cells
@@ -1450,6 +1500,7 @@ impl TuiApp {
                 });
                 self.supervisors.clear();
                 self.last_todo_body = None;
+                self.latest_active_todo_label = None;
             }
             BotEvent::Error(message) => {
                 self.status.last_error = Some(message.clone());
@@ -2817,7 +2868,10 @@ async fn run_bot_turn(
                 }
                 CatEvent::StateUpdate(user_state) => {
                     let items = bot_core::todo::todos_from_user_state(&user_state);
-                    let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
+                    let _ = tx.send(BotEvent::TodoState {
+                        body: format_todo_state(&items),
+                        latest_active: latest_active_todo_label(&items),
+                    });
                 }
                 CatEvent::Stats {
                     prompt_tokens,
@@ -2954,7 +3008,10 @@ async fn run_tui_trigger_turn(
             }
             CatEvent::StateUpdate(user_state) => {
                 let items = bot_core::todo::todos_from_user_state(&user_state);
-                let _ = tx.send(BotEvent::TodoState(format_todo_state(&items)));
+                let _ = tx.send(BotEvent::TodoState {
+                    body: format_todo_state(&items),
+                    latest_active: latest_active_todo_label(&items),
+                });
             }
             CatEvent::Stats {
                 prompt_tokens,
@@ -3160,7 +3217,10 @@ enum BotEvent {
     ContextCompaction(ContextCompactionEvent),
     SupervisorProgress(SupervisorTraceEvent),
     SupervisorReport(WorkflowReport),
-    TodoState(String),
+    TodoState {
+        body: String,
+        latest_active: Option<String>,
+    },
     ApprovalRequested(ToolApprovalRequest),
     ApprovalUpdated(ToolApprovalRequest),
     ApprovalResolved {
@@ -4505,6 +4565,60 @@ mod tests {
     }
 
     #[test]
+    fn latest_active_todo_label_uses_last_unfinished_item() {
+        let items = vec![
+            bot_core::todo::TodoItem {
+                id: 1,
+                content: "Draft release notes".to_string(),
+                description: None,
+                done: false,
+                batch_id: Some(7),
+                batch_title: Some("Release".to_string()),
+                batch_index: Some(0),
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
+            },
+            bot_core::todo::TodoItem {
+                id: 2,
+                content: "Ship".to_string(),
+                description: None,
+                done: true,
+                batch_id: None,
+                batch_title: None,
+                batch_index: None,
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
+            },
+            bot_core::todo::TodoItem {
+                id: 3,
+                content: "Verify install".to_string(),
+                description: None,
+                done: false,
+                batch_id: Some(7),
+                batch_title: Some("Release".to_string()),
+                batch_index: Some(1),
+                storage_kind: Default::default(),
+                collection_uuid: None,
+                thing_uuid: None,
+            },
+        ];
+
+        assert_eq!(
+            latest_active_todo_label(&items).as_deref(),
+            Some("todo #3 Verify install · Release")
+        );
+    }
+
+    #[test]
+    fn compact_workspace_label_uses_final_path_component() {
+        assert_eq!(compact_workspace_label("/home/skye/remi-cat"), "remi-cat");
+        assert_eq!(compact_workspace_label("/"), "/");
+        assert_eq!(compact_workspace_label(""), ".");
+    }
+
+    #[test]
     fn appends_token_meta_to_history_cell() {
         let mut cell = HistoryCell::assistant("hello");
         append_token_meta(
@@ -4529,6 +4643,17 @@ mod tests {
         assert!(crate::MAX_COMMAND_PREPROCESS_DEPTH >= 1);
         assert_eq!(crate::CLI_CHANNEL, "cli");
         assert_eq!(crate::CLI_USERNAME, "local-user");
+    }
+
+    #[test]
+    fn default_tui_start_uses_fresh_channel_id() {
+        let first = tui_start_channel_id(crate::CLI_CHAT_ID);
+        let second = tui_start_channel_id(crate::CLI_CHAT_ID);
+
+        assert!(first.starts_with("tui:"));
+        assert!(second.starts_with("tui:"));
+        assert_ne!(first, second);
+        assert_eq!(tui_start_channel_id("desk"), "desk");
     }
 
     fn test_cli_config() -> CliConfig {

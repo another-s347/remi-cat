@@ -113,6 +113,13 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             let path = string_arg(args, "path").unwrap_or(".");
             (format!("查看目录 {path}"), "列出目录内容".to_string())
         }
+        "rg" => {
+            let pattern = string_arg(args, "query").unwrap_or("内容");
+            (
+                format!("搜索 {pattern}"),
+                "使用 ripgrep 搜索工作区".to_string(),
+            )
+        }
         "fs_remove" => {
             let path = string_arg(args, "path").unwrap_or("文件");
             (format!("删除 {path}"), "移除工作区路径".to_string())
@@ -180,6 +187,17 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
                 .filter(|line| !line.trim().is_empty())
                 .count();
             format!("列出 {count} 项")
+        }
+        "rg" => {
+            if result.trim() == "No matches." {
+                "未找到匹配".to_string()
+            } else {
+                let count = result
+                    .lines()
+                    .filter(|line| !line.trim().is_empty() && !line.starts_with('['))
+                    .count();
+                format!("找到 {count} 行")
+            }
         }
         "fetch" => fetch_summary(result).unwrap_or(started),
         "workspace_bash" | "bash" => bash_summary(args, result),

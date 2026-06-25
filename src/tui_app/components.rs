@@ -1302,6 +1302,20 @@ pub(super) fn format_todo_state(items: &[bot_core::todo::TodoItem]) -> String {
     lines.join("\n")
 }
 
+pub(super) fn latest_active_todo_label(items: &[bot_core::todo::TodoItem]) -> Option<String> {
+    let item = items.iter().rev().find(|item| !item.done)?;
+    let mut label = format!("todo #{} {}", item.id, single_line(&item.content));
+    if let Some(batch) = item
+        .batch_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        label.push_str(&format!(" · {batch}"));
+    }
+    Some(truncate_chars(&label, 80))
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalOption {
     pub(super) label: &'static str,

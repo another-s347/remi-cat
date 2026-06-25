@@ -1099,6 +1099,159 @@ impl Tool for RootedFsLsTool {
     }
 }
 
+// ── RipgrepTool ───────────────────────────────────────────────────────────────
+
+pub struct RipgrepTool {
+    pub sandbox: Arc<dyn Sandbox>,
+    pub redactor: SharedRedactor,
+}
+
+impl Tool for RipgrepTool {
+    fn name(&self) -> &str {
+        "rg"
+    }
+    fn description(&self) -> &str {
+        "Search workspace files with ripgrep. Prefer this for text/code search. \
+         Pass one ripgrep argument string; paths are workspace-relative. Results include file paths, line numbers, and columns."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Arguments to pass to rg, for example \"TODO src -g '*.rs'\". Parsed shell-style, then executed as rg argv." },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": format!("Maximum output bytes to return (default {DEFAULT_FS_READ_LENGTH}).")
+                }
+            },
+            "required": ["query"]
+        })
+    }
+    fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        _ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
+    {
+        let sandbox = Arc::clone(&self.sandbox);
+        let redactor = Arc::clone(&self.redactor);
+        async move {
+            let query = arguments["query"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AgentError::tool("rg", "missing 'query'"))?
+                .to_string();
+            let rg_args = parse_rg_query(&query)?;
+            let max_bytes = arguments["max_bytes"]
+                .as_u64()
+                .unwrap_or(DEFAULT_FS_READ_LENGTH as u64)
+                .clamp(1, 256 * 1024) as usize;
+            let command = rg_command(&rg_args);
+            Ok(ToolResult::Output(stream! {
+                let started = Instant::now();
+                let command_preview = log_preview(&command, 160);
+                tracing::info!(
+                    command = %command_preview,
+                    query_len = query.len(),
+                    args = rg_args.len(),
+                    sandbox_kind = %sandbox.kind(),
+                    "rg.start"
+                );
+                match sandbox.bash(&command, None, 30_000).await {
+                    Err(err) => {
+                        tracing::warn!(
+                            command = %command_preview,
+                            sandbox_kind = %sandbox.kind(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %err,
+                            "rg.failed"
+                        );
+                        yield ToolOutput::text(format!("error: {err:#}"));
+                    }
+                    Ok(output) => {
+                        let stdout_bytes = output.stdout.len();
+                        let stderr_bytes = output.stderr.len();
+                        tracing::info!(
+                            command = %command_preview,
+                            sandbox_kind = %sandbox.kind(),
+                            exit_code = output.exit_code,
+                            stdout_bytes,
+                            stderr_bytes,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "rg.completed"
+                        );
+                        let text = format_rg_output(output, max_bytes, &redactor);
+                        yield ToolOutput::text(text);
+                    }
+                }
+            }))
+        }
+    }
+}
+
+fn parse_rg_query(query: &str) -> Result<Vec<String>, AgentError> {
+    shlex::split(query)
+        .ok_or_else(|| AgentError::tool("rg", "failed to parse query; check shell quoting"))
+}
+
+fn rg_command(query_args: &[String]) -> String {
+    let mut args = vec![
+        "rg".to_string(),
+        "--line-number".to_string(),
+        "--column".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+    ];
+    args.extend(query_args.iter().cloned());
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn format_rg_output(
+    output: SandboxBashOutput,
+    max_bytes: usize,
+    redactor: &SharedRedactor,
+) -> String {
+    if output.exit_code == 1 && output.stdout.is_empty() && output.stderr.is_empty() {
+        return "No matches.".to_string();
+    }
+    let mut text = output.stdout;
+    if !output.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr] ");
+        text.push_str(&output.stderr);
+    }
+    if output.exit_code != 0 && output.exit_code != 1 {
+        text.push_str(&format!("\n[exit {}]", output.exit_code));
+    }
+    let mut bytes = text.into_bytes();
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+        while std::str::from_utf8(&bytes).is_err() {
+            bytes.pop();
+        }
+    }
+    let mut text = String::from_utf8(bytes).unwrap_or_default();
+    if truncated {
+        text.push_str(&format!("\n[truncated to {max_bytes} bytes]"));
+    }
+    redactor.read().unwrap().redact(&text)
+}
+
 // ── ExaSearchTool ─────────────────────────────────────────────────────────────
 
 const EXA_API_URL: &str = "https://api.exa.ai/search";
@@ -1247,9 +1400,9 @@ impl Tool for ExaSearchTool {
 mod tests {
     use super::{
         format_command_output, format_utc_offset, parse_apply_patch, parse_manage_yourself_command,
-        parse_ssh_target, parse_timezone_spec, ssh_command_args, validate_ssh_named, NowTool,
-        ParsedPatchOp, PatchHunk, RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor,
-        SshTarget, WorkspaceBashTool,
+        parse_rg_query, parse_ssh_target, parse_timezone_spec, rg_command, ssh_command_args,
+        validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool, RootedFsApplyPatchTool,
+        RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
     };
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use futures::StreamExt;
@@ -1507,6 +1660,55 @@ mod tests {
             serde_json::from_str(&cancelled).expect("cancel output should be json");
         assert_eq!(cancelled["status"], "cancelled");
         assert_eq!(cancelled["message"], "bash task cancelled");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn rg_command_quotes_arguments() {
+        let args = parse_rg_query(r#""can't touch this" src/lib.rs -g '*.rs' -t rust"#)
+            .expect("query should parse");
+        let command = rg_command(&args);
+        assert!(command.contains("'can'\"'\"'t touch this'"));
+        assert!(command.contains("'-g' '*.rs'"));
+        assert!(command.contains("'-t' 'rust'"));
+        assert!(command.ends_with("'-t' 'rust'"));
+    }
+
+    #[tokio::test]
+    async fn rg_tool_searches_workspace() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("src"))
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("src/lib.rs"), "fn alpha() {}\nfn beta() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("README.md"), "alpha docs\n")
+            .await
+            .unwrap();
+        let tool = RipgrepTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let output = collect_tool_text(
+            <RipgrepTool as Tool>::execute(
+                &tool,
+                json!({
+                    "query": "alpha src -g '*.rs'"
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("rg should execute"),
+        )
+        .await;
+
+        assert!(output.contains("src/lib.rs:1:4:"));
+        assert!(output.contains("fn alpha() {}"));
+        assert!(!output.contains("README.md"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

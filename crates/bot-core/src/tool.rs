@@ -12,7 +12,7 @@ pub use crate::im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use crate::search::SearchTool;
 pub use crate::tool_pretty::{tool_success, PrettyToolCall, PrettyToolStatus};
 pub use crate::tools::{
-    BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RootedFsApplyPatchTool,
+    BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool,
     RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
     SecretRedactor, SharedRedactor, SleepTool, WorkspaceBashTool, WorkspaceSshTool,
 };

@@ -971,10 +971,20 @@ impl CatBot {
     }
 
     pub fn tool_list_for_agent(&self, session_agent_id: Option<&str>) -> Vec<(String, String)> {
+        self.tool_list_for_agent_and_model(session_agent_id, None)
+    }
+
+    pub fn tool_list_for_agent_and_model(
+        &self,
+        session_agent_id: Option<&str>,
+        session_model_profile_id: Option<&str>,
+    ) -> Vec<(String, String)> {
         use remi_agentloop::tool::registry::ToolRegistry;
         let effective_agent = self.effective_agent_profile(session_agent_id);
-        let active_agent =
-            self.runtime_for_agent_and_model(&effective_agent.profile.id, &self.model_profile.id);
+        let effective_model = self
+            .effective_model_profile_for_agent(session_model_profile_id, &effective_agent.profile);
+        let active_agent = self
+            .runtime_for_agent_and_model(&effective_agent.profile.id, &effective_model.profile.id);
         active_agent
             .local_tools
             .definitions(&serde_json::Value::Null)

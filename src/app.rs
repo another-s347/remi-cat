@@ -71,6 +71,23 @@ pub(crate) const SESSION_AGENT_ID_METADATA_KEY: &str = "agent_id";
 pub(crate) const SESSION_INPUT_HISTORY_METADATA_KEY: &str = "input_history";
 pub(crate) const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
 
+fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
+    match detect_setup_state(data_dir) {
+        SetupState::Initialized { config, .. } => {
+            config.apply_env_defaults();
+            *data_dir =
+                std::path::PathBuf::from(std::env::var("REMI_DATA_DIR").unwrap_or(config.data_dir));
+        }
+        SetupState::LegacyEnvCompatible { .. } if tui_mode => {
+            let config = crate::runtime_config::RuntimeConfig::default_for(data_dir);
+            config.apply_env_defaults();
+            *data_dir =
+                std::path::PathBuf::from(std::env::var("REMI_DATA_DIR").unwrap_or(config.data_dir));
+        }
+        _ => {}
+    }
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match parse_cli_args(&raw_args) {
@@ -179,12 +196,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             unsafe {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
             }
-            if let SetupState::Initialized { config, .. } = detect_setup_state(&data_dir) {
-                config.apply_env_defaults();
-                data_dir = std::path::PathBuf::from(
-                    std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
-                );
-            }
+            apply_runtime_env_defaults(&mut data_dir, cli.tui);
             if cli.tui {
                 let workspace_dir =
                     std::env::current_dir().context("resolving current workspace")?;
@@ -540,6 +552,9 @@ mod cli_tests {
     use im_feishu::FeishuMessage;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -662,6 +677,55 @@ mod cli_tests {
                 .join("profiles")
                 .join("dev")
         );
+    }
+
+    #[test]
+    fn tui_legacy_env_applies_runtime_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let data_root = std::env::temp_dir().join(format!(
+            "remi-tui-runtime-defaults-{}",
+            uuid::Uuid::new_v4()
+        ));
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+            for key in [
+                "REMI_DATA_DIR",
+                "REMI_SANDBOX_KIND",
+                "REMI_SANDBOX_HOST_DIR",
+                "REMI_SHELL_MODE",
+                "REMI_ACP_MODE",
+                "REMI_ACP_CLIENT",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+
+        let mut data_dir = data_root.clone();
+        super::apply_runtime_env_defaults(&mut data_dir, true);
+
+        assert_eq!(data_dir, data_root);
+        assert_eq!(
+            std::env::var("REMI_DATA_DIR").unwrap(),
+            data_root.display().to_string()
+        );
+        assert_eq!(std::env::var("REMI_SANDBOX_KIND").unwrap(), "no_sandbox");
+        assert_eq!(std::env::var("REMI_ACP_MODE").unwrap(), "local");
+        assert_eq!(std::env::var("REMI_ACP_CLIENT").unwrap(), "codex");
+
+        unsafe {
+            for key in [
+                "OPENAI_API_KEY",
+                "REMI_DATA_DIR",
+                "REMI_SANDBOX_KIND",
+                "REMI_SANDBOX_HOST_DIR",
+                "REMI_SHELL_MODE",
+                "REMI_ACP_MODE",
+                "REMI_ACP_CLIENT",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+        let _ = std::fs::remove_dir_all(data_root);
     }
 
     #[test]

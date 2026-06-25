@@ -27,6 +27,7 @@ pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] 
         ("memory__recall", "Search memory directly."),
         ("memory__upsert_named", "Save or update a named memory."),
         ("now", "Return the current time."),
+        ("rg", "Search workspace files with ripgrep."),
         ("search", "Search local memory/skills or web results."),
         ("skill__get", "Read a skill document."),
         ("skill__search", "Search installed skills."),
@@ -93,6 +94,9 @@ pub(crate) fn tool_runtime_errors(name: &str) -> Vec<String> {
     match name {
         "ssh" if !host_command_available("ssh") => vec![
             "ssh is not usable because the host ssh executable was not found in PATH".to_string(),
+        ],
+        "rg" if !host_command_available("rg") => vec![
+            "rg is not usable because the host rg executable was not found in PATH".to_string(),
         ],
         _ => Vec::new(),
     }
