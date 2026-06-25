@@ -25,6 +25,7 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 - For background instances, use `profile status <name>` before `profile stop`, `profile restart`, or `profile delete`.
 - Use `manage_yourself` for Remi CLI commands. It only supports one argument shape: `{"command":"profile list"}`.
 - Use help through `manage_yourself` when unsure about syntax, for example `{"command":"help"}` or `{"command":"profile agent --help"}`.
+- Current-session runtime settings use slash commands in chat. To change reasoning strength for the active session, tell the user or runtime to run `/model reasoning set <auto|none|minimal|low|medium|high|xhigh|max>`; use `/model reasoning reset` to return to the model profile default.
 - Use `{"command":"tools --json"}` before adding tools to an agent profile. It lists all runtime-known tools, ignores the active allowlist, and includes configuration warnings/errors.
 - The `command` value is the arguments after `remi-cat`; do not include the binary name and do not wrap it in another `arguments` field.
 - `manage_yourself` runs the current host `remi-cat` binary directly, so it works even when sandboxed shell commands cannot see the binary.
@@ -57,7 +58,7 @@ Create or update runtime configuration:
 profile create <profile> admin.enabled=false sandbox.kind=no_sandbox shell.mode=local
 --profile <profile> config set admin.port=8790
 --profile <profile> sandbox set kind=no_sandbox
---profile <profile> config set acp.mode=local acp.client=codex
+--profile <profile> acp setup --client codex --tool-name codex
 ```
 
 Manage background instances:
@@ -151,16 +152,17 @@ profile workflow delete <profile> review-loop
 profile workflow list <profile>
 ```
 
-## Codex ACP Commands
+## ACP Client Commands
 
 ```bash
-codex setup
-codex setup --bin /path/to/codex --agent default
-codex setup --arg=--config --arg=model=\"gpt-5-codex\"
-codex doctor
+acp setup --client codex --bin /path/to/codex --agent default --tool-name codex
+acp setup --client codex --arg=--config --arg=model=\"gpt-5-codex\"
+acp setup --client remi --tool-name acp__remi
+acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp
+acp doctor
 ```
 
-`codex setup` writes the ACP runtime settings for the selected profile. Repeated `--arg` values are stored as Codex global startup args and inserted before `exec`. `codex doctor` verifies the runtime config, Codex binary availability, and whether the `codex` tool is available to the root agent.
+`acp setup` writes the ACP runtime settings for the selected profile. Repeated `--arg` values are stored as local ACP startup args and inserted before the client execution command. `codex setup` and `codex doctor` remain compatibility aliases for Codex ACP. Named ACP tools are exposed as `codex` for Codex by default, or `acp__<client>` for other clients unless `--tool-name` is set.
 
 ## Feishu/Lark Commands
 

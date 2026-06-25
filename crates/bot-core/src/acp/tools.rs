@@ -24,18 +24,32 @@ const DEFAULT_CODEX_WAIT_MS: u64 = 30_000;
 pub struct AcpChatTool {
     backend: Arc<AcpBackend>,
     approval_manager: Arc<ToolApprovalManager>,
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
 }
 
 impl AcpChatTool {
-    pub fn codex(backend: Arc<AcpBackend>, approval_manager: Arc<ToolApprovalManager>) -> Self {
+    pub fn new(
+        backend: Arc<AcpBackend>,
+        approval_manager: Arc<ToolApprovalManager>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             backend,
             approval_manager,
-            name: "codex",
-            description: "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session, `title` for a new session, or `startup_args` for local Codex CLI global arguments inserted before `exec`.",
+            name: name.into(),
+            description: description.into(),
         }
+    }
+
+    pub fn codex(backend: Arc<AcpBackend>, approval_manager: Arc<ToolApprovalManager>) -> Self {
+        Self::new(
+            backend,
+            approval_manager,
+            "codex",
+            "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session, `title` for a new session, or `startup_args` for local Codex CLI global arguments inserted before `exec`.",
+        )
     }
 }
 
@@ -59,11 +73,11 @@ struct AcpChatArguments {
 
 impl Tool for AcpChatTool {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn description(&self) -> &str {
-        self.description
+        &self.description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -94,12 +108,12 @@ impl Tool for AcpChatTool {
     {
         let backend = Arc::clone(&self.backend);
         let approval_manager = Arc::clone(&self.approval_manager);
-        let tool_name = self.name;
+        let tool_name = self.name.clone();
         let ctx = ctx.clone();
         async move {
             let args: AcpChatArguments = serde_json::from_value(arguments).map_err(|_| {
                 AgentError::tool(
-                    tool_name,
+                    &tool_name,
                     "expected {message?, session_id?, title?, task_id?, action?, wait_ms?, startup_args?}",
                 )
             })?;
@@ -111,11 +125,14 @@ impl Tool for AcpChatTool {
             {
                 let action = args.action.as_deref().unwrap_or("poll");
                 if action != "poll" {
-                    return Err(AgentError::tool(tool_name, "unsupported codex task action"));
+                    return Err(AgentError::tool(
+                        &tool_name,
+                        "unsupported codex task action",
+                    ));
                 }
                 let status = backend.poll_tool_task(task_id).await;
                 let preview = serde_json::to_string_pretty(&status)
-                    .map_err(|err| AgentError::tool(tool_name, err.to_string()))?;
+                    .map_err(|err| AgentError::tool(&tool_name, err.to_string()))?;
                 return Ok(ToolResult::Output(status_stream(status, preview)));
             }
 
@@ -123,8 +140,8 @@ impl Tool for AcpChatTool {
                 .message
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| AgentError::tool(tool_name, "missing message or task_id"))?;
-            let current_channel = current_bound_channel(tool_name, &ctx)?;
+                .ok_or_else(|| AgentError::tool(&tool_name, "missing message or task_id"))?;
+            let current_channel = current_bound_channel(&tool_name, &ctx)?;
             let prepared = backend
                 .prepare_tool_turn(AcpToolRequest {
                     message,
@@ -134,7 +151,7 @@ impl Tool for AcpChatTool {
                     codex_startup_args: args.startup_args,
                 })
                 .await
-                .map_err(|err| AgentError::tool(tool_name, err.to_string()))?;
+                .map_err(|err| AgentError::tool(&tool_name, err.to_string()))?;
 
             let sub_thread_id = ThreadId(prepared.sub_session_id.clone());
             let sub_run_id = RunId(Uuid::new_v4().to_string());

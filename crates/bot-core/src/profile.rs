@@ -152,6 +152,9 @@ impl AgentProfile {
         validate_required("id", &profile.id)?;
         validate_required("name", &profile.name)?;
         validate_required("description", &profile.description)?;
+        if profile.max_turns == Some(0) {
+            profile.max_turns = None;
+        }
         profile.system_prompt = body.trim().to_string();
         if profile.system_prompt.is_empty() {
             anyhow::bail!("agent profile system prompt body must not be empty");
@@ -216,6 +219,23 @@ You are Remi.
         assert!(profile.allows_tool("codex"));
         assert!(!profile.allows_tool("bash"));
         assert!(profile.persistent_sessions);
+    }
+
+    #[test]
+    fn max_turns_zero_is_treated_as_unlimited_for_legacy_profiles() {
+        let profile = AgentProfile::from_markdown(
+            r#"---
+id: default
+name: Remi
+description: General assistant
+max_turns: 0
+---
+You are Remi.
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(profile.max_turns, None);
     }
 
     #[test]

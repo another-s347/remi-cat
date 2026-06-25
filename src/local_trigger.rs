@@ -5,7 +5,10 @@ use futures::StreamExt;
 
 use crate::core::Runtime;
 use crate::local_trigger_scheduler::LocalTriggerDispatch;
-use crate::{SESSION_AGENT_ID_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY};
+use crate::{
+    parse_session_reasoning_effort, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
+};
 
 pub(crate) async fn run_dispatcher(
     runtime: Rc<Runtime>,
@@ -40,15 +43,20 @@ pub(crate) async fn run_dispatch(
             dispatch.trigger_name
         ));
     }
-    let (model_profile_id, agent_id) = {
+    let (model_profile_id, reasoning_effort, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(&dispatch.thread_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            parse_session_reasoning_effort(
+                sessions
+                    .metadata_string(&dispatch.thread_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+            ),
             sessions.metadata_string(&dispatch.thread_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
     let opts = StreamOptions {
         model_profile_id,
+        reasoning_effort,
         agent_id,
         sender_user_id: Some(dispatch.owner_user_id),
         sender_username: dispatch.owner_username,

@@ -80,7 +80,39 @@ impl RuntimeConfig {
         }
         set_env_if_absent("REMI_SHELL_MODE", self.shell.mode.as_env_value());
         set_env_if_absent("REMI_ACP_MODE", self.acp.mode.as_env_value());
-        set_env_if_absent("REMI_ACP_CLIENT", self.acp.client.as_env_value());
+        set_env_if_absent("REMI_ACP_CLIENT", self.acp.client.as_str());
+        if let Some(tool_name) = self
+            .acp
+            .tool_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_TOOL_NAME", tool_name);
+        }
+        if let Some(base_url) = self
+            .acp
+            .base_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_BASE_URL", base_url);
+        }
+        if let Some(model) = self
+            .acp
+            .model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_MODEL", model);
+        }
+        if let Some(api_key) = self
+            .acp
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_API_KEY", api_key);
+        }
         if let Some(agent_name) = self
             .acp
             .agent_name
@@ -88,6 +120,22 @@ impl RuntimeConfig {
             .filter(|value| !value.trim().is_empty())
         {
             set_env_if_absent("REMI_ACP_AGENT_NAME", agent_name);
+        }
+        if let Some(local_bin) = self
+            .acp
+            .local_bin
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            set_env_if_absent("REMI_ACP_LOCAL_BIN", local_bin);
+        }
+        if !self.acp.local_args.is_empty() {
+            match serde_json::to_string(&self.acp.local_args) {
+                Ok(value) => set_env_if_absent("REMI_ACP_LOCAL_ARGS", &value),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to serialize ACP local startup args")
+                }
+            }
         }
         if let Some(codex_bin) = self
             .acp
@@ -315,7 +363,19 @@ pub struct AcpConfig {
     #[serde(default)]
     pub client: AcpClient,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -327,27 +387,70 @@ impl Default for AcpConfig {
         Self {
             mode: AcpMode::LocalStub,
             client: AcpClient::Codex,
+            tool_name: None,
             agent_name: None,
+            base_url: None,
+            model: None,
+            api_key: None,
+            local_bin: None,
+            local_args: Vec::new(),
             codex_bin: None,
             codex_args: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpClient {
     Remi,
-    #[default]
     Codex,
+    Other(String),
+}
+
+impl Default for AcpClient {
+    fn default() -> Self {
+        Self::Codex
+    }
 }
 
 impl AcpClient {
-    pub fn as_env_value(&self) -> &'static str {
+    pub fn new(value: impl Into<String>) -> Self {
+        match value.into().trim().to_ascii_lowercase().as_str() {
+            "remi" => Self::Remi,
+            "codex" => Self::Codex,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Remi => "remi",
             Self::Codex => "codex",
+            Self::Other(value) => value,
         }
+    }
+}
+
+impl Serialize for AcpClient {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AcpClient {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(serde::de::Error::custom("acp.client must not be empty"));
+        }
+        Ok(Self::new(trimmed))
     }
 }
 
@@ -462,7 +565,6 @@ pub fn has_legacy_env_credentials() -> bool {
         .or_else(|_| std::env::var("ZHIPU_API_KEY"))
         .or_else(|_| std::env::var("BIGMODEL_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .or_else(|_| std::env::var("REMI_API_KEY"))
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }

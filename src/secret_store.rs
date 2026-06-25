@@ -26,6 +26,10 @@ pub struct SecretStore {
 
 impl SecretStore {
     pub fn from_env() -> Self {
+        Self::from_env_with_default_dotenv_path(PathBuf::from(".env"))
+    }
+
+    pub fn from_env_with_default_dotenv_path(default_dotenv_path: PathBuf) -> Self {
         let backend = std::env::var("REMI_SECRET_BACKEND")
             .unwrap_or_else(|_| "dotenv".to_string())
             .trim()
@@ -44,7 +48,7 @@ impl SecretStore {
                 backend: SecretBackend::Dotenv {
                     path: std::env::var("REMI_SECRET_DOTENV_PATH")
                         .map(PathBuf::from)
-                        .unwrap_or_else(|_| PathBuf::from(".env")),
+                        .unwrap_or(default_dotenv_path),
                 },
             },
         }
@@ -237,5 +241,26 @@ mod tests {
         assert!(validate_secret_key("EXA_API_KEY").is_ok());
         assert!(validate_secret_key("1BAD").is_err());
         assert!(validate_secret_key("BAD-NAME").is_err());
+    }
+
+    #[test]
+    fn default_dotenv_path_can_be_supplied_by_runtime_context() {
+        let explicit = std::env::var_os("REMI_SECRET_DOTENV_PATH");
+        unsafe {
+            std::env::remove_var("REMI_SECRET_DOTENV_PATH");
+        }
+
+        let store =
+            SecretStore::from_env_with_default_dotenv_path(PathBuf::from("/tmp/remi-home/.env"));
+        assert_eq!(
+            store.backend_label(),
+            "dotenv:/tmp/remi-home/.env".to_string()
+        );
+
+        unsafe {
+            if let Some(value) = explicit {
+                std::env::set_var("REMI_SECRET_DOTENV_PATH", value);
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::cli::CodexCommand;
+use crate::cli::{AcpCommand, CodexCommand};
 use crate::config::{
     detect_setup_state, AcpClient, AcpMode, FeishuTransport, RuntimeConfig, RuntimeSandboxKind,
     SetupState,
@@ -8,7 +8,7 @@ use crate::config::{
 use crate::core::Runtime;
 use crate::instance_profile::InstanceProfile;
 use crate::profile_command::apply_runtime_config_entries;
-use bot_core::{AgentRegistry, CatBot, ModelProfileRegistry};
+use bot_core::{api_key_from_env, AgentRegistry, CatBot, ModelProfileRegistry};
 
 pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
     let setup_state = detect_setup_state(data_dir);
@@ -60,10 +60,22 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
         }
     }
 
-    let api_key_present = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("REMI_API_KEY"))
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
+    let agents_dir = std::env::var("REMI_AGENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("agents"));
+    let models_dir = data_dir.join("models");
+    let agent_registry = AgentRegistry::load(&agents_dir)?;
+    let model_registry = ModelProfileRegistry::load(&models_dir)?;
+    let api_key_present = match &setup_state {
+        SetupState::Initialized { config, .. } => model_registry
+            .get(&config.model_profile)
+            .map(|profile| api_key_from_env(profile).is_ok())
+            .unwrap_or(false),
+        _ => model_registry
+            .default_profile()
+            .map(|profile| api_key_from_env(profile).is_ok())
+            .unwrap_or(false),
+    };
     println!(
         "api_key: {}",
         if api_key_present {
@@ -72,13 +84,6 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
             "missing"
         }
     );
-
-    let agents_dir = std::env::var("REMI_AGENTS_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| data_dir.join("agents"));
-    let models_dir = data_dir.join("models");
-    let agent_registry = AgentRegistry::load(&agents_dir)?;
-    let model_registry = ModelProfileRegistry::load(&models_dir)?;
     println!("{}", sdk_doctor_report(data_dir));
     println!("{}", sandbox_doctor_report(data_dir, &setup_state));
 
@@ -141,37 +146,111 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
     Ok(())
 }
 
-pub(crate) fn run_codex_command(
+pub(crate) async fn run_codex_command(
     profile: &InstanceProfile,
     data_dir: &Path,
     command: CodexCommand,
 ) -> anyhow::Result<()> {
     match command {
         CodexCommand::Setup { bin, agent, args } => {
-            run_codex_setup(profile, data_dir, bin, agent, args)
+            run_acp_command(
+                profile,
+                data_dir,
+                AcpCommand::Setup {
+                    client: "codex".to_string(),
+                    mode: Some("local".to_string()),
+                    tool_name: Some("codex".to_string()),
+                    agent,
+                    base_url: None,
+                    model: None,
+                    api_key: None,
+                    bin,
+                    args,
+                },
+            )
+            .await
         }
-        CodexCommand::Doctor => run_codex_doctor(profile, data_dir),
+        CodexCommand::Doctor => run_acp_doctor(profile, data_dir, "codex"),
     }
 }
 
-fn run_codex_setup(
+pub(crate) async fn run_acp_command(
     profile: &InstanceProfile,
     data_dir: &Path,
-    bin: Option<String>,
+    command: AcpCommand,
+) -> anyhow::Result<()> {
+    match command {
+        AcpCommand::Setup {
+            client,
+            mode,
+            tool_name,
+            agent,
+            base_url,
+            model,
+            api_key,
+            bin,
+            args,
+        } => {
+            run_acp_setup(
+                profile, data_dir, client, mode, tool_name, agent, base_url, model, api_key, bin,
+                args,
+            )
+            .await
+        }
+        AcpCommand::Doctor => run_acp_doctor(profile, data_dir, "acp"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_acp_setup(
+    profile: &InstanceProfile,
+    data_dir: &Path,
+    client: String,
+    mode: Option<String>,
+    tool_name: Option<String>,
     agent: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    bin: Option<String>,
     args: Vec<String>,
 ) -> anyhow::Result<()> {
+    let client = normalize_acp_client(&client)?;
+    let mode = mode
+        .map(|value| normalize_acp_mode_arg(&value))
+        .transpose()?
+        .unwrap_or_else(|| {
+            if base_url
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                "remote".to_string()
+            } else {
+                "local".to_string()
+            }
+        });
     let mut entries = vec![
         "admin.enabled=false".to_string(),
         "im.mode=disabled".to_string(),
-        "acp.mode=local".to_string(),
-        "acp.client=codex".to_string(),
+        format!("acp.mode={mode}"),
+        format!("acp.client={client}"),
     ];
+    if let Some(tool_name) = tool_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        validate_tool_name(&tool_name)?;
+        entries.push(format!("acp.tool_name={tool_name}"));
+    }
     if let Some(bin) = bin
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        entries.push(format!("acp.codex_bin={bin}"));
+        entries.push(format!("acp.local_bin={bin}"));
+        if client == "codex" {
+            entries.push(format!("acp.codex_bin={bin}"));
+        }
     }
     if let Some(agent) = agent
         .map(|value| value.trim().to_string())
@@ -179,21 +258,43 @@ fn run_codex_setup(
     {
         entries.push(format!("acp.agent_name={agent}"));
     }
+    if let Some(base_url) = base_url
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entries.push(format!("acp.base_url={base_url}"));
+    }
+    if let Some(model) = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entries.push(format!("acp.model={model}"));
+    }
+    if let Some(api_key) = api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        entries.push(format!("acp.api_key={api_key}"));
+    }
     let args: Vec<String> = args
         .into_iter()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect();
     if !args.is_empty() {
-        entries.push(format!("acp.codex_args={}", serde_json::to_string(&args)?));
+        let encoded = serde_json::to_string(&args)?;
+        entries.push(format!("acp.local_args={encoded}"));
+        if client == "codex" {
+            entries.push(format!("acp.codex_args={encoded}"));
+        }
     }
-    apply_runtime_config_entries(profile, data_dir, &entries, true)?;
+    apply_runtime_config_entries(profile, data_dir, &entries, true).await?;
     println!();
-    run_codex_doctor(profile, data_dir)
+    run_acp_doctor(profile, data_dir, "acp")
 }
 
-fn run_codex_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
-    println!("remi-cat codex doctor");
+fn run_acp_doctor(profile: &InstanceProfile, data_dir: &Path, label: &str) -> anyhow::Result<()> {
+    println!("remi-cat {label} doctor");
     println!("profile: {}", profile.label());
     println!("data_dir: {}", data_dir.display());
     match detect_setup_state(data_dir) {
@@ -203,7 +304,7 @@ fn run_codex_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Resul
         } => {
             println!("runtime_config: {}", config_path.display());
             println!("setup: initialized");
-            print_codex_status(&config);
+            print_acp_status(&config);
         }
         SetupState::Invalid { config_path, error } => {
             println!("runtime_config: {}", config_path.display());
@@ -216,7 +317,7 @@ fn run_codex_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Resul
                 data_dir.join("runtime.yaml").display()
             );
             println!("setup: legacy-env-compatible (no runtime.yaml)");
-            print_codex_env_status();
+            print_acp_env_status();
         }
         SetupState::Uninitialized { data_dir } => {
             println!(
@@ -224,17 +325,123 @@ fn run_codex_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Resul
                 data_dir.join("runtime.yaml").display()
             );
             println!("setup: not initialized");
-            print_codex_env_status();
+            print_acp_env_status();
         }
     }
     Ok(())
+}
+
+fn normalize_acp_client(value: &str) -> anyhow::Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("ACP client may only contain ASCII letters, digits, `-`, and `_`");
+    }
+    Ok(value)
+}
+
+fn normalize_acp_mode_arg(value: &str) -> anyhow::Result<String> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "local" | "stub" | "local_stub" => Ok("local".to_string()),
+        "remote" => Ok("remote".to_string()),
+        other => anyhow::bail!("unknown ACP mode `{other}`"),
+    }
+}
+
+fn validate_tool_name(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("ACP tool name may only contain ASCII letters, digits, `_`, and `-`");
+    }
+    Ok(())
+}
+
+fn print_acp_status(config: &RuntimeConfig) {
+    let client = config.acp.client.as_str();
+    println!("acp_mode: {}", config.acp.mode.as_env_value());
+    println!("acp_client: {client}");
+    println!("acp_tool_name: {}", configured_acp_tool_name(config));
+    println!(
+        "acp_agent_name: {}",
+        config.acp.agent_name.as_deref().unwrap_or("default")
+    );
+    if matches!(config.acp.mode, AcpMode::Remote) {
+        println!(
+            "acp_base_url: {}",
+            config.acp.base_url.as_deref().unwrap_or("unset")
+        );
+        println!(
+            "acp_model: {}",
+            config.acp.model.as_deref().unwrap_or("unset")
+        );
+        println!(
+            "acp_api_key: {}",
+            if config
+                .acp
+                .api_key
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                "set"
+            } else {
+                "unset"
+            }
+        );
+    }
+    let bin = configured_local_acp_bin(config);
+    let binary_status = local_acp_binary_status(&bin);
+    println!("acp_local_bin: {bin}");
+    println!(
+        "acp_local_args_count: {}",
+        configured_local_args_count(config)
+    );
+    println!("acp_local_binary: {}", binary_status.label());
+    println!("acp_tool: {}", acp_tool_status(config, &binary_status));
+    if client == "codex" {
+        println!("codex_bin: {}", configured_codex_bin(config));
+        println!("codex_args_count: {}", config.acp.codex_args.len());
+    }
+}
+
+fn print_acp_env_status() {
+    let client = std::env::var("REMI_ACP_CLIENT").unwrap_or_else(|_| "unset".to_string());
+    let mode = std::env::var("REMI_ACP_MODE").unwrap_or_else(|_| "unset".to_string());
+    let bin = configured_local_acp_bin_from_env();
+    let binary_status = local_acp_binary_status(&bin);
+    println!("acp_mode: {mode}");
+    println!("acp_client: {client}");
+    println!(
+        "acp_tool_name: {}",
+        std::env::var("REMI_ACP_TOOL_NAME").unwrap_or_else(|_| default_acp_tool_name(&client))
+    );
+    println!(
+        "acp_agent_name: {}",
+        std::env::var("REMI_ACP_AGENT_NAME").unwrap_or_else(|_| "default".to_string())
+    );
+    println!(
+        "acp_base_url: {}",
+        std::env::var("REMI_ACP_BASE_URL").unwrap_or_else(|_| "unset".to_string())
+    );
+    println!("acp_local_bin: {bin}");
+    println!(
+        "acp_local_args_count: {}",
+        codex_args_count_from_env("REMI_ACP_LOCAL_ARGS")
+    );
+    println!("acp_local_binary: {}", binary_status.label());
 }
 
 fn print_codex_status(config: &RuntimeConfig) {
     let bin = configured_codex_bin(config);
     let binary_status = codex_binary_status(&bin);
     println!("acp_mode: {}", config.acp.mode.as_env_value());
-    println!("acp_client: {}", config.acp.client.as_env_value());
+    println!("acp_client: {}", config.acp.client.as_str());
     println!(
         "acp_agent_name: {}",
         config.acp.agent_name.as_deref().unwrap_or("default")
@@ -252,40 +459,107 @@ fn print_codex_status(config: &RuntimeConfig) {
     );
 }
 
-fn print_codex_env_status() {
-    let bin = std::env::var("REMI_ACP_CODEX_BIN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "codex".to_string());
-    let binary_status = codex_binary_status(&bin);
-    let client = std::env::var("REMI_ACP_CLIENT").unwrap_or_else(|_| "unset".to_string());
-    let mode = std::env::var("REMI_ACP_MODE").unwrap_or_else(|_| "unset".to_string());
-    println!("acp_mode: {mode}");
-    println!("acp_client: {client}");
-    println!(
-        "acp_agent_name: {}",
-        std::env::var("REMI_ACP_AGENT_NAME").unwrap_or_else(|_| "default".to_string())
-    );
-    println!("codex_bin: {bin}");
-    println!(
-        "codex_args_count: {}",
-        codex_args_count_from_env("REMI_ACP_CODEX_ARGS")
-    );
-    println!("codex_binary: {}", binary_status.label());
-    println!(
-        "codex_tool: {}",
-        if client.trim().eq_ignore_ascii_case("codex")
-            && matches!(binary_status, CodexBinaryStatus::Available)
-        {
-            "available"
-        } else {
-            "not injected"
-        }
-    );
-}
-
 fn codex_tool_configured(config: &RuntimeConfig) -> bool {
     matches!(config.acp.client, AcpClient::Codex) && matches!(config.acp.mode, AcpMode::LocalStub)
+}
+
+fn configured_acp_tool_name(config: &RuntimeConfig) -> String {
+    config
+        .acp
+        .tool_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_acp_tool_name(config.acp.client.as_str()))
+}
+
+fn default_acp_tool_name(client: &str) -> String {
+    if client.trim().eq_ignore_ascii_case("codex") {
+        "codex".to_string()
+    } else {
+        format!("acp__{}", client.trim().replace('-', "_"))
+    }
+}
+
+fn configured_local_acp_bin(config: &RuntimeConfig) -> String {
+    config
+        .acp
+        .local_bin
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if matches!(config.acp.client, AcpClient::Codex) {
+                config
+                    .acp
+                    .codex_bin
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            std::env::var("REMI_ACP_LOCAL_BIN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            if matches!(config.acp.client, AcpClient::Codex) {
+                Some(configured_codex_bin(config))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.acp.client.as_str().to_string())
+}
+
+fn configured_local_acp_bin_from_env() -> String {
+    std::env::var("REMI_ACP_LOCAL_BIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("REMI_ACP_CODEX_BIN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn configured_local_args_count(config: &RuntimeConfig) -> usize {
+    if !config.acp.local_args.is_empty() {
+        config.acp.local_args.len()
+    } else {
+        config.acp.codex_args.len()
+    }
+}
+
+fn local_acp_binary_status(bin: &str) -> CodexBinaryStatus {
+    codex_binary_status(bin)
+}
+
+fn acp_tool_status(config: &RuntimeConfig, binary_status: &CodexBinaryStatus) -> &'static str {
+    match config.acp.mode {
+        AcpMode::Remote => {
+            if config
+                .acp
+                .base_url
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                "available"
+            } else {
+                "not injected"
+            }
+        }
+        AcpMode::LocalStub => match config.acp.client {
+            AcpClient::Remi => "available",
+            _ if matches!(binary_status, CodexBinaryStatus::Available) => "available",
+            _ => "not injected",
+        },
+    }
 }
 
 fn configured_codex_bin(config: &RuntimeConfig) -> String {

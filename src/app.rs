@@ -20,7 +20,7 @@ pub(crate) use crate::cli::{
 pub(crate) use crate::cli::{parse_command, parse_global_args};
 #[cfg(test)]
 pub(crate) use crate::cli::{
-    CodexCommand, FeedbackCommand, GitHubIssueCreateRequest, HooksCommand,
+    AcpCommand, CodexCommand, FeedbackCommand, GitHubIssueCreateRequest, HooksCommand,
 };
 #[cfg(test)]
 pub(crate) use crate::command::{
@@ -37,8 +37,9 @@ pub(crate) use crate::command::{
     run_streaming_command, run_streaming_command_with_stdin, AuthStatusSummary, FeishuDoctorStatus,
 };
 pub(crate) use crate::command::{
-    print_registered_tools, run_codex_command, run_doctor, run_feedback_command, run_feishu_doctor,
-    run_feishu_init, run_hooks_command, run_secret_command, run_setup, run_update_command,
+    print_registered_tools, run_acp_command, run_codex_command, run_doctor, run_feedback_command,
+    run_feishu_doctor, run_feishu_init, run_hooks_command, run_secret_command, run_setup,
+    run_update_command,
 };
 use crate::config::{detect_setup_state, has_legacy_env_credentials, ImMode, SetupState};
 use crate::core::Runtime;
@@ -67,9 +68,18 @@ pub(crate) const CLI_CHAT_ID: &str = "local-dev";
 pub(crate) const CLI_USERNAME: &str = "local-user";
 pub(crate) const SESSION_DEBUG_METADATA_KEY: &str = "debug";
 pub(crate) const SESSION_MODEL_PROFILE_METADATA_KEY: &str = "model_profile_id";
+pub(crate) const SESSION_REASONING_EFFORT_METADATA_KEY: &str = "reasoning_effort";
 pub(crate) const SESSION_AGENT_ID_METADATA_KEY: &str = "agent_id";
 pub(crate) const SESSION_INPUT_HISTORY_METADATA_KEY: &str = "input_history";
 pub(crate) const MAX_COMMAND_PREPROCESS_DEPTH: usize = 8;
+
+pub(crate) fn parse_session_reasoning_effort(
+    raw: Option<String>,
+) -> Option<bot_core::ReasoningEffort> {
+    raw.as_deref()
+        .and_then(bot_core::ReasoningEffort::parse)
+        .filter(|effort| *effort != bot_core::ReasoningEffort::Auto)
+}
 
 fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
     match detect_setup_state(data_dir) {
@@ -98,10 +108,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         },
     };
     let _ = dotenvy::dotenv();
-    let secret_store = Arc::new(Mutex::new(SecretStore::from_env()));
-    let startup_secrets = secret_store.lock().await.entries()?;
-    apply_entries_to_env(&startup_secrets);
-
     let tool_output_overflow_bytes = parsed.tool_output_overflow_bytes;
     let command = parsed.command;
     let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
@@ -116,6 +122,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
     let mut data_dir = selected_profile.data_dir.clone();
     std::fs::create_dir_all(&data_dir)?;
+    let secret_store = Arc::new(Mutex::new(if tui_mode {
+        SecretStore::from_env_with_default_dotenv_path(data_dir.join(".env"))
+    } else {
+        SecretStore::from_env()
+    }));
+    let startup_secrets = secret_store.lock().await.entries()?;
+    apply_entries_to_env(&startup_secrets);
     let _observability_guard = init_observability(
         matches!(
             &command,
@@ -125,7 +138,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     )?;
 
     if let AppCommand::Profile(profile_command) = &command {
-        run_profile_command(profile_command)?;
+        run_profile_command(profile_command, &data_dir).await?;
         return Ok(());
     }
 
@@ -134,7 +147,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if entries.is_empty() {
                 run_setup(&selected_profile, &mut data_dir, Arc::clone(&secret_store)).await?;
             } else {
-                run_noninteractive_setup(&selected_profile, &data_dir, &entries)?;
+                run_noninteractive_setup(&selected_profile, &data_dir, &entries).await?;
             }
             return Ok(());
         }
@@ -154,7 +167,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         AppCommand::ConfigSet(entries) => {
-            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false)?;
+            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false).await?;
             return Ok(());
         }
         AppCommand::SandboxSet(entries) => {
@@ -162,7 +175,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|entry| prefix_short_config_entry("sandbox", entry))
                 .collect::<Vec<_>>();
-            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false)?;
+            apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false).await?;
             return Ok(());
         }
         AppCommand::Profile(_) => unreachable!(),
@@ -174,8 +187,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             run_feishu_doctor().await?;
             return Ok(());
         }
+        AppCommand::Acp(command) => {
+            run_acp_command(&selected_profile, &data_dir, command).await?;
+            return Ok(());
+        }
         AppCommand::Codex(command) => {
-            run_codex_command(&selected_profile, &data_dir, command)?;
+            run_codex_command(&selected_profile, &data_dir, command).await?;
             return Ok(());
         }
         AppCommand::Update(command) => {
@@ -539,9 +556,9 @@ mod cli_tests {
         parse_global_args, parse_goal_max_rounds, parse_release_version, percent_encode_query,
         prefix_short_config_entry, redact_known_secrets, run_streaming_command,
         run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
-        try_parse_cli_args, update_available, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand,
-        ProfileCommand, UpdateCommand,
+        try_parse_cli_args, update_available, AcpCommand, AppCommand, CliConfig, CodexCommand,
+        FeedbackCommand, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind,
+        GitHubIssueCreateRequest, HooksCommand, ProfileCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
     use crate::profile_command::{
@@ -1026,6 +1043,52 @@ mod cli_tests {
                 if bin.as_deref() == Some("/usr/local/bin/codex")
                     && agent.as_deref() == Some("default")
                     && args == vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()]
+        ));
+    }
+
+    #[test]
+    fn acp_setup_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "acp",
+                "setup",
+                "--client",
+                "my-acp",
+                "--mode",
+                "remote",
+                "--tool-name",
+                "acp__my_acp",
+                "--agent",
+                "default",
+                "--base-url",
+                "http://127.0.0.1:8788",
+                "--model",
+                "gpt-5",
+                "--api-key",
+                "secret",
+                "--arg=--verbose"
+            ]))
+            .unwrap(),
+            AppCommand::Acp(AcpCommand::Setup {
+                client,
+                mode,
+                tool_name,
+                agent,
+                base_url,
+                model,
+                api_key,
+                bin,
+                args
+            })
+                if client == "my-acp"
+                    && mode.as_deref() == Some("remote")
+                    && tool_name.as_deref() == Some("acp__my_acp")
+                    && agent.as_deref() == Some("default")
+                    && base_url.as_deref() == Some("http://127.0.0.1:8788")
+                    && model.as_deref() == Some("gpt-5")
+                    && api_key.as_deref() == Some("secret")
+                    && bin.is_none()
+                    && args == vec!["--verbose".to_string()]
         ));
     }
 

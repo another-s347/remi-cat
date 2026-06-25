@@ -13,7 +13,14 @@ pub fn register_acp_tools(
     backend: Arc<AcpBackend>,
     approval_manager: Arc<ToolApprovalManager>,
 ) {
-    if backend.codex_tool_available() {
-        registry.register(AcpChatTool::codex(backend, approval_manager));
+    if backend.active_tool_available() {
+        let name = backend.active_tool_name();
+        let description = backend.active_tool_description();
+        registry.register(AcpChatTool::new(
+            backend,
+            approval_manager,
+            name,
+            description,
+        ));
     }
 }

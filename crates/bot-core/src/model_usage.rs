@@ -208,6 +208,7 @@ mod tests {
             model: model.to_string(),
             base_url: base_url.map(ToOwned::to_owned),
             thinking: None,
+            reasoning_effort: None,
             max_output_tokens: 1,
             context_tokens: 1,
             supports_images: false,

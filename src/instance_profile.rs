@@ -19,9 +19,13 @@ pub struct InstanceProfile {
 
 impl InstanceProfile {
     pub fn default_instance() -> Self {
+        Self::default_in_data_root(Path::new(DEFAULT_DATA_DIR))
+    }
+
+    pub fn default_in_data_root(data_root: &Path) -> Self {
         Self {
             name: None,
-            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
+            data_dir: data_root.to_path_buf(),
         }
     }
 
@@ -42,10 +46,14 @@ impl InstanceProfile {
     }
 
     pub fn from_label(label: &str) -> Result<Self> {
+        Self::from_label_in_data_root(label, Path::new(DEFAULT_DATA_DIR))
+    }
+
+    pub fn from_label_in_data_root(label: &str, data_root: &Path) -> Result<Self> {
         if label == "default" {
-            Ok(Self::default_instance())
+            Ok(Self::default_in_data_root(data_root))
         } else {
-            Self::named(label)
+            Self::named_in_data_root(label, data_root)
         }
     }
 
@@ -85,7 +93,11 @@ pub struct ProfileRunMetadata {
 }
 
 pub fn profiles_root() -> PathBuf {
-    PathBuf::from(DEFAULT_DATA_DIR).join(PROFILES_DIR)
+    profiles_root_in_data_root(Path::new(DEFAULT_DATA_DIR))
+}
+
+pub fn profiles_root_in_data_root(data_root: &Path) -> PathBuf {
+    data_root.join(PROFILES_DIR)
 }
 
 pub fn tui_home_data_dir() -> PathBuf {
@@ -120,9 +132,9 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn discover_profiles() -> Result<Vec<InstanceProfile>> {
-    let mut profiles = vec![InstanceProfile::default_instance()];
-    let root = profiles_root();
+pub fn discover_profiles_in_data_root(data_root: &Path) -> Result<Vec<InstanceProfile>> {
+    let mut profiles = vec![InstanceProfile::default_in_data_root(data_root)];
+    let root = profiles_root_in_data_root(data_root);
     if root.exists() {
         for entry in std::fs::read_dir(&root)
             .with_context(|| format!("reading profile directory {}", root.display()))?
@@ -135,7 +147,7 @@ pub fn discover_profiles() -> Result<Vec<InstanceProfile>> {
                 continue;
             };
             if validate_profile_name(&name).is_ok() {
-                profiles.push(InstanceProfile::named(&name)?);
+                profiles.push(InstanceProfile::named_in_data_root(&name, data_root)?);
             }
         }
     }
@@ -143,9 +155,12 @@ pub fn discover_profiles() -> Result<Vec<InstanceProfile>> {
     Ok(profiles)
 }
 
-pub fn configured_profiles_excluding(data_dir: &Path) -> Result<Vec<RuntimeConfig>> {
+pub fn configured_profiles_excluding_in_data_root(
+    data_dir: &Path,
+    data_root: &Path,
+) -> Result<Vec<RuntimeConfig>> {
     let mut configs = Vec::new();
-    for profile in discover_profiles()? {
+    for profile in discover_profiles_in_data_root(data_root)? {
         if same_path(&profile.data_dir, data_dir) {
             continue;
         }
@@ -156,8 +171,8 @@ pub fn configured_profiles_excluding(data_dir: &Path) -> Result<Vec<RuntimeConfi
     Ok(configs)
 }
 
-pub fn remove_named_profile(name: &str) -> Result<PathBuf> {
-    let profile = InstanceProfile::named(name)?;
+pub fn remove_named_profile_in_data_root(name: &str, data_root: &Path) -> Result<PathBuf> {
+    let profile = InstanceProfile::named_in_data_root(name, data_root)?;
     if !profile.data_dir.exists() {
         anyhow::bail!("profile `{name}` does not exist");
     }
@@ -223,6 +238,18 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolves_profiles_inside_selected_data_root() {
+        let root = std::path::Path::new("/tmp/remi-home");
+        let default = InstanceProfile::from_label_in_data_root("default", root).unwrap();
+        assert_eq!(default.name, None);
+        assert_eq!(default.data_dir, root);
+
+        let named = InstanceProfile::from_label_in_data_root("work", root).unwrap();
+        assert_eq!(named.name.as_deref(), Some("work"));
+        assert_eq!(named.data_dir, root.join("profiles").join("work"));
     }
 
     #[test]

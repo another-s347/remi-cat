@@ -17,6 +17,7 @@ pub(crate) enum AppCommand {
     SandboxSet(Vec<String>),
     Profile(ProfileCommand),
     Feishu(FeishuCommand),
+    Acp(AcpCommand),
     Codex(CodexCommand),
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
@@ -161,6 +162,11 @@ enum CliCommand {
     Feishu {
         #[command(subcommand)]
         command: FeishuCliCommand,
+    },
+    #[command(about = "Configure and inspect ACP clients")]
+    Acp {
+        #[command(subcommand)]
+        command: AcpCliCommand,
     },
     #[command(about = "Configure and inspect Codex ACP")]
     Codex {
@@ -324,6 +330,55 @@ enum CodexCliCommand {
         args: Vec<String>,
     },
     #[command(about = "Inspect Codex ACP configuration")]
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum AcpCliCommand {
+    #[command(
+        about = "Configure an ACP client",
+        after_help = "Examples:\n  remi-cat acp setup --client codex --bin /usr/local/bin/codex --tool-name codex\n  remi-cat acp setup --client remi --tool-name acp__remi\n  remi-cat acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp\n\nThis writes generic `acp.*` runtime settings to the selected profile runtime config. `codex setup` is a compatibility wrapper over this command."
+    )]
+    Setup {
+        #[arg(
+            long,
+            default_value = "codex",
+            value_name = "NAME",
+            help = "ACP client id"
+        )]
+        client: String,
+        #[arg(long, value_name = "local|remote", help = "ACP mode")]
+        mode: Option<String>,
+        #[arg(
+            long = "tool-name",
+            value_name = "NAME",
+            help = "Tool name exposed to agents"
+        )]
+        tool_name: Option<String>,
+        #[arg(long, value_name = "NAME", help = "ACP agent name")]
+        agent: Option<String>,
+        #[arg(long = "base-url", value_name = "URL", help = "Remote ACP base URL")]
+        base_url: Option<String>,
+        #[arg(long, value_name = "MODEL", help = "Remote model name")]
+        model: Option<String>,
+        #[arg(
+            long = "api-key",
+            value_name = "KEY",
+            help = "Remote ACP bearer API key"
+        )]
+        api_key: Option<String>,
+        #[arg(long = "bin", value_name = "PATH", help = "Local ACP client binary")]
+        bin: Option<String>,
+        #[arg(
+            long = "arg",
+            value_name = "ARG",
+            action = ArgAction::Append,
+            allow_hyphen_values = true,
+            help = "Extra local ACP startup arg; repeat to pass multiple args"
+        )]
+        args: Vec<String>,
+    },
+    #[command(about = "Inspect ACP configuration")]
     Doctor,
 }
 
@@ -610,6 +665,22 @@ pub(crate) enum CodexCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcpCommand {
+    Setup {
+        client: String,
+        mode: Option<String>,
+        tool_name: Option<String>,
+        agent: Option<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+        api_key: Option<String>,
+        bin: Option<String>,
+        args: Vec<String>,
+    },
+    Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpdateCommand {
     Check {
         json: bool,
@@ -850,6 +921,30 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Feishu { command }) => Ok(AppCommand::Feishu(match command {
             FeishuCliCommand::Init => FeishuCommand::Init,
             FeishuCliCommand::Doctor => FeishuCommand::Doctor,
+        })),
+        Some(CliCommand::Acp { command }) => Ok(AppCommand::Acp(match command {
+            AcpCliCommand::Setup {
+                client,
+                mode,
+                tool_name,
+                agent,
+                base_url,
+                model,
+                api_key,
+                bin,
+                args,
+            } => AcpCommand::Setup {
+                client,
+                mode,
+                tool_name,
+                agent,
+                base_url,
+                model,
+                api_key,
+                bin,
+                args,
+            },
+            AcpCliCommand::Doctor => AcpCommand::Doctor,
         })),
         Some(CliCommand::Codex { command }) => Ok(AppCommand::Codex(match command {
             CodexCliCommand::Setup { bin, agent, args } => CodexCommand::Setup { bin, agent, args },

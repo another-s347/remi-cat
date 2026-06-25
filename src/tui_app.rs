@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bot_core::{
-    CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus, Message, PrettyToolCall,
-    PrettyToolStatus, StreamOptions, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage,
-    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
-    UserQuestionStatus, WorkflowReport,
+    model_profile_key_status, CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus,
+    Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, StreamOptions,
+    SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
+    ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
+    WorkflowReport,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -44,6 +45,7 @@ mod render;
 use components::*;
 use composer::*;
 
+use crate::command::model_reasoning_effort_label;
 use crate::session::{ChannelBinding, Session, SubSessionKind};
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
 #[cfg(test)]
@@ -53,9 +55,10 @@ use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
 use crate::{
-    process_runtime_commands, CliConfig, Runtime, RuntimeCommandPipelineResult,
-    SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY,
+    parse_session_reasoning_effort, process_runtime_commands, CliConfig, Runtime,
+    RuntimeCommandPipelineResult, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
+    SESSION_REASONING_EFFORT_METADATA_KEY,
 };
 
 const TUI_CHANNEL: &str = "tui";
@@ -1608,7 +1611,21 @@ impl TuiApp {
         let Some(input) = self.composer.command_text() else {
             return Vec::new();
         };
+        if let Some(scope) = command_hierarchy_scope(input) {
+            return self
+                .command_catalog
+                .iter()
+                .filter(|command| command_is_direct_child(command, &scope))
+                .collect();
+        }
         let terms = command_filter_terms(input);
+        if terms.is_empty() && input.trim_start() == "/" {
+            return self
+                .command_catalog
+                .iter()
+                .filter(|command| command_is_direct_child(command, &[]))
+                .collect();
+        }
         self.command_catalog
             .iter()
             .filter(|command| command_matches_filter(command, &terms))
@@ -1778,7 +1795,7 @@ impl TuiApp {
             workflows.sort_by(|a, b| a.id.cmp(&b.id));
             commands.extend(
                 workflows
-                    .into_iter()
+                    .iter()
                     .filter(|workflow| workflow.id != "goal")
                     .map(|workflow| CommandEntry {
                         value: format!("/{} ", workflow.id),
@@ -1786,6 +1803,20 @@ impl TuiApp {
                         accepts_arguments: true,
                         searchable: format!(
                             "/{} {} {} workflow {}",
+                            workflow.id, workflow.name, workflow.description, workflow.id
+                        ),
+                    }),
+            );
+            commands.extend(
+                workflows
+                    .iter()
+                    .filter(|workflow| workflow.id != "goal")
+                    .map(|workflow| CommandEntry {
+                        value: format!("/workflow start {} ", workflow.id),
+                        description: format!("启动 workflow: {}", workflow.name),
+                        accepts_arguments: true,
+                        searchable: format!(
+                            "/workflow start {} {} {} workflow {}",
                             workflow.id, workflow.name, workflow.description, workflow.id
                         ),
                     }),
@@ -1798,6 +1829,53 @@ impl TuiApp {
             description: skill.description,
             accepts_arguments: true,
             searchable: format!("skill {} 技能 {}", skill.name, skill.source),
+        }));
+        let mut model_profiles = self.runtime.bot.model_profiles();
+        model_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        for profile in model_profiles {
+            let reasoning = model_reasoning_effort_label(profile);
+            let key_status = model_profile_key_status(profile);
+            let key_label = if key_status.configured {
+                "key ok".to_string()
+            } else {
+                format!("key missing: {}", key_status.env_keys.join(" or "))
+            };
+            commands.push(CommandEntry {
+                value: format!("/model {} ", profile.id),
+                description: format!(
+                    "Model: {} - {} - reasoning {}",
+                    profile.name, key_label, reasoning
+                ),
+                accepts_arguments: true,
+                searchable: format!(
+                    "/model {} {} {} {} reasoning {}",
+                    profile.id, profile.name, profile.model, key_label, reasoning
+                ),
+            });
+            commands.extend(reasoning_effort_menu_entries(profile).into_iter());
+            commands.push(CommandEntry {
+                value: format!("/model use {} ", profile.id),
+                description: format!(
+                    "Switch model: {} - {} - reasoning {}",
+                    profile.name, key_label, reasoning
+                ),
+                accepts_arguments: false,
+                searchable: format!(
+                    "/model use {} {} {} {} reasoning {}",
+                    profile.id, profile.name, profile.model, key_label, reasoning
+                ),
+            });
+        }
+        let mut agent_profiles = self.runtime.bot.agent_profiles();
+        agent_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        commands.extend(agent_profiles.into_iter().map(|profile| CommandEntry {
+            value: format!("/agent use {} ", profile.id),
+            description: format!("切换 agent: {}", profile.name),
+            accepts_arguments: false,
+            searchable: format!(
+                "/agent use {} {} {}",
+                profile.id, profile.name, profile.description
+            ),
         }));
         self.command_catalog = commands;
     }
@@ -2767,15 +2845,19 @@ async fn run_bot_turn(
         };
 
     {
-        let (model_profile_id, agent_id) = {
+        let (model_profile_id, reasoning_effort, agent_id) = {
             let sessions = runtime.sessions.lock().await;
             (
                 sessions.metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+                parse_session_reasoning_effort(
+                    sessions.metadata_string(&session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+                ),
                 sessions.metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
             )
         };
         let opts = StreamOptions {
             model_profile_id,
+            reasoning_effort,
             agent_id,
             skill_injections,
             sender_user_id: Some(sender_user_id),
@@ -2912,15 +2994,20 @@ async fn run_tui_trigger_turn(
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    let (model_profile_id, agent_id) = {
+    let (model_profile_id, reasoning_effort, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(&dispatch.thread_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            parse_session_reasoning_effort(
+                sessions
+                    .metadata_string(&dispatch.thread_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+            ),
             sessions.metadata_string(&dispatch.thread_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
     let opts = StreamOptions {
         model_profile_id,
+        reasoning_effort,
         agent_id,
         sender_user_id: Some(dispatch.owner_user_id),
         sender_username: dispatch.owner_username,
@@ -3265,6 +3352,11 @@ enum PopupKind {
 
 fn static_commands() -> Vec<CommandEntry> {
     [
+        ("/goal ", "目标命令", true),
+        ("/workflow ", "workflow 命令", true),
+        ("/model ", "Model commands", true),
+        ("/agent ", "agent 命令", true),
+        ("/skill ", "skill 命令", true),
         ("/fork", "fork 当前 session 到新 pane", false),
         ("/new", "创建空 session 到新 pane", false),
         ("/exit", "退出 TUI", false),
@@ -3280,10 +3372,26 @@ fn static_commands() -> Vec<CommandEntry> {
         ("/clear", "清空当前 session 历史", false),
         ("/doctor", "运行诊断", false),
         ("/usage", "查询当前模型额度", false),
-        ("/model status", "显示模型状态", false),
-        ("/model list", "列出模型 profile", false),
-        ("/model use ", "切换模型 profile", true),
-        ("/model reset", "重置 session 模型 override", false),
+        ("/model status", "Show model status", false),
+        ("/model list", "List model profiles", false),
+        ("/model reasoning ", "Reasoning strength commands", true),
+        ("/model reasoning status", "Show reasoning strength", false),
+        (
+            "/model reasoning list",
+            "List reasoning strength names",
+            false,
+        ),
+        (
+            "/model reasoning set ",
+            "Set session reasoning strength",
+            true,
+        ),
+        (
+            "/model reasoning reset",
+            "Reset session reasoning strength",
+            false,
+        ),
+        ("/model reset", "Reset session model override", false),
         ("/agent status", "显示当前 agent 状态", false),
         ("/agent list", "列出可切换 agents", false),
         ("/agent use ", "切换当前 session agent", true),
@@ -3301,6 +3409,33 @@ fn static_commands() -> Vec<CommandEntry> {
     .collect()
 }
 
+fn reasoning_effort_menu_entries(profile: &ModelProfileConfig) -> Vec<CommandEntry> {
+    ReasoningEffort::VARIANTS
+        .into_iter()
+        .filter(|effort| {
+            *effort == ReasoningEffort::Auto
+                || profile.merged_extra_options(None, Some(*effort)).is_ok()
+        })
+        .map(|effort| CommandEntry {
+            value: format!("/model {} {}", profile.id, effort.as_str()),
+            description: format!(
+                "Use {} with reasoning {}",
+                profile.name,
+                effort.display_name()
+            ),
+            accepts_arguments: false,
+            searchable: format!(
+                "/model {} {} {} reasoning {} {}",
+                profile.id,
+                effort.as_str(),
+                profile.name,
+                effort.display_name(),
+                effort.description()
+            ),
+        })
+        .collect()
+}
+
 fn command_filter_terms(input: &str) -> Vec<String> {
     input
         .trim_start()
@@ -3315,6 +3450,39 @@ fn command_filter_terms(input: &str) -> Vec<String> {
 fn command_matches_filter(command: &CommandEntry, terms: &[String]) -> bool {
     let searchable = command.searchable.to_lowercase();
     terms.iter().all(|term| searchable.contains(term))
+}
+
+fn command_hierarchy_scope(input: &str) -> Option<Vec<String>> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/')
+        || trimmed.contains('\n')
+        || !trimmed.chars().last().is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let tokens = command_value_tokens(trimmed);
+    Some(tokens)
+}
+
+fn command_is_direct_child(command: &CommandEntry, scope: &[String]) -> bool {
+    let tokens = command_value_tokens(&command.value);
+    if tokens.len() != scope.len() + 1 {
+        return false;
+    }
+    tokens
+        .iter()
+        .zip(scope.iter())
+        .all(|(left, right)| left == right)
+}
+
+fn command_value_tokens(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .trim_start_matches('/')
+        .split(|ch: char| ch.is_whitespace() || ch == ':')
+        .map(|token| token.trim_end_matches(':').to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3683,6 +3851,82 @@ mod tests {
         let name_terms = command_filter_terms("/Review Loop");
         assert_eq!(name_terms, vec!["review", "loop"]);
         assert!(command_matches_filter(&command, &name_terms));
+    }
+
+    #[test]
+    fn command_hierarchy_selects_direct_children() {
+        let commands = static_commands();
+        let root = commands
+            .iter()
+            .filter(|command| command_is_direct_child(command, &[]))
+            .map(|command| command.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(root.contains(&"/model "));
+        assert!(root.contains(&"/workflow "));
+        assert!(!root.contains(&"/model status"));
+
+        let model_scope = command_hierarchy_scope("/model ").unwrap();
+        let model_children = commands
+            .iter()
+            .filter(|command| command_is_direct_child(command, &model_scope))
+            .map(|command| command.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(model_children.contains(&"/model status"));
+        assert!(model_children.contains(&"/model reasoning "));
+        assert!(!model_children.contains(&"/agent status"));
+
+        let workflow = CommandEntry {
+            value: "/workflow start review-loop ".to_string(),
+            description: "启动 workflow: Review Loop".to_string(),
+            accepts_arguments: true,
+            searchable: "/workflow start review-loop Review Loop workflow".to_string(),
+        };
+        let workflow_scope = command_hierarchy_scope("/workflow start ").unwrap();
+        assert!(command_is_direct_child(&workflow, &workflow_scope));
+        assert!(!command_is_direct_child(&workflow, &model_scope));
+    }
+
+    #[test]
+    fn model_profile_menu_can_drill_down_to_reasoning_efforts() {
+        let profile = ModelProfileConfig {
+            id: "mimo-v2.5-pro".to_string(),
+            name: "MiMo V2.5 Pro".to_string(),
+            description: None,
+            provider: Some("mimo".to_string()),
+            model: "mimo-v2.5-pro".to_string(),
+            base_url: Some("https://api.xiaomimimo.com/v1".to_string()),
+            thinking: None,
+            reasoning_effort: None,
+            max_output_tokens: 131_072,
+            context_tokens: 1_000_000,
+            supports_images: false,
+            short_term_tokens: 24_000,
+            overflow_bytes: 32_000,
+            auto_compress: true,
+            extra_options: serde_json::Map::new(),
+        };
+        let profile_command = CommandEntry {
+            value: format!("/model {} ", profile.id),
+            description: "Model: MiMo V2.5 Pro".to_string(),
+            accepts_arguments: true,
+            searchable: "mimo".to_string(),
+        };
+        let mut commands = vec![profile_command];
+        commands.extend(reasoning_effort_menu_entries(&profile));
+
+        let model_scope = command_hierarchy_scope("/model ").unwrap();
+        assert!(commands
+            .iter()
+            .any(|command| command_is_direct_child(command, &model_scope)
+                && command.value == "/model mimo-v2.5-pro "));
+
+        let profile_scope = command_hierarchy_scope("/model mimo-v2.5-pro ").unwrap();
+        let reason_children = commands
+            .iter()
+            .filter(|command| command_is_direct_child(command, &profile_scope))
+            .map(|command| command.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(reason_children, vec!["/model mimo-v2.5-pro auto"]);
     }
 
     #[test]

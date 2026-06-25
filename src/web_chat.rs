@@ -17,8 +17,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::{
-    process_runtime_commands, Runtime, RuntimeCommandPipelineResult, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY,
+    parse_session_reasoning_effort, process_runtime_commands, Runtime,
+    RuntimeCommandPipelineResult, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
 };
 
 const SDK_DB_FILE_NAME: &str = "todo-sdk.db";
@@ -968,10 +969,13 @@ async fn run_turn(
             }
         };
 
-    let (model_profile_id, agent_id) = {
+    let (model_profile_id, reasoning_effort, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            parse_session_reasoning_effort(
+                sessions.metadata_string(session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+            ),
             sessions.metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
@@ -980,6 +984,7 @@ async fn run_turn(
         .model_context_tokens_for_agent(model_profile_id.as_deref(), agent_id.as_deref());
     let opts = StreamOptions {
         model_profile_id,
+        reasoning_effort,
         agent_id,
         skill_injections,
         sender_user_id: Some(WEB_USER_ID.to_string()),

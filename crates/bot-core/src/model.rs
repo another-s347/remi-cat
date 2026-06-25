@@ -5,7 +5,7 @@
 
 pub use crate::model_profile::{
     api_key_from_env, install_embedded_model_profiles, resolve_model_profile_from_env,
-    ModelProfileConfig, ModelProfileRegistry, ModelProfileSource, ResolvedModelProfile,
-    ThinkingMode,
+    ModelProfileConfig, ModelProfileRegistry, ModelProfileSource, ReasoningEffort,
+    ResolvedModelProfile, ThinkingMode,
 };
 pub use crate::model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};

@@ -8,14 +8,15 @@ use std::process::Stdio;
 use anyhow::Context;
 
 use bot_core::{
-    install_embedded_agent_profiles, install_embedded_model_profiles, AgentProfile, AgentRegistry,
+    install_embedded_agent_profiles, install_embedded_model_profiles,
+    validate_model_profile_api_key, AgentProfile, AgentRegistry, ModelProfileRegistry,
     WorkflowDefinition,
 };
 
 use crate::instance_profile::{
-    configured_profiles_excluding, discover_profiles, read_run_metadata, remove_named_profile,
-    remove_run_metadata, write_run_metadata, InstanceProfile, ProfileRunMetadata,
-    DIAGNOSTIC_PROFILE_NAME,
+    configured_profiles_excluding_in_data_root, discover_profiles_in_data_root, read_run_metadata,
+    remove_named_profile_in_data_root, remove_run_metadata, write_run_metadata, InstanceProfile,
+    ProfileRunMetadata, DIAGNOSTIC_PROFILE_NAME,
 };
 use crate::runtime_config::{
     detect_setup_state, write_runtime_config, AcpClient, AcpMode, FeishuTransport, ImMode,
@@ -100,7 +101,7 @@ pub enum ProfileWorkflowCommand {
     },
 }
 
-pub fn run_noninteractive_setup(
+pub async fn run_noninteractive_setup(
     profile: &InstanceProfile,
     data_dir: &Path,
     entries: &[String],
@@ -110,15 +111,15 @@ pub fn run_noninteractive_setup(
         .filter(|entry| entry.as_str() != "--non-interactive")
         .cloned()
         .collect::<Vec<_>>();
-    apply_runtime_config_entries(profile, data_dir, &entries, true)
+    apply_runtime_config_entries(profile, data_dir, &entries, true).await
 }
 
-pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
-    ensure_builtin_diagnostic_profile()?;
+pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> anyhow::Result<()> {
+    ensure_builtin_diagnostic_profile_in_data_root(data_root)?;
     match command {
         ProfileCommand::List => {
             println!("NAME\tSETUP\tRUNNING\tADMIN\tSANDBOX\tDATA DIR");
-            for profile in discover_profiles()? {
+            for profile in discover_profiles_in_data_root(data_root)? {
                 let state = detect_setup_state(&profile.data_dir);
                 let running = profile_run_state(&profile).label();
                 let (setup, admin, sandbox) = match &state {
@@ -147,7 +148,7 @@ pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
             }
         }
         ProfileCommand::Show(name) => {
-            let profile = InstanceProfile::from_label(name)?;
+            let profile = profile_from_label(name, data_root)?;
             println!("profile: {}", profile.label());
             println!("data_dir: {}", profile.data_dir.display());
             println!("run_status: {}", profile_run_state(&profile).label());
@@ -191,54 +192,61 @@ pub fn run_profile_command(command: &ProfileCommand) -> anyhow::Result<()> {
             }
         }
         ProfileCommand::Create { name, entries } => {
-            let profile = InstanceProfile::named(name)?;
+            let profile = InstanceProfile::named_in_data_root(name, data_root)?;
             if matches!(
                 detect_setup_state(&profile.data_dir),
                 SetupState::Initialized { .. }
             ) {
                 anyhow::bail!("profile `{name}` already exists");
             }
-            apply_runtime_config_entries(&profile, &profile.data_dir, entries, true)?;
+            apply_runtime_config_entries(&profile, &profile.data_dir, entries, true).await?;
         }
         ProfileCommand::Delete { name, force } => {
             if !force {
                 anyhow::bail!("refusing to delete profile `{name}` without --force");
             }
-            let path = remove_named_profile(name)?;
+            let path = remove_named_profile_in_data_root(name, data_root)?;
             println!("Deleted profile `{name}` at {}", path.display());
         }
         ProfileCommand::Start(name) => {
-            let profile = InstanceProfile::from_label(name)?;
+            let profile = profile_from_label(name, data_root)?;
             start_profile(&profile)?;
         }
         ProfileCommand::Stop { name, force } => {
-            let profile = InstanceProfile::from_label(name)?;
+            let profile = profile_from_label(name, data_root)?;
             stop_profile(&profile, *force)?;
         }
         ProfileCommand::Restart { name, force } => {
-            let profile = InstanceProfile::from_label(name)?;
+            let profile = profile_from_label(name, data_root)?;
             stop_profile(&profile, *force)?;
             start_profile(&profile)?;
         }
         ProfileCommand::Status(name) => {
-            let profile = InstanceProfile::from_label(name)?;
+            let profile = profile_from_label(name, data_root)?;
             print_profile_status(&profile)?;
         }
         ProfileCommand::StatusAll => {
-            for profile in discover_profiles()? {
+            for profile in discover_profiles_in_data_root(data_root)? {
                 print_profile_status(&profile)?;
             }
         }
-        ProfileCommand::Agent(command) => run_profile_agent_command(command)?,
-        ProfileCommand::Workflow(command) => run_profile_workflow_command(command)?,
+        ProfileCommand::Agent(command) => run_profile_agent_command(command, data_root).await?,
+        ProfileCommand::Workflow(command) => run_profile_workflow_command(command, data_root)?,
     }
     Ok(())
 }
 
-fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()> {
+fn profile_from_label(label: &str, data_root: &Path) -> anyhow::Result<InstanceProfile> {
+    InstanceProfile::from_label_in_data_root(label, data_root)
+}
+
+async fn run_profile_agent_command(
+    command: &ProfileAgentCommand,
+    data_root: &Path,
+) -> anyhow::Result<()> {
     match command {
         ProfileAgentCommand::List { profile } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
             println!("ID\tNAME\tMODEL\tTOOLS\tDESCRIPTION");
@@ -256,7 +264,7 @@ fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()
             }
         }
         ProfileAgentCommand::Show { profile, agent_id } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
             let agent = registry
@@ -265,7 +273,7 @@ fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()
             print_agent(agent);
         }
         ProfileAgentCommand::Upsert { profile, path } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let markdown = read_cli_input(path)?;
             let parsed = AgentProfile::from_markdown(&markdown)?;
@@ -283,7 +291,7 @@ fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()
             );
         }
         ProfileAgentCommand::SetDefault { profile, agent_id } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
             if registry.get(agent_id).is_none() {
@@ -294,7 +302,8 @@ fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()
                 &profile.data_dir,
                 &[format!("root_agent_id={agent_id}")],
                 false,
-            )?;
+            )
+            .await?;
             println!(
                 "Default agent for profile `{}` is `{agent_id}`",
                 profile.label()
@@ -304,10 +313,13 @@ fn run_profile_agent_command(command: &ProfileAgentCommand) -> anyhow::Result<()
     Ok(())
 }
 
-fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Result<()> {
+fn run_profile_workflow_command(
+    command: &ProfileWorkflowCommand,
+    data_root: &Path,
+) -> anyhow::Result<()> {
     match command {
         ProfileWorkflowCommand::List { profile } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             println!("ID\tNAME\tNODES\tEDGES\tDESCRIPTION");
             println!("goal\tGoal\t2\t1\tEmbedded goal workflow");
@@ -328,7 +340,7 @@ fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Res
             profile,
             workflow_id,
         } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let workflow = if workflow_id == "goal" {
                 bot_core::supervisor_workflow::embedded_goal_definition()
@@ -338,7 +350,7 @@ fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Res
             print_workflow(&workflow)?;
         }
         ProfileWorkflowCommand::Upsert { profile, path } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             ensure_profile_assets(&profile.data_dir)?;
             let raw = read_cli_input(path)?;
             let workflow: WorkflowDefinition =
@@ -369,7 +381,7 @@ fn run_profile_workflow_command(command: &ProfileWorkflowCommand) -> anyhow::Res
             profile,
             workflow_id,
         } => {
-            let profile = InstanceProfile::from_label(profile)?;
+            let profile = profile_from_label(profile, data_root)?;
             let path = profile
                 .data_dir
                 .join("workflows")
@@ -446,21 +458,23 @@ fn ensure_profile_assets(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 pub fn ensure_builtin_diagnostic_profile() -> anyhow::Result<()> {
-    let profile = InstanceProfile::named(DIAGNOSTIC_PROFILE_NAME)?;
+    ensure_builtin_diagnostic_profile_in_data_root(Path::new(
+        crate::instance_profile::DEFAULT_DATA_DIR,
+    ))
+}
+
+pub fn ensure_builtin_diagnostic_profile_in_data_root(data_root: &Path) -> anyhow::Result<()> {
+    let profile = InstanceProfile::named_in_data_root(DIAGNOSTIC_PROFILE_NAME, data_root)?;
     ensure_profile_assets(&profile.data_dir)?;
     match detect_setup_state(&profile.data_dir) {
         SetupState::Initialized { .. } | SetupState::Invalid { .. } => return Ok(()),
         SetupState::LegacyEnvCompatible { .. } | SetupState::Uninitialized { .. } => {}
     }
 
-    let default_model_profile =
-        match detect_setup_state(Path::new(crate::instance_profile::DEFAULT_DATA_DIR)) {
-            SetupState::Initialized { config, .. } => config.model_profile,
-            _ => {
-                RuntimeConfig::default_for(Path::new(crate::instance_profile::DEFAULT_DATA_DIR))
-                    .model_profile
-            }
-        };
+    let default_model_profile = match detect_setup_state(data_root) {
+        SetupState::Initialized { config, .. } => config.model_profile,
+        _ => RuntimeConfig::default_for(data_root).model_profile,
+    };
 
     let mut config = RuntimeConfig::default_for(&profile.data_dir);
     config.root_agent_id = DIAGNOSTIC_PROFILE_NAME.to_string();
@@ -473,7 +487,7 @@ pub fn ensure_builtin_diagnostic_profile() -> anyhow::Result<()> {
     config.admin.port = first_available_port(
         &config.admin.host,
         config.admin.port,
-        &configured_ports(&profile.data_dir)?,
+        &configured_ports_in_data_root(&profile.data_dir, data_root)?,
     )?;
     write_runtime_config(&profile.data_dir, &config)?;
     Ok(())
@@ -780,7 +794,7 @@ fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
     !process_is_alive(pid)
 }
 
-pub fn apply_runtime_config_entries(
+pub async fn apply_runtime_config_entries(
     profile: &InstanceProfile,
     data_dir: &Path,
     entries: &[String],
@@ -816,11 +830,23 @@ pub fn apply_runtime_config_entries(
     if profile.is_named() && config.sandbox.container_name == "remi-cat-sandbox" {
         config.sandbox.container_name = format!("remi-cat-sandbox-{}", profile.label());
     }
+    let mut model_changed = false;
     for entry in entries {
+        if runtime_config_entry_changes_model(entry) {
+            model_changed = true;
+        }
         apply_runtime_config_entry(&mut config, entry)
             .with_context(|| format!("applying config entry `{entry}`"))?;
     }
-    normalize_runtime_config(data_dir, &mut config)?;
+    let data_root = profile_data_root(profile);
+    normalize_runtime_config(data_dir, &data_root, &mut config)?;
+    if model_changed {
+        let registry = ModelProfileRegistry::load(data_dir.join("models"))?;
+        let model_profile = registry.get(&config.model_profile).ok_or_else(|| {
+            anyhow::anyhow!("model profile `{}` does not exist", config.model_profile)
+        })?;
+        validate_model_profile_api_key(model_profile).await?;
+    }
     let path = write_runtime_config(data_dir, &config)?;
     println!(
         "Saved profile `{}` runtime config to {}",
@@ -831,6 +857,17 @@ pub fn apply_runtime_config_entries(
     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
     println!("sandbox_container: {}", config.sandbox.container_name);
     Ok(())
+}
+
+fn runtime_config_entry_changes_model(entry: &str) -> bool {
+    let entry = entry.trim().trim_start_matches("--");
+    let Some((raw_key, _)) = entry.split_once('=') else {
+        return false;
+    };
+    matches!(
+        raw_key.trim().replace('-', "_").as_str(),
+        "model_profile" | "model"
+    )
 }
 
 fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow::Result<()> {
@@ -865,8 +902,20 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "shell_mode" | "shell.mode" => config.shell.mode = parse_shell_mode(value)?,
         "acp_mode" | "acp.mode" => config.acp.mode = parse_acp_mode(value)?,
         "acp_client" | "acp.client" => config.acp.client = parse_acp_client(value)?,
+        "acp_tool_name" | "acp.tool_name" | "acp.tool" => {
+            config.acp.tool_name = nonempty_optional(value)
+        }
         "acp_agent_name" | "acp.agent_name" | "acp.agent" => {
             config.acp.agent_name = nonempty_optional(value)
+        }
+        "acp_base_url" | "acp.base_url" => config.acp.base_url = nonempty_optional(value),
+        "acp_model" | "acp.model" => config.acp.model = nonempty_optional(value),
+        "acp_api_key" | "acp.api_key" => config.acp.api_key = nonempty_optional(value),
+        "acp_local_bin" | "acp.local_bin" | "local.bin" | "local_bin" => {
+            config.acp.local_bin = nonempty_optional(value)
+        }
+        "acp_local_args" | "acp.local_args" | "local.args" | "local_args" => {
+            config.acp.local_args = parse_string_array(value)?
         }
         "acp_codex_bin" | "acp.codex_bin" | "codex.bin" | "codex_bin" => {
             config.acp.codex_bin = nonempty_optional(value)
@@ -908,7 +957,24 @@ pub fn prefix_short_config_entry(prefix: &str, entry: &str) -> String {
     }
 }
 
-fn normalize_runtime_config(data_dir: &Path, config: &mut RuntimeConfig) -> anyhow::Result<()> {
+fn profile_data_root(profile: &InstanceProfile) -> std::path::PathBuf {
+    if profile.is_named() {
+        profile
+            .data_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(crate::instance_profile::DEFAULT_DATA_DIR).to_path_buf())
+    } else {
+        profile.data_dir.clone()
+    }
+}
+
+fn normalize_runtime_config(
+    data_dir: &Path,
+    data_root: &Path,
+    config: &mut RuntimeConfig,
+) -> anyhow::Result<()> {
     match config.sandbox.kind {
         RuntimeSandboxKind::Disabled | RuntimeSandboxKind::NoSandbox => {
             if config.sandbox.host_dir.trim().is_empty() {
@@ -916,11 +982,14 @@ fn normalize_runtime_config(data_dir: &Path, config: &mut RuntimeConfig) -> anyh
             }
         }
         RuntimeSandboxKind::Docker => {
-            config.sandbox.container_name =
-                available_container_name(&config.sandbox.container_name, data_dir)?;
+            config.sandbox.container_name = available_container_name_in_data_root(
+                &config.sandbox.container_name,
+                data_dir,
+                data_root,
+            )?;
         }
     }
-    let mut reserved_ports = configured_ports(data_dir)?;
+    let mut reserved_ports = configured_ports_in_data_root(data_dir, data_root)?;
     if config.admin.enabled {
         let requested = config.admin.port;
         config.admin.port = first_available_port(&config.admin.host, requested, &reserved_ports)?;
@@ -1000,11 +1069,15 @@ fn parse_acp_mode(value: &str) -> anyhow::Result<AcpMode> {
 }
 
 fn parse_acp_client(value: &str) -> anyhow::Result<AcpClient> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "codex" => Ok(AcpClient::Codex),
-        "remi" | "stub" | "local" => Ok(AcpClient::Remi),
-        other => anyhow::bail!("unknown ACP client `{other}`"),
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("ACP client may only contain ASCII letters, digits, `-`, and `_`");
     }
+    Ok(AcpClient::new(value))
 }
 
 fn parse_string_array(value: &str) -> anyhow::Result<Vec<String>> {
@@ -1026,8 +1099,18 @@ pub fn format_admin_addr(config: &RuntimeConfig) -> String {
 }
 
 pub fn configured_ports(data_dir: &Path) -> anyhow::Result<HashSet<u16>> {
+    configured_ports_in_data_root(
+        data_dir,
+        Path::new(crate::instance_profile::DEFAULT_DATA_DIR),
+    )
+}
+
+pub fn configured_ports_in_data_root(
+    data_dir: &Path,
+    data_root: &Path,
+) -> anyhow::Result<HashSet<u16>> {
     let mut ports = HashSet::new();
-    for config in configured_profiles_excluding(data_dir)? {
+    for config in configured_profiles_excluding_in_data_root(data_dir, data_root)? {
         if config.admin.enabled {
             ports.insert(config.admin.port);
         }
@@ -1064,7 +1147,19 @@ pub fn print_port_adjustment(label: &str, requested: u16, selected: u16) {
 }
 
 pub fn available_container_name(requested: &str, data_dir: &Path) -> anyhow::Result<String> {
-    let used: HashSet<String> = configured_profiles_excluding(data_dir)?
+    available_container_name_in_data_root(
+        requested,
+        data_dir,
+        Path::new(crate::instance_profile::DEFAULT_DATA_DIR),
+    )
+}
+
+pub fn available_container_name_in_data_root(
+    requested: &str,
+    data_dir: &Path,
+    data_root: &Path,
+) -> anyhow::Result<String> {
+    let used: HashSet<String> = configured_profiles_excluding_in_data_root(data_dir, data_root)?
         .into_iter()
         .filter(|config| matches!(config.sandbox.kind, RuntimeSandboxKind::Docker))
         .map(|config| config.sandbox.container_name)

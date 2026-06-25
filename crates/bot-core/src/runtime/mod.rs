@@ -24,10 +24,10 @@ use crate::{
     sandbox, skill, supervisor_workflow, todo, trigger, AccountUsage, AgentModelBindings,
     AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
     FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument,
-    ImFileBridge, MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, SharedRedactor,
-    SkillDocument, SkillLoadDiagnostic, SkillSummary, SupervisorTraceEvent, ThreadHistoryMessage,
-    ToolApprovalManager, UserQuestionManager, WorkflowDecision, WorkflowDefinition,
-    WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
+    ImFileBridge, MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
+    SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SupervisorTraceEvent,
+    ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager, WorkflowDecision,
+    WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
 };
 
 mod approval_markers;
@@ -94,6 +94,8 @@ pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) 
 pub struct StreamOptions {
     /// Optional session-persisted model profile override.
     pub model_profile_id: Option<String>,
+    /// Optional session-persisted reasoning effort override for the current model.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Optional session-persisted root agent override.
     pub agent_id: Option<String>,
     /// Skill documents explicitly loaded by slash-command preprocessing for this turn.
@@ -231,7 +233,6 @@ pub struct CatBot {
     run_locks: ThreadRunLocks,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
-    api_key: String,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
 }
@@ -353,6 +354,17 @@ impl CatBot {
         )
     }
 
+    pub fn effective_model_profile_with_reasoning(
+        &self,
+        session_model_profile_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> anyhow::Result<EffectiveModelProfile> {
+        apply_reasoning_effort_override(
+            self.effective_model_profile(session_model_profile_id),
+            reasoning_effort,
+        )
+    }
+
     pub fn effective_agent_profile(&self, session_agent_id: Option<&str>) -> EffectiveAgentProfile {
         self.effective_agent_profile_for_workflow(session_agent_id, None)
     }
@@ -466,7 +478,8 @@ impl CatBot {
     }
 
     pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
-        model_usage::query_account_usage(&self.model_profile, &self.api_key).await
+        let api_key = api_key_from_env(&self.model_profile)?;
+        model_usage::query_account_usage(&self.model_profile, &api_key).await
     }
 
     pub async fn account_usage_for(
@@ -474,7 +487,8 @@ impl CatBot {
         session_model_profile_id: Option<&str>,
     ) -> anyhow::Result<AccountUsage> {
         let effective = self.effective_model_profile(session_model_profile_id);
-        model_usage::query_account_usage(&effective.profile, &self.api_key).await
+        let api_key = api_key_from_env(&effective.profile)?;
+        model_usage::query_account_usage(&effective.profile, &api_key).await
     }
 
     fn agent_for_model_profile(&self, profile_id: &str) -> &CatAgent<InnerAgent> {
@@ -524,9 +538,10 @@ impl CatBot {
     ///
     /// | Variable                  | Description                                           |
     /// |---------------------------|-------------------------------------------------------|
-    /// | `OPENAI_API_KEY`          | API key (required)                                    |
+    /// | `<PROVIDER>_API_KEY`      | Provider-specific model API key, for example `OPENAI_API_KEY`, `MIMO_API_KEY`, or `DEEPSEEK_API_KEY` |
     /// | `REMI_MODEL_PROFILE`      | Selected model profile id (default: `default`)        |
-    /// | `REMI_KIMI_THINKING`      | Optional thinking override for supported Kimi profiles |
+    /// | `REMI_KIMI_THINKING`      | Legacy thinking override for supported Kimi profiles  |
+    /// | `REMI_REASONING_EFFORT`   | Optional reasoning effort override (`auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
     /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers auto compression (default: 80) |
     /// | `REMI_SHORT_TERM_TOKENS`  | Absolute auto-compression token threshold override    |
@@ -1044,22 +1059,24 @@ impl CatBot {
                 });
         }
 
-        if !self.acp_backend.codex_tool_available() {
+        if !self.acp_backend.active_tool_available() {
+            let acp_tool_name = self.acp_backend.active_tool_name();
+            let acp_tool_description = self.acp_backend.active_tool_description();
             by_name
-                .entry("codex".to_string())
+                .entry(acp_tool_name.clone())
                 .and_modify(|entry| {
                     entry.registered = false;
                     entry.enabled = false;
-                    entry.errors = tool_errors("codex", false);
+                    entry.errors = tool_errors(&acp_tool_name, false);
                 })
                 .or_insert_with(|| RegisteredToolStatus {
-                    name: "codex".to_string(),
-                    description: "Open, resume, or poll a Codex ACP session.".to_string(),
+                    name: acp_tool_name.clone(),
+                    description: acp_tool_description,
                     registered: false,
                     enabled: false,
-                    in_active_allowlist: self.tool_in_active_allowlist("codex"),
+                    in_active_allowlist: self.tool_in_active_allowlist(&acp_tool_name),
                     warnings: Vec::new(),
-                    errors: tool_errors("codex", false),
+                    errors: tool_errors(&acp_tool_name, false),
                 });
         }
 
@@ -1308,14 +1325,34 @@ impl CatBot {
                 opts.model_profile_id.as_deref(),
                 &effective_agent.profile,
             );
+            let effective_model = match apply_reasoning_effort_override(
+                effective_model,
+                opts.reasoning_effort,
+            ) {
+                Ok(effective) => effective,
+                Err(err) => {
+                    let err = AgentError::other(err.to_string());
+                    tracing::warn!(
+                        thread_id = %thread_id_owned,
+                        elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                        error = %err,
+                        "agent_turn.failed"
+                    );
+                    yield CatEvent::Error(err);
+                    return;
+                }
+            };
+            let runtime_model_key =
+                model_runtime_key(&effective_model.profile.id, opts.reasoning_effort);
             let active_agent = self.runtime_for_agent_and_model(
                 &effective_agent.profile.id,
-                &effective_model.profile.id,
+                &runtime_model_key,
             );
             tracing::info!(
                 thread_id = %thread_id_owned,
                 model_profile = %effective_model.profile.id,
                 model = %effective_model.profile.model,
+                reasoning_effort = opts.reasoning_effort.map(ReasoningEffort::as_str).unwrap_or(""),
                 model_source = ?effective_model.source,
                 agent_id = %effective_agent.profile.id,
                 agent_source = ?effective_agent.source,
@@ -2025,6 +2062,12 @@ struct LocalToolDeps {
 }
 
 impl LocalToolDeps {
+    fn with_api_key(&self, api_key: String) -> Self {
+        let mut deps = self.clone_for_subagent();
+        deps.api_key = api_key;
+        deps
+    }
+
     fn clone_for_subagent(&self) -> Self {
         Self {
             skill_store: Arc::clone(&self.skill_store),
@@ -2447,36 +2490,44 @@ impl CatBotBuilder {
         let local_tools = tool_deps.build_tools(&profile, self.extra_options.clone(), true);
         let mut model_agents = HashMap::new();
         for model_profile in self.model_registry.list() {
-            if model_profile.id == profile.id {
-                continue;
+            for variant in model_runtime_variants(model_profile)? {
+                if model_profile.id == profile.id && variant.key == model_profile.id {
+                    continue;
+                }
+                let model_api_key = runtime_api_key_for_profile(&variant.profile);
+                let model_inner = build_inner_agent(
+                    &model_api_key,
+                    &variant.profile,
+                    system_prompt.clone(),
+                    self.max_turns,
+                    variant.extra_options.clone(),
+                );
+                let model_tools = tool_deps.with_api_key(model_api_key).build_tools(
+                    &variant.profile,
+                    variant.extra_options,
+                    true,
+                );
+                let model_overflow_bytes = self
+                    .overflow_bytes
+                    .unwrap_or(variant.profile.overflow_bytes);
+                model_agents.insert(
+                    variant.key,
+                    CatAgent {
+                        inner: model_inner,
+                        local_tools: model_tools,
+                        data_dir: memory.data_dir.clone(),
+                        workspace_root: workspace_root.clone(),
+                        workspace_root_label: sandbox.workspace_root_label(),
+                        allow_host_absolute_paths: sandbox.kind() != "docker",
+                        overflow_bytes: model_overflow_bytes,
+                        im_bridge: self.im_bridge.clone(),
+                        tool_allowlist: self.tool_allowlist.clone(),
+                        approval_manager: Arc::clone(&approval_manager),
+                        user_question_manager: Arc::clone(&user_question_manager),
+                        hook_manager: Arc::clone(&hook_manager),
+                    },
+                );
             }
-            let model_extra_options = model_profile.merged_extra_options(None)?;
-            let model_inner = build_inner_agent(
-                &self.api_key,
-                model_profile,
-                system_prompt.clone(),
-                self.max_turns,
-                model_extra_options.clone(),
-            );
-            let model_tools = tool_deps.build_tools(model_profile, model_extra_options, true);
-            let model_overflow_bytes = self.overflow_bytes.unwrap_or(model_profile.overflow_bytes);
-            model_agents.insert(
-                model_profile.id.clone(),
-                CatAgent {
-                    inner: model_inner,
-                    local_tools: model_tools,
-                    data_dir: memory.data_dir.clone(),
-                    workspace_root: workspace_root.clone(),
-                    workspace_root_label: sandbox.workspace_root_label(),
-                    allow_host_absolute_paths: sandbox.kind() != "docker",
-                    overflow_bytes: model_overflow_bytes,
-                    im_bridge: self.im_bridge.clone(),
-                    tool_allowlist: self.tool_allowlist.clone(),
-                    approval_manager: Arc::clone(&approval_manager),
-                    user_question_manager: Arc::clone(&user_question_manager),
-                    hook_manager: Arc::clone(&hook_manager),
-                },
-            );
         }
 
         let agent_registry = AgentRegistry::load(&agents_dir)?;
@@ -2532,36 +2583,42 @@ impl CatBotBuilder {
             };
             let mut by_model = HashMap::new();
             for model_profile in self.model_registry.list() {
-                let model_extra_options = model_profile.merged_extra_options(None)?;
-                let model_inner = build_inner_agent(
-                    &self.api_key,
-                    model_profile,
-                    agent_profile.system_prompt.clone(),
-                    agent_profile.max_turns,
-                    model_extra_options.clone(),
-                );
-                let model_tools =
-                    agent_tool_deps.build_tools(model_profile, model_extra_options, true);
-                let agent_tool_allowlist = agent_tool_allowlist(agent_profile);
-                let model_overflow_bytes =
-                    self.overflow_bytes.unwrap_or(model_profile.overflow_bytes);
-                by_model.insert(
-                    model_profile.id.clone(),
-                    CatAgent {
-                        inner: model_inner,
-                        local_tools: model_tools,
-                        data_dir: memory.data_dir.clone(),
-                        workspace_root: workspace_root.clone(),
-                        workspace_root_label: sandbox.workspace_root_label(),
-                        allow_host_absolute_paths: sandbox.kind() != "docker",
-                        overflow_bytes: model_overflow_bytes,
-                        im_bridge: self.im_bridge.clone(),
-                        tool_allowlist: Some(agent_tool_allowlist),
-                        approval_manager: Arc::clone(&approval_manager),
-                        user_question_manager: Arc::clone(&user_question_manager),
-                        hook_manager: Arc::clone(&hook_manager),
-                    },
-                );
+                for variant in model_runtime_variants(model_profile)? {
+                    let model_api_key = runtime_api_key_for_profile(&variant.profile);
+                    let model_inner = build_inner_agent(
+                        &model_api_key,
+                        &variant.profile,
+                        agent_profile.system_prompt.clone(),
+                        agent_profile.max_turns,
+                        variant.extra_options.clone(),
+                    );
+                    let model_tools = agent_tool_deps.with_api_key(model_api_key).build_tools(
+                        &variant.profile,
+                        variant.extra_options,
+                        true,
+                    );
+                    let agent_tool_allowlist = agent_tool_allowlist(agent_profile);
+                    let model_overflow_bytes = self
+                        .overflow_bytes
+                        .unwrap_or(variant.profile.overflow_bytes);
+                    by_model.insert(
+                        variant.key,
+                        CatAgent {
+                            inner: model_inner,
+                            local_tools: model_tools,
+                            data_dir: memory.data_dir.clone(),
+                            workspace_root: workspace_root.clone(),
+                            workspace_root_label: sandbox.workspace_root_label(),
+                            allow_host_absolute_paths: sandbox.kind() != "docker",
+                            overflow_bytes: model_overflow_bytes,
+                            im_bridge: self.im_bridge.clone(),
+                            tool_allowlist: Some(agent_tool_allowlist),
+                            approval_manager: Arc::clone(&approval_manager),
+                            user_question_manager: Arc::clone(&user_question_manager),
+                            hook_manager: Arc::clone(&hook_manager),
+                        },
+                    );
+                }
             }
             agent_runtimes.insert(agent_profile.id.clone(), by_model);
         }
@@ -2596,10 +2653,96 @@ impl CatBotBuilder {
             run_locks,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
-            api_key: self.api_key,
             redactor,
         })
     }
+}
+
+fn runtime_api_key_for_profile(profile: &ModelProfileConfig) -> String {
+    match api_key_from_env(profile) {
+        Ok(api_key) => api_key,
+        Err(err) => {
+            tracing::warn!(
+                model_profile = %profile.id,
+                provider = profile.provider.as_deref().unwrap_or(""),
+                model = %profile.model,
+                error = %err,
+                "model profile API key is unavailable; requests for this profile will fail until configured"
+            );
+            String::new()
+        }
+    }
+}
+
+struct ModelRuntimeVariant {
+    key: String,
+    profile: ModelProfileConfig,
+    extra_options: serde_json::Map<String, serde_json::Value>,
+}
+
+fn model_runtime_key(profile_id: &str, reasoning_effort: Option<ReasoningEffort>) -> String {
+    match reasoning_effort {
+        Some(effort) if effort != ReasoningEffort::Auto => {
+            format!("{profile_id}::reasoning={}", effort.as_str())
+        }
+        _ => profile_id.to_string(),
+    }
+}
+
+fn model_runtime_variants(
+    profile: &ModelProfileConfig,
+) -> anyhow::Result<Vec<ModelRuntimeVariant>> {
+    let mut variants = vec![ModelRuntimeVariant {
+        key: profile.id.clone(),
+        profile: profile.clone(),
+        extra_options: profile.merged_extra_options(None, None)?,
+    }];
+
+    for effort in ReasoningEffort::VARIANTS {
+        if effort == ReasoningEffort::Auto {
+            continue;
+        }
+        let extra_options = match profile.merged_extra_options(None, Some(effort)) {
+            Ok(options) => options,
+            Err(err) => {
+                tracing::debug!(
+                    model_profile = %profile.id,
+                    model = %profile.model,
+                    reasoning_effort = effort.as_str(),
+                    error = %err,
+                    "skipping unsupported reasoning runtime variant"
+                );
+                continue;
+            }
+        };
+        let mut variant_profile = profile.clone();
+        variant_profile.reasoning_effort = Some(effort);
+        variants.push(ModelRuntimeVariant {
+            key: model_runtime_key(&profile.id, Some(effort)),
+            profile: variant_profile,
+            extra_options,
+        });
+    }
+
+    Ok(variants)
+}
+
+fn apply_reasoning_effort_override(
+    mut effective: EffectiveModelProfile,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> anyhow::Result<EffectiveModelProfile> {
+    let Some(effort) = reasoning_effort else {
+        return Ok(effective);
+    };
+    if effort == ReasoningEffort::Auto {
+        return Ok(effective);
+    }
+    effective
+        .profile
+        .merged_extra_options(None, Some(effort))
+        .map(|_| ())?;
+    effective.profile.reasoning_effort = Some(effort);
+    Ok(effective)
 }
 
 fn delegate_tool_name(agent_id: &str) -> String {
@@ -3344,6 +3487,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             base_url: Some("https://api.openai.com/v1".to_string()),
             thinking: None,
+            reasoning_effort: None,
             max_output_tokens: 4096,
             context_tokens: 128000,
             supports_images: true,
@@ -3791,6 +3935,7 @@ You are Remi.
                 model: "deepseek-v4-flash".to_string(),
                 base_url: Some("https://api.deepseek.com".to_string()),
                 thinking: None,
+                reasoning_effort: None,
                 max_output_tokens: 393216,
                 context_tokens: 1_000_000,
                 supports_images: false,

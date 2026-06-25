@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,8 +16,9 @@ use crate::profile_command::{
 };
 use crate::secret_store::SecretStore;
 use bot_core::{
-    install_embedded_agent_profiles, install_embedded_model_profiles, AgentProfile, AgentRegistry,
-    CatBotBuilder, CatEvent, Content, ModelProfileConfig, ModelProfileRegistry, StreamOptions,
+    install_embedded_agent_profiles, install_embedded_model_profiles,
+    validate_model_profile_api_key, AgentProfile, AgentRegistry, CatBotBuilder, CatEvent, Content,
+    ModelProfileConfig, ModelProfileRegistry, StreamOptions,
 };
 
 pub(crate) async fn run_setup(
@@ -91,12 +91,20 @@ pub(crate) async fn run_setup(
         .primary
         .clone()
         .unwrap_or_else(|| "default".to_string());
+    let model_options = models
+        .iter()
+        .map(|profile| {
+            format!(
+                "{} - {} [{}]",
+                profile.id,
+                profile.name,
+                model_key_status_label(profile)
+            )
+        })
+        .collect::<Vec<_>>();
     let model_profile = choose_from_list(
         "Primary model profile",
-        &models
-            .iter()
-            .map(|profile| format!("{} - {}", profile.id, profile.name))
-            .collect::<Vec<_>>(),
+        &model_options,
         existing_config
             .as_ref()
             .map(|config| config.model_profile.as_str())
@@ -145,9 +153,10 @@ pub(crate) async fn run_setup(
     let api_key = prompt_secret(current_api_key.as_deref())?;
     if !api_key.trim().is_empty() {
         unsafe {
-            std::env::set_var(api_key_env_key, api_key.trim());
+            std::env::set_var(&api_key_env_key, api_key.trim());
         }
     }
+    validate_model_profile_api_key(selected_model_profile).await?;
 
     let previous_config = existing_config.clone();
     let mut config = existing_config.unwrap_or_else(|| RuntimeConfig::default_for(data_dir));
@@ -224,7 +233,7 @@ pub(crate) async fn run_setup(
     }
 
     let runtime_path = write_runtime_config(data_dir, &config)?;
-    match run_setup_smoke(data_dir, &config, api_key_env_key, api_key.trim()).await {
+    match run_setup_smoke(data_dir, &config, &api_key_env_key, api_key.trim()).await {
         Ok(reply) => {
             let env_path = PathBuf::from(".env");
             if !profile.is_named() {
@@ -234,7 +243,7 @@ pub(crate) async fn run_setup(
                 secret_store
                     .lock()
                     .await
-                    .set(api_key_env_key, api_key.trim())?;
+                    .set(&api_key_env_key, api_key.trim())?;
             }
             println!("\nSetup verification succeeded.");
             println!("Smoke reply: {}", reply.trim());
@@ -317,46 +326,51 @@ async fn run_setup_smoke(
 }
 
 fn prompt_with_default(label: &str, default: &str) -> anyhow::Result<String> {
-    print!("{label} [{default}]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let value = input.trim();
-    if value.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(value.to_string())
-    }
+    crate::tui_form::text_input(label, default, false)
 }
 
 fn choose_from_list(label: &str, options: &[String], default_id: &str) -> anyhow::Result<String> {
-    println!("{label}:");
-    for option in options {
-        println!("  - {option}");
-    }
-    prompt_with_default("Enter id", default_id)
+    let default_index = options
+        .iter()
+        .position(|option| option_id(option) == default_id)
+        .unwrap_or(0);
+    crate::tui_form::select(label, options, default_index).map(|selected| option_id(&selected))
 }
 
 fn prompt_bool_with_default(label: &str, default: bool) -> anyhow::Result<bool> {
-    let default_text = if default { "yes" } else { "no" };
-    loop {
-        let value = prompt_with_default(label, default_text)?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" | "true" | "1" | "on" => return Ok(true),
-            "n" | "no" | "false" | "0" | "off" => return Ok(false),
-            _ => println!("Please enter yes or no."),
-        }
-    }
+    crate::tui_form::bool_input(label, default)
 }
 
-fn api_key_env_key_for_profile(profile: &ModelProfileConfig) -> &'static str {
+fn option_id(option: &str) -> String {
+    option
+        .split_once(" - ")
+        .map(|(id, _)| id)
+        .unwrap_or(option)
+        .trim()
+        .to_string()
+}
+
+fn api_key_env_key_for_profile(profile: &ModelProfileConfig) -> String {
     api_key_env_keys_for_profile(profile)
         .into_iter()
         .next()
-        .unwrap_or("OPENAI_API_KEY")
+        .unwrap_or_else(|| "OPENAI_API_KEY".to_string())
 }
 
-fn api_key_env_keys_for_profile(profile: &ModelProfileConfig) -> Vec<&'static str> {
+fn model_key_status_label(profile: &ModelProfileConfig) -> String {
+    let keys = api_key_env_keys_for_profile(profile);
+    if keys.iter().any(|key| {
+        std::env::var(key)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }) {
+        "key ok".to_string()
+    } else {
+        format!("key missing: {}", keys.join(" or "))
+    }
+}
+
+fn api_key_env_keys_for_profile(profile: &ModelProfileConfig) -> Vec<String> {
     let provider = profile
         .provider
         .as_deref()
@@ -370,43 +384,58 @@ fn api_key_env_keys_for_profile(profile: &ModelProfileConfig) -> Vec<&'static st
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    let mut keys =
-        if provider == "mimo" || model.contains("mimo") || base_url.contains("xiaomimimo.com") {
-            vec!["MIMO_API_KEY"]
-        } else if provider == "kimi"
-            || provider == "moonshot"
-            || model.contains("kimi")
-            || base_url.contains("moonshot.cn")
-        {
-            vec!["MOONSHOT_API_KEY", "KIMI_API_KEY"]
-        } else if provider == "glm"
-            || provider == "zhipu"
-            || provider == "bigmodel"
-            || model.contains("glm")
-            || base_url.contains("bigmodel.cn")
-        {
-            vec!["GLM_API_KEY", "ZHIPU_API_KEY", "BIGMODEL_API_KEY"]
-        } else {
-            Vec::new()
-        };
-    keys.extend(["OPENAI_API_KEY", "REMI_API_KEY"]);
-    keys
+    if provider == "deepseek" || model.contains("deepseek") || base_url.contains("deepseek.com") {
+        vec!["DEEPSEEK_API_KEY".to_string()]
+    } else if provider == "mimo" || model.contains("mimo") || base_url.contains("xiaomimimo.com") {
+        vec!["MIMO_API_KEY".to_string()]
+    } else if provider == "kimi"
+        || provider == "moonshot"
+        || model.contains("kimi")
+        || base_url.contains("moonshot.cn")
+    {
+        vec!["MOONSHOT_API_KEY".to_string(), "KIMI_API_KEY".to_string()]
+    } else if provider == "glm"
+        || provider == "zhipu"
+        || provider == "bigmodel"
+        || model.contains("glm")
+        || base_url.contains("bigmodel.cn")
+    {
+        vec![
+            "GLM_API_KEY".to_string(),
+            "ZHIPU_API_KEY".to_string(),
+            "BIGMODEL_API_KEY".to_string(),
+        ]
+    } else if provider == "openai"
+        || provider.is_empty()
+        || model.starts_with("gpt-")
+        || model.starts_with('o')
+        || base_url.contains("api.openai.com")
+    {
+        vec!["OPENAI_API_KEY".to_string()]
+    } else if !provider.is_empty() {
+        vec![format!("{}_API_KEY", env_key_fragment(&provider))]
+    } else {
+        vec!["OPENAI_API_KEY".to_string()]
+    }
+}
+
+fn env_key_fragment(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn prompt_secret(current: Option<&str>) -> anyhow::Result<String> {
-    let prompt = if current.is_some() {
-        "OpenAI-compatible API key [leave blank to keep current]: "
+    let label = if current.is_some() {
+        "OpenAI-compatible API key (blank keeps current)"
     } else {
-        "OpenAI-compatible API key: "
+        "OpenAI-compatible API key"
     };
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let value = input.trim().to_string();
-    if value.is_empty() {
-        Ok(current.unwrap_or_default().to_string())
-    } else {
-        Ok(value)
-    }
+    crate::tui_form::text_input(label, current.unwrap_or_default(), true)
 }

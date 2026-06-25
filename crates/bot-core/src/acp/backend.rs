@@ -72,10 +72,11 @@ enum AcpConfig {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AcpRemoteClient {
     Remi,
     Codex,
+    Other(String),
 }
 
 impl AcpRemoteClient {
@@ -88,17 +89,23 @@ impl AcpRemoteClient {
             .as_str()
         {
             "codex" => Self::Codex,
-            _ => Self::Remi,
+            "remi" | "" => Self::Remi,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Remi => "remi",
+            Self::Codex => "codex",
+            Self::Other(value) => value,
         }
     }
 }
 
 impl std::fmt::Display for AcpRemoteClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Remi => f.write_str("remi"),
-            Self::Codex => f.write_str("codex"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -152,6 +159,27 @@ impl AcpConfig {
         match self {
             Self::Local { agent_name, .. } | Self::Remote { agent_name, .. } => agent_name.as_str(),
         }
+    }
+
+    fn client(&self) -> &AcpRemoteClient {
+        match self {
+            Self::Local { client, .. } | Self::Remote { client, .. } => client,
+        }
+    }
+
+    fn tool_name(&self) -> String {
+        std::env::var("REMI_ACP_TOOL_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_tool_name_for_client(self.client().as_str()))
+    }
+}
+
+fn default_tool_name_for_client(client: &str) -> String {
+    if client.trim().eq_ignore_ascii_case("codex") {
+        "codex".to_string()
+    } else {
+        format!("acp__{}", client.trim().replace('-', "_"))
     }
 }
 
@@ -290,13 +318,8 @@ impl AcpBackend {
         true
     }
 
-    pub fn client_name(&self) -> &'static str {
-        match &self.config {
-            AcpConfig::Local { client, .. } | AcpConfig::Remote { client, .. } => match client {
-                AcpRemoteClient::Remi => "remi",
-                AcpRemoteClient::Codex => "codex",
-            },
-        }
+    pub fn client_name(&self) -> &str {
+        self.config.client().as_str()
     }
 
     pub fn uses_codex(&self) -> bool {
@@ -307,10 +330,29 @@ impl AcpBackend {
         if !self.uses_codex() {
             return false;
         }
+        self.active_tool_available()
+    }
+
+    pub fn active_tool_available(&self) -> bool {
         match &self.config {
-            AcpConfig::Local { .. } => local_codex_binary_available(),
+            AcpConfig::Local { client, .. } => match client {
+                AcpRemoteClient::Remi => true,
+                AcpRemoteClient::Codex => local_codex_binary_available(),
+                AcpRemoteClient::Other(_) => local_acp_binary_available(),
+            },
             AcpConfig::Remote { base_url, .. } => !base_url.trim().is_empty(),
         }
+    }
+
+    pub fn active_tool_name(&self) -> String {
+        self.config.tool_name()
+    }
+
+    pub fn active_tool_description(&self) -> String {
+        format!(
+            "Open or resume an ACP session using the `{}` client.",
+            self.config.client()
+        )
     }
 
     pub async fn prepare_tool_turn(&self, request: AcpToolRequest) -> Result<PreparedToolTurn> {
@@ -841,6 +883,25 @@ impl AcpBackend {
                     )
                     .await
                 }
+                AcpRemoteClient::Other(client_name) => {
+                    tracing::info!(
+                        acp_session_id = session_id,
+                        acp_client = %client_name,
+                        prompt_len = prompt.len(),
+                        configured_startup_args_count = codex_args.len(),
+                        request_startup_args_count = codex_startup_args.len(),
+                        "acp.invoke.start"
+                    );
+                    invoke_local_codex(
+                        session_id,
+                        prompt,
+                        codex_args,
+                        codex_startup_args,
+                        None,
+                        None,
+                    )
+                    .await
+                }
             },
             AcpConfig::Remote {
                 base_url,
@@ -850,7 +911,9 @@ impl AcpBackend {
                 model,
             } => {
                 let endpoint = match client {
-                    AcpRemoteClient::Remi => format!("{}/runs", base_url),
+                    AcpRemoteClient::Remi | AcpRemoteClient::Other(_) => {
+                        format!("{}/runs", base_url)
+                    }
                     AcpRemoteClient::Codex => format!("{}/responses", base_url),
                 };
                 tracing::info!(
@@ -869,7 +932,7 @@ impl AcpBackend {
                 }
 
                 let body = match client {
-                    AcpRemoteClient::Remi => serde_json::json!({
+                    AcpRemoteClient::Remi | AcpRemoteClient::Other(_) => serde_json::json!({
                         "agent": agent_name,
                         "agent_name": agent_name,
                         "sessionId": session_id,
@@ -1001,13 +1064,14 @@ impl AcpBackend {
 }
 
 fn local_codex_binary() -> String {
-    std::env::var("REMI_ACP_CODEX_BIN")
+    std::env::var("REMI_ACP_LOCAL_BIN")
+        .or_else(|_| std::env::var("REMI_ACP_CODEX_BIN"))
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "codex".to_string())
 }
 
-fn local_codex_binary_available() -> bool {
+fn local_acp_binary_available() -> bool {
     StdCommand::new(local_codex_binary())
         .arg("--version")
         .output()
@@ -1015,8 +1079,23 @@ fn local_codex_binary_available() -> bool {
         .unwrap_or(false)
 }
 
+fn local_codex_binary_available() -> bool {
+    StdCommand::new(
+        std::env::var("REMI_ACP_CODEX_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "codex".to_string()),
+    )
+    .arg("--version")
+    .output()
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
 fn local_codex_args_from_env() -> Vec<String> {
-    let Ok(value) = std::env::var("REMI_ACP_CODEX_ARGS") else {
+    let Ok(value) =
+        std::env::var("REMI_ACP_LOCAL_ARGS").or_else(|_| std::env::var("REMI_ACP_CODEX_ARGS"))
+    else {
         return Vec::new();
     };
     let value = value.trim();

@@ -9,7 +9,10 @@ use futures::StreamExt;
 use im_feishu::FeishuMessage;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::app::{CliConfig, SESSION_AGENT_ID_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY};
+use crate::app::{
+    parse_session_reasoning_effort, CliConfig, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
+};
 use crate::channel::feishu::collect_cli_bot_reply;
 use crate::channel::{Channel, ChannelKind};
 use crate::command::{process_runtime_commands, RuntimeCommandPipelineResult};
@@ -89,15 +92,19 @@ pub(crate) async fn process_prompt_message(
         print!("{command_prefix}");
         io::stdout().flush()?;
     }
-    let (model_profile_id, agent_id) = {
+    let (model_profile_id, reasoning_effort, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            parse_session_reasoning_effort(
+                sessions.metadata_string(&session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+            ),
             sessions.metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
     let opts = StreamOptions {
         model_profile_id,
+        reasoning_effort,
         agent_id,
         skill_injections,
         ..StreamOptions::default()

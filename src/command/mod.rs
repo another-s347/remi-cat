@@ -9,7 +9,7 @@ mod setup;
 mod update;
 
 pub(crate) use doctor::{
-    command_doctor_report, print_registered_tools, run_codex_command, run_doctor,
+    command_doctor_report, print_registered_tools, run_acp_command, run_codex_command, run_doctor,
     sandbox_doctor_report, sdk_doctor_report,
 };
 pub(crate) use feedback::run_feedback_command;
@@ -34,12 +34,13 @@ pub(crate) use update::{
 
 use crate::app::{
     MAX_COMMAND_PREPROCESS_DEPTH, SESSION_AGENT_ID_METADATA_KEY, SESSION_DEBUG_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
 };
 use crate::cli::parse_secret_command;
 use crate::core::Runtime;
 use bot_core::{
-    AccountBalance, AccountUsage, AccountUsageStatus, CatBot, GoalMaxRounds, SkillDocument,
+    model_profile_key_status, validate_model_profile_api_key, AccountBalance, AccountUsage,
+    AccountUsageStatus, CatBot, GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument,
     SkillLoadDiagnostic, SkillLoadDiagnosticSeverity,
 };
 
@@ -542,14 +543,11 @@ async fn handle_model_command(
 ) -> anyhow::Result<String> {
     let rest = command.trim().strip_prefix("/model").unwrap_or("").trim();
     if rest.is_empty() || rest == "status" {
-        let stored = runtime
-            .sessions
-            .lock()
-            .await
-            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        let (stored, stored_reasoning) = session_model_and_reasoning(runtime, session_id).await?;
         return Ok(format_model_status(
             &runtime.bot,
             stored.as_deref(),
+            stored_reasoning,
             session_id,
         ));
     }
@@ -561,47 +559,256 @@ async fn handle_model_command(
             .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
         return Ok(format_model_list(&runtime.bot, stored.as_deref()));
     }
-    if rest == "reset" {
-        runtime
+    if rest == "reasoning" || rest == "reasoning status" {
+        let (stored, stored_reasoning) = session_model_and_reasoning(runtime, session_id).await?;
+        return Ok(format_model_reasoning_status(
+            &runtime.bot,
+            stored.as_deref(),
+            stored_reasoning,
+            session_id,
+        ));
+    }
+    if rest == "reasoning list" {
+        return Ok(format_model_reasoning_list());
+    }
+    if rest == "reasoning reset" {
+        let (stored, _) = {
+            let mut sessions = runtime.sessions.lock().await;
+            sessions.remove_metadata(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)?;
+            (
+                sessions.metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+                None::<ReasoningEffort>,
+            )
+        };
+        return Ok(format!(
+            "Cleared the current session reasoning override.\n\n{}",
+            format_model_reasoning_status(&runtime.bot, stored.as_deref(), None, session_id)
+        ));
+    }
+    if let Some(value) = rest
+        .strip_prefix("reasoning set")
+        .or_else(|| rest.strip_prefix("reasoning use"))
+        .map(str::trim)
+    {
+        if value.is_empty() {
+            anyhow::bail!(
+                "Usage: /model reasoning set <auto|none|minimal|low|medium|high|xhigh|max>"
+            );
+        }
+        let effort = ReasoningEffort::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown reasoning effort `{value}`. Use `/model reasoning list` to see available values."
+            )
+        })?;
+        let stored_model = runtime
             .sessions
             .lock()
             .await
-            .remove_metadata(session_id, SESSION_MODEL_PROFILE_METADATA_KEY)?;
+            .metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY);
+        runtime
+            .bot
+            .effective_model_profile_with_reasoning(stored_model.as_deref(), Some(effort))
+            .with_context(|| {
+                format!(
+                    "reasoning effort `{}` is not supported by the current model profile",
+                    effort.as_str()
+                )
+            })?;
+        let stored_reasoning = if effort == ReasoningEffort::Auto {
+            runtime
+                .sessions
+                .lock()
+                .await
+                .remove_metadata(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)?;
+            None
+        } else {
+            runtime.sessions.lock().await.set_metadata_string(
+                session_id,
+                SESSION_REASONING_EFFORT_METADATA_KEY,
+                effort.as_str(),
+            )?;
+            Some(effort)
+        };
         return Ok(format!(
-            "已清除当前 session 的模型 override。\n\n{}",
-            format_model_status(&runtime.bot, None, session_id)
+            "Set the current session reasoning effort to `{}`.\n\n{}",
+            effort.as_str(),
+            format_model_reasoning_status(
+                &runtime.bot,
+                stored_model.as_deref(),
+                stored_reasoning,
+                session_id
+            )
+        ));
+    }
+    if let Some((profile_id, reasoning_effort)) = parse_direct_model_selection(&runtime.bot, rest)?
+    {
+        return switch_model_profile(runtime, session_id, &profile_id, reasoning_effort).await;
+    }
+    if rest == "reset" {
+        let stored_reasoning = {
+            let mut sessions = runtime.sessions.lock().await;
+            sessions.remove_metadata(session_id, SESSION_MODEL_PROFILE_METADATA_KEY)?;
+            sessions
+                .metadata_string(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)
+                .as_deref()
+                .and_then(ReasoningEffort::parse)
+        };
+        return Ok(format!(
+            "Cleared the current session model override.\n\n{}",
+            format_model_status(&runtime.bot, None, stored_reasoning, session_id)
         ));
     }
     if let Some(id) = rest.strip_prefix("use").map(str::trim) {
         if id.is_empty() {
-            anyhow::bail!("用法：/model use <profile_id>");
+            anyhow::bail!("Usage: /model use <profile_id>");
         }
-        let Some(profile) = runtime.bot.get_model_profile(id) else {
+        return switch_model_profile(runtime, session_id, id, None).await;
+    }
+    Ok("Usage: /model status, /model list, /model <profile_id> [effort], /model use <profile_id>, /model reasoning status, /model reasoning list, /model reasoning set <effort>, /model reasoning reset, /model reset".to_string())
+}
+
+fn parse_direct_model_selection(
+    bot: &CatBot,
+    rest: &str,
+) -> anyhow::Result<Option<(String, Option<ReasoningEffort>)>> {
+    let mut parts = rest.split_whitespace();
+    let Some(profile_id) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(profile) = bot.get_model_profile(profile_id) else {
+        return Ok(None);
+    };
+    let reasoning = match parts.next() {
+        Some(raw) => Some(ReasoningEffort::parse(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown reasoning effort `{raw}`. Use `/model reasoning list` to see available values."
+            )
+        })?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("Usage: /model <profile_id> [auto|none|minimal|low|medium|high|xhigh|max]");
+    }
+    Ok(Some((profile.id.clone(), reasoning)))
+}
+
+async fn switch_model_profile(
+    runtime: &Runtime,
+    session_id: &str,
+    id: &str,
+    requested_reasoning: Option<ReasoningEffort>,
+) -> anyhow::Result<String> {
+    let Some(profile) = runtime.bot.get_model_profile(id) else {
+        anyhow::bail!("unknown model profile `{id}`. Use `/model list` to see available profiles.");
+    };
+    let profile_id = profile.id.clone();
+    validate_model_profile_api_key(profile).await?;
+    let stored_reasoning_before_switch = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_string(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)
+        .as_deref()
+        .and_then(ReasoningEffort::parse);
+    let reset_reasoning = requested_reasoning == Some(ReasoningEffort::Auto);
+    let requested_reasoning = requested_reasoning.filter(|effort| *effort != ReasoningEffort::Auto);
+    let candidate_reasoning = if reset_reasoning {
+        None
+    } else {
+        requested_reasoning.or(stored_reasoning_before_switch)
+    };
+    let mut cleared_reasoning = None;
+    let stored_reasoning = if let Some(effort) = candidate_reasoning {
+        if runtime
+            .bot
+            .effective_model_profile_with_reasoning(Some(&profile_id), Some(effort))
+            .is_ok()
+        {
+            Some(effort)
+        } else if requested_reasoning == Some(effort) {
             anyhow::bail!(
-                "unknown model profile `{id}`. Use `/model list` to see available profiles."
+                "reasoning effort `{}` is not supported by model profile `{profile_id}`",
+                effort.as_str()
             );
-        };
-        let profile_id = profile.id.clone();
-        runtime.sessions.lock().await.set_metadata_string(
+        } else {
+            cleared_reasoning = Some(effort);
+            None
+        }
+    } else {
+        None
+    };
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        sessions.set_metadata_string(
             session_id,
             SESSION_MODEL_PROFILE_METADATA_KEY,
             &profile_id,
         )?;
-        return Ok(format!(
-            "已切换当前 session 模型为 `{}`。\n\n{}",
-            profile_id,
-            format_model_status(&runtime.bot, Some(&profile_id), session_id)
-        ));
+        if reset_reasoning {
+            sessions.remove_metadata(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)?;
+        } else if requested_reasoning.is_some() {
+            sessions.set_metadata_string(
+                session_id,
+                SESSION_REASONING_EFFORT_METADATA_KEY,
+                requested_reasoning.unwrap().as_str(),
+            )?;
+        } else if cleared_reasoning.is_some() {
+            sessions.remove_metadata(session_id, SESSION_REASONING_EFFORT_METADATA_KEY)?;
+        }
     }
-    Ok("用法：/model status，/model list，/model use <profile_id>，/model reset".to_string())
+    let notice = cleared_reasoning
+        .map(|effort| {
+            format!(
+                "Cleared session reasoning override `{}` because `{}` does not support it.\n\n",
+                effort.as_str(),
+                profile_id
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "Switched the current session model to `{}`.\n\n{}{}",
+        profile_id,
+        notice,
+        format_model_status(
+            &runtime.bot,
+            Some(&profile_id),
+            stored_reasoning,
+            session_id
+        )
+    ))
+}
+
+async fn session_model_and_reasoning(
+    runtime: &Runtime,
+    session_id: &str,
+) -> anyhow::Result<(Option<String>, Option<ReasoningEffort>)> {
+    let (model_profile_id, raw_reasoning) = {
+        let sessions = runtime.sessions.lock().await;
+        (
+            sessions.metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            sessions.metadata_string(session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+        )
+    };
+    let reasoning = match raw_reasoning.as_deref() {
+        Some(raw) => Some(ReasoningEffort::parse(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "stored session reasoning effort `{raw}` is invalid; use `/model reasoning reset`"
+            )
+        })?),
+        None => None,
+    };
+    Ok((model_profile_id, reasoning))
 }
 
 fn format_model_status(
     bot: &CatBot,
     stored_model_profile_id: Option<&str>,
+    stored_reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
 ) -> String {
-    let effective = bot.effective_model_profile(stored_model_profile_id);
+    let effective = bot
+        .effective_model_profile_with_reasoning(stored_model_profile_id, stored_reasoning_effort)
+        .unwrap_or_else(|_| bot.effective_model_profile(stored_model_profile_id));
     let source = if effective.invalid_session_model.is_none()
         && stored_model_profile_id
             .map(str::trim)
@@ -631,11 +838,21 @@ fn format_model_status(
         format!("context_tokens: {}", effective.profile.context_tokens),
         format!("max_output_tokens: {}", effective.profile.max_output_tokens),
         format!("supports_images: {}", effective.profile.supports_images),
+        format!("thinking: {}", model_thinking_label(&effective.profile)),
+        format!(
+            "reasoning_effort: {}",
+            model_reasoning_effort_label(&effective.profile)
+        ),
     ];
     if let Some(stored) = stored_model_profile_id {
         lines.push(format!("session_override: `{stored}`"));
     } else {
         lines.push("session_override: none".to_string());
+    }
+    if let Some(effort) = stored_reasoning_effort {
+        lines.push(format!("reasoning_session_override: `{}`", effort.as_str()));
+    } else {
+        lines.push("reasoning_session_override: none".to_string());
     }
     if let Some(invalid) = effective.invalid_session_model {
         lines.push(format!(
@@ -665,14 +882,22 @@ fn format_model_list(bot: &CatBot, stored_model_profile_id: Option<&str>) -> Str
         } else {
             format!(" [{}]", markers.join(", "))
         };
+        let key_status = model_profile_key_status(profile);
+        let key_label = if key_status.configured {
+            "ok".to_string()
+        } else {
+            format!("missing ({})", key_status.env_keys.join(" or "))
+        };
         lines.push(format!(
-            "- `{}`{}: {} / `{}` / context={} / images={}",
+            "- `{}`{}: {} / `{}` / context={} / images={} / reasoning={} / key={}",
             profile.id,
             marker,
             profile.provider.as_deref().unwrap_or("unknown"),
             profile.model,
             profile.context_tokens,
-            profile.supports_images
+            profile.supports_images,
+            model_reasoning_effort_label(profile),
+            key_label
         ));
     }
     if let Some(invalid) = effective.invalid_session_model {
@@ -682,6 +907,72 @@ fn format_model_list(bot: &CatBot, stored_model_profile_id: Option<&str>) -> Str
         ));
     }
     lines.join("\n")
+}
+
+fn format_model_reasoning_status(
+    bot: &CatBot,
+    stored_model_profile_id: Option<&str>,
+    stored_reasoning_effort: Option<ReasoningEffort>,
+    session_id: &str,
+) -> String {
+    let effective = bot
+        .effective_model_profile_with_reasoning(stored_model_profile_id, stored_reasoning_effort)
+        .unwrap_or_else(|_| bot.effective_model_profile(stored_model_profile_id));
+    let mut lines = vec![
+        "**model reasoning**".to_string(),
+        String::new(),
+        format!("session_id: `{session_id}`"),
+        format!("effective_model_profile: `{}`", effective.profile.id),
+        format!("name: {}", effective.profile.name),
+        format!("model: `{}`", effective.profile.model),
+        format!("thinking: {}", model_thinking_label(&effective.profile)),
+        format!(
+            "reasoning_effort: {}",
+            model_reasoning_effort_label(&effective.profile)
+        ),
+        format!(
+            "session_override: {}",
+            stored_reasoning_effort
+                .map(|effort| format!("`{}`", effort.as_str()))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        String::new(),
+        "Use `/model reasoning set <effort>` to override this session, or `/model reasoning reset` to return to the model profile default.".to_string(),
+    ];
+    if let Some(invalid) = effective.invalid_session_model {
+        lines.push(format!(
+            "\nwarning: stored session override `{invalid}` is invalid; using fallback `{}`",
+            effective.profile.id
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_model_reasoning_list() -> String {
+    let mut lines = vec!["**model reasoning efforts**".to_string(), String::new()];
+    for effort in ReasoningEffort::VARIANTS {
+        lines.push(format!(
+            "- `{}`: {} - {}",
+            effort.as_str(),
+            effort.display_name(),
+            effort.description()
+        ));
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn model_reasoning_effort_label(profile: &ModelProfileConfig) -> String {
+    profile
+        .reasoning_effort
+        .map(|effort| format!("{} ({})", effort.display_name(), effort.as_str()))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn model_thinking_label(profile: &ModelProfileConfig) -> String {
+    profile
+        .thinking
+        .map(|thinking| format!("{} ({})", thinking.display_name(), thinking.as_str()))
+        .unwrap_or_else(|| "default".to_string())
 }
 
 async fn handle_skill_command(

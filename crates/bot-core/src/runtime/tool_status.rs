@@ -1,6 +1,10 @@
 pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] {
     &[
         (
+            "acp__remi",
+            "Open, resume, or poll a named ACP client session.",
+        ),
+        (
             "apply_patch",
             "Apply a unified diff patch inside the workspace.",
         ),
@@ -83,7 +87,13 @@ pub(crate) fn tool_errors(name: &str, registered: bool) -> Vec<String> {
                 .to_string(),
         ],
         "codex" => vec![
-            "codex is not registered because ACP Codex is not configured or the Codex binary is unavailable; run remi-cat codex setup and remi-cat codex doctor"
+            "codex is not registered because ACP Codex is not configured or the Codex binary is unavailable; run remi-cat acp setup --client codex and remi-cat acp doctor"
+                .to_string(),
+        ],
+        name if name.starts_with("acp__") => vec![
+            format!(
+                "{name} is not registered because the configured ACP client is unavailable; run remi-cat acp setup and remi-cat acp doctor"
+            )
                 .to_string(),
         ],
         _ => Vec::new(),

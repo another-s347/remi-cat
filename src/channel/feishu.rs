@@ -16,8 +16,9 @@ use tracing::{info, warn};
 use user_store::UserStore;
 
 use crate::app::{
-    CLI_CHANNEL, FEISHU_CHANNEL, SESSION_AGENT_ID_METADATA_KEY, SESSION_DEBUG_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY,
+    parse_session_reasoning_effort, CLI_CHANNEL, FEISHU_CHANNEL, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_DEBUG_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
+    SESSION_REASONING_EFFORT_METADATA_KEY,
 };
 use crate::channel::{Channel, ChannelKind};
 use crate::command::{process_runtime_commands, RuntimeCommandPipelineResult};
@@ -303,15 +304,19 @@ async fn collect_bot_reply(
             token: d.token.clone(),
         })
         .collect();
-    let (model_profile_id, agent_id) = {
+    let (model_profile_id, reasoning_effort, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+            parse_session_reasoning_effort(
+                sessions.metadata_string(&session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+            ),
             sessions.metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
     let opts = StreamOptions {
         model_profile_id,
+        reasoning_effort,
         agent_id,
         skill_injections,
         sender_user_id: Some(msg.sender_user_id.clone()),
