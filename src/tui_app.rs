@@ -9,11 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bot_core::{
-    model_profile_key_status, CatEvent, Content, ContextCompactionEvent, ContextCompactionStatus,
-    Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, StreamOptions,
-    SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
-    ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
-    WorkflowReport,
+    model_profile_key_status, CatEvent, ContextCompactionEvent, ContextCompactionStatus, Message,
+    ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, SupervisorTraceEvent,
+    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
+    UserQuestionRequest, UserQuestionResponse, UserQuestionStatus, WorkflowReport,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -55,10 +54,8 @@ use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
 use crate::{
-    parse_session_reasoning_effort, process_runtime_commands, CliConfig, Runtime,
-    RuntimeCommandPipelineResult, SESSION_AGENT_ID_METADATA_KEY,
+    ChatChannel, ChatRequest, CliConfig, CoreChatEvent, Runtime, SESSION_AGENT_ID_METADATA_KEY,
     SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
-    SESSION_REASONING_EFFORT_METADATA_KEY,
 };
 
 const TUI_CHANNEL: &str = "tui";
@@ -101,9 +98,12 @@ pub(crate) async fn run_tui(
             .id
     };
 
-    let mut app = TuiApp::new(runtime, cli, session_id, trigger_rx).await;
+    let mut app = TuiApp::new(runtime, cli, session_id.clone(), trigger_rx).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
+    eprintln!(
+        "\nYou can resume this session using `remi-cat --resume {session_id}`"
+    );
     result
 }
 
@@ -2789,203 +2789,20 @@ async fn run_bot_turn(
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    let (stream_thread_id, text, skill_injections, persist_agent_child_turn) =
-        match crate::sub_session_input_target(&runtime, &session_id).await {
-            Some(crate::SubSessionInputTarget::Acp { acp_session_id, .. }) => {
-                match runtime
-                    .bot
-                    .acp_bound_message(&acp_session_id, text.trim())
-                    .await
-                {
-                    Ok(reply) => {
-                        crate::append_direct_sub_session_turn(
-                            &runtime,
-                            &session_id,
-                            text.trim(),
-                            &reply,
-                        )
-                        .await;
-                        let _ = tx.send(BotEvent::Text(reply));
-                    }
-                    Err(error) => {
-                        let _ = tx.send(BotEvent::Error(error.to_string()));
-                    }
-                }
-                let _ = tx.send(BotEvent::Done);
-                return;
-            }
-            Some(crate::SubSessionInputTarget::Agent { sub_thread_id, .. }) => {
-                (sub_thread_id, text, Vec::new(), true)
-            }
-            None => match process_runtime_commands(&runtime, &session_id, text.trim()).await {
-                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
-                    if text.trim() == "/clear" {
-                        let _ = tx.send(BotEvent::SessionCleared);
-                    }
-                    let _ = tx.send(BotEvent::Prefix(reply));
-                    let _ = tx.send(BotEvent::Done);
-                    return;
-                }
-                Ok(RuntimeCommandPipelineResult::Continue {
-                    text,
-                    prefix,
-                    skill_injections,
-                }) => {
-                    if !prefix.is_empty() {
-                        let _ = tx.send(BotEvent::Prefix(prefix));
-                    }
-                    (session_id.clone(), text, skill_injections, false)
-                }
-                Err(error) => {
-                    let _ = tx.send(BotEvent::Error(error.to_string()));
-                    let _ = tx.send(BotEvent::Done);
-                    return;
-                }
-            },
-        };
-
-    {
-        let (model_profile_id, reasoning_effort, agent_id) = {
-            let sessions = runtime.sessions.lock().await;
-            (
-                sessions.metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-                parse_session_reasoning_effort(
-                    sessions.metadata_string(&session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
-                ),
-                sessions.metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
-            )
-        };
-        let opts = StreamOptions {
-            model_profile_id,
-            reasoning_effort,
-            agent_id,
-            skill_injections,
-            sender_user_id: Some(sender_user_id),
-            sender_username: Some(sender_username),
-            message_id: Some(format!("tui-msg-{}", uuid::Uuid::new_v4())),
-            chat_type: Some("p2p".to_string()),
-            platform: Some(TUI_CHANNEL.to_string()),
-            todo_create_via_sdk: true,
-            trigger_tools_enabled: true,
-            cancel: Some(cancel),
-            ..StreamOptions::default()
-        };
-        let user_text_for_history = text.clone();
-        let mut assistant_text_for_history = String::new();
-        let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
-            &stream_thread_id,
-            Content::text(text),
-            opts
-        ));
-        while let Some(event) = stream.next().await {
-            match event {
-                CatEvent::Text(delta) => {
-                    if persist_agent_child_turn {
-                        assistant_text_for_history.push_str(&delta);
-                    }
-                    let _ = tx.send(BotEvent::Text(delta));
-                }
-                CatEvent::Thinking(delta) => {
-                    let _ = tx.send(BotEvent::Thinking(delta));
-                }
-                CatEvent::ToolCallStart { id, name } => {
-                    let _ = tx.send(BotEvent::ToolStart { id, name });
-                }
-                CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                    let _ = tx.send(BotEvent::ToolArgs { id, delta });
-                }
-                CatEvent::ToolCall { id, name, args } => {
-                    let _ = tx.send(BotEvent::ToolCall {
-                        id,
-                        name,
-                        args: args.to_string(),
-                    });
-                }
-                CatEvent::ToolCallResult {
-                    id,
-                    name,
-                    args,
-                    result,
-                    success,
-                    elapsed_ms,
-                } => {
-                    let _ = tx.send(BotEvent::ToolDone {
-                        id,
-                        name,
-                        args: args.to_string(),
-                        result,
-                        success,
-                        elapsed_ms,
-                    });
-                }
-                CatEvent::SubSession(event) => {
-                    let _ = tx.send(BotEvent::SubSession(event));
-                }
-                CatEvent::ContextCompaction(event) => {
-                    let _ = tx.send(BotEvent::ContextCompaction(event));
-                }
-                CatEvent::Supervisor(report) => {
-                    let _ = tx.send(BotEvent::SupervisorReport(report));
-                }
-                CatEvent::SupervisorProgress(progress) => {
-                    let _ = tx.send(BotEvent::SupervisorProgress(progress));
-                }
-                CatEvent::ToolApprovalRequested(request) => {
-                    let _ = tx.send(BotEvent::ApprovalRequested(request));
-                }
-                CatEvent::ToolApprovalUpdated(request) => {
-                    let _ = tx.send(BotEvent::ApprovalUpdated(request));
-                }
-                CatEvent::ToolApprovalResolved { request, decision } => {
-                    let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
-                }
-                CatEvent::UserQuestionRequested(request) => {
-                    let _ = tx.send(BotEvent::UserQuestionRequested(request));
-                }
-                CatEvent::UserQuestionUpdated(request) => {
-                    let _ = tx.send(BotEvent::UserQuestionUpdated(request));
-                }
-                CatEvent::UserQuestionResolved { request, response } => {
-                    let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
-                }
-                CatEvent::StateUpdate(user_state) => {
-                    let items = bot_core::todo::todos_from_user_state(&user_state);
-                    let _ = tx.send(BotEvent::TodoState {
-                        body: format_todo_state(&items),
-                        latest_active: latest_active_todo_label(&items),
-                    });
-                }
-                CatEvent::Stats {
-                    prompt_tokens,
-                    completion_tokens,
-                    max_prompt_tokens,
-                    elapsed_ms,
-                } => {
-                    let _ = tx.send(BotEvent::Stats {
-                        prompt_tokens,
-                        completion_tokens,
-                        max_prompt_tokens,
-                        elapsed_ms,
-                    });
-                }
-                CatEvent::Error(error) => {
-                    let _ = tx.send(BotEvent::Error(error.to_string()));
-                }
-                CatEvent::Done => break,
-                _ => {}
-            }
+    let is_clear_command = text.trim() == "/clear";
+    let request = ChatRequest::text(session_id.clone(), ChatChannel::Tui, text)
+        .with_sender(sender_user_id, Some(sender_username))
+        .with_message(format!("tui-msg-{}", uuid::Uuid::new_v4()), "p2p")
+        .with_platform(Some(TUI_CHANNEL.to_string()))
+        .enable_sdk_todo_and_triggers()
+        .with_cancel(cancel);
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
+    while let Some(event) = stream.next().await {
+        if forward_core_event_to_tui(event, &tx, is_clear_command) {
+            break;
         }
-        if persist_agent_child_turn {
-            crate::append_direct_sub_session_turn(
-                &runtime,
-                &session_id,
-                user_text_for_history.trim(),
-                &assistant_text_for_history,
-            )
-            .await;
-        }
-        let _ = tx.send(BotEvent::Done);
     }
+    let _ = tx.send(BotEvent::Done);
 }
 
 async fn run_tui_trigger_turn(
@@ -2994,135 +2811,142 @@ async fn run_tui_trigger_turn(
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    let (model_profile_id, reasoning_effort, agent_id) = {
-        let sessions = runtime.sessions.lock().await;
-        (
-            sessions.metadata_string(&dispatch.thread_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-            parse_session_reasoning_effort(
-                sessions
-                    .metadata_string(&dispatch.thread_id, SESSION_REASONING_EFFORT_METADATA_KEY),
-            ),
-            sessions.metadata_string(&dispatch.thread_id, SESSION_AGENT_ID_METADATA_KEY),
+    let request = ChatRequest::trigger_text(dispatch.thread_id, ChatChannel::Tui, dispatch.request)
+        .with_sender(dispatch.owner_user_id, dispatch.owner_username)
+        .with_message(
+            format!("trigger-{}", uuid::Uuid::new_v4()),
+            dispatch.chat_type.unwrap_or_else(|| "p2p".to_string()),
         )
-    };
-    let opts = StreamOptions {
-        model_profile_id,
-        reasoning_effort,
-        agent_id,
-        sender_user_id: Some(dispatch.owner_user_id),
-        sender_username: dispatch.owner_username,
-        message_id: Some(format!("trigger-{}", uuid::Uuid::new_v4())),
-        chat_type: dispatch.chat_type.or_else(|| Some("p2p".to_string())),
-        platform: dispatch.platform.or_else(|| Some(TUI_CHANNEL.to_string())),
-        todo_create_via_sdk: true,
-        trigger_tools_enabled: false,
-        trigger_run: true,
-        cancel: Some(cancel),
-        ..StreamOptions::default()
-    };
-    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
-        &dispatch.thread_id,
-        Content::text(dispatch.request),
-        opts
-    ));
+        .with_platform(dispatch.platform.or_else(|| Some(TUI_CHANNEL.to_string())))
+        .enable_sdk_todo()
+        .with_cancel(cancel);
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     while let Some(event) = stream.next().await {
-        match event {
-            CatEvent::Text(delta) => {
-                let _ = tx.send(BotEvent::Text(delta));
-            }
-            CatEvent::Thinking(delta) => {
-                let _ = tx.send(BotEvent::Thinking(delta));
-            }
-            CatEvent::ToolCallStart { id, name } => {
-                let _ = tx.send(BotEvent::ToolStart { id, name });
-            }
-            CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                let _ = tx.send(BotEvent::ToolArgs { id, delta });
-            }
-            CatEvent::ToolCall { id, name, args } => {
-                let _ = tx.send(BotEvent::ToolCall {
-                    id,
-                    name,
-                    args: args.to_string(),
-                });
-            }
-            CatEvent::ToolCallResult {
-                id,
-                name,
-                args,
-                result,
-                success,
-                elapsed_ms,
-            } => {
-                let _ = tx.send(BotEvent::ToolDone {
-                    id,
-                    name,
-                    args: args.to_string(),
-                    result,
-                    success,
-                    elapsed_ms,
-                });
-            }
-            CatEvent::SubSession(event) => {
-                let _ = tx.send(BotEvent::SubSession(event));
-            }
-            CatEvent::ContextCompaction(event) => {
-                let _ = tx.send(BotEvent::ContextCompaction(event));
-            }
-            CatEvent::Supervisor(report) => {
-                let _ = tx.send(BotEvent::SupervisorReport(report));
-            }
-            CatEvent::SupervisorProgress(progress) => {
-                let _ = tx.send(BotEvent::SupervisorProgress(progress));
-            }
-            CatEvent::ToolApprovalRequested(request) => {
-                let _ = tx.send(BotEvent::ApprovalRequested(request));
-            }
-            CatEvent::ToolApprovalUpdated(request) => {
-                let _ = tx.send(BotEvent::ApprovalUpdated(request));
-            }
-            CatEvent::ToolApprovalResolved { request, decision } => {
-                let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
-            }
-            CatEvent::UserQuestionRequested(request) => {
-                let _ = tx.send(BotEvent::UserQuestionRequested(request));
-            }
-            CatEvent::UserQuestionUpdated(request) => {
-                let _ = tx.send(BotEvent::UserQuestionUpdated(request));
-            }
-            CatEvent::UserQuestionResolved { request, response } => {
-                let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
-            }
-            CatEvent::StateUpdate(user_state) => {
-                let items = bot_core::todo::todos_from_user_state(&user_state);
-                let _ = tx.send(BotEvent::TodoState {
-                    body: format_todo_state(&items),
-                    latest_active: latest_active_todo_label(&items),
-                });
-            }
-            CatEvent::Stats {
-                prompt_tokens,
-                completion_tokens,
-                max_prompt_tokens,
-                elapsed_ms,
-            } => {
-                let _ = tx.send(BotEvent::Stats {
-                    prompt_tokens,
-                    completion_tokens,
-                    max_prompt_tokens,
-                    elapsed_ms,
-                });
-            }
-            CatEvent::Error(error) => {
-                let _ = tx.send(BotEvent::Error(error.to_string()));
-            }
-            CatEvent::Done => break,
-            _ => {}
+        if forward_core_event_to_tui(event, &tx, false) {
+            break;
         }
     }
     let _ = tx.send(BotEvent::Done);
 }
 
+fn forward_core_event_to_tui(
+    event: CoreChatEvent,
+    tx: &mpsc::UnboundedSender<BotEvent>,
+    clear_on_reply: bool,
+) -> bool {
+    match event {
+        CoreChatEvent::Prefix(prefix) => {
+            let _ = tx.send(BotEvent::Prefix(prefix));
+            false
+        }
+        CoreChatEvent::Reply(reply) => {
+            if clear_on_reply {
+                let _ = tx.send(BotEvent::SessionCleared);
+            }
+            let _ = tx.send(BotEvent::Prefix(reply));
+            false
+        }
+        CoreChatEvent::Bot(event) => forward_cat_event_to_tui(event, tx),
+        CoreChatEvent::Done => true,
+    }
+}
+
+fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent>) -> bool {
+    match event {
+        CatEvent::Text(delta) => {
+            let _ = tx.send(BotEvent::Text(delta));
+        }
+        CatEvent::Thinking(delta) => {
+            let _ = tx.send(BotEvent::Thinking(delta));
+        }
+        CatEvent::ToolCallStart { id, name } => {
+            let _ = tx.send(BotEvent::ToolStart { id, name });
+        }
+        CatEvent::ToolCallArgumentsDelta { id, delta } => {
+            let _ = tx.send(BotEvent::ToolArgs { id, delta });
+        }
+        CatEvent::ToolCall { id, name, args } => {
+            let _ = tx.send(BotEvent::ToolCall {
+                id,
+                name,
+                args: args.to_string(),
+            });
+        }
+        CatEvent::ToolCallResult {
+            id,
+            name,
+            args,
+            result,
+            success,
+            elapsed_ms,
+        } => {
+            let _ = tx.send(BotEvent::ToolDone {
+                id,
+                name,
+                args: args.to_string(),
+                result,
+                success,
+                elapsed_ms,
+            });
+        }
+        CatEvent::SubSession(event) => {
+            let _ = tx.send(BotEvent::SubSession(event));
+        }
+        CatEvent::ContextCompaction(event) => {
+            let _ = tx.send(BotEvent::ContextCompaction(event));
+        }
+        CatEvent::Supervisor(report) => {
+            let _ = tx.send(BotEvent::SupervisorReport(report));
+        }
+        CatEvent::SupervisorProgress(progress) => {
+            let _ = tx.send(BotEvent::SupervisorProgress(progress));
+        }
+        CatEvent::ToolApprovalRequested(request) => {
+            let _ = tx.send(BotEvent::ApprovalRequested(request));
+        }
+        CatEvent::ToolApprovalUpdated(request) => {
+            let _ = tx.send(BotEvent::ApprovalUpdated(request));
+        }
+        CatEvent::ToolApprovalResolved { request, decision } => {
+            let _ = tx.send(BotEvent::ApprovalResolved { request, decision });
+        }
+        CatEvent::UserQuestionRequested(request) => {
+            let _ = tx.send(BotEvent::UserQuestionRequested(request));
+        }
+        CatEvent::UserQuestionUpdated(request) => {
+            let _ = tx.send(BotEvent::UserQuestionUpdated(request));
+        }
+        CatEvent::UserQuestionResolved { request, response } => {
+            let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
+        }
+        CatEvent::StateUpdate(user_state) => {
+            let items = bot_core::todo::todos_from_user_state(&user_state);
+            let _ = tx.send(BotEvent::TodoState {
+                body: format_todo_state(&items),
+                latest_active: latest_active_todo_label(&items),
+            });
+        }
+        CatEvent::Stats {
+            prompt_tokens,
+            completion_tokens,
+            max_prompt_tokens,
+            elapsed_ms,
+        } => {
+            let _ = tx.send(BotEvent::Stats {
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+                elapsed_ms,
+            });
+        }
+        CatEvent::Error(error) => {
+            let _ = tx.send(BotEvent::Error(error.to_string()));
+        }
+        CatEvent::Done => return true,
+        _ => {}
+    }
+    false
+}
 async fn run_tui_fork_command(
     runtime: Rc<Runtime>,
     source_session_id: String,

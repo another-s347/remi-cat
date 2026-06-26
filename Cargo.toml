@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.6"
+version = "0.2.7"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -44,6 +44,7 @@ remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", r
 ] }
 
 anyhow = "1"
+async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

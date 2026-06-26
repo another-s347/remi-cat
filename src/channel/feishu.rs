@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use bot_core::im_tools::{encode_agent_file_key, SubSessionBindingUpsertRequest};
 use bot_core::{
-    CatEvent, Content, ContentPart, ContextMetrics, ImAttachment, ImDocument, StreamOptions,
-    TokenUsage,
+    CatEvent, Content, ContentPart, ContextMetrics, ImAttachment, ImDocument, TokenUsage,
 };
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
@@ -16,16 +15,12 @@ use tracing::{info, warn};
 use user_store::UserStore;
 
 use crate::app::{
-    parse_session_reasoning_effort, CLI_CHANNEL, FEISHU_CHANNEL, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_DEBUG_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
-    SESSION_REASONING_EFFORT_METADATA_KEY,
+    CLI_CHANNEL, FEISHU_CHANNEL, SESSION_AGENT_ID_METADATA_KEY, SESSION_DEBUG_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 use crate::channel::{Channel, ChannelKind};
-use crate::command::{process_runtime_commands, RuntimeCommandPipelineResult};
 use crate::config::FeishuTransport;
-use crate::core::{
-    append_direct_sub_session_turn, sub_session_input_target, Runtime, SubSessionInputTarget,
-};
+use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
 
 #[path = "feishu/actions.rs"]
 mod actions;
@@ -218,7 +213,7 @@ pub(crate) async fn collect_cli_bot_reply(
 async fn collect_bot_reply(
     runtime: Rc<Runtime>,
     platform: &str,
-    mut msg: FeishuMessage,
+    msg: FeishuMessage,
     sender_username: Option<String>,
     mut replies: Option<&mut FeishuReplyStream>,
 ) -> anyhow::Result<String> {
@@ -239,50 +234,6 @@ async fn collect_bot_reply(
         .await;
         return Ok(reply);
     }
-    let direct_sub_session_target = sub_session_input_target(&runtime, &session_id).await;
-    if let Some(SubSessionInputTarget::Acp { acp_session_id, .. }) = &direct_sub_session_target {
-        let reply = runtime
-            .bot
-            .acp_bound_message(acp_session_id, msg.text.trim())
-            .await
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        append_direct_sub_session_turn(&runtime, &session_id, msg.text.trim(), &reply).await;
-        append_reply_chunk(
-            &mut String::new(),
-            &mut replies,
-            FeishuReplyKind::Text,
-            &reply,
-        )
-        .await;
-        return Ok(reply);
-    }
-    let (command_prefix, skill_injections, stream_thread_id) =
-        if let Some(SubSessionInputTarget::Agent { sub_thread_id, .. }) = direct_sub_session_target
-        {
-            (String::new(), Vec::new(), sub_thread_id)
-        } else {
-            match process_runtime_commands(&runtime, &session_id, msg.text.trim()).await? {
-                RuntimeCommandPipelineResult::Reply(reply) => {
-                    append_reply_chunk(
-                        &mut String::new(),
-                        &mut replies,
-                        FeishuReplyKind::Text,
-                        &reply,
-                    )
-                    .await;
-                    return Ok(reply);
-                }
-                RuntimeCommandPipelineResult::Continue {
-                    text,
-                    prefix,
-                    skill_injections: injections,
-                } => {
-                    msg.text = text;
-                    (prefix, injections, session_id.clone())
-                }
-            }
-        };
-
     let im_attachments = msg
         .files
         .iter()
@@ -304,32 +255,6 @@ async fn collect_bot_reply(
             token: d.token.clone(),
         })
         .collect();
-    let (model_profile_id, reasoning_effort, agent_id) = {
-        let sessions = runtime.sessions.lock().await;
-        (
-            sessions.metadata_string(&session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-            parse_session_reasoning_effort(
-                sessions.metadata_string(&session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
-            ),
-            sessions.metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
-        )
-    };
-    let opts = StreamOptions {
-        model_profile_id,
-        reasoning_effort,
-        agent_id,
-        skill_injections,
-        sender_user_id: Some(msg.sender_user_id.clone()),
-        sender_username,
-        message_id: Some(msg.message_id.clone()),
-        chat_type: Some(msg.chat_type.clone()),
-        platform: Some(platform.to_string()),
-        todo_create_via_sdk: true,
-        trigger_tools_enabled: true,
-        im_attachments,
-        im_documents,
-        ..StreamOptions::default()
-    };
     let content = build_message_content(
         &msg.text,
         &[],
@@ -337,218 +262,56 @@ async fn collect_bot_reply(
         msg.files.len(),
         msg.documents.len(),
     );
-    let mut output = command_prefix;
-    let mut streaming_tool_names = HashMap::<String, String>::new();
+    let channel = if platform == FEISHU_CHANNEL {
+        ChatChannel::Feishu
+    } else {
+        ChatChannel::Cli
+    };
+    let request = ChatRequest::text(session_id.clone(), channel, msg.text.clone())
+        .with_content(content)
+        .with_sender(msg.sender_user_id.clone(), sender_username)
+        .with_message(msg.message_id.clone(), msg.chat_type.clone())
+        .with_platform(Some(platform.to_string()))
+        .enable_sdk_todo_and_triggers()
+        .with_im_context(im_attachments, im_documents);
     let debug_enabled = runtime
         .sessions
         .lock()
         .await
         .metadata_bool(&session_id, SESSION_DEBUG_METADATA_KEY);
-    if !output.is_empty() {
-        if let Some(replies) = replies.as_deref_mut() {
-            replies.push(FeishuReplyKind::Text, &output).await;
-        }
-    }
-    let mut supervisor_execution_started = false;
-    let mut stream =
-        std::pin::pin!(runtime
-            .bot
-            .stream_with_options(&stream_thread_id, content, opts));
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
+    let mut forwarder = FeishuEventForwarder {
+        runtime: &runtime,
+        platform,
+        msg: &msg,
+        session_id: &session_id,
+        debug_enabled,
+        output: String::new(),
+        replies: &mut replies,
+        streaming_tool_names: HashMap::new(),
+        supervisor_execution_started: false,
+    };
     loop {
         tokio::select! {
             event = stream.next() => {
                 let Some(event) = event else { break };
-                match event {
-                    CatEvent::Text(delta) => {
-                        supervisor_execution_started = false;
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Text, &delta).await;
-                    }
-                    CatEvent::Thinking(content) => {
-                        let chunk = format!("\n\n**Thinking**\n{}\n", fenced_block("text", &content));
-                        supervisor_execution_started = false;
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Thinking, &chunk).await;
-                    }
-                    CatEvent::ToolCallStart { id, name } => {
-                        streaming_tool_names.insert(id.clone(), name.clone());
-                        let pretty = bot_core::PrettyToolCall::started(
-                            &id,
-                            &name,
-                            &serde_json::Value::Object(serde_json::Map::new()),
-                        );
-                        let line = format_feishu_tool_line(&pretty);
-                        supervisor_execution_started = false;
-                        update_tool_reply(&mut output, &mut replies, &id, &line, false).await;
-                    }
-                    CatEvent::ToolCallArgumentsDelta { .. } => {}
-                    CatEvent::ToolCall { id, name, args } => {
-                        streaming_tool_names.remove(&id);
-                        let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
-                        let line = format_feishu_tool_line(&pretty);
-                        supervisor_execution_started = false;
-                        update_tool_reply(&mut output, &mut replies, &id, &line, false).await;
-                    }
-                    CatEvent::ToolCallResult {
-                        id,
-                        name,
-                        args,
-                        result,
-                        success,
-                        elapsed_ms,
-                    } => {
-                        streaming_tool_names.remove(&id);
-                        let pretty = bot_core::PrettyToolCall::completed(
-                            &id, &name, &args, &result, success, elapsed_ms,
-                        );
-                        let line = format_feishu_tool_line(&pretty);
-                        supervisor_execution_started = false;
-                        update_tool_reply(&mut output, &mut replies, &id, &line, true).await;
-                    }
-                    CatEvent::SubSession(event) => {
-                        record_sub_session_event(&runtime, &session_id, platform, &msg, &event).await;
-                        if let Some(line) = format_feishu_sub_session_line(&event) {
-                            let done = matches!(
-                                event.payload,
-                                SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
-                            );
-                            update_sub_session_reply(
-                                &mut output,
-                                &mut replies,
-                                &event.sub_thread_id.0,
-                                &line,
-                                done,
-                            )
-                            .await;
-                        }
-                    }
-                    CatEvent::SupervisorProgress(progress) => {
-                        let reply_kind = supervisor_reply_kind(&progress);
-                        let mut chunk = String::new();
-                        if !supervisor_execution_started {
-                            chunk.push_str("\n\n---\n\n**Supervisor execution**\n");
-                            supervisor_execution_started = true;
-                        }
-                        chunk.push_str(&format_supervisor_progress(&progress));
-                        append_reply_chunk(&mut output, &mut replies, reply_kind, &chunk).await;
-                    }
-                    CatEvent::Supervisor(report) => {
-                        let context = runtime.bot.workflow_status(&session_id).await.map(|instance| instance.context).unwrap_or(serde_json::Value::Null);
-                        let chunk = bot_core::supervisor_workflow::format_prefix(&report, &context);
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Supervisor, &chunk).await;
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::ContextCompaction(event) => {
-                        let line = format_context_compaction_line(&event);
-                        let done = !matches!(event.status, bot_core::ContextCompactionStatus::Started);
-                        update_context_compaction_reply(&mut output, &mut replies, &event.id, &line, done).await;
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::ToolApprovalRequested(request) => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.approval_requested(&request).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::ToolApprovalUpdated(request) => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.approval_updated(&request).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::ToolApprovalResolved { request, decision } => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.approval_resolved(&request, decision).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::UserQuestionRequested(request) => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.user_question_requested(&request).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::UserQuestionUpdated(request) => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.user_question_updated(&request).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::UserQuestionResolved { request, response } => {
-                        if let Some(replies) = replies.as_deref_mut() {
-                            replies.user_question_resolved(&request, &response).await;
-                        }
-                        supervisor_execution_started = false;
-                    }
-                    CatEvent::Stats {
-                        prompt_tokens,
-                        completion_tokens,
-                        max_prompt_tokens,
-                        elapsed_ms,
-                    } => {
-                        if !debug_enabled {
-                            continue;
-                        }
-                        let (model_profile_id, agent_id) = {
-                            let sessions = runtime.sessions.lock().await;
-                            (
-                                sessions.metadata_string(
-                                    &session_id,
-                                    SESSION_MODEL_PROFILE_METADATA_KEY,
-                                ),
-                                sessions
-                                    .metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY),
-                            )
-                        };
-                        let context_tokens = runtime
-                            .bot
-                            .model_context_tokens_for_agent(
-                                model_profile_id.as_deref(),
-                                agent_id.as_deref(),
-                            );
-                        let context = ContextMetrics::from_usage(
-                            TokenUsage {
-                                prompt_tokens,
-                                completion_tokens,
-                                max_prompt_tokens,
-                            },
-                            context_tokens,
-                        );
-                        let chunk = format!(
-                            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({:.1}%)` `elapsed: {elapsed_ms}ms`",
-                            context.percent
-                        );
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Stats, &chunk).await;
-                    }
-                    CatEvent::Error(err) => {
-                        let chunk = format!(
-                            "\n\n---\n**调试信息**\n\n**Error**\n{}",
-                            fenced_block("text", &err.to_string())
-                        );
-                        append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Error, &chunk).await;
-                        break;
-                    }
-                    CatEvent::Done => break,
-                    _ => {}
+                if forwarder.forward_core_event(event).await {
+                    break;
                 }
             }
             _ = &mut timeout => {
                 let chunk = "\n\n---\n**调试信息**\n\n**Timeout** reply timed out";
-                append_reply_chunk(&mut output, &mut replies, FeishuReplyKind::Error, chunk).await;
+                forwarder.append(FeishuReplyKind::Error, chunk).await;
                 break;
             }
         }
     }
-    if output.trim().is_empty() {
-        append_reply_chunk(
-            &mut output,
-            &mut replies,
-            FeishuReplyKind::Text,
-            "（无响应）",
-        )
-        .await;
+    if forwarder.output.trim().is_empty() {
+        forwarder.append(FeishuReplyKind::Text, "（无响应）").await;
     }
-    Ok(output)
+    Ok(forwarder.output)
 }
 
 fn is_fork_command(command: &str) -> bool {
@@ -629,6 +392,238 @@ async fn handle_feishu_fork_command(
             fork.id,
             fork.title.as_deref().unwrap_or("新对话")
         )),
+    }
+}
+
+struct FeishuEventForwarder<'a, 'b> {
+    runtime: &'a Runtime,
+    platform: &'a str,
+    msg: &'a FeishuMessage,
+    session_id: &'a str,
+    debug_enabled: bool,
+    output: String,
+    replies: &'b mut Option<&'b mut FeishuReplyStream>,
+    streaming_tool_names: HashMap<String, String>,
+    supervisor_execution_started: bool,
+}
+
+impl FeishuEventForwarder<'_, '_> {
+    async fn forward_core_event(&mut self, event: CoreChatEvent) -> bool {
+        match event {
+            CoreChatEvent::Prefix(prefix) | CoreChatEvent::Reply(prefix) => {
+                self.append(FeishuReplyKind::Text, &prefix).await;
+                false
+            }
+            CoreChatEvent::Done => true,
+            CoreChatEvent::Bot(event) => self.forward_cat_event(event).await,
+        }
+    }
+
+    async fn forward_cat_event(&mut self, event: CatEvent) -> bool {
+        match event {
+            CatEvent::Text(delta) => {
+                self.supervisor_execution_started = false;
+                self.append(FeishuReplyKind::Text, &delta).await;
+            }
+            CatEvent::Thinking(content) => {
+                let chunk = format!("\n\n**Thinking**\n{}\n", fenced_block("text", &content));
+                self.supervisor_execution_started = false;
+                self.append(FeishuReplyKind::Thinking, &chunk).await;
+            }
+            CatEvent::ToolCallStart { id, name } => {
+                self.streaming_tool_names.insert(id.clone(), name.clone());
+                let pretty = bot_core::PrettyToolCall::started(
+                    &id,
+                    &name,
+                    &serde_json::Value::Object(serde_json::Map::new()),
+                );
+                let line = format_feishu_tool_line(&pretty);
+                self.supervisor_execution_started = false;
+                self.update_tool(&id, &line, false).await;
+            }
+            CatEvent::ToolCallArgumentsDelta { .. } => {}
+            CatEvent::ToolCall { id, name, args } => {
+                self.streaming_tool_names.remove(&id);
+                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
+                let line = format_feishu_tool_line(&pretty);
+                self.supervisor_execution_started = false;
+                self.update_tool(&id, &line, false).await;
+            }
+            CatEvent::ToolCallResult {
+                id,
+                name,
+                args,
+                result,
+                success,
+                elapsed_ms,
+            } => {
+                self.streaming_tool_names.remove(&id);
+                let pretty = bot_core::PrettyToolCall::completed(
+                    &id, &name, &args, &result, success, elapsed_ms,
+                );
+                let line = format_feishu_tool_line(&pretty);
+                self.supervisor_execution_started = false;
+                self.update_tool(&id, &line, true).await;
+            }
+            CatEvent::SubSession(event) => {
+                record_sub_session_event(
+                    self.runtime,
+                    self.session_id,
+                    self.platform,
+                    self.msg,
+                    &event,
+                )
+                .await;
+                if let Some(line) = format_feishu_sub_session_line(&event) {
+                    let done = matches!(
+                        event.payload,
+                        SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
+                    );
+                    self.update_sub_session(&event.sub_thread_id.0, &line, done)
+                        .await;
+                }
+            }
+            CatEvent::SupervisorProgress(progress) => {
+                let reply_kind = supervisor_reply_kind(&progress);
+                let mut chunk = String::new();
+                if !self.supervisor_execution_started {
+                    chunk.push_str("\n\n---\n\n**Supervisor execution**\n");
+                    self.supervisor_execution_started = true;
+                }
+                chunk.push_str(&format_supervisor_progress(&progress));
+                self.append(reply_kind, &chunk).await;
+            }
+            CatEvent::Supervisor(report) => {
+                let context = self
+                    .runtime
+                    .bot
+                    .workflow_status(self.session_id)
+                    .await
+                    .map(|instance| instance.context)
+                    .unwrap_or(serde_json::Value::Null);
+                let chunk = bot_core::supervisor_workflow::format_prefix(&report, &context);
+                self.append(FeishuReplyKind::Supervisor, &chunk).await;
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::ContextCompaction(event) => {
+                let line = format_context_compaction_line(&event);
+                let done = !matches!(event.status, bot_core::ContextCompactionStatus::Started);
+                self.update_context_compaction(&event.id, &line, done).await;
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::ToolApprovalRequested(request) => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.approval_requested(&request).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::ToolApprovalUpdated(request) => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.approval_updated(&request).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::ToolApprovalResolved { request, decision } => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.approval_resolved(&request, decision).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::UserQuestionRequested(request) => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.user_question_requested(&request).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::UserQuestionUpdated(request) => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.user_question_updated(&request).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::UserQuestionResolved { request, response } => {
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.user_question_resolved(&request, &response).await;
+                }
+                self.supervisor_execution_started = false;
+            }
+            CatEvent::Stats {
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+                elapsed_ms,
+            } => {
+                if self.debug_enabled {
+                    self.append_stats(
+                        prompt_tokens,
+                        completion_tokens,
+                        max_prompt_tokens,
+                        elapsed_ms,
+                    )
+                    .await;
+                }
+            }
+            CatEvent::Error(err) => {
+                let chunk = format!(
+                    "\n\n---\n**调试信息**\n\n**Error**\n{}",
+                    fenced_block("text", &err.to_string())
+                );
+                self.append(FeishuReplyKind::Error, &chunk).await;
+                return true;
+            }
+            CatEvent::Done => return true,
+            _ => {}
+        }
+        false
+    }
+
+    async fn append_stats(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        max_prompt_tokens: u32,
+        elapsed_ms: u64,
+    ) {
+        let (model_profile_id, agent_id) = {
+            let sessions = self.runtime.sessions.lock().await;
+            (
+                sessions.metadata_string(self.session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+                sessions.metadata_string(self.session_id, SESSION_AGENT_ID_METADATA_KEY),
+            )
+        };
+        let context_tokens = self
+            .runtime
+            .bot
+            .model_context_tokens_for_agent(model_profile_id.as_deref(), agent_id.as_deref());
+        let context = ContextMetrics::from_usage(
+            TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+            },
+            context_tokens,
+        );
+        let chunk = format!(
+            "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({:.1}%)` `elapsed: {elapsed_ms}ms`",
+            context.percent
+        );
+        self.append(FeishuReplyKind::Stats, &chunk).await;
+    }
+
+    async fn append(&mut self, kind: FeishuReplyKind, chunk: &str) {
+        append_reply_chunk(&mut self.output, self.replies, kind, chunk).await;
+    }
+
+    async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) {
+        update_tool_reply(&mut self.output, self.replies, call_id, line, done).await;
+    }
+
+    async fn update_context_compaction(&mut self, id: &str, line: &str, done: bool) {
+        update_context_compaction_reply(&mut self.output, self.replies, id, line, done).await;
+    }
+
+    async fn update_sub_session(&mut self, id: &str, line: &str, done: bool) {
+        update_sub_session_reply(&mut self.output, self.replies, id, line, done).await;
     }
 }
 

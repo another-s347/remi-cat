@@ -7,9 +7,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bot_core::{
-    todo::TodoItem, CatEvent, Content, ContextMetrics, ModelInputSnapshot, StreamOptions,
-    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
-    UserQuestionRequest, UserQuestionResponse,
+    todo::TodoItem, CatEvent, ContextMetrics, ModelInputSnapshot, ThreadHistoryMessage, TokenUsage,
+    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -17,9 +16,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::{
-    parse_session_reasoning_effort, process_runtime_commands, Runtime,
-    RuntimeCommandPipelineResult, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
+    ChatChannel, ChatRequest, CoreChatEvent, Runtime, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 
 const SDK_DB_FILE_NAME: &str = "todo-sdk.db";
@@ -741,6 +739,313 @@ fn stats_payload(
     })
 }
 
+enum WebEventMap {
+    Emit(&'static str, serde_json::Value),
+    Done,
+    Skip,
+}
+
+struct WebCoreEventMapper {
+    context_tokens: u32,
+    run_started_at: Instant,
+    first_response_at: Option<Duration>,
+    total_prompt_tokens: u32,
+    total_completion_tokens: u32,
+    max_prompt_tokens: u32,
+    model_elapsed_ms: u64,
+    model_input_snapshot: Option<ModelInputSnapshot>,
+    streaming_tools: HashMap<String, StreamingToolCall>,
+}
+
+impl WebCoreEventMapper {
+    fn new(context_tokens: u32, run_started_at: Instant) -> Self {
+        Self {
+            context_tokens,
+            run_started_at,
+            first_response_at: None,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            max_prompt_tokens: 0,
+            model_elapsed_ms: 0,
+            model_input_snapshot: None,
+            streaming_tools: HashMap::new(),
+        }
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.total_prompt_tokens,
+            completion_tokens: self.total_completion_tokens,
+            max_prompt_tokens: self.max_prompt_tokens,
+        }
+    }
+
+    fn stats_payload(&self) -> serde_json::Value {
+        stats_payload(
+            self.usage(),
+            self.context_tokens,
+            self.first_response_at,
+            self.model_elapsed_ms,
+            self.run_started_at.elapsed().as_millis(),
+        )
+    }
+
+    fn mark_first_response(&mut self) {
+        self.first_response_at
+            .get_or_insert_with(|| self.run_started_at.elapsed());
+    }
+
+    fn map(&mut self, runtime: &Runtime, session_id: &str, event: CoreChatEvent) -> WebEventMap {
+        match event {
+            CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
+                self.mark_first_response();
+                WebEventMap::Emit("text_delta", serde_json::json!({"text": text}))
+            }
+            CoreChatEvent::Done => WebEventMap::Done,
+            CoreChatEvent::Bot(event) => self.map_cat_event(runtime, session_id, event),
+        }
+    }
+
+    fn map_cat_event(
+        &mut self,
+        runtime: &Runtime,
+        session_id: &str,
+        event: CatEvent,
+    ) -> WebEventMap {
+        match event {
+            CatEvent::Text(text) => {
+                self.mark_first_response();
+                WebEventMap::Emit("text_delta", serde_json::json!({"text": text}))
+            }
+            CatEvent::Thinking(text) => {
+                self.mark_first_response();
+                WebEventMap::Emit("thinking_delta", serde_json::json!({"text": text}))
+            }
+            CatEvent::ToolCallStart { id, name } => {
+                self.mark_first_response();
+                self.streaming_tools.insert(
+                    id.clone(),
+                    StreamingToolCall {
+                        name: name.clone(),
+                        arguments: String::new(),
+                        last_emit: Instant::now(),
+                    },
+                );
+                let args = serde_json::Value::Object(serde_json::Map::new());
+                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
+                WebEventMap::Emit(
+                    "tool_started",
+                    serde_json::json!({
+                        "call_id": id,
+                        "tool_name": name,
+                        "args": args,
+                        "pretty": pretty,
+                        "partial": true,
+                    }),
+                )
+            }
+            CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                if let Some(call) = self.streaming_tools.get_mut(&id) {
+                    call.arguments.push_str(&delta);
+                    if call.last_emit.elapsed() < Duration::from_millis(500) {
+                        WebEventMap::Skip
+                    } else {
+                        call.last_emit = Instant::now();
+                        streaming_tool_progress(&id, call)
+                            .map(|pretty| {
+                                WebEventMap::Emit(
+                                    "tool_started",
+                                    serde_json::json!({
+                                        "call_id": id,
+                                        "tool_name": call.name.clone(),
+                                        "args": {},
+                                        "pretty": pretty,
+                                        "partial": true,
+                                    }),
+                                )
+                            })
+                            .unwrap_or(WebEventMap::Skip)
+                    }
+                } else {
+                    WebEventMap::Skip
+                }
+            }
+            CatEvent::ToolCall { id, name, args } => {
+                self.mark_first_response();
+                self.streaming_tools.remove(&id);
+                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
+                WebEventMap::Emit(
+                    "tool_started",
+                    serde_json::json!({
+                        "call_id": id,
+                        "tool_name": name,
+                        "args": args,
+                        "pretty": pretty,
+                    }),
+                )
+            }
+            CatEvent::ToolCallResult {
+                id,
+                name,
+                args,
+                result,
+                success,
+                elapsed_ms,
+            } => {
+                self.streaming_tools.remove(&id);
+                let pretty = bot_core::PrettyToolCall::completed(
+                    &id, &name, &args, &result, success, elapsed_ms,
+                );
+                WebEventMap::Emit(
+                    "tool_completed",
+                    serde_json::json!({
+                        "call_id": id,
+                        "tool_name": name,
+                        "args": args,
+                        "result": result,
+                        "success": success,
+                        "elapsed_ms": elapsed_ms,
+                        "pretty": pretty,
+                    }),
+                )
+            }
+            CatEvent::ToolApprovalRequested(request) => WebEventMap::Emit(
+                "approval_requested",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::ToolApprovalUpdated(request) => WebEventMap::Emit(
+                "approval_updated",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::ToolApprovalResolved { request, decision } => WebEventMap::Emit(
+                "approval_resolved",
+                serde_json::json!({
+                    "request": request,
+                    "decision": decision,
+                }),
+            ),
+            CatEvent::UserQuestionRequested(request) => WebEventMap::Emit(
+                "user_question_requested",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::UserQuestionUpdated(request) => WebEventMap::Emit(
+                "user_question_updated",
+                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::UserQuestionResolved { request, response } => WebEventMap::Emit(
+                "user_question_resolved",
+                serde_json::json!({
+                    "request": request,
+                    "response": response,
+                }),
+            ),
+            CatEvent::SubSession(event) => WebEventMap::Emit("sub_session", {
+                let mut value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(event.sub_thread_id.0.clone()),
+                    );
+                    map.insert(
+                        "run_id".to_string(),
+                        serde_json::Value::String(event.sub_run_id.0.clone()),
+                    );
+                }
+                value
+            }),
+            CatEvent::SupervisorProgress(progress) => WebEventMap::Emit(
+                "supervisor_progress",
+                serde_json::to_value(progress).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::Supervisor(report) => WebEventMap::Emit(
+                "supervisor_report",
+                serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::ContextCompaction(event) => WebEventMap::Emit(
+                "context_compaction",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::StateUpdate(user_state) => WebEventMap::Emit(
+                "todo_state",
+                serde_json::json!({
+                    "items": bot_core::todo::todos_from_user_state(&user_state),
+                }),
+            ),
+            CatEvent::ModelInputSnapshot(snapshot) => {
+                persist_model_input_snapshot(runtime, session_id, &snapshot);
+                self.model_input_snapshot = Some(snapshot.clone());
+                WebEventMap::Emit(
+                    "model_input_snapshot",
+                    serde_json::json!({
+                        "run_id": snapshot.run_id,
+                        "estimated_tokens": snapshot.totals.estimated_tokens,
+                        "segment_count": snapshot.segments.len(),
+                    }),
+                )
+            }
+            CatEvent::Stats {
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+                elapsed_ms,
+            } => self.map_stats(
+                runtime,
+                session_id,
+                prompt_tokens,
+                completion_tokens,
+                max_prompt_tokens,
+                elapsed_ms,
+            ),
+            CatEvent::Error(error) => {
+                WebEventMap::Emit("error", serde_json::json!({"message": error.to_string()}))
+            }
+            CatEvent::Done => WebEventMap::Done,
+            _ => WebEventMap::Skip,
+        }
+    }
+
+    fn map_stats(
+        &mut self,
+        runtime: &Runtime,
+        session_id: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        max_prompt_tokens: u32,
+        elapsed_ms: u64,
+    ) -> WebEventMap {
+        self.total_prompt_tokens = prompt_tokens;
+        self.total_completion_tokens = completion_tokens;
+        self.max_prompt_tokens = max_prompt_tokens;
+        self.model_elapsed_ms = elapsed_ms;
+        let context_tokens = self.context_tokens;
+        if let Some(snapshot) = &mut self.model_input_snapshot {
+            snapshot.apply_usage(
+                self.total_prompt_tokens,
+                self.total_completion_tokens,
+                self.max_prompt_tokens,
+                context_tokens,
+            );
+            persist_model_input_snapshot(runtime, session_id, snapshot);
+        }
+        WebEventMap::Emit("stats", self.stats_payload())
+    }
+
+    #[cfg(test)]
+    fn map_stats_without_snapshot(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        max_prompt_tokens: u32,
+        elapsed_ms: u64,
+    ) -> WebEventMap {
+        self.total_prompt_tokens = prompt_tokens;
+        self.total_completion_tokens = completion_tokens;
+        self.max_prompt_tokens = max_prompt_tokens;
+        self.model_elapsed_ms = elapsed_ms;
+        WebEventMap::Emit("stats", self.stats_payload())
+    }
+}
+
 pub(crate) fn web_sdk_db_path(data_dir: &Path, user_key: &str) -> PathBuf {
     data_dir
         .join("sdk")
@@ -767,19 +1072,12 @@ async fn run_turn(
     runtime: Rc<Runtime>,
     session_id: &str,
     run_id: &str,
-    mut text: String,
+    text: String,
     cancel: Arc<Notify>,
     sink: WebRunEventSink,
 ) {
     let run_started_at = Instant::now();
-    let mut first_response_at: Option<Duration> = None;
-    let mut total_prompt_tokens = 0_u32;
-    let mut total_completion_tokens = 0_u32;
-    let mut max_prompt_tokens = 0_u32;
-    let mut model_elapsed_ms = 0_u64;
-    let mut model_input_snapshot: Option<ModelInputSnapshot> = None;
     let mut sequence = 0;
-    let mut streaming_tools = HashMap::<String, StreamingToolCall>::new();
     send_event(
         &sink,
         ChatEventV1::new("run_started", run_id, session_id, sequence, None),
@@ -849,161 +1147,26 @@ async fn run_turn(
         return;
     }
 
-    let direct_sub_session_target = crate::sub_session_input_target(&runtime, session_id).await;
-    if let Some(crate::SubSessionInputTarget::Acp { acp_session_id, .. }) =
-        &direct_sub_session_target
-    {
-        match runtime
-            .bot
-            .acp_bound_message(acp_session_id, text.trim())
-            .await
-        {
-            Ok(reply) => {
-                crate::append_direct_sub_session_turn(&runtime, session_id, text.trim(), &reply)
-                    .await;
-                send_event(
-                    &sink,
-                    ChatEventV1::new(
-                        "text_delta",
-                        run_id,
-                        session_id,
-                        sequence,
-                        Some(serde_json::json!({"text": reply})),
-                    ),
-                )
-                .await;
-                sequence += 1;
-            }
-            Err(error) => {
-                send_event(
-                    &sink,
-                    ChatEventV1::new(
-                        "error",
-                        run_id,
-                        session_id,
-                        sequence,
-                        Some(serde_json::json!({"message": error.to_string()})),
-                    ),
-                )
-                .await;
-                sequence += 1;
-            }
-        }
-        send_event(
-            &sink,
-            ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
-        )
-        .await;
-        return;
-    }
-
-    let (stream_thread_id, skill_injections) =
-        if let Some(crate::SubSessionInputTarget::Agent { sub_thread_id, .. }) =
-            direct_sub_session_target
-        {
-            (sub_thread_id, Vec::new())
-        } else {
-            match process_runtime_commands(&runtime, session_id, text.trim()).await {
-                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
-                    send_event(
-                        &sink,
-                        ChatEventV1::new(
-                            "text_delta",
-                            run_id,
-                            session_id,
-                            sequence,
-                            Some(serde_json::json!({"text": reply})),
-                        ),
-                    )
-                    .await;
-                    sequence += 1;
-                    send_event(
-                        &sink,
-                        ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
-                    )
-                    .await;
-                    return;
-                }
-                Ok(RuntimeCommandPipelineResult::Continue {
-                    text: next_text,
-                    prefix,
-                    skill_injections: injections,
-                }) => {
-                    text = next_text;
-                    if !prefix.is_empty() {
-                        send_event(
-                            &sink,
-                            ChatEventV1::new(
-                                "text_delta",
-                                run_id,
-                                session_id,
-                                sequence,
-                                Some(serde_json::json!({"text": prefix})),
-                            ),
-                        )
-                        .await;
-                        sequence += 1;
-                    }
-                    (session_id.to_string(), injections)
-                }
-                Err(error) => {
-                    send_event(
-                        &sink,
-                        ChatEventV1::new(
-                            "error",
-                            run_id,
-                            session_id,
-                            sequence,
-                            Some(serde_json::json!({"message": error.to_string()})),
-                        ),
-                    )
-                    .await;
-                    sequence += 1;
-                    send_event(
-                        &sink,
-                        ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        };
-
-    let (model_profile_id, reasoning_effort, agent_id) = {
+    let (model_profile_id, agent_id) = {
         let sessions = runtime.sessions.lock().await;
         (
             sessions.metadata_string(session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-            parse_session_reasoning_effort(
-                sessions.metadata_string(session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
-            ),
             sessions.metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
     let context_tokens = runtime
         .bot
         .model_context_tokens_for_agent(model_profile_id.as_deref(), agent_id.as_deref());
-    let opts = StreamOptions {
-        model_profile_id,
-        reasoning_effort,
-        agent_id,
-        skill_injections,
-        sender_user_id: Some(WEB_USER_ID.to_string()),
-        sender_username: Some(WEB_USER_ID.to_string()),
-        message_id: Some(run_id.to_string()),
-        chat_type: Some("p2p".to_string()),
-        platform: Some(WEB_CHANNEL.to_string()),
-        todo_create_via_sdk: true,
-        trigger_tools_enabled: true,
-        cancel: Some(cancel),
-        ..StreamOptions::default()
-    };
-    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
-        &stream_thread_id,
-        Content::text(text),
-        opts,
-    ));
+    let request = ChatRequest::text(session_id.to_string(), ChatChannel::Web, text)
+        .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
+        .with_message(run_id.to_string(), "p2p")
+        .with_platform(Some(WEB_CHANNEL.to_string()))
+        .enable_sdk_todo_and_triggers()
+        .with_cancel(cancel);
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
+    let mut event_mapper = WebCoreEventMapper::new(context_tokens, run_started_at);
 
     loop {
         let event = tokio::select! {
@@ -1018,222 +1181,17 @@ async fn run_turn(
             }
         };
         let Some(event) = event else { break };
-        let mapped = match event {
-            CatEvent::Text(text) => {
-                first_response_at.get_or_insert_with(|| run_started_at.elapsed());
-                Some(("text_delta", serde_json::json!({"text": text})))
+        match event_mapper.map(&runtime, session_id, event) {
+            WebEventMap::Emit(kind, data) => {
+                send_event(
+                    &sink,
+                    ChatEventV1::new(kind, run_id, session_id, sequence, Some(data)),
+                )
+                .await;
+                sequence += 1;
             }
-            CatEvent::Thinking(text) => {
-                first_response_at.get_or_insert_with(|| run_started_at.elapsed());
-                Some(("thinking_delta", serde_json::json!({"text": text})))
-            }
-            CatEvent::ToolCallStart { id, name } => {
-                first_response_at.get_or_insert_with(|| run_started_at.elapsed());
-                streaming_tools.insert(
-                    id.clone(),
-                    StreamingToolCall {
-                        name: name.clone(),
-                        arguments: String::new(),
-                        last_emit: Instant::now(),
-                    },
-                );
-                let args = serde_json::Value::Object(serde_json::Map::new());
-                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
-                Some((
-                    "tool_started",
-                    serde_json::json!({
-                        "call_id": id,
-                        "tool_name": name,
-                        "args": args,
-                        "pretty": pretty,
-                        "partial": true,
-                    }),
-                ))
-            }
-            CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                if let Some(call) = streaming_tools.get_mut(&id) {
-                    call.arguments.push_str(&delta);
-                    if call.last_emit.elapsed() < Duration::from_millis(500) {
-                        None
-                    } else {
-                        call.last_emit = Instant::now();
-                        streaming_tool_progress(&id, call).map(|pretty| {
-                            (
-                                "tool_started",
-                                serde_json::json!({
-                                    "call_id": id,
-                                    "tool_name": call.name.clone(),
-                                    "args": {},
-                                    "pretty": pretty,
-                                    "partial": true,
-                                }),
-                            )
-                        })
-                    }
-                } else {
-                    None
-                }
-            }
-            CatEvent::ToolCall { id, name, args } => {
-                first_response_at.get_or_insert_with(|| run_started_at.elapsed());
-                streaming_tools.remove(&id);
-                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
-                Some((
-                    "tool_started",
-                    serde_json::json!({
-                        "call_id": id,
-                        "tool_name": name,
-                        "args": args,
-                        "pretty": pretty,
-                    }),
-                ))
-            }
-            CatEvent::ToolCallResult {
-                id,
-                name,
-                args,
-                result,
-                success,
-                elapsed_ms,
-            } => {
-                streaming_tools.remove(&id);
-                let pretty = bot_core::PrettyToolCall::completed(
-                    &id, &name, &args, &result, success, elapsed_ms,
-                );
-                Some((
-                    "tool_completed",
-                    serde_json::json!({
-                        "call_id": id,
-                        "tool_name": name,
-                        "args": args,
-                        "result": result,
-                        "success": success,
-                        "elapsed_ms": elapsed_ms,
-                        "pretty": pretty,
-                    }),
-                ))
-            }
-            CatEvent::ToolApprovalRequested(request) => Some((
-                "approval_requested",
-                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::ToolApprovalUpdated(request) => Some((
-                "approval_updated",
-                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::ToolApprovalResolved { request, decision } => Some((
-                "approval_resolved",
-                serde_json::json!({
-                    "request": request,
-                    "decision": decision,
-                }),
-            )),
-            CatEvent::UserQuestionRequested(request) => Some((
-                "user_question_requested",
-                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::UserQuestionUpdated(request) => Some((
-                "user_question_updated",
-                serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::UserQuestionResolved { request, response } => Some((
-                "user_question_resolved",
-                serde_json::json!({
-                    "request": request,
-                    "response": response,
-                }),
-            )),
-            CatEvent::SubSession(event) => Some(("sub_session", {
-                let mut value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                if let serde_json::Value::Object(map) = &mut value {
-                    map.insert(
-                        "thread_id".to_string(),
-                        serde_json::Value::String(event.sub_thread_id.0.clone()),
-                    );
-                    map.insert(
-                        "run_id".to_string(),
-                        serde_json::Value::String(event.sub_run_id.0.clone()),
-                    );
-                }
-                value
-            })),
-            CatEvent::SupervisorProgress(progress) => Some((
-                "supervisor_progress",
-                serde_json::to_value(progress).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::Supervisor(report) => Some((
-                "supervisor_report",
-                serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::ContextCompaction(event) => Some((
-                "context_compaction",
-                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
-            )),
-            CatEvent::StateUpdate(user_state) => Some((
-                "todo_state",
-                serde_json::json!({
-                    "items": bot_core::todo::todos_from_user_state(&user_state),
-                }),
-            )),
-            CatEvent::ModelInputSnapshot(snapshot) => {
-                persist_model_input_snapshot(&runtime, session_id, &snapshot);
-                model_input_snapshot = Some(snapshot.clone());
-                Some((
-                    "model_input_snapshot",
-                    serde_json::json!({
-                        "run_id": snapshot.run_id,
-                        "estimated_tokens": snapshot.totals.estimated_tokens,
-                        "segment_count": snapshot.segments.len(),
-                    }),
-                ))
-            }
-            CatEvent::Stats {
-                prompt_tokens,
-                completion_tokens,
-                max_prompt_tokens: round_max_prompt_tokens,
-                elapsed_ms,
-            } => {
-                total_prompt_tokens = prompt_tokens;
-                total_completion_tokens = completion_tokens;
-                max_prompt_tokens = round_max_prompt_tokens;
-                model_elapsed_ms = elapsed_ms;
-                if let Some(snapshot) = &mut model_input_snapshot {
-                    snapshot.apply_usage(
-                        total_prompt_tokens,
-                        total_completion_tokens,
-                        max_prompt_tokens,
-                        context_tokens,
-                    );
-                    persist_model_input_snapshot(&runtime, session_id, snapshot);
-                }
-                Some((
-                    "stats",
-                    stats_payload(
-                        TokenUsage {
-                            prompt_tokens: total_prompt_tokens,
-                            completion_tokens: total_completion_tokens,
-                            max_prompt_tokens,
-                        },
-                        context_tokens,
-                        first_response_at,
-                        model_elapsed_ms,
-                        run_started_at.elapsed().as_millis(),
-                    ),
-                ))
-            }
-            CatEvent::Error(error) => {
-                Some(("error", serde_json::json!({"message": error.to_string()})))
-            }
-            CatEvent::Done => break,
-            _ => None,
-        };
-        if let Some((kind, data)) = mapped {
-            send_event(
-                &sink,
-                ChatEventV1::new(kind, run_id, session_id, sequence, Some(data)),
-            )
-            .await;
-            sequence += 1;
+            WebEventMap::Done => break,
+            WebEventMap::Skip => {}
         }
     }
 
@@ -1244,17 +1202,7 @@ async fn run_turn(
             run_id,
             session_id,
             sequence,
-            Some(stats_payload(
-                TokenUsage {
-                    prompt_tokens: total_prompt_tokens,
-                    completion_tokens: total_completion_tokens,
-                    max_prompt_tokens,
-                },
-                context_tokens,
-                first_response_at,
-                model_elapsed_ms,
-                run_started_at.elapsed().as_millis(),
-            )),
+            Some(event_mapper.stats_payload()),
         ),
     )
     .await;
@@ -1439,5 +1387,77 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        stats_payload, streaming_tool_progress, StreamingToolCall, WebCoreEventMapper, WebEventMap,
+    };
+    use bot_core::TokenUsage;
+
+    #[test]
+    fn stats_payload_includes_context_usage_and_timings() {
+        let payload = stats_payload(
+            TokenUsage {
+                prompt_tokens: 40,
+                completion_tokens: 2,
+                max_prompt_tokens: 100,
+            },
+            200,
+            Some(Duration::from_millis(12)),
+            34,
+            56,
+        );
+
+        assert_eq!(payload["ttft_ms"], 12);
+        assert_eq!(payload["prompt_tokens"], 40);
+        assert_eq!(payload["completion_tokens"], 2);
+        assert_eq!(payload["total_tokens"], 42);
+        assert_eq!(payload["max_prompt_tokens"], 100);
+        assert_eq!(payload["context_tokens"], 200);
+        assert_eq!(payload["model_elapsed_ms"], 34);
+        assert_eq!(payload["elapsed_ms"], 56);
+    }
+
+    #[test]
+    fn streaming_tool_progress_extracts_partial_write_summary() {
+        let call = StreamingToolCall {
+            name: "fs_write".to_string(),
+            arguments: r#"{"path":"src/lib.rs","content":"hello world"}"#.to_string(),
+            last_emit: Instant::now(),
+        };
+
+        let pretty = streaming_tool_progress("call-1", &call).expect("progress");
+
+        assert_eq!(pretty.id, "call-1");
+        assert_eq!(pretty.tool_name, "fs_write");
+        assert_eq!(pretty.title, "写入 src/lib.rs");
+        assert_eq!(pretty.summary, "已生成 11 字节 内容");
+    }
+
+    #[test]
+    fn web_mapper_tracks_stats_for_final_payload() {
+        let mut mapper = WebCoreEventMapper::new(1000, Instant::now());
+
+        let mapped = mapper.map_stats_without_snapshot(100, 25, 500, 77);
+
+        match mapped {
+            WebEventMap::Emit(kind, payload) => {
+                assert_eq!(kind, "stats");
+                assert_eq!(payload["prompt_tokens"], 100);
+                assert_eq!(payload["completion_tokens"], 25);
+                assert_eq!(payload["max_prompt_tokens"], 500);
+                assert_eq!(payload["context_tokens"], 1000);
+                assert_eq!(payload["model_elapsed_ms"], 77);
+            }
+            _ => panic!("expected stats event"),
+        }
+        let final_payload = mapper.stats_payload();
+        assert_eq!(final_payload["prompt_tokens"], 100);
+        assert_eq!(final_payload["completion_tokens"], 25);
     }
 }

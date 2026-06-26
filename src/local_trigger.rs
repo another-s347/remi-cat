@@ -1,14 +1,10 @@
 use std::rc::Rc;
 
-use bot_core::{CatEvent, Content, StreamOptions};
+use bot_core::CatEvent;
 use futures::StreamExt;
 
-use crate::core::Runtime;
+use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
 use crate::local_trigger_scheduler::LocalTriggerDispatch;
-use crate::{
-    parse_session_reasoning_effort, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY, SESSION_REASONING_EFFORT_METADATA_KEY,
-};
 
 pub(crate) async fn run_dispatcher(
     runtime: Rc<Runtime>,
@@ -43,45 +39,30 @@ pub(crate) async fn run_dispatch(
             dispatch.trigger_name
         ));
     }
-    let (model_profile_id, reasoning_effort, agent_id) = {
-        let sessions = runtime.sessions.lock().await;
-        (
-            sessions.metadata_string(&dispatch.thread_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-            parse_session_reasoning_effort(
-                sessions
-                    .metadata_string(&dispatch.thread_id, SESSION_REASONING_EFFORT_METADATA_KEY),
-            ),
-            sessions.metadata_string(&dispatch.thread_id, SESSION_AGENT_ID_METADATA_KEY),
-        )
-    };
-    let opts = StreamOptions {
-        model_profile_id,
-        reasoning_effort,
-        agent_id,
-        sender_user_id: Some(dispatch.owner_user_id),
-        sender_username: dispatch.owner_username,
-        message_id: Some(format!("trigger-{}", uuid::Uuid::new_v4())),
-        chat_type: dispatch.chat_type.or_else(|| Some("p2p".to_string())),
-        platform: dispatch.platform,
-        todo_create_via_sdk: true,
-        trigger_tools_enabled: false,
-        trigger_run: true,
-        ..StreamOptions::default()
-    };
-    let mut stream = std::pin::pin!(runtime.bot.stream_with_options(
-        &dispatch.thread_id,
-        Content::text(dispatch.request),
-        opts,
-    ));
+    let request = ChatRequest::trigger_text(
+        dispatch.thread_id,
+        ChatChannel::LocalTrigger,
+        dispatch.request,
+    )
+    .with_sender(dispatch.owner_user_id, dispatch.owner_username)
+    .with_message(
+        format!("trigger-{}", uuid::Uuid::new_v4()),
+        dispatch.chat_type.unwrap_or_else(|| "p2p".to_string()),
+    )
+    .with_platform(dispatch.platform)
+    .enable_sdk_todo();
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     while let Some(event) = stream.next().await {
         match event {
-            CatEvent::Text(delta) => {
+            CoreChatEvent::Bot(CatEvent::Text(delta)) => {
                 if let Some(tx) = &output_tx {
                     let _ = tx.send(delta);
                 }
             }
-            CatEvent::Error(err) => return Err(anyhow::anyhow!(err.to_string())),
-            CatEvent::Done => break,
+            CoreChatEvent::Bot(CatEvent::Error(err)) => {
+                return Err(anyhow::anyhow!(err.to_string()))
+            }
+            CoreChatEvent::Bot(CatEvent::Done) | CoreChatEvent::Done => break,
             _ => {}
         }
     }

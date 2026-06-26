@@ -4518,9 +4518,10 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "base64",
  "bot-core",

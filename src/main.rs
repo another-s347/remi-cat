@@ -24,15 +24,11 @@ pub(crate) use app::{
     direct_workflow_options, CLI_CHANNEL, CLI_USERNAME, MAX_COMMAND_PREPROCESS_DEPTH,
 };
 pub(crate) use app::{
-    parse_session_reasoning_effort, CLI_CHAT_ID, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
-    SESSION_REASONING_EFFORT_METADATA_KEY,
+    CLI_CHAT_ID, SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 pub(crate) use cli::CliConfig;
-pub(crate) use command::{process_runtime_commands, RuntimeCommandPipelineResult};
-pub(crate) use core::{
-    append_direct_sub_session_turn, sub_session_input_target, Runtime, SubSessionInputTarget,
-};
+pub(crate) use core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
