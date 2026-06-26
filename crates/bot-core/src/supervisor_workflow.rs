@@ -62,7 +62,10 @@ pub enum WorkflowStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowDecision {
-    pub edge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +95,9 @@ pub enum SupervisorTraceEvent {
     Output {
         content: String,
     },
+    AgentMessage {
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,6 +108,10 @@ pub struct WorkflowReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge: Option<String>,
     pub to_node: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_edges: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_nodes: Vec<String>,
     pub status: WorkflowStatus,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +220,160 @@ impl WorkflowDefinition {
     }
     pub fn outgoing(&self, node: &str) -> Vec<&WorkflowEdge> {
         self.edges.iter().filter(|edge| edge.from == node).collect()
+    }
+
+    pub fn reachable_subtree(&self, root: &str) -> Result<WorkflowSubtreeNode, String> {
+        let mut seen = HashSet::new();
+        seen.insert(root.to_string());
+        self.build_subtree_node(root, None, vec![root.to_string()], Vec::new(), &mut seen)
+    }
+
+    pub fn jump_targets(&self, root: &str) -> Result<Vec<WorkflowJumpTarget>, String> {
+        let subtree = self.reachable_subtree(root)?;
+        let mut targets = Vec::new();
+        collect_jump_targets(root, &subtree, &mut targets);
+        Ok(targets)
+    }
+
+    pub fn descendant_path(&self, root: &str, target: &str) -> Option<Vec<WorkflowEdge>> {
+        if root == target {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        seen.insert(root.to_string());
+        self.descendant_path_inner(root, target, &mut seen)
+    }
+
+    fn descendant_path_inner(
+        &self,
+        node: &str,
+        target: &str,
+        seen: &mut HashSet<String>,
+    ) -> Option<Vec<WorkflowEdge>> {
+        for edge in self.outgoing(node) {
+            if edge.to == target {
+                return Some(vec![edge.clone()]);
+            }
+            if seen.contains(&edge.to) {
+                continue;
+            }
+            seen.insert(edge.to.clone());
+            if let Some(mut path) = self.descendant_path_inner(&edge.to, target, seen) {
+                let mut edges = vec![edge.clone()];
+                edges.append(&mut path);
+                return Some(edges);
+            }
+            seen.remove(&edge.to);
+        }
+        None
+    }
+
+    fn build_subtree_node(
+        &self,
+        node_id: &str,
+        via_edge: Option<WorkflowSubtreeEdge>,
+        path_nodes: Vec<String>,
+        path_edges: Vec<String>,
+        seen: &mut HashSet<String>,
+    ) -> Result<WorkflowSubtreeNode, String> {
+        let node = self
+            .node(node_id)
+            .ok_or_else(|| format!("node `{node_id}` does not exist"))?;
+        let cycle_cut = via_edge.is_some() && path_nodes[..path_nodes.len() - 1].contains(&node.id);
+        let jump_allowed = via_edge.is_some() && node.id != path_nodes[0];
+        let mut subtree = WorkflowSubtreeNode {
+            id: node.id.clone(),
+            agent: node.agent.clone(),
+            prompt: node.prompt.clone(),
+            via_edge,
+            path_nodes,
+            path_edges,
+            cycle_cut,
+            jump_allowed,
+            children: Vec::new(),
+        };
+        if cycle_cut {
+            return Ok(subtree);
+        }
+        for edge in self.outgoing(&node.id) {
+            let mut child_path_nodes = subtree.path_nodes.clone();
+            child_path_nodes.push(edge.to.clone());
+            let mut child_path_edges = subtree.path_edges.clone();
+            child_path_edges.push(edge.id.clone());
+            let child_via_edge = Some(WorkflowSubtreeEdge {
+                id: edge.id.clone(),
+                prompt: edge.prompt.clone(),
+            });
+            let repeats = seen.contains(&edge.to);
+            if !repeats {
+                seen.insert(edge.to.clone());
+            }
+            let child = self.build_subtree_node(
+                &edge.to,
+                child_via_edge,
+                child_path_nodes,
+                child_path_edges,
+                seen,
+            )?;
+            if !repeats {
+                seen.remove(&edge.to);
+            }
+            subtree.children.push(child);
+        }
+        Ok(subtree)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowSubtreeNode {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_edge: Option<WorkflowSubtreeEdge>,
+    pub path_nodes: Vec<String>,
+    pub path_edges: Vec<String>,
+    pub cycle_cut: bool,
+    pub jump_allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<WorkflowSubtreeNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowSubtreeEdge {
+    pub id: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowJumpTarget {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_agent: Option<String>,
+    pub node_prompt: String,
+    pub path_nodes: Vec<String>,
+    pub path_edges: Vec<String>,
+    pub cycle_cut: bool,
+}
+
+fn collect_jump_targets(
+    root: &str,
+    node: &WorkflowSubtreeNode,
+    targets: &mut Vec<WorkflowJumpTarget>,
+) {
+    if node.jump_allowed && node.id != root {
+        targets.push(WorkflowJumpTarget {
+            node_id: node.id.clone(),
+            node_agent: node.agent.clone(),
+            node_prompt: node.prompt.clone(),
+            path_nodes: node.path_nodes.clone(),
+            path_edges: node.path_edges.clone(),
+            cycle_cut: node.cycle_cut,
+        });
+    }
+    for child in &node.children {
+        collect_jump_targets(root, child, targets);
     }
 }
 
@@ -358,12 +522,13 @@ pub fn parse_decision(raw: &str) -> Result<WorkflowDecision, String> {
     let json = extract_json_object(raw.trim()).ok_or_else(|| "missing JSON object".to_string())?;
     let mut decision: WorkflowDecision =
         serde_json::from_str(json).map_err(|err| format!("invalid supervisor JSON: {err}"))?;
-    decision.edge = decision.edge.trim().to_string();
+    decision.edge = trim_option(decision.edge);
+    decision.target_node = trim_option(decision.target_node);
     decision.agent_message = trim_option(decision.agent_message);
     decision.next_node_message = trim_option(decision.next_node_message);
     decision.reason = decision.reason.trim().to_string();
-    if decision.edge.is_empty() {
-        return Err("edge may not be empty".into());
+    if decision.edge.is_none() && decision.target_node.is_none() {
+        return Err("edge or target_node is required".into());
     }
     if decision.reason.is_empty() {
         return Err("reason may not be empty".into());
@@ -377,17 +542,66 @@ pub fn apply_decision(
     round: u32,
 ) -> Result<(WorkflowReport, Option<String>), String> {
     let from_node = instance.current_node.clone();
-    let edge = instance
-        .definition
-        .edge(&decision.edge)
+    let path_edges = if let Some(target_node) = decision.target_node.as_deref() {
+        if target_node == from_node {
+            return Err(format!("target_node `{target_node}` is the current node"));
+        }
+        let targets = instance
+            .definition
+            .jump_targets(&from_node)?
+            .into_iter()
+            .filter(|target| target.node_id == target_node)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Err(format!(
+                "target_node `{target_node}` is not reachable from current node `{from_node}`"
+            ));
+        }
+        let selected = if let Some(edge_id) = decision.edge.as_deref() {
+            targets
+                .iter()
+                .find(|target| target.path_edges.iter().any(|id| id == edge_id))
+                .ok_or_else(|| {
+                    format!(
+                        "edge `{edge_id}` is not on the path from `{from_node}` to `{target_node}`"
+                    )
+                })?
+        } else {
+            &targets[0]
+        };
+        selected
+            .path_edges
+            .iter()
+            .map(|edge_id| {
+                instance.definition.edge(edge_id).cloned().ok_or_else(|| {
+                    format!(
+                        "edge `{edge_id}` on path from `{from_node}` to `{target_node}` does not exist"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let edge_id = decision
+            .edge
+            .as_deref()
+            .ok_or_else(|| "edge or target_node is required".to_string())?;
+        let edge = instance
+            .definition
+            .edge(edge_id)
+            .cloned()
+            .ok_or_else(|| format!("edge `{edge_id}` does not exist"))?;
+        if edge.from != from_node {
+            return Err(format!(
+                "edge `{}` is not allowed from current node",
+                edge.id
+            ));
+        }
+        vec![edge]
+    };
+    let edge = path_edges
+        .last()
         .cloned()
-        .ok_or_else(|| format!("edge `{}` does not exist", decision.edge))?;
-    if edge.from != from_node {
-        return Err(format!(
-            "edge `{}` is not allowed from current node",
-            edge.id
-        ));
-    }
+        .ok_or_else(|| "workflow transition path may not be empty".to_string())?;
     let terminal = edge.to == instance.definition.terminal_node;
     if !terminal && decision.agent_message.is_none() {
         return Err("non-terminal transition requires agent_message".into());
@@ -408,12 +622,17 @@ pub fn apply_decision(
         WorkflowStatus::Active
     };
     instance.updated_at = Utc::now();
+    let path_edge_ids: Vec<String> = path_edges.iter().map(|edge| edge.id.clone()).collect();
+    let mut path_node_ids = vec![from_node.clone()];
+    path_node_ids.extend(path_edges.iter().map(|edge| edge.to.clone()));
     let report = WorkflowReport {
         workflow_id: instance.definition.id.clone(),
         workflow_name: instance.definition.name.clone(),
         from_node,
         edge: Some(edge.id),
         to_node: edge.to,
+        path_edges: path_edge_ids,
+        path_nodes: path_node_ids,
         status: instance.status.clone(),
         reason: decision.reason,
         agent_message: agent_message.clone(),
@@ -453,6 +672,8 @@ pub fn supervisor_prompt(
             serde_json::json!({"id": edge.id, "to": edge.to, "to_agent": to_agent, "prompt": edge.prompt})
         })
         .collect();
+    let allowed_subtree = definition.reachable_subtree(&node.id)?;
+    let allowed_jump_targets = definition.jump_targets(&node.id)?;
     let payload = serde_json::json!({
         "workflow_prompt": definition.prompt,
         "context": instance.context,
@@ -460,13 +681,17 @@ pub fn supervisor_prompt(
         "incoming_edge": incoming,
         "current_node": {"id": node.id, "agent": node.agent, "prompt": node.prompt},
         "allowed_outgoing_edges": outgoing,
+        "allowed_subtree": allowed_subtree,
+        "allowed_jump_targets": allowed_jump_targets,
         "todo": todo_prompt,
         "main_agent_history": history,
     });
     Ok(format!(
         "You are a supervisor workflow agent. Use tools when needed to verify the main agent's work.\n\
-         Select exactly one allowed outgoing edge. Return only JSON with this shape:\n\
-         {{\"edge\":\"edge id\",\"agent_message\":\"required instruction for non-terminal transitions, otherwise null\",\"next_node_message\":\"optional private message for the next supervisor node\",\"reason\":\"short reason\"}}\n\
+         Select either a direct edge from allowed_outgoing_edges or any target_node from allowed_jump_targets. Use target_node when the main agent appears to have already completed intermediate workflow nodes.\n\
+         allowed_subtree is rooted at the current node; cycle_cut=true means the subtree was truncated at a repeated node and must not be expanded further.\n\
+         Return only JSON with this shape:\n\
+         {{\"target_node\":\"node id or null\",\"edge\":\"direct edge id or null\",\"agent_message\":\"required instruction for non-terminal transitions, otherwise null\",\"next_node_message\":\"optional private message for the next supervisor node\",\"reason\":\"short reason\"}}\n\
          For a transition to a non-terminal node, agent_message must be non-empty. For a terminal transition it is ignored.\n\n{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     ))
@@ -622,8 +847,19 @@ mod tests {
             r#"{"edge":"continue","agent_message":"work","next_node_message":null,"reason":"not done"}"#,
         )
         .unwrap();
-        assert_eq!(decision.edge, "continue");
+        assert_eq!(decision.edge.as_deref(), Some("continue"));
         assert_eq!(decision.agent_message.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn parses_target_node_decision() {
+        let decision = parse_decision(
+            r#"{"target_node":" verify ","agent_message":"work","next_node_message":null,"reason":" skipped ahead "}"#,
+        )
+        .unwrap();
+        assert_eq!(decision.edge, None);
+        assert_eq!(decision.target_node.as_deref(), Some("verify"));
+        assert_eq!(decision.reason, "skipped ahead");
     }
 
     #[test]
@@ -651,6 +887,8 @@ mod tests {
         assert!(prompt.contains("check the tests"));
         assert!(prompt.contains("Choose when more main-agent work is required."));
         assert!(prompt.contains("Review the complete main-agent history"));
+        assert!(prompt.contains("\"allowed_subtree\""));
+        assert!(prompt.contains("\"allowed_jump_targets\""));
         assert!(prompt.contains("\"main_agent_history\": []"));
     }
 
@@ -712,7 +950,8 @@ mod tests {
         let (_, message) = apply_decision(
             &mut instance,
             WorkflowDecision {
-                edge: "verify".into(),
+                edge: Some("verify".into()),
+                target_node: None,
                 agent_message: Some("run tests".into()),
                 next_node_message: Some("implementation looked complete".into()),
                 reason: "needs verification".into(),
@@ -732,7 +971,8 @@ mod tests {
         let (report, message) = apply_decision(
             &mut instance,
             WorkflowDecision {
-                edge: "complete".into(),
+                edge: Some("complete".into()),
+                target_node: None,
                 agent_message: Some("this must be ignored".into()),
                 next_node_message: None,
                 reason: "verified".into(),
@@ -744,5 +984,228 @@ mod tests {
         assert_eq!(message, None);
         assert_eq!(report.status, WorkflowStatus::Completed);
         assert_eq!(instance.current_node, "stop");
+    }
+
+    #[test]
+    fn builds_cycle_truncated_subtree() {
+        let definition = cyclic_definition();
+
+        let subtree = definition.reachable_subtree("a").unwrap();
+
+        assert_eq!(subtree.id, "a");
+        let b = &subtree.children[0];
+        let c = &b.children[0];
+        let repeated_a = &c.children[0];
+        assert_eq!(b.id, "b");
+        assert_eq!(c.id, "c");
+        assert_eq!(repeated_a.id, "a");
+        assert!(repeated_a.cycle_cut);
+        assert!(repeated_a.children.is_empty());
+        assert!(!repeated_a.jump_allowed);
+
+        let targets = definition.jump_targets("a").unwrap();
+        let target_ids: Vec<_> = targets
+            .iter()
+            .map(|target| target.node_id.as_str())
+            .collect();
+        assert_eq!(target_ids, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn applies_descendant_target_jump() {
+        let mut instance = workflow_instance(linear_definition());
+
+        let (report, message) = apply_decision(
+            &mut instance,
+            WorkflowDecision {
+                edge: None,
+                target_node: Some("verify".into()),
+                agent_message: Some("verify what already changed".into()),
+                next_node_message: Some("skipped implementation".into()),
+                reason: "main agent already implemented".into(),
+                trace: Vec::new(),
+            },
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(message.as_deref(), Some("verify what already changed"));
+        assert_eq!(instance.current_node, "verify");
+        assert_eq!(instance.incoming_edge.as_deref(), Some("to_verify"));
+        assert_eq!(report.edge.as_deref(), Some("to_verify"));
+        assert_eq!(report.path_edges, vec!["to_implement", "to_verify"]);
+        assert_eq!(report.path_nodes, vec!["review", "implement", "verify"]);
+    }
+
+    #[test]
+    fn rejects_non_descendant_target() {
+        let mut instance = workflow_instance(linear_definition());
+
+        let err = apply_decision(
+            &mut instance,
+            WorkflowDecision {
+                edge: None,
+                target_node: Some("missing".into()),
+                agent_message: Some("work".into()),
+                next_node_message: None,
+                reason: "bad target".into(),
+                trace: Vec::new(),
+            },
+            0,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("not reachable"));
+    }
+
+    #[test]
+    fn terminal_descendant_target_completes() {
+        let mut instance = workflow_instance(linear_definition());
+
+        let (report, message) = apply_decision(
+            &mut instance,
+            WorkflowDecision {
+                edge: None,
+                target_node: Some("stop".into()),
+                agent_message: Some("ignored".into()),
+                next_node_message: None,
+                reason: "all done".into(),
+                trace: Vec::new(),
+            },
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(message, None);
+        assert_eq!(instance.status, WorkflowStatus::Completed);
+        assert_eq!(report.to_node, "stop");
+        assert_eq!(
+            report.path_edges,
+            vec!["to_implement", "to_verify", "complete"]
+        );
+    }
+
+    fn workflow_instance(definition: WorkflowDefinition) -> WorkflowInstance {
+        WorkflowInstance {
+            current_node: definition.initial_node.clone(),
+            definition,
+            context: serde_json::json!({}),
+            incoming_edge: None,
+            node_message: None,
+            status: WorkflowStatus::Active,
+            max_rounds: WorkflowMaxRounds::default(),
+            last_report: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn linear_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            version: 1,
+            id: "linear".into(),
+            name: "Linear".into(),
+            description: String::new(),
+            prompt: "supervise".into(),
+            start_prompt: "start".into(),
+            initial_node: "review".into(),
+            terminal_node: "stop".into(),
+            nodes: vec![
+                WorkflowNode {
+                    id: "review".into(),
+                    agent: None,
+                    prompt: "review".into(),
+                },
+                WorkflowNode {
+                    id: "implement".into(),
+                    agent: None,
+                    prompt: "implement".into(),
+                },
+                WorkflowNode {
+                    id: "verify".into(),
+                    agent: Some("explorer".into()),
+                    prompt: "verify".into(),
+                },
+                WorkflowNode {
+                    id: "stop".into(),
+                    agent: None,
+                    prompt: "stop".into(),
+                },
+            ],
+            edges: vec![
+                WorkflowEdge {
+                    id: "to_implement".into(),
+                    from: "review".into(),
+                    to: "implement".into(),
+                    prompt: "implement".into(),
+                },
+                WorkflowEdge {
+                    id: "to_verify".into(),
+                    from: "implement".into(),
+                    to: "verify".into(),
+                    prompt: "verify".into(),
+                },
+                WorkflowEdge {
+                    id: "complete".into(),
+                    from: "verify".into(),
+                    to: "stop".into(),
+                    prompt: "complete".into(),
+                },
+            ],
+        }
+    }
+
+    fn cyclic_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            version: 1,
+            id: "cyclic".into(),
+            name: "Cyclic".into(),
+            description: String::new(),
+            prompt: "supervise".into(),
+            start_prompt: "start".into(),
+            initial_node: "a".into(),
+            terminal_node: "stop".into(),
+            nodes: vec![
+                WorkflowNode {
+                    id: "a".into(),
+                    agent: None,
+                    prompt: "a".into(),
+                },
+                WorkflowNode {
+                    id: "b".into(),
+                    agent: None,
+                    prompt: "b".into(),
+                },
+                WorkflowNode {
+                    id: "c".into(),
+                    agent: None,
+                    prompt: "c".into(),
+                },
+                WorkflowNode {
+                    id: "stop".into(),
+                    agent: None,
+                    prompt: "stop".into(),
+                },
+            ],
+            edges: vec![
+                WorkflowEdge {
+                    id: "ab".into(),
+                    from: "a".into(),
+                    to: "b".into(),
+                    prompt: "a to b".into(),
+                },
+                WorkflowEdge {
+                    id: "bc".into(),
+                    from: "b".into(),
+                    to: "c".into(),
+                    prompt: "b to c".into(),
+                },
+                WorkflowEdge {
+                    id: "ca".into(),
+                    from: "c".into(),
+                    to: "a".into(),
+                    prompt: "c to a".into(),
+                },
+            ],
+        }
     }
 }

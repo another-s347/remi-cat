@@ -99,6 +99,8 @@ pub async fn migrate_legacy_goal(data_dir: &Path, thread_id: &str) -> Option<Wor
                 "review"
             }
             .into(),
+            path_edges: Vec::new(),
+            path_nodes: Vec::new(),
             status: if completed {
                 WorkflowStatus::Completed
             } else {

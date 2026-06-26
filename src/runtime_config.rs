@@ -2,6 +2,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use figment::{
+    providers::{Format, Serialized, Yaml},
+    Figment,
+};
 use serde::{Deserialize, Serialize};
 
 const RUNTIME_FILE_NAME: &str = "runtime.yaml";
@@ -23,6 +27,20 @@ pub struct RuntimeConfig {
     pub shell: ShellConfig,
     #[serde(default)]
     pub acp: AcpConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeConfigResolutionSource {
+    Initialized,
+    LegacyTuiDefaults,
+    Unresolved,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfigResolution {
+    pub data_dir: PathBuf,
+    pub config: Option<RuntimeConfig>,
+    pub source: RuntimeConfigResolutionSource,
 }
 
 impl RuntimeConfig {
@@ -152,6 +170,98 @@ impl RuntimeConfig {
                     tracing::warn!(error = %err, "failed to serialize Codex startup args")
                 }
             }
+        }
+    }
+
+    pub fn apply_env_overrides(&self) {
+        self.apply_env_defaults();
+        set_env("REMI_DATA_DIR", &self.data_dir);
+        set_env("REMI_AGENT_ID", &self.root_agent_id);
+        set_env("REMI_MODEL_PROFILE", &self.model_profile);
+        if let Some(overflow_bytes) = self.tool_output.overflow_bytes {
+            set_env(
+                "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
+                &overflow_bytes.to_string(),
+            );
+        } else {
+            remove_env("REMI_TOOL_OUTPUT_OVERFLOW_BYTES");
+        }
+        set_env("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
+        set_env(
+            "REMI_SANDBOX_HOST_DIR",
+            &self.sandbox.host_dir_or_data_dir(&self.data_dir),
+        );
+        set_env("REMI_SANDBOX_CONTAINER_DIR", &self.sandbox.container_dir);
+        set_env("REMI_SANDBOX_IMAGE", &self.sandbox.image);
+        set_env("REMI_SANDBOX_CONTAINER_NAME", &self.sandbox.container_name);
+        set_env(
+            "REMI_ADMIN_ENABLED",
+            if self.admin.enabled { "true" } else { "false" },
+        );
+        set_env("REMI_ADMIN_HOST", &self.admin.host);
+        set_env("REMI_ADMIN_PORT", &self.admin.port.to_string());
+        set_env("REMI_IM_MODE", self.im.mode.as_env_value());
+        set_env("REMI_FEISHU_TRANSPORT", self.im.transport.as_env_value());
+        set_env("REMI_FEISHU_HOOK_HOST", &self.im.event_hook.host);
+        set_env(
+            "REMI_FEISHU_HOOK_PORT",
+            &self.im.event_hook.port.to_string(),
+        );
+        set_env("REMI_FEISHU_HOOK_PATH", &self.im.event_hook.path);
+        set_env_optional(
+            "REMI_FEISHU_HOOK_VERIFICATION_TOKEN",
+            nonempty_str(&self.im.event_hook.verification_token),
+        );
+        set_env("REMI_SHELL_MODE", self.shell.mode.as_env_value());
+        set_env("REMI_ACP_MODE", self.acp.mode.as_env_value());
+        set_env("REMI_ACP_CLIENT", self.acp.client.as_str());
+        set_env_optional("REMI_ACP_TOOL_NAME", self.acp.tool_name.as_deref());
+        set_env_optional("REMI_ACP_BASE_URL", self.acp.base_url.as_deref());
+        set_env_optional("REMI_ACP_MODEL", self.acp.model.as_deref());
+        set_env_optional("REMI_ACP_API_KEY", self.acp.api_key.as_deref());
+        set_env_optional("REMI_ACP_AGENT_NAME", self.acp.agent_name.as_deref());
+        set_env_optional("REMI_ACP_LOCAL_BIN", self.acp.local_bin.as_deref());
+        set_env_json_array("REMI_ACP_LOCAL_ARGS", &self.acp.local_args);
+        set_env_optional("REMI_ACP_CODEX_BIN", self.acp.codex_bin.as_deref());
+        set_env_json_array("REMI_ACP_CODEX_ARGS", &self.acp.codex_args);
+    }
+}
+
+pub fn resolve_runtime_config_for_run(
+    data_dir: &Path,
+    tui_mode: bool,
+) -> Result<RuntimeConfigResolution> {
+    match detect_setup_state(data_dir) {
+        SetupState::Initialized { config, .. } => {
+            config.apply_env_overrides();
+            let data_dir = PathBuf::from(
+                std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
+            );
+            Ok(RuntimeConfigResolution {
+                data_dir,
+                config: Some(config),
+                source: RuntimeConfigResolutionSource::Initialized,
+            })
+        }
+        SetupState::LegacyEnvCompatible { .. } if tui_mode => {
+            let config = RuntimeConfig::default_for(data_dir);
+            config.apply_env_defaults();
+            let data_dir = PathBuf::from(
+                std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
+            );
+            Ok(RuntimeConfigResolution {
+                data_dir,
+                config: Some(config),
+                source: RuntimeConfigResolutionSource::LegacyTuiDefaults,
+            })
+        }
+        SetupState::Invalid { error, .. } => anyhow::bail!("runtime config is invalid: {error}"),
+        SetupState::LegacyEnvCompatible { .. } | SetupState::Uninitialized { .. } => {
+            Ok(RuntimeConfigResolution {
+                data_dir: data_dir.to_path_buf(),
+                config: None,
+                source: RuntimeConfigResolutionSource::Unresolved,
+            })
         }
     }
 }
@@ -514,11 +624,11 @@ pub fn load_runtime_config(data_dir: &Path) -> Result<Option<RuntimeConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config =
-        serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(config))
+    Figment::from(Serialized::defaults(RuntimeConfig::default_for(data_dir)))
+        .merge(Yaml::file(&path))
+        .extract()
+        .with_context(|| format!("loading runtime config {}", path.display()))
+        .map(Some)
 }
 
 pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
@@ -602,17 +712,50 @@ pub fn upsert_dotenv_value(path: &Path, key: &str, value: &str) -> Result<()> {
 
 fn set_env_if_absent(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
-        unsafe {
-            std::env::set_var(key, value);
-        }
+        set_env(key, value);
+    }
+}
+
+fn set_env(key: &str, value: &str) {
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn remove_env(key: &str) {
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
+
+fn nonempty_str(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn set_env_optional(key: &str, value: Option<&str>) {
+    match value.filter(|value| !value.trim().is_empty()) {
+        Some(value) => set_env(key, value),
+        None => remove_env(key),
+    }
+}
+
+fn set_env_json_array(key: &str, values: &[String]) {
+    if values.is_empty() {
+        remove_env(key);
+        return;
+    }
+    match serde_json::to_string(values) {
+        Ok(value) => set_env(key, &value),
+        Err(err) => tracing::warn!(key, error = %err, "failed to serialize runtime env array"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_setup_state, load_runtime_config, runtime_config_path, write_runtime_config,
-        AcpClient, AdminConfig, ImMode, RuntimeConfig, SetupState,
+        detect_setup_state, load_runtime_config, resolve_runtime_config_for_run,
+        runtime_config_path, write_runtime_config, AcpClient, AdminConfig, ImMode, RuntimeConfig,
+        RuntimeConfigResolutionSource, SetupState,
     };
     use std::sync::Mutex;
 
@@ -669,6 +812,7 @@ model_profile: default
 
     #[test]
     fn detects_legacy_env_compatibility_without_runtime_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir =
             std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
         unsafe {
@@ -705,6 +849,147 @@ model_profile: default
         unsafe {
             std::env::remove_var("REMI_ACP_CODEX_ARGS");
         }
+    }
+
+    #[test]
+    fn apply_env_overrides_replaces_stale_model_profile_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("REMI_MODEL_PROFILE", "default");
+            std::env::set_var("REMI_AGENT_ID", "old-agent");
+        }
+        let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        cfg.root_agent_id = "default".to_string();
+        cfg.model_profile = "deepseek-v4-flash".to_string();
+        cfg.apply_env_overrides();
+        assert_eq!(
+            std::env::var("REMI_MODEL_PROFILE").unwrap(),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(std::env::var("REMI_AGENT_ID").unwrap(), "default");
+        unsafe {
+            std::env::remove_var("REMI_MODEL_PROFILE");
+            std::env::remove_var("REMI_AGENT_ID");
+        }
+    }
+
+    #[test]
+    fn apply_env_overrides_replaces_stale_runtime_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("REMI_ACP_CLIENT", "codex");
+            std::env::set_var("REMI_ACP_TOOL_NAME", "old_acp");
+            std::env::set_var("REMI_ACP_LOCAL_ARGS", r#"["old"]"#);
+            std::env::set_var("REMI_ACP_CODEX_ARGS", r#"["old"]"#);
+            std::env::set_var("REMI_SHELL_MODE", "disabled");
+            std::env::set_var("REMI_SANDBOX_KIND", "docker");
+            std::env::set_var("REMI_IM_MODE", "feishu");
+            std::env::set_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES", "1");
+        }
+
+        let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        cfg.tool_output.overflow_bytes = Some(7777);
+        cfg.sandbox.kind = super::RuntimeSandboxKind::NoSandbox;
+        cfg.shell.mode = super::ShellMode::Local;
+        cfg.im.mode = ImMode::Disabled;
+        cfg.acp.client = AcpClient::Remi;
+        cfg.acp.tool_name = Some("e2e_acp".to_string());
+        cfg.acp.local_args = vec!["hello".to_string(), "world".to_string()];
+        cfg.acp.codex_args.clear();
+
+        cfg.apply_env_overrides();
+
+        assert_eq!(std::env::var("REMI_ACP_CLIENT").unwrap(), "remi");
+        assert_eq!(std::env::var("REMI_ACP_TOOL_NAME").unwrap(), "e2e_acp");
+        assert_eq!(
+            std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
+            r#"["hello","world"]"#
+        );
+        assert!(std::env::var("REMI_ACP_CODEX_ARGS").is_err());
+        assert_eq!(std::env::var("REMI_SHELL_MODE").unwrap(), "local");
+        assert_eq!(std::env::var("REMI_SANDBOX_KIND").unwrap(), "no_sandbox");
+        assert_eq!(std::env::var("REMI_IM_MODE").unwrap(), "disabled");
+        assert_eq!(
+            std::env::var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES").unwrap(),
+            "7777"
+        );
+
+        unsafe {
+            std::env::remove_var("REMI_ACP_CLIENT");
+            std::env::remove_var("REMI_ACP_TOOL_NAME");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
+            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+            std::env::remove_var("REMI_SHELL_MODE");
+            std::env::remove_var("REMI_SANDBOX_KIND");
+            std::env::remove_var("REMI_IM_MODE");
+            std::env::remove_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES");
+        }
+    }
+
+    #[test]
+    fn resolver_uses_initialized_runtime_config_as_authority() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
+        let mut cfg = RuntimeConfig::default_for(&dir);
+        cfg.model_profile = "deepseek-v4-flash".to_string();
+        write_runtime_config(&dir, &cfg).unwrap();
+        unsafe {
+            std::env::set_var("REMI_MODEL_PROFILE", "default");
+        }
+
+        let resolution = resolve_runtime_config_for_run(&dir, false).unwrap();
+        assert_eq!(
+            resolution.source,
+            RuntimeConfigResolutionSource::Initialized
+        );
+        assert_eq!(resolution.data_dir, dir);
+        assert_eq!(
+            resolution.config.unwrap().model_profile,
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            std::env::var("REMI_MODEL_PROFILE").unwrap(),
+            "deepseek-v4-flash"
+        );
+
+        unsafe {
+            std::env::remove_var("REMI_MODEL_PROFILE");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolver_applies_legacy_defaults_only_for_tui_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
+        unsafe {
+            std::env::remove_var("REMI_DATA_DIR");
+            std::env::remove_var("REMI_MODEL_PROFILE");
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+        }
+
+        let unresolved = resolve_runtime_config_for_run(&dir, false).unwrap();
+        assert_eq!(unresolved.source, RuntimeConfigResolutionSource::Unresolved);
+        assert!(unresolved.config.is_none());
+
+        let tui_resolution = resolve_runtime_config_for_run(&dir, true).unwrap();
+        assert_eq!(
+            tui_resolution.source,
+            RuntimeConfigResolutionSource::LegacyTuiDefaults
+        );
+        assert_eq!(
+            std::env::var("REMI_MODEL_PROFILE").unwrap(),
+            RuntimeConfig::default_for(&dir).model_profile
+        );
+
+        unsafe {
+            std::env::remove_var("REMI_DATA_DIR");
+            std::env::remove_var("REMI_MODEL_PROFILE");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

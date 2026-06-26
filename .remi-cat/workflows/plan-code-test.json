@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "id": "plan-code-test",
+  "name": "Plan Code Test",
+  "description": "Plan the work, implement it, verify it, then finish.",
+  "prompt": "Supervise a basic engineering workflow. Move through planning, coding, and testing based on the main agent history. You may skip ahead to any reachable later node when the main agent has already completed intermediate work. Do not mark the workflow complete until the change is implemented and verified.",
+  "start_prompt": "Begin by checking whether the task has a concrete plan, implementation, or verification evidence.",
+  "initial_node": "plan",
+  "terminal_node": "done",
+  "nodes": [
+    {
+      "id": "plan",
+      "prompt": "Decide whether the task has a sufficient implementation plan. If planning is still needed, instruct the main agent to produce or refine a concise plan. If the plan already exists, advance to code."
+    },
+    {
+      "id": "code",
+      "prompt": "Decide whether implementation is complete. If code changes are still needed, instruct the main agent to implement the next concrete change. If implementation is complete, advance to test."
+    },
+    {
+      "id": "test",
+      "prompt": "Decide whether the implementation has been verified. If verification is missing or failing, instruct the main agent to run or fix the relevant tests/checks. If verification is sufficient, advance to done."
+    },
+    {
+      "id": "done",
+      "prompt": "The work is planned, implemented, and verified. Stop the workflow."
+    }
+  ],
+  "edges": [
+    {
+      "id": "needs_plan",
+      "from": "plan",
+      "to": "plan",
+      "prompt": "Choose when the main agent still needs to create or refine the plan."
+    },
+    {
+      "id": "to_code",
+      "from": "plan",
+      "to": "code",
+      "prompt": "Choose when planning is sufficient and implementation should proceed."
+    },
+    {
+      "id": "needs_code",
+      "from": "code",
+      "to": "code",
+      "prompt": "Choose when implementation is incomplete and more coding work is required."
+    },
+    {
+      "id": "to_test",
+      "from": "code",
+      "to": "test",
+      "prompt": "Choose when implementation is complete and verification should proceed."
+    },
+    {
+      "id": "needs_test",
+      "from": "test",
+      "to": "test",
+      "prompt": "Choose when tests or verification are missing, failing, or insufficient."
+    },
+    {
+      "id": "complete",
+      "from": "test",
+      "to": "done",
+      "prompt": "Choose only when the task is planned, implemented, and verified."
+    }
+  ]
+}

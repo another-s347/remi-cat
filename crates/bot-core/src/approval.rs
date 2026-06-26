@@ -78,9 +78,11 @@ impl ApprovalSessionPolicy {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Ask => "low auto-runs; medium/high ask for approval",
+            Self::Ask => "low risk auto-runs; medium/high ask for approval",
             Self::AllowAll => "all tool requests auto-run in this session",
-            Self::ModelAuto => "low/medium auto-run after risk review; high asks for approval",
+            Self::ModelAuto => {
+                "only low risk auto-runs after risk review; medium/high ask for approval"
+            }
         }
     }
 }
@@ -234,28 +236,6 @@ impl ToolApprovalManager {
         events.push(ApprovalEvent::Requested(request.clone()));
         events.push(ApprovalEvent::Updated(request.clone()));
 
-        if self.session_model_auto(&request.session_id).await && review.risk != ToolRiskLevel::High
-        {
-            tracing::info!(
-                approval_id = %request.id,
-                session_id = %request.session_id,
-                tool_name = %request.tool_name,
-                risk = ?request.risk,
-                review_risk = ?review.risk,
-                reason = "session_model_auto",
-                decision = ?ToolApprovalDecision::AllowSessionModelAuto,
-                "tool_approval.immediate"
-            );
-            events.push(ApprovalEvent::Resolved {
-                request,
-                decision: ToolApprovalDecision::AllowSessionModelAuto,
-            });
-            return (
-                ApprovalWait::Immediate(ApprovalResolution::Approved),
-                events,
-            );
-        }
-
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
@@ -318,14 +298,6 @@ impl ToolApprovalManager {
             .is_some_and(|grant| *grant == SessionGrant::AllowAll)
     }
 
-    async fn session_model_auto(&self, session_id: &str) -> bool {
-        let state = self.state.lock().await;
-        state
-            .grants
-            .get(session_id)
-            .is_some_and(|grant| *grant == SessionGrant::ModelAuto)
-    }
-
     async fn apply_decision(&self, request: &ToolApprovalRequest, decision: ToolApprovalDecision) {
         let mut state = self.state.lock().await;
         match decision {
@@ -357,41 +329,29 @@ pub enum ApprovalEvent {
 
 pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRiskLevel {
     match tool_name {
-        "fs_read"
-        | "fs_ls"
-        | "rg"
-        | "search"
-        | "skill__get"
-        | "skill__search"
-        | "apply_patch"
-        | "fetch"
-        | "memory__get_detail"
-        | "memory__recall"
-        | "memory__upsert_named"
-        | "todo__add"
-        | "todo__complete"
-        | "todo__list"
-        | "todo__remove"
-        | "todo__update"
-        | "trigger__list"
-        | "web_search"
-        | "now"
-        | "instant"
-        | "lazy_wait"
-        | "sleep" => ToolRiskLevel::Low,
+        "fs_read" | "fs_ls" | "rg" | "search" | "skill__get" | "skill__search"
+        | "memory__get_detail" | "memory__recall" | "todo__list" | "trigger__list"
+        | "web_search" | "now" | "instant" | "lazy_wait" | "sleep" | "ask_user_question" => {
+            ToolRiskLevel::Low
+        }
+        "fetch" => classify_fetch_risk(args),
         "workspace_bash" | "bash" => classify_bash_risk(args),
         "ssh" => classify_ssh_risk(args),
-        "fs_write" | "fs_create" | "fs_mkdir" | "fs_remove" => {
-            classify_fs_mutation_risk(tool_name, args)
-        }
+        "fs_remove" => classify_fs_remove_risk(args),
+        "fs_write" | "fs_create" | "fs_mkdir" | "apply_patch" => ToolRiskLevel::Medium,
         "manage_yourself" => classify_manage_yourself_risk(args),
         name if name.starts_with("im__") || name.contains("send") || name.contains("upload") => {
-            ToolRiskLevel::High
+            ToolRiskLevel::Medium
         }
-        "agent__explorer" => ToolRiskLevel::Low,
         "codex" => ToolRiskLevel::Medium,
         name if name.starts_with("acp__") => ToolRiskLevel::Medium,
         name if name.starts_with("agent__") || name.starts_with("trigger__") => {
+            ToolRiskLevel::Medium
+        }
+        name if name.starts_with("memory__")
+            || name.starts_with("todo__")
+            || name.starts_with("skill__") =>
+        {
             ToolRiskLevel::Medium
         }
         _ => ToolRiskLevel::Medium,
@@ -408,7 +368,7 @@ fn classify_bash_risk(args: &serde_json::Value) -> ToolRiskLevel {
     if is_destructive_shell_command(command) {
         return ToolRiskLevel::High;
     }
-    ToolRiskLevel::High
+    ToolRiskLevel::Medium
 }
 
 fn classify_ssh_risk(args: &serde_json::Value) -> ToolRiskLevel {
@@ -433,8 +393,21 @@ fn classify_ssh_risk(args: &serde_json::Value) -> ToolRiskLevel {
     classify_bash_risk(args)
 }
 
+fn classify_fetch_risk(args: &serde_json::Value) -> ToolRiskLevel {
+    if args
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        ToolRiskLevel::Low
+    } else {
+        ToolRiskLevel::Medium
+    }
+}
+
 fn is_readonly_shell_command(command: &str) -> bool {
-    if command_has_unsafe_shell_syntax(command) {
+    if command_has_non_readonly_shell_syntax(command) {
         return false;
     }
     let mut segments = split_readonly_shell_segments(command)
@@ -443,7 +416,7 @@ fn is_readonly_shell_command(command: &str) -> bool {
     segments.peek().is_some() && segments.all(|segment| is_readonly_command_segment(segment.trim()))
 }
 
-fn command_has_unsafe_shell_syntax(command: &str) -> bool {
+fn command_has_non_readonly_shell_syntax(command: &str) -> bool {
     let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
@@ -516,19 +489,14 @@ fn shell_program_name(word: &str) -> &str {
         .unwrap_or(word)
 }
 
-fn classify_fs_mutation_risk(tool_name: &str, args: &serde_json::Value) -> ToolRiskLevel {
-    if tool_name == "fs_remove" {
-        return ToolRiskLevel::High;
-    }
+fn classify_fs_remove_risk(args: &serde_json::Value) -> ToolRiskLevel {
     let path = args
         .get("path")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    if touches_core_config_path(path) {
-        return ToolRiskLevel::High;
-    }
-    if tool_name == "fs_remove"
-        && (args["recursive"].as_bool().unwrap_or(false) || has_broad_wildcard(path))
+    if is_high_risk_delete_path(path)
+        || args["recursive"].as_bool().unwrap_or(false)
+        || has_broad_wildcard(path)
     {
         return ToolRiskLevel::High;
     }
@@ -568,50 +536,36 @@ fn classify_manage_yourself_risk(args: &serde_json::Value) -> ToolRiskLevel {
         {
             ToolRiskLevel::Low
         }
-        _ => ToolRiskLevel::High,
+        _ => ToolRiskLevel::Medium,
     }
-}
-
-fn touches_core_config_path(path: &str) -> bool {
-    let normalized = path.trim_start_matches("./").trim_start_matches('/');
-    if normalized.is_empty() {
-        return false;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        ".env"
-            | ".env.local"
-            | ".env.production"
-            | "cargo.toml"
-            | "cargo.lock"
-            | "package.json"
-            | "package-lock.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
-            | "dockerfile"
-            | "docker-compose.yml"
-            | "docker-compose.yaml"
-            | ".git/config"
-            | ".remi-cat/runtime.yaml"
-            | ".remi-cat/runtime.yml"
-    ) || lower.starts_with(".github/")
-        || lower.starts_with(".cargo/")
-        || lower.starts_with(".ssh/")
-        || lower.starts_with("/etc/")
-        || lower.starts_with("etc/")
 }
 
 fn has_broad_wildcard(path: &str) -> bool {
     let wildcard_count = path.chars().filter(|ch| matches!(ch, '*' | '?')).count();
-    wildcard_count >= 2 || path.contains("**") || matches!(path.trim(), "*" | "*/*" | "./*")
+    wildcard_count >= 2
+        || path.contains("**")
+        || matches!(path.trim(), "*" | "*/*" | "./*" | "/*" | "/*/*")
+}
+
+fn is_high_risk_delete_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed == "/" {
+        return true;
+    }
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let depth = trimmed
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    depth <= 2
 }
 
 fn is_destructive_command(command: &str, words: &[String]) -> bool {
     let lower = command.to_ascii_lowercase();
-    if lower.contains("rm -rf")
-        || lower.contains("rm -fr")
-        || lower.contains("mkfs")
+    if lower.contains("mkfs")
         || lower.contains("dd if=")
         || lower.contains(":(){")
         || lower.contains("chmod -r")
@@ -627,13 +581,34 @@ fn is_destructive_command(command: &str, words: &[String]) -> bool {
     }) else {
         return true;
     };
-    matches!(
-        program,
-        "rm" | "rmdir" | "mv" | "cp" | "truncate" | "dd" | "mkfs" | "chmod" | "chown" | "sudo"
-    ) || words
-        .iter()
-        .skip(1)
-        .any(|word| touches_core_config_path(word) || has_broad_wildcard(word))
+    if matches!(program, "dd" | "mkfs" | "sudo") {
+        return true;
+    }
+    if matches!(program, "chmod" | "chown") && words.iter().any(|word| word == "-R" || word == "-r")
+    {
+        return true;
+    }
+    if matches!(program, "rm" | "rmdir") {
+        let recursive = words
+            .iter()
+            .skip(1)
+            .any(|word| word.starts_with('-') && word.contains('r'));
+        return recursive
+            || words
+                .iter()
+                .skip(1)
+                .filter(|word| !word.starts_with('-'))
+                .any(|word| is_high_risk_delete_path(word) || has_broad_wildcard(word));
+    }
+    if program == "find" {
+        return words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        });
+    }
+    false
 }
 
 pub fn summarize_tool_args(args: &serde_json::Value) -> String {
@@ -710,23 +685,23 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
                 .to_string()
         }
         ToolRiskLevel::Low => {
-            "The tool request is classified as read-only or a simple local state update that is safe to auto-run.".to_string()
+            "The tool request is classified as read-only and is safe to auto-run.".to_string()
         }
         ToolRiskLevel::Medium if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
-            "The shell request is not in the read-only allowlist, but no destructive pattern was detected.".to_string()
+            "The shell request is not read-only, but no high-risk deletion or destructive system pattern was detected.".to_string()
         }
-        ToolRiskLevel::Medium if matches!(tool_name, "fs_write" | "fs_create" | "fs_mkdir") => {
-            "The request creates or updates workspace files and does not target protected configuration paths.".to_string()
+        ToolRiskLevel::Medium if matches!(tool_name, "fs_write" | "fs_create" | "fs_mkdir" | "fs_remove" | "apply_patch") => {
+            "The request writes, creates, patches, or removes workspace content without matching the high-risk deletion rules.".to_string()
         }
         ToolRiskLevel::Medium
             if tool_name.starts_with("agent__")
                 || tool_name == "codex"
                 || tool_name.starts_with("acp__") =>
         {
-            "The request delegates work to another agent and should be reviewed unless this session allows model-auto approval.".to_string()
+            "The request delegates work to another agent and should be reviewed before running.".to_string()
         }
         ToolRiskLevel::Medium if tool_name.starts_with("trigger__") => {
-            "The request changes automation state and should be reviewed unless this session allows model-auto approval.".to_string()
+            "The request changes automation state and should be reviewed before running.".to_string()
         }
         ToolRiskLevel::Medium => {
             format!(
@@ -734,11 +709,10 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
             )
         }
         ToolRiskLevel::High if matches!(tool_name, "bash" | "workspace_bash" | "ssh") => {
-            "The shell request may mutate files, change permissions, run privileged/package-management actions, or contains unsupported shell syntax.".to_string()
+            "The shell request matches high-risk deletion or destructive system command rules.".to_string()
         }
         ToolRiskLevel::High if tool_name == "fs_remove" => {
-            "The request removes filesystem content and always requires human confirmation."
-                .to_string()
+            "The request matches high-risk deletion rules and requires human confirmation.".to_string()
         }
         ToolRiskLevel::High if args_summary.to_ascii_lowercase().contains("[redacted]") => {
             "The request touches sensitive-looking arguments and requires human confirmation."
@@ -789,39 +763,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn risk_policy_marks_readonly_low_and_dangerous_high() {
+    fn risk_policy_marks_readonly_low_writes_medium_and_only_dangerous_deletes_high() {
         assert_eq!(
             classify_tool_risk("fs_read", &serde_json::json!({})),
             ToolRiskLevel::Low
         );
         assert_eq!(
             classify_tool_risk("todo__list", &serde_json::json!({})),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk(
-                "todo__add",
-                &serde_json::json!({ "title": "x", "items": [] })
-            ),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk(
-                "todo__update",
-                &serde_json::json!({ "id": "1", "content": "x" })
-            ),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk("todo__complete", &serde_json::json!({ "id": "1" })),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk("todo__remove", &serde_json::json!({ "id": "1" })),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk("apply_patch", &serde_json::json!({})),
             ToolRiskLevel::Low
         );
         assert_eq!(
@@ -833,10 +781,6 @@ mod tests {
             ToolRiskLevel::Low
         );
         assert_eq!(
-            classify_tool_risk("memory__upsert_named", &serde_json::json!({ "name": "x" })),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
             classify_tool_risk("web_search", &serde_json::json!({ "query": "x" })),
             ToolRiskLevel::Low
         );
@@ -845,11 +789,64 @@ mod tests {
             ToolRiskLevel::Low
         );
         assert_eq!(
+            classify_tool_risk("fetch", &serde_json::json!({ "task_id": "fetch_1" })),
+            ToolRiskLevel::Low
+        );
+        assert_eq!(
             classify_tool_risk(
                 "fetch",
                 &serde_json::json!({ "url": "https://example.com" })
             ),
+            ToolRiskLevel::Medium
+        );
+        assert_eq!(
+            classify_tool_risk(
+                "ask_user_question",
+                &serde_json::json!({ "question": "ok?" })
+            ),
             ToolRiskLevel::Low
+        );
+
+        for (tool, args) in [
+            ("apply_patch", serde_json::json!({ "patch": "..." })),
+            ("fs_write", serde_json::json!({ "path": ".env" })),
+            ("fs_create", serde_json::json!({ "path": "notes.txt" })),
+            ("fs_mkdir", serde_json::json!({ "path": "tmp/work" })),
+            ("memory__upsert_named", serde_json::json!({ "name": "x" })),
+            (
+                "todo__add",
+                serde_json::json!({ "title": "x", "items": [] }),
+            ),
+            (
+                "todo__update",
+                serde_json::json!({ "id": "1", "content": "x" }),
+            ),
+            ("todo__complete", serde_json::json!({ "id": "1" })),
+            ("todo__remove", serde_json::json!({ "id": "1" })),
+            ("trigger__upsert", serde_json::json!({ "id": "x" })),
+            ("trigger__delete", serde_json::json!({ "id": "x" })),
+            ("agent__explorer", serde_json::json!({ "task": "inspect" })),
+            ("agent__coder", serde_json::json!({ "task": "edit" })),
+            ("codex", serde_json::json!({ "message": "work" })),
+            ("im__send_text", serde_json::json!({ "text": "hello" })),
+        ] {
+            assert_eq!(
+                classify_tool_risk(tool, &args),
+                ToolRiskLevel::Medium,
+                "{tool}"
+            );
+        }
+
+        assert_eq!(
+            classify_tool_risk("fs_remove", &serde_json::json!({ "path": "x" })),
+            ToolRiskLevel::Medium
+        );
+        assert_eq!(
+            classify_tool_risk(
+                "fs_remove",
+                &serde_json::json!({ "path": "src/file.rs", "recursive": false })
+            ),
+            ToolRiskLevel::Medium
         );
         assert_eq!(
             review_tool_risk(
@@ -860,37 +857,19 @@ mod tests {
             .risk,
             ToolRiskLevel::Low
         );
-        assert_eq!(
-            classify_tool_risk("agent__explorer", &serde_json::json!({ "task": "inspect" })),
-            ToolRiskLevel::Low
-        );
-        assert_eq!(
-            classify_tool_risk("agent__coder", &serde_json::json!({ "task": "edit" })),
-            ToolRiskLevel::Medium
-        );
-        assert_eq!(
-            classify_tool_risk("fs_remove", &serde_json::json!({ "path": "x" })),
-            ToolRiskLevel::High
-        );
-        assert_eq!(
-            classify_tool_risk("fs_write", &serde_json::json!({ "path": "notes.txt" })),
-            ToolRiskLevel::Medium
-        );
-        assert_eq!(
-            classify_tool_risk("fs_write", &serde_json::json!({ "path": ".env" })),
-            ToolRiskLevel::High
-        );
-        assert_eq!(
-            classify_tool_risk("fs_remove", &serde_json::json!({ "path": "src/**/*" })),
-            ToolRiskLevel::High
-        );
-        assert_eq!(
-            classify_tool_risk(
-                "fs_remove",
-                &serde_json::json!({ "path": "target", "recursive": true })
-            ),
-            ToolRiskLevel::High
-        );
+        for args in [
+            serde_json::json!({ "path": "/" }),
+            serde_json::json!({ "path": "/etc" }),
+            serde_json::json!({ "path": "/etc/nginx" }),
+            serde_json::json!({ "path": "src/**/*" }),
+            serde_json::json!({ "path": "target", "recursive": true }),
+        ] {
+            assert_eq!(
+                classify_tool_risk("fs_remove", &args),
+                ToolRiskLevel::High,
+                "{args}"
+            );
+        }
         for command in [
             "profile list",
             "profile show default",
@@ -923,7 +902,7 @@ mod tests {
                     "manage_yourself",
                     &serde_json::json!({ "command": command })
                 ),
-                ToolRiskLevel::High,
+                ToolRiskLevel::Medium,
                 "{command}"
             );
         }
@@ -958,19 +937,32 @@ mod tests {
 
         for command in [
             "ls; rm -rf x",
-            "ls && pwd",
-            "rm file.txt",
             "rm -rf src/**/*",
-            "sed -i s/a/b/ .env",
+            "rm /tmp/x",
+            "rm -rf /tmp/x",
             "find . -type f -delete",
-            "grep $(whoami) file.txt",
-            "python3 script.py",
-            "cargo test -p bot-core",
             "sudo apt-get remove libc6",
         ] {
             assert_eq!(
                 classify_tool_risk("bash", &serde_json::json!({ "command": command })),
                 ToolRiskLevel::High,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "ls && pwd",
+            "rm file.txt",
+            "sed -i s/a/b/ .env",
+            "grep $(whoami) file.txt",
+            "python3 script.py",
+            "cargo test -p bot-core",
+            "touch file.txt",
+            "echo hi > file.txt",
+        ] {
+            assert_eq!(
+                classify_tool_risk("bash", &serde_json::json!({ "command": command })),
+                ToolRiskLevel::Medium,
                 "{command}"
             );
         }
@@ -991,6 +983,13 @@ mod tests {
                 &serde_json::json!({ "host": "prod", "command": "rm -rf /tmp/x" })
             ),
             ToolRiskLevel::High
+        );
+        assert_eq!(
+            classify_tool_risk(
+                "ssh",
+                &serde_json::json!({ "host": "prod", "command": "rm file.txt" })
+            ),
+            ToolRiskLevel::Medium
         );
         assert_eq!(
             classify_tool_risk("ssh", &serde_json::json!({ "pid": "ssh_1" })),
@@ -1053,7 +1052,7 @@ mod tests {
             matches!(
                 event,
                 ApprovalEvent::Updated(request)
-                    if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::High)
+                    if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::Medium)
             )
         }));
     }
@@ -1076,7 +1075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_model_auto_only_auto_approves_non_high() {
+    async fn session_model_auto_does_not_auto_approve_medium() {
         let manager = ToolApprovalManager::new();
         let first = ToolApprovalRequest {
             id: "a1".into(),
@@ -1100,14 +1099,21 @@ mod tests {
         let (resolution, _) = manager.finish_request(&first, decision).await;
         assert_eq!(resolution, ApprovalResolution::Approved);
 
-        let (resolution, _) = manager
-            .request(ToolApprovalRequest {
+        let (wait, events) = manager
+            .start_request(ToolApprovalRequest {
                 id: "a2".into(),
                 tool_call_id: "t2".into(),
                 ..first.clone()
             })
             .await;
-        assert_eq!(resolution, ApprovalResolution::Approved);
+        assert!(matches!(wait, ApprovalWait::Pending(_)));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ApprovalEvent::Updated(request)
+                    if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::Medium)
+            )
+        }));
 
         let high = ToolApprovalRequest {
             id: "a3".into(),
@@ -1141,8 +1147,8 @@ mod tests {
             manager.session_policy("s1").await,
             ApprovalSessionPolicy::ModelAuto
         );
-        let (resolution, events) = manager
-            .request(ToolApprovalRequest {
+        let (wait, events) = manager
+            .start_request(ToolApprovalRequest {
                 id: "p1".into(),
                 session_id: "s1".into(),
                 run_id: "r1".into(),
@@ -1154,13 +1160,11 @@ mod tests {
                 review: None,
             })
             .await;
-        assert_eq!(resolution, ApprovalResolution::Approved);
+        assert!(matches!(wait, ApprovalWait::Pending(_)));
         assert!(events.iter().any(|event| matches!(
             event,
-            ApprovalEvent::Resolved {
-                decision: ToolApprovalDecision::AllowSessionModelAuto,
-                ..
-            }
+            ApprovalEvent::Updated(request)
+                if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::Medium)
         )));
 
         manager

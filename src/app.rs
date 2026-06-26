@@ -30,6 +30,7 @@ pub(crate) use crate::command::{
 #[cfg(test)]
 pub(crate) use crate::command::{
     direct_workflow_options, is_goal_set_command, parse_goal_max_rounds,
+    parse_workflow_start_options,
 };
 #[cfg(test)]
 pub(crate) use crate::command::{
@@ -41,7 +42,10 @@ pub(crate) use crate::command::{
     run_feishu_doctor, run_feishu_init, run_hooks_command, run_secret_command, run_setup,
     run_update_command,
 };
-use crate::config::{detect_setup_state, has_legacy_env_credentials, ImMode, SetupState};
+use crate::config::{
+    detect_setup_state, has_legacy_env_credentials, resolve_runtime_config_for_run, ImMode,
+    SetupState,
+};
 use crate::core::Runtime;
 use crate::instance_profile::{tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
 #[cfg(test)]
@@ -82,19 +86,21 @@ pub(crate) fn parse_session_reasoning_effort(
 }
 
 fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
-    match detect_setup_state(data_dir) {
-        SetupState::Initialized { config, .. } => {
-            config.apply_env_defaults();
-            *data_dir =
-                std::path::PathBuf::from(std::env::var("REMI_DATA_DIR").unwrap_or(config.data_dir));
+    match resolve_runtime_config_for_run(data_dir, tui_mode) {
+        Ok(resolution) => {
+            tracing::debug!(
+                source = ?resolution.source,
+                model_profile = resolution
+                    .config
+                    .as_ref()
+                    .map(|config| config.model_profile.as_str())
+                    .unwrap_or(""),
+                data_dir = %resolution.data_dir.display(),
+                "resolved runtime config"
+            );
+            *data_dir = resolution.data_dir;
         }
-        SetupState::LegacyEnvCompatible { .. } if tui_mode => {
-            let config = crate::runtime_config::RuntimeConfig::default_for(data_dir);
-            config.apply_env_defaults();
-            *data_dir =
-                std::path::PathBuf::from(std::env::var("REMI_DATA_DIR").unwrap_or(config.data_dir));
-        }
-        _ => {}
+        Err(err) => tracing::warn!(error = %err, "failed to resolve runtime config"),
     }
 }
 
@@ -245,11 +251,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             unsafe {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
             }
-            if let SetupState::Initialized { config, .. } = detect_setup_state(&data_dir) {
-                config.apply_env_defaults();
-                data_dir = std::path::PathBuf::from(
-                    std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),
+            if let Ok(resolution) = resolve_runtime_config_for_run(&data_dir, false) {
+                tracing::debug!(
+                    source = ?resolution.source,
+                    model_profile = resolution
+                        .config
+                        .as_ref()
+                        .map(|config| config.model_profile.as_str())
+                        .unwrap_or(""),
+                    data_dir = %resolution.data_dir.display(),
+                    "resolved runtime config"
                 );
+                data_dir = resolution.data_dir;
             }
             if let Some(overflow_bytes) = tool_output_overflow_bytes {
                 unsafe {
@@ -553,12 +566,12 @@ mod cli_tests {
         feedback_repo, feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
         first_available_port, format_context_compaction_line, format_feishu_tool_line,
         github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_command,
-        parse_global_args, parse_goal_max_rounds, parse_release_version, percent_encode_query,
-        prefix_short_config_entry, redact_known_secrets, run_streaming_command,
-        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
-        try_parse_cli_args, update_available, AcpCommand, AppCommand, CliConfig, CodexCommand,
-        FeedbackCommand, FeishuCommand, FeishuDoctorStatus, FeishuReplyKind,
-        GitHubIssueCreateRequest, HooksCommand, ProfileCommand, UpdateCommand,
+        parse_global_args, parse_goal_max_rounds, parse_release_version,
+        parse_workflow_start_options, percent_encode_query, prefix_short_config_entry,
+        redact_known_secrets, run_streaming_command, run_streaming_command_with_stdin,
+        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available, AcpCommand,
+        AppCommand, CliConfig, CodexCommand, FeedbackCommand, FeishuCommand, FeishuDoctorStatus,
+        FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand, ProfileCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
     use crate::profile_command::{
@@ -901,6 +914,27 @@ mod cli_tests {
         ));
         assert!(parse_command(&args(&["profile", "workflow", "delete", "dev", "goal"])).is_err());
         assert!(matches!(
+            parse_command(&args(&["workflow", "list"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::List { profile }))
+                if profile == "default"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["workflow", "show", "--profile", "dev", "verify"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::Show { profile, workflow_id }))
+                if profile == "dev" && workflow_id == "verify"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["workflow", "add", "/tmp/verify.json"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::Upsert { profile, path }))
+                if profile == "default" && path == "/tmp/verify.json"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["workflow", "rm", "--profile", "dev", "verify"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Workflow(ProfileWorkflowCommand::Delete { profile, workflow_id }))
+                if profile == "dev" && workflow_id == "verify"
+        ));
+        assert!(parse_command(&args(&["workflow", "rm", "goal"])).is_err());
+        assert!(matches!(
             parse_command(&args(&["config", "set", "admin.port=8790"])).unwrap(),
             AppCommand::ConfigSet(entries) if entries == args(&["admin.port=8790"])
         ));
@@ -932,6 +966,23 @@ mod cli_tests {
             direct_workflow_options("review-looping", "review-loop"),
             None
         );
+    }
+
+    #[test]
+    fn workflow_start_options_accept_plain_goal_text() {
+        let (context, max_rounds) = parse_workflow_start_options("verify the task").unwrap();
+        assert_eq!(context, serde_json::json!({ "goal": "verify the task" }));
+        assert_eq!(max_rounds, bot_core::WorkflowMaxRounds::Limited(20));
+
+        let (context, max_rounds) =
+            parse_workflow_start_options("--max-rounds 5 verify the task").unwrap();
+        assert_eq!(context, serde_json::json!({ "goal": "verify the task" }));
+        assert_eq!(max_rounds, bot_core::WorkflowMaxRounds::Limited(5));
+
+        let (context, max_rounds) =
+            parse_workflow_start_options("--context {\"goal\":\"verify the task\"}").unwrap();
+        assert_eq!(context, serde_json::json!({ "goal": "verify the task" }));
+        assert_eq!(max_rounds, bot_core::WorkflowMaxRounds::Limited(20));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use remi_agentloop::prelude::{
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
-use remi_agentloop::types::AgentEvent;
+use remi_agentloop::types::{AgentEvent, ResumePayload};
 use tokio::sync::mpsc;
 
 use crate::approval::{
@@ -124,8 +124,10 @@ fn is_denied_approval_event(event: &CatEvent) -> bool {
 pub struct CatAgent<I> {
     /// The inner agent (AgentLoop or composed layers).
     pub inner: I,
-    /// Locally-handled tools (skill__* + todo__*).
-    pub local_tools: DefaultToolRegistry,
+    /// Locally-handled tools shared across model/runtime variants.
+    pub local_tools: Arc<DefaultToolRegistry>,
+    /// Model-bound local tools, such as delegate agents with baked-in model options.
+    pub model_tools: Option<DefaultToolRegistry>,
     /// Workspace root — oversized tool outputs are spilled here.
     pub data_dir: PathBuf,
     /// Workspace root used by workspace file tools.
@@ -161,12 +163,20 @@ where
     ///
     /// Called by `CatBot::stream()` in lib.rs after injecting memory context.
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
+        self.stream_with_input_and_tool_allowlist(input, None)
+    }
+
+    pub fn stream_with_input_and_tool_allowlist<'a>(
+        &'a self,
+        input: LoopInput,
+        tool_allowlist_override: Option<Vec<String>>,
+    ) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
         let workspace_root = self.workspace_root.clone();
         let workspace_root_label = self.workspace_root_label.clone();
         let allow_host_absolute_paths = self.allow_host_absolute_paths;
         let overflow_bytes = self.overflow_bytes;
-        let tool_allowlist = self.tool_allowlist.clone();
+        let tool_allowlist = tool_allowlist_override.or_else(|| self.tool_allowlist.clone());
         let hook_manager = Arc::clone(&self.hook_manager);
         let tool_def_ctx = build_tool_definition_ctx(&input);
         let supervisor_run =
@@ -191,6 +201,7 @@ where
         let dynamic_tool_count = dynamic_tools.definitions_with_context(&tool_def_ctx).len();
         let extra_defs = merge_runtime_tool_definitions(
             &self.local_tools,
+            self.model_tools.as_ref(),
             &dynamic_tools,
             &tool_def_ctx,
             &[],
@@ -282,7 +293,7 @@ where
                             let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
                                 .iter()
                                 .cloned()
-                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && self.local_tools.contains(&tc.name));
+                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && runtime_tools_contains(&self.local_tools, self.model_tools.as_ref(), &tc.name));
                             let (dynamic, external): (Vec<_>, Vec<_>) = remaining
                                 .into_iter()
                                 .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && dynamic_tools.contains(&tc.name));
@@ -511,10 +522,14 @@ where
                                     "tool_batch.execute_start"
                                 );
                                 let batch_started = Instant::now();
-                                let results = self
-                                    .local_tools
-                                    .execute_parallel(&approved_local, &resume_map, &tool_ctx)
-                                    .await;
+                                let results = execute_runtime_tools(
+                                    &self.local_tools,
+                                    self.model_tools.as_ref(),
+                                    &approved_local,
+                                    &resume_map,
+                                    &tool_ctx,
+                                )
+                                .await;
                                 tracing::info!(
                                     thread_id = %state.thread_id.0,
                                     run_id = %state.run_id.0,
@@ -1004,6 +1019,7 @@ where
                             refresh_runtime_tool_definitions(
                                 &mut state,
                                 &self.local_tools,
+                                self.model_tools.as_ref(),
                                 &dynamic_tools,
                                 tool_allowlist.as_deref(),
                             );
@@ -1142,12 +1158,16 @@ fn build_tool_definition_ctx(input: &LoopInput) -> ToolDefinitionContext {
 
 fn merge_runtime_tool_definitions(
     local_tools: &DefaultToolRegistry,
+    model_tools: Option<&DefaultToolRegistry>,
     dynamic_tools: &DefaultToolRegistry,
     ctx: &ToolDefinitionContext,
     external_defs: &[ToolDefinition],
     tool_allowlist: Option<&[String]>,
 ) -> Vec<ToolDefinition> {
     let mut defs = local_tools.definitions_with_context(ctx);
+    if let Some(model_tools) = model_tools {
+        defs.extend(model_tools.definitions_with_context(ctx));
+    }
     defs.extend(dynamic_tools.definitions_with_context(ctx));
     defs.extend_from_slice(external_defs);
     let defs = filter_trigger_management_tool_definitions(ctx, defs);
@@ -1157,6 +1177,7 @@ fn merge_runtime_tool_definitions(
 fn refresh_runtime_tool_definitions(
     state: &mut remi_agentloop::prelude::AgentState,
     local_tools: &DefaultToolRegistry,
+    model_tools: Option<&DefaultToolRegistry>,
     dynamic_tools: &DefaultToolRegistry,
     tool_allowlist: Option<&[String]>,
 ) {
@@ -1165,7 +1186,7 @@ fn refresh_runtime_tool_definitions(
         .iter()
         .filter(|definition| {
             let name = definition.function.name.as_str();
-            !local_tools.contains(name) && !dynamic_tools.contains(name)
+            !runtime_tools_contains(local_tools, model_tools, name) && !dynamic_tools.contains(name)
         })
         .cloned()
         .collect();
@@ -1179,11 +1200,58 @@ fn refresh_runtime_tool_definitions(
 
     state.tool_definitions = merge_runtime_tool_definitions(
         local_tools,
+        model_tools,
         dynamic_tools,
         &ctx,
         &external_defs,
         tool_allowlist,
     );
+}
+
+fn runtime_tools_contains(
+    local_tools: &DefaultToolRegistry,
+    model_tools: Option<&DefaultToolRegistry>,
+    name: &str,
+) -> bool {
+    local_tools.contains(name)
+        || model_tools
+            .map(|tools| tools.contains(name))
+            .unwrap_or(false)
+}
+
+async fn execute_runtime_tools<'a>(
+    local_tools: &'a DefaultToolRegistry,
+    model_tools: Option<&'a DefaultToolRegistry>,
+    calls: &'a [ParsedToolCall],
+    resume_map: &'a HashMap<String, ResumePayload>,
+    ctx: &'a ToolContext,
+) -> Vec<(String, Result<BoxedToolResult<'a>, AgentError>)> {
+    let Some(model_tools) = model_tools else {
+        return local_tools.execute_parallel(calls, resume_map, ctx).await;
+    };
+    if model_tools.is_empty() {
+        return local_tools.execute_parallel(calls, resume_map, ctx).await;
+    }
+
+    let local_results = local_tools.execute_parallel(calls, resume_map, ctx).await;
+    let model_results = model_tools.execute_parallel(calls, resume_map, ctx).await;
+    let mut local_by_id = local_results
+        .into_iter()
+        .collect::<HashMap<String, Result<BoxedToolResult<'a>, AgentError>>>();
+    let mut model_by_id = model_results
+        .into_iter()
+        .collect::<HashMap<String, Result<BoxedToolResult<'a>, AgentError>>>();
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        let result = if model_tools.contains(&call.name) {
+            model_by_id.remove(&call.id)
+        } else {
+            local_by_id.remove(&call.id)
+        }
+        .unwrap_or_else(|| Err(AgentError::ToolNotFound(call.name.clone())));
+        results.push((call.id.clone(), result));
+    }
+    results
 }
 
 fn filter_trigger_management_tool_definitions(
@@ -2286,7 +2354,8 @@ mod tests {
     async fn usage_events_emit_stats_before_done() {
         let agent = CatAgent {
             inner: UsageThenDoneInnerAgent,
-            local_tools: DefaultToolRegistry::new(),
+            local_tools: Arc::new(DefaultToolRegistry::new()),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),
@@ -2328,7 +2397,8 @@ mod tests {
     async fn cancelled_agent_event_emits_history_before_done() {
         let agent = CatAgent {
             inner: CancelledWithCheckpointInnerAgent,
-            local_tools: DefaultToolRegistry::new(),
+            local_tools: Arc::new(DefaultToolRegistry::new()),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),
@@ -2369,7 +2439,8 @@ mod tests {
         local_tools.register(LazyWaitTool);
         let agent = CatAgent {
             inner: ParallelToolInnerAgent,
-            local_tools,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),
@@ -2398,7 +2469,8 @@ mod tests {
     async fn unhandled_external_tool_emits_failed_tool_result_and_resumes() {
         let agent = CatAgent {
             inner: UnhandledExternalToolInnerAgent,
-            local_tools: DefaultToolRegistry::new(),
+            local_tools: Arc::new(DefaultToolRegistry::new()),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),
@@ -2450,7 +2522,8 @@ mod tests {
         local_tools.register(RiskySendTool);
         let agent = CatAgent {
             inner: ApprovalDeniedInnerAgent,
-            local_tools,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),
@@ -2497,7 +2570,8 @@ mod tests {
         local_tools.register(InstantTool);
         let agent = CatAgent {
             inner: EndlessToolInnerAgent,
-            local_tools,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
             data_dir: test_root(),
             workspace_root: test_root(),
             workspace_root_label: "/workspace".to_string(),

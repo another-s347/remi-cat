@@ -285,8 +285,8 @@ fn static_command_catalog() -> Vec<CommandCatalogEntry> {
         ),
         (
             "/permissions auto",
-            "自动通过中低风险",
-            "本 session 中 low/medium 自动通过，high 仍请求审批",
+            "自动通过低风险",
+            "本 session 中仅 low 自动通过，medium/high 仍请求审批",
             false,
         ),
         (

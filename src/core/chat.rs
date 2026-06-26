@@ -201,6 +201,58 @@ impl Runtime {
                             yield CoreChatEvent::Done;
                             return;
                         }
+                        Ok(RuntimeCommandPipelineResult::StartWorkflow { prefix, workflow_id, context, max_rounds }) => {
+                            if !prefix.is_empty() {
+                                yield CoreChatEvent::Prefix(prefix);
+                            }
+                            let platform = request.platform();
+                            let (model_profile_id, reasoning_effort, agent_id) = {
+                                let sessions = self.sessions.lock().await;
+                                (
+                                    sessions.metadata_string(&request.session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
+                                    parse_session_reasoning_effort(
+                                        sessions.metadata_string(&request.session_id, SESSION_REASONING_EFFORT_METADATA_KEY),
+                                    ),
+                                    sessions.metadata_string(&request.session_id, SESSION_AGENT_ID_METADATA_KEY),
+                                )
+                            };
+                            let opts = StreamOptions {
+                                model_profile_id,
+                                reasoning_effort,
+                                agent_id,
+                                sender_user_id: request.sender_user_id,
+                                sender_username: request.sender_username,
+                                message_id: request.message_id,
+                                chat_type: request.chat_type,
+                                platform,
+                                todo_create_via_sdk: request.todo_create_via_sdk,
+                                trigger_tools_enabled: request.trigger_tools_enabled,
+                                trigger_run: request.trigger_run,
+                                im_attachments: request.im_attachments,
+                                im_documents: request.im_documents,
+                                cancel: request.cancel,
+                                ..StreamOptions::default()
+                            };
+                            let mut stream = std::pin::pin!(
+                                self.bot.stream_workflow_start_with_options(
+                                    &request.session_id,
+                                    workflow_id,
+                                    context,
+                                    max_rounds,
+                                    opts,
+                                )
+                            );
+                            while let Some(event) = stream.next().await {
+                                let done = matches!(event, CatEvent::Done);
+                                yield CoreChatEvent::Bot(event);
+                                if done {
+                                    yield CoreChatEvent::Done;
+                                    return;
+                                }
+                            }
+                            yield CoreChatEvent::Done;
+                            return;
+                        }
                         Ok(RuntimeCommandPipelineResult::Continue { text, prefix, skill_injections: injections }) => {
                             if !prefix.is_empty() {
                                 yield CoreChatEvent::Prefix(prefix);

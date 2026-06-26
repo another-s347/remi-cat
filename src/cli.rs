@@ -1,6 +1,6 @@
 use crate::app::{CLI_CHAT_ID, CLI_USERNAME};
 use crate::instance_profile::{self, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
-use crate::profile_command::{self, ProfileCommand};
+use crate::profile_command::{self, ProfileCommand, ProfileWorkflowCommand};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
 pub(crate) const CLI_USER_ID: &str = "local-user";
@@ -157,6 +157,11 @@ enum CliCommand {
     Profile {
         #[command(subcommand)]
         command: ProfileCliCommand,
+    },
+    #[command(about = "Manage supervisor workflows")]
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCliCommand,
     },
     #[command(about = "Manage Feishu/Lark setup")]
     Feishu {
@@ -648,6 +653,45 @@ enum ProfileWorkflowCliCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum WorkflowCliCommand {
+    #[command(about = "List supervisor workflows")]
+    List(WorkflowProfileArg),
+    #[command(about = "Show one supervisor workflow")]
+    Show {
+        #[command(flatten)]
+        profile: WorkflowProfileArg,
+        #[arg(help = "Workflow id")]
+        workflow_id: String,
+    },
+    #[command(
+        alias = "upsert",
+        about = "Validate and save a supervisor workflow JSON file"
+    )]
+    Add {
+        #[command(flatten)]
+        profile: WorkflowProfileArg,
+        #[arg(help = "Path to a workflow JSON file")]
+        path: String,
+    },
+    #[command(
+        alias = "delete",
+        about = "Delete a profile-specific supervisor workflow"
+    )]
+    Rm {
+        #[command(flatten)]
+        profile: WorkflowProfileArg,
+        #[arg(help = "Workflow id")]
+        workflow_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct WorkflowProfileArg {
+    #[arg(long, default_value = "default", help = "Runtime profile name")]
+    profile: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FeishuCommand {
     Init,
@@ -918,6 +962,9 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Profile { command }) => {
             Ok(AppCommand::Profile(profile_cli_to_command(command)?))
         }
+        Some(CliCommand::Workflow { command }) => Ok(AppCommand::Profile(
+            ProfileCommand::Workflow(workflow_cli_to_command(command)?),
+        )),
         Some(CliCommand::Feishu { command }) => Ok(AppCommand::Feishu(match command {
             FeishuCliCommand::Init => FeishuCommand::Init,
             FeishuCliCommand::Doctor => FeishuCommand::Doctor,
@@ -986,6 +1033,49 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             username: CLI_USERNAME.to_string(),
         })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
+    }
+}
+
+fn workflow_cli_to_command(command: WorkflowCliCommand) -> anyhow::Result<ProfileWorkflowCommand> {
+    match command {
+        WorkflowCliCommand::List(args) => {
+            let _ = InstanceProfile::from_label(&args.profile)?;
+            Ok(ProfileWorkflowCommand::List {
+                profile: args.profile,
+            })
+        }
+        WorkflowCliCommand::Show {
+            profile,
+            workflow_id,
+        } => {
+            let _ = InstanceProfile::from_label(&profile.profile)?;
+            profile_command::validate_file_id(&workflow_id)?;
+            Ok(ProfileWorkflowCommand::Show {
+                profile: profile.profile,
+                workflow_id,
+            })
+        }
+        WorkflowCliCommand::Add { profile, path } => {
+            let _ = InstanceProfile::from_label(&profile.profile)?;
+            Ok(ProfileWorkflowCommand::Upsert {
+                profile: profile.profile,
+                path,
+            })
+        }
+        WorkflowCliCommand::Rm {
+            profile,
+            workflow_id,
+        } => {
+            let _ = InstanceProfile::from_label(&profile.profile)?;
+            profile_command::validate_file_id(&workflow_id)?;
+            if workflow_id == "goal" {
+                anyhow::bail!("embedded workflow `goal` cannot be deleted");
+            }
+            Ok(ProfileWorkflowCommand::Delete {
+                profile: profile.profile,
+                workflow_id,
+            })
+        }
     }
 }
 

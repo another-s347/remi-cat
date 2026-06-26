@@ -767,6 +767,102 @@ impl CatBot {
             .await
     }
 
+    pub fn stream_workflow_start_with_options<'a>(
+        &'a self,
+        thread_id: &'a str,
+        workflow_id: String,
+        context: serde_json::Value,
+        max_rounds: WorkflowMaxRounds,
+        opts: StreamOptions,
+    ) -> impl Stream<Item = CatEvent> + 'a {
+        let thread_id_owned = thread_id.to_string();
+        stream! {
+            let instance = match self
+                .start_workflow_by_id(
+                    &thread_id_owned,
+                    &workflow_id,
+                    context,
+                    max_rounds,
+                )
+                .await
+            {
+                Ok(instance) => instance,
+                Err(err) => {
+                    yield CatEvent::Error(err);
+                    return;
+                }
+            };
+
+            let ctx = match self.memory.load_context(&thread_id_owned).await {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    yield CatEvent::Error(AgentError::other(err.to_string()));
+                    return;
+                }
+            };
+            let history = build_injected_history(&ctx);
+            let todo_prompt = todo::latest_unfinished_batch_system_prompt(&ctx.user_state);
+            let supervisor_model_profile_id = opts.model_profile_id.clone();
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+            let evaluation = self.evaluate_workflow_after_round(
+                &thread_id_owned,
+                &history,
+                todo_prompt,
+                0,
+                supervisor_model_profile_id.as_deref(),
+                progress_tx,
+            );
+            tokio::pin!(evaluation);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut evaluation => break outcome,
+                    progress = progress_rx.recv() => {
+                        if let Some(progress) = progress {
+                            yield CatEvent::SupervisorProgress(progress);
+                        }
+                    }
+                }
+            };
+            while let Ok(progress) = progress_rx.try_recv() {
+                yield CatEvent::SupervisorProgress(progress);
+            }
+
+            match outcome {
+                WorkflowRoundOutcome::NoWorkflow => {
+                    yield CatEvent::Supervisor(WorkflowReport {
+                        workflow_id: instance.definition.id.clone(),
+                        workflow_name: instance.definition.name.clone(),
+                        from_node: instance.current_node.clone(),
+                        edge: None,
+                        to_node: instance.current_node.clone(),
+                        path_edges: Vec::new(),
+                        path_nodes: Vec::new(),
+                        status: instance.status.clone(),
+                        reason: "workflow did not produce a supervisor decision".to_string(),
+                        agent_message: None,
+                        next_node_message: None,
+                        supervisor_trace: Vec::new(),
+                        round: 0,
+                        max_rounds: instance.max_rounds.clone(),
+                        error: None,
+                    });
+                }
+                WorkflowRoundOutcome::Report(report) => {
+                    yield CatEvent::Supervisor(report);
+                }
+                WorkflowRoundOutcome::Continue { report, message } => {
+                    yield CatEvent::Supervisor(report);
+                    let mut main_stream = std::pin::pin!(
+                        self.stream_with_options(&thread_id_owned, Content::text(message), opts)
+                    );
+                    while let Some(event) = main_stream.next().await {
+                        yield event;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn workflow_status(&self, thread_id: &str) -> Option<WorkflowInstance> {
         let user_state = self.memory.load_user_state(thread_id).await;
         if let Some(instance) = supervisor_workflow::instance_from_user_state(&user_state) {
@@ -795,6 +891,8 @@ impl CatBot {
             from_node: instance.current_node.clone(),
             edge: None,
             to_node: instance.current_node.clone(),
+            path_edges: Vec::new(),
+            path_nodes: Vec::new(),
             status: WorkflowStatus::Paused,
             reason: "paused by user".to_string(),
             agent_message: None,
@@ -969,10 +1067,7 @@ impl CatBot {
     /// Useful for the `/tools` slash command — lets users see what the agent
     /// can do without reading source code.
     pub fn tool_list(&self) -> Vec<(String, String)> {
-        use remi_agentloop::tool::registry::ToolRegistry;
-        self.inner
-            .local_tools
-            .definitions(&serde_json::Value::Null)
+        cat_agent_tool_definitions(&self.inner)
             .into_iter()
             .filter(|d| {
                 self.inner
@@ -994,15 +1089,12 @@ impl CatBot {
         session_agent_id: Option<&str>,
         session_model_profile_id: Option<&str>,
     ) -> Vec<(String, String)> {
-        use remi_agentloop::tool::registry::ToolRegistry;
         let effective_agent = self.effective_agent_profile(session_agent_id);
         let effective_model = self
             .effective_model_profile_for_agent(session_model_profile_id, &effective_agent.profile);
         let active_agent = self
             .runtime_for_agent_and_model(&effective_agent.profile.id, &effective_model.profile.id);
-        active_agent
-            .local_tools
-            .definitions(&serde_json::Value::Null)
+        cat_agent_tool_definitions(active_agent)
             .into_iter()
             .filter(|d| {
                 active_agent
@@ -1020,9 +1112,7 @@ impl CatBot {
     /// an agent can inspect unavailable tools and decide how to update its
     /// profile allowlist or runtime configuration.
     pub fn registered_tool_statuses(&self) -> Vec<RegisteredToolStatus> {
-        use remi_agentloop::tool::registry::ToolRegistry;
-
-        let enabled_defs = self.inner.local_tools.definitions(&serde_json::Value::Null);
+        let enabled_defs = cat_agent_tool_definitions(&self.inner);
         let mut by_name: HashMap<String, RegisteredToolStatus> = HashMap::new();
         for definition in enabled_defs {
             let name = definition.function.name;
@@ -1041,7 +1131,7 @@ impl CatBot {
         }
 
         for (name, description) in builtin_tool_catalog() {
-            let registered = self.inner.local_tools.contains(name);
+            let registered = cat_agent_contains_tool(&self.inner, name);
             by_name
                 .entry(name.to_string())
                 .or_insert_with(|| RegisteredToolStatus {
@@ -1173,6 +1263,8 @@ impl CatBot {
             from_node: node.clone(),
             edge: None,
             to_node: node,
+            path_edges: Vec::new(),
+            path_nodes: Vec::new(),
             status: WorkflowStatus::Error,
             reason: error.clone(),
             agent_message: None,
@@ -1206,7 +1298,8 @@ impl CatBot {
         let effective_model = self.effective_model_profile(model_profile_id);
         let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
         let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
-            let mut stream = std::pin::pin!(active_agent.stream_with_input(input));
+            let mut stream = std::pin::pin!(active_agent
+                .stream_with_input_and_tool_allowlist(input, Some(vec!["rg".to_string()])));
             let mut output = String::new();
             let mut trace = Vec::new();
             while let Some(event) = stream.next().await {
@@ -1240,9 +1333,6 @@ impl CatBot {
                     _ => {}
                 }
             }
-            trace.push(SupervisorTraceEvent::Output {
-                content: output.clone(),
-            });
             Ok((output, trace))
         })
         .await
@@ -1250,6 +1340,19 @@ impl CatBot {
         let (output, trace) = output;
         let mut decision =
             supervisor_workflow::parse_decision(&output).map_err(AgentError::other)?;
+        let pretty = serde_json::to_string_pretty(&decision)
+            .map_err(|err| AgentError::other(format!("format supervisor JSON: {err}")))?;
+        let final_output = SupervisorTraceEvent::Output { content: pretty };
+        let _ = progress.send(final_output.clone());
+        let mut trace = trace;
+        trace.push(final_output);
+        if let Some(agent_message) = decision.agent_message.as_deref() {
+            let event = SupervisorTraceEvent::AgentMessage {
+                content: agent_message.to_string(),
+            };
+            let _ = progress.send(event.clone());
+            trace.push(event);
+        }
         decision.trace = trace;
         Ok(decision)
     }
@@ -2039,6 +2142,29 @@ fn trigger_command_metadata(thread_id: &str, opts: &StreamOptions) -> serde_json
     meta
 }
 
+fn cat_agent_tool_definitions(
+    agent: &CatAgent<InnerAgent>,
+) -> Vec<remi_agentloop::tool::ToolDefinition> {
+    use remi_agentloop::tool::registry::ToolRegistry;
+
+    let mut definitions = agent.local_tools.definitions(&serde_json::Value::Null);
+    if let Some(model_tools) = &agent.model_tools {
+        definitions.extend(model_tools.definitions(&serde_json::Value::Null));
+    }
+    definitions
+}
+
+fn cat_agent_contains_tool(agent: &CatAgent<InnerAgent>, name: &str) -> bool {
+    use remi_agentloop::tool::registry::ToolRegistry;
+
+    agent.local_tools.contains(name)
+        || agent
+            .model_tools
+            .as_ref()
+            .map(|tools| tools.contains(name))
+            .unwrap_or(false)
+}
+
 struct LocalToolDeps {
     skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
     memory: Arc<MemoryStore>,
@@ -2092,12 +2218,7 @@ impl LocalToolDeps {
         }
     }
 
-    fn build_tools(
-        &self,
-        profile: &ModelProfileConfig,
-        extra_options: serde_json::Map<String, serde_json::Value>,
-        include_acp: bool,
-    ) -> DefaultToolRegistry {
+    fn build_static_tools(&self, include_acp: bool) -> DefaultToolRegistry {
         let mut local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut local_tools, Arc::clone(&self.skill_store));
         todo::register_todo_tools(&mut local_tools, Arc::clone(&self.todo_backend));
@@ -2109,6 +2230,16 @@ impl LocalToolDeps {
                 Arc::clone(&self.approval_manager),
             );
         }
+        register_runtime_tools(&mut local_tools, self, &self.active_agent_id, true);
+        local_tools
+    }
+
+    fn build_model_tools(
+        &self,
+        profile: &ModelProfileConfig,
+        extra_options: serde_json::Map<String, serde_json::Value>,
+    ) -> DefaultToolRegistry {
+        let mut local_tools = DefaultToolRegistry::new();
         register_delegate_agent_tools(
             &mut local_tools,
             self,
@@ -2119,7 +2250,6 @@ impl LocalToolDeps {
             extra_options,
             self.overflow_bytes,
         );
-        register_runtime_tools(&mut local_tools, self, &self.active_agent_id, true);
         local_tools
     }
 }
@@ -2451,7 +2581,8 @@ impl CatBotBuilder {
         acp_backend.set_local_runner(Arc::new(LocalAcpAgentRunner {
             agent: CatAgent {
                 inner: acp_local_inner,
-                local_tools: acp_local_tools,
+                local_tools: Arc::new(acp_local_tools),
+                model_tools: None,
                 data_dir: memory.data_dir.clone(),
                 workspace_root: workspace_root.clone(),
                 workspace_root_label: sandbox.workspace_root_label(),
@@ -2487,7 +2618,8 @@ impl CatBotBuilder {
             hook_manager: Arc::clone(&hook_manager),
             overflow_bytes,
         };
-        let local_tools = tool_deps.build_tools(&profile, self.extra_options.clone(), true);
+        let local_tools = Arc::new(tool_deps.build_static_tools(true));
+        let model_tools = tool_deps.build_model_tools(&profile, self.extra_options.clone());
         let mut model_agents = HashMap::new();
         for model_profile in self.model_registry.list() {
             for variant in model_runtime_variants(model_profile)? {
@@ -2502,11 +2634,9 @@ impl CatBotBuilder {
                     self.max_turns,
                     variant.extra_options.clone(),
                 );
-                let model_tools = tool_deps.with_api_key(model_api_key).build_tools(
-                    &variant.profile,
-                    variant.extra_options,
-                    true,
-                );
+                let model_tools = tool_deps
+                    .with_api_key(model_api_key)
+                    .build_model_tools(&variant.profile, variant.extra_options);
                 let model_overflow_bytes = self
                     .overflow_bytes
                     .unwrap_or(variant.profile.overflow_bytes);
@@ -2514,7 +2644,8 @@ impl CatBotBuilder {
                     variant.key,
                     CatAgent {
                         inner: model_inner,
-                        local_tools: model_tools,
+                        local_tools: Arc::clone(&local_tools),
+                        model_tools: Some(model_tools),
                         data_dir: memory.data_dir.clone(),
                         workspace_root: workspace_root.clone(),
                         workspace_root_label: sandbox.workspace_root_label(),
@@ -2581,6 +2712,7 @@ impl CatBotBuilder {
                 hook_manager: Arc::clone(&hook_manager),
                 overflow_bytes,
             };
+            let agent_static_tools = Arc::new(agent_tool_deps.build_static_tools(true));
             let mut by_model = HashMap::new();
             for model_profile in self.model_registry.list() {
                 for variant in model_runtime_variants(model_profile)? {
@@ -2592,11 +2724,9 @@ impl CatBotBuilder {
                         agent_profile.max_turns,
                         variant.extra_options.clone(),
                     );
-                    let model_tools = agent_tool_deps.with_api_key(model_api_key).build_tools(
-                        &variant.profile,
-                        variant.extra_options,
-                        true,
-                    );
+                    let model_tools = agent_tool_deps
+                        .with_api_key(model_api_key)
+                        .build_model_tools(&variant.profile, variant.extra_options);
                     let agent_tool_allowlist = agent_tool_allowlist(agent_profile);
                     let model_overflow_bytes = self
                         .overflow_bytes
@@ -2605,7 +2735,8 @@ impl CatBotBuilder {
                         variant.key,
                         CatAgent {
                             inner: model_inner,
-                            local_tools: model_tools,
+                            local_tools: Arc::clone(&agent_static_tools),
+                            model_tools: Some(model_tools),
                             data_dir: memory.data_dir.clone(),
                             workspace_root: workspace_root.clone(),
                             workspace_root_label: sandbox.workspace_root_label(),
@@ -2627,6 +2758,7 @@ impl CatBotBuilder {
             inner: CatAgent {
                 inner: inner_loop,
                 local_tools,
+                model_tools: Some(model_tools),
                 data_dir: memory.data_dir.clone(),
                 workspace_root: workspace_root.clone(),
                 workspace_root_label: sandbox.workspace_root_label(),
@@ -2882,7 +3014,8 @@ impl Tool for RemiSubAgentTool {
         }
         let agent = CatAgent {
             inner: builder.build_loop(),
-            local_tools: build_subagent_tools(&self.deps, &self.profile),
+            local_tools: Arc::new(build_subagent_tools(&self.deps, &self.profile)),
+            model_tools: None,
             data_dir: self.data_dir.clone(),
             workspace_root: self.deps.workspace_root.clone(),
             workspace_root_label: self.deps.sandbox.workspace_root_label(),

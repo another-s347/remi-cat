@@ -639,6 +639,8 @@ fn workflow_status_report(instance: &bot_core::WorkflowInstance) -> bot_core::Wo
         from_node: instance.current_node.clone(),
         edge: instance.incoming_edge.clone(),
         to_node: instance.current_node.clone(),
+        path_edges: Vec::new(),
+        path_nodes: Vec::new(),
         status: instance.status.clone(),
         reason: match instance.status {
             bot_core::WorkflowStatus::Active => "workflow is active".to_string(),

@@ -119,6 +119,9 @@ pub(super) fn format_supervisor_progress(event: &bot_core::SupervisorTraceEvent)
         bot_core::SupervisorTraceEvent::Output { content } => {
             format!("\n**Output**\n{}\n", fenced_block("json", content))
         }
+        bot_core::SupervisorTraceEvent::AgentMessage { content } => {
+            format!("\n**Agent message**\n{}\n", fenced_block("text", content))
+        }
     }
 }
 
@@ -128,7 +131,8 @@ pub(super) fn supervisor_reply_kind(event: &bot_core::SupervisorTraceEvent) -> F
         bot_core::SupervisorTraceEvent::ToolCall { .. } => FeishuReplyKind::ToolCall,
         bot_core::SupervisorTraceEvent::ToolResult { .. } => FeishuReplyKind::ToolResult,
         bot_core::SupervisorTraceEvent::OutputDelta { .. }
-        | bot_core::SupervisorTraceEvent::Output { .. } => FeishuReplyKind::Supervisor,
+        | bot_core::SupervisorTraceEvent::Output { .. }
+        | bot_core::SupervisorTraceEvent::AgentMessage { .. } => FeishuReplyKind::Supervisor,
     }
 }
 

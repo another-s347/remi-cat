@@ -101,9 +101,7 @@ pub(crate) async fn run_tui(
     let mut app = TuiApp::new(runtime, cli, session_id.clone(), trigger_rx).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
-    eprintln!(
-        "\nYou can resume this session using `remi-cat --resume {session_id}`"
-    );
+    eprintln!("\nYou can resume this session using `remi-cat --resume {session_id}`");
     result
 }
 
@@ -4229,6 +4227,8 @@ mod tests {
             from_node: "review".to_string(),
             edge: Some("continue".to_string()),
             to_node: "work".to_string(),
+            path_edges: Vec::new(),
+            path_nodes: Vec::new(),
             status: bot_core::supervisor_workflow::WorkflowStatus::Active,
             reason: "Need another step".to_string(),
             agent_message: None,

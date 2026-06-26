@@ -698,7 +698,10 @@ pub async fn validate_model_profile_api_key(profile: &ModelProfileConfig) -> Res
         "{}/models",
         model_api_base_url(profile).trim_end_matches('/')
     );
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("building API key validation client")?
         .get(&endpoint)
         .bearer_auth(api_key)
         .send()

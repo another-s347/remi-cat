@@ -39,13 +39,18 @@ use crate::app::{
 use crate::cli::parse_secret_command;
 use crate::core::Runtime;
 use bot_core::{
-    model_profile_key_status, validate_model_profile_api_key, AccountBalance, AccountUsage,
-    AccountUsageStatus, CatBot, GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument,
-    SkillLoadDiagnostic, SkillLoadDiagnosticSeverity,
+    api_key_from_env, model_profile_key_status, AccountBalance, AccountUsage, AccountUsageStatus,
+    CatBot, GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument, SkillLoadDiagnostic,
+    SkillLoadDiagnosticSeverity,
 };
 
 pub(crate) enum RuntimeCommandResult {
     Reply(String),
+    StartWorkflow {
+        workflow_id: String,
+        context: serde_json::Value,
+        max_rounds: GoalMaxRounds,
+    },
     Continue {
         text: String,
         prefix: String,
@@ -55,6 +60,12 @@ pub(crate) enum RuntimeCommandResult {
 
 pub(crate) enum RuntimeCommandPipelineResult {
     Reply(String),
+    StartWorkflow {
+        prefix: String,
+        workflow_id: String,
+        context: serde_json::Value,
+        max_rounds: GoalMaxRounds,
+    },
     Continue {
         text: String,
         prefix: String,
@@ -75,6 +86,18 @@ pub(crate) async fn process_runtime_commands(
             Some(RuntimeCommandResult::Reply(reply)) => {
                 prefix.push_str(&reply);
                 return Ok(RuntimeCommandPipelineResult::Reply(prefix));
+            }
+            Some(RuntimeCommandResult::StartWorkflow {
+                workflow_id,
+                context,
+                max_rounds,
+            }) => {
+                return Ok(RuntimeCommandPipelineResult::StartWorkflow {
+                    prefix,
+                    workflow_id,
+                    context,
+                    max_rounds,
+                });
             }
             Some(RuntimeCommandResult::Continue {
                 text: next_text,
@@ -175,8 +198,9 @@ pub(crate) async fn handle_runtime_command(
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
     if command.starts_with("/workflow") {
-        let reply = handle_workflow_command(&runtime.bot, session_id, command).await?;
-        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+        return handle_workflow_command(&runtime.bot, session_id, command)
+            .await
+            .map(Some);
     }
     if command == "/model" || command.starts_with("/model ") {
         let reply = handle_model_command(runtime, session_id, command).await?;
@@ -229,8 +253,8 @@ pub(crate) async fn handle_runtime_command(
             &usage,
         ))));
     }
-    if let Some(reply) = handle_direct_workflow_command(&runtime.bot, session_id, command).await? {
-        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    if let Some(result) = handle_direct_workflow_command(&runtime.bot, command).await? {
+        return Ok(Some(result));
     }
     Ok(None)
 }
@@ -530,7 +554,7 @@ fn format_permissions_status(
     policy: bot_core::approval::ApprovalSessionPolicy,
 ) -> String {
     format!(
-        "**permissions**\n\nsession_id: `{session_id}`\nmode: `{}`\n{}\n\nmodes:\n- `ask`: low 自动通过；medium/high 请求审批\n- `auto` / `medium`: low/medium 自动通过；high 请求审批\n- `allow`: 本 session 所有 tool request 自动通过",
+        "**permissions**\n\nsession_id: `{session_id}`\nmode: `{}`\n{}\n\nmodes:\n- `ask`: low 自动通过；medium/high 请求审批\n- `auto` / `medium`: 仅 low 自动通过；medium/high 请求审批\n- `allow`: 本 session 所有 tool request 自动通过",
         policy.label(),
         policy.description()
     )
@@ -702,7 +726,7 @@ async fn switch_model_profile(
         anyhow::bail!("unknown model profile `{id}`. Use `/model list` to see available profiles.");
     };
     let profile_id = profile.id.clone();
-    validate_model_profile_api_key(profile).await?;
+    api_key_from_env(profile)?;
     let stored_reasoning_before_switch = runtime
         .sessions
         .lock()
@@ -1205,51 +1229,58 @@ async fn handle_workflow_command(
     bot: &CatBot,
     session_id: &str,
     command: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RuntimeCommandResult> {
     let rest = command
         .trim()
         .strip_prefix("/workflow")
         .unwrap_or("")
         .trim();
     if rest.is_empty() || rest == "status" {
-        return Ok(match bot.workflow_status(session_id).await {
-            Some(instance) => format_workflow_status(&instance),
-            None => "当前 session 没有 supervisor workflow。".to_string(),
-        });
+        return Ok(RuntimeCommandResult::Reply(
+            match bot.workflow_status(session_id).await {
+                Some(instance) => format_workflow_status(&instance),
+                None => "当前 session 没有 supervisor workflow。".to_string(),
+            },
+        ));
     }
     if rest == "pause" || rest == "stop" {
         bot.pause_workflow(session_id).await?;
-        return Ok("已暂停当前 session 的 supervisor workflow。".to_string());
+        return Ok(RuntimeCommandResult::Reply(
+            "已暂停当前 session 的 supervisor workflow。".to_string(),
+        ));
     }
     if rest == "clear" {
         bot.clear_workflow(session_id).await?;
-        return Ok("已清除当前 session 的 supervisor workflow。".to_string());
+        return Ok(RuntimeCommandResult::Reply(
+            "已清除当前 session 的 supervisor workflow。".to_string(),
+        ));
     }
     let set_args = rest
         .strip_prefix("set")
         .or_else(|| rest.strip_prefix("start"))
         .map(str::trim);
     let Some(set_args) = set_args else {
-        return Ok("用法：/workflow set <id> [--max-rounds N|unlimited] [--context {JSON}]，/workflow pause，/workflow clear，/workflow status".to_string());
+        return Ok(RuntimeCommandResult::Reply("用法：/workflow start <id> [--max-rounds N|unlimited] [--context {JSON}|plain goal text]，/workflow stop，/workflow clear，/workflow status".to_string()));
     };
     let mut split = set_args.splitn(2, char::is_whitespace);
     let workflow_id = split.next().unwrap_or("").trim();
     let options = split.next().unwrap_or("").trim();
     if workflow_id.is_empty() {
-        return Ok("用法：/workflow set <id> ...".to_string());
+        return Ok(RuntimeCommandResult::Reply(
+            "用法：/workflow start <id> ...".to_string(),
+        ));
     }
-    start_workflow_command(bot, session_id, workflow_id, options).await
+    start_workflow_command(bot, workflow_id, options).await
 }
 
 async fn handle_direct_workflow_command(
     bot: &CatBot,
-    session_id: &str,
     command: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<RuntimeCommandResult>> {
     let Some((workflow_id, options)) = resolve_direct_workflow_command(bot, command)? else {
         return Ok(None);
     };
-    start_workflow_command(bot, session_id, &workflow_id, options)
+    start_workflow_command(bot, &workflow_id, options)
         .await
         .map(Some)
 }
@@ -1299,10 +1330,27 @@ pub(crate) fn direct_workflow_options<'a>(rest: &'a str, name: &str) -> Option<&
 
 async fn start_workflow_command(
     bot: &CatBot,
-    session_id: &str,
     workflow_id: &str,
+    options: &str,
+) -> anyhow::Result<RuntimeCommandResult> {
+    let (context, max_rounds) = parse_workflow_start_options(options)?;
+    if !bot
+        .workflow_definitions()?
+        .iter()
+        .any(|workflow| workflow.id == workflow_id)
+    {
+        anyhow::bail!("workflow `{workflow_id}` not found");
+    }
+    Ok(RuntimeCommandResult::StartWorkflow {
+        workflow_id: workflow_id.to_string(),
+        context,
+        max_rounds,
+    })
+}
+
+pub(crate) fn parse_workflow_start_options(
     mut options: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(serde_json::Value, GoalMaxRounds)> {
     let mut max_rounds = GoalMaxRounds::default();
     let mut context = serde_json::json!({});
     while !options.is_empty() {
@@ -1319,15 +1367,14 @@ async fn start_workflow_command(
             options = "";
             continue;
         }
+        if !options.starts_with("--") {
+            context = serde_json::json!({ "goal": options.trim() });
+            options = "";
+            continue;
+        }
         anyhow::bail!("unknown workflow option: {options}");
     }
-    let instance = bot
-        .start_workflow_by_id(session_id, workflow_id, context, max_rounds)
-        .await?;
-    Ok(format!(
-        "已设置 supervisor workflow。\n\n{}",
-        format_workflow_status(&instance)
-    ))
+    Ok((context, max_rounds))
 }
 
 fn format_workflow_status(instance: &bot_core::WorkflowInstance) -> String {

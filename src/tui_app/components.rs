@@ -135,7 +135,11 @@ impl SupervisorUiState {
             lines.push(format!("reason: {reason}"));
         }
         for event in &self.events {
-            lines.push(format!("{}: {}", event.label, event.body));
+            if event.kind == "json" {
+                lines.push(format!("{}:\n{}", event.label, event.body));
+            } else {
+                lines.push(format!("{}: {}", event.label, event.body));
+            }
         }
         if lines.is_empty() {
             "reviewing workflow state".to_string()
@@ -1048,10 +1052,19 @@ pub(super) fn supervisor_event_display(event: &SupervisorTraceEvent) -> Supervis
             label: format!("{name} result"),
             body: truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS),
         },
-        SupervisorTraceEvent::OutputDelta { content }
-        | SupervisorTraceEvent::Output { content } => SupervisorEventDisplay {
+        SupervisorTraceEvent::OutputDelta { content } => SupervisorEventDisplay {
             kind: "output",
             label: "output".to_string(),
+            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
+        },
+        SupervisorTraceEvent::Output { content } => SupervisorEventDisplay {
+            kind: "json",
+            label: "final json".to_string(),
+            body: truncate_chars(content, MAX_TOOL_BODY_CHARS),
+        },
+        SupervisorTraceEvent::AgentMessage { content } => SupervisorEventDisplay {
+            kind: "agent_message",
+            label: "agent message".to_string(),
             body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
         },
     }
@@ -1336,7 +1349,7 @@ pub(super) fn approval_options() -> [ApprovalOption; 4] {
             decision: ToolApprovalDecision::AllowSession,
         },
         ApprovalOption {
-            label: "Yes, and let the model auto-approve medium-risk tools this session",
+            label: "Yes, and keep only low-risk tools auto-approved this session",
             key: "m",
             decision: ToolApprovalDecision::AllowSessionModelAuto,
         },
