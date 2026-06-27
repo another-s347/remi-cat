@@ -1469,18 +1469,28 @@ fn approval_request_from_codex_value(
         .unwrap_or_else(|| approval_id.clone());
     let tool_name = first_string(value, &["tool_name", "toolName", "name", "command"])
         .unwrap_or_else(|| "codex".to_string());
+    let arguments = value
+        .get("arguments")
+        .or_else(|| value.get("args"))
+        .or_else(|| value.get("input"));
     let args_summary = first_string(
         value,
         &["args_summary", "argsSummary", "summary", "command"],
     )
-    .or_else(|| {
-        value
-            .get("arguments")
-            .or_else(|| value.get("args"))
-            .or_else(|| value.get("input"))
-            .and_then(|args| serde_json::to_string(args).ok())
-    })
+    .or_else(|| arguments.and_then(|args| serde_json::to_string(args).ok()))
     .unwrap_or_else(|| tool_name.clone());
+    let risk = arguments
+        .map(|args| crate::approval::classify_tool_risk(&tool_name, args))
+        .or_else(|| approval_risk_from_value(value))
+        .unwrap_or(ToolRiskLevel::Medium);
+    let command_key = arguments
+        .map(|args| crate::approval::command_key(&tool_name, args))
+        .or_else(|| {
+            Some(crate::approval::command_key(
+                &tool_name,
+                &serde_json::json!({ "summary": args_summary }),
+            ))
+        });
     Some(ToolApprovalRequest {
         id: approval_id,
         session_id: first_string(value, &["session_id", "sessionId"])
@@ -1488,8 +1498,10 @@ fn approval_request_from_codex_value(
         run_id: first_string(value, &["run_id", "runId"]).unwrap_or_default(),
         tool_call_id,
         tool_name,
-        risk: approval_risk_from_value(value).unwrap_or(ToolRiskLevel::High),
+        risk,
         args_summary,
+        command_key,
+        model_review_reason: None,
         platform: first_string(value, &["platform"]),
         review: None,
     })
@@ -1533,10 +1545,17 @@ fn approval_decision_from_value(value: &Value) -> Option<ToolApprovalDecision> {
         "allow_once" | "allow-once" | "once" | "approved" | "approve" | "allow" => {
             Some(ToolApprovalDecision::AllowOnce)
         }
-        "allow_session" | "allow-session" | "session" => Some(ToolApprovalDecision::AllowSession),
-        "allow_session_model_auto" | "allow-session-model-auto" | "model_auto" | "auto" => {
-            Some(ToolApprovalDecision::AllowSessionModelAuto)
-        }
+        "allow_same_command_session"
+        | "allow-same-command-session"
+        | "allow_session"
+        | "allow-session"
+        | "session" => Some(ToolApprovalDecision::AllowSameCommandSession),
+        "allow_risk_level_session"
+        | "allow-risk-level-session"
+        | "allow_session_model_auto"
+        | "allow-session-model-auto"
+        | "model_auto"
+        | "auto" => Some(ToolApprovalDecision::AllowRiskLevelSession),
         _ => None,
     }
 }
@@ -1811,7 +1830,7 @@ mod tests {
         codex_stdout_line_events, invoke_local_codex_with_program, invoke_local_stub,
         AcpApprovalDecision, AcpBackend, AcpRemoteClient, AcpToolRequest, AcpToolTaskEvent,
     };
-    use crate::ToolApprovalDecision;
+    use crate::{ToolApprovalDecision, ToolRiskLevel};
     use anyhow::Result;
     use std::future::Future;
     use std::io::Write;
@@ -2124,7 +2143,33 @@ printf 'done\n' > "$out"
                     && request.session_id == "acp-session-1"
                     && request.tool_call_id == "call_1"
                     && request.tool_name == "bash"
+                    && request.risk == ToolRiskLevel::Medium
                     && request.args_summary.contains("rm file")
+        ));
+
+        let events = codex_stdout_line_events(
+            "acp-session-1",
+            r#"{"type":"approval.requested","approval_id":"approval_2","tool_call_id":"call_2","tool_name":"bash","risk":"high","arguments":{"cmd":"grep needle file.txt"}}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [AcpToolTaskEvent::ApprovalRequested(request)]
+                if request.id == "approval_2"
+                    && request.tool_name == "bash"
+                    && request.risk == ToolRiskLevel::Low
+                    && request.args_summary.contains("grep needle file.txt")
+        ));
+
+        let events = codex_stdout_line_events(
+            "acp-session-1",
+            r#"{"type":"approval.requested","approval_id":"approval_3","tool_call_id":"call_3","tool_name":"bash"}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [AcpToolTaskEvent::ApprovalRequested(request)]
+                if request.id == "approval_3"
+                    && request.tool_name == "bash"
+                    && request.risk == ToolRiskLevel::Medium
         ));
     }
 

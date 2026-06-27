@@ -61,6 +61,7 @@ pub(super) struct SupervisorEventDisplay {
 }
 
 impl SupervisorUiState {
+    #[cfg(test)]
     pub(super) fn push_event(&mut self, event: SupervisorEventDisplay) {
         if matches!(event.kind, "output") {
             if let Some(existing) = self
@@ -96,11 +97,6 @@ impl SupervisorUiState {
                 MAX_TOOL_BODY_CHARS,
             ));
         }
-    }
-
-    pub(super) fn running_title(&self) -> String {
-        let workflow = self.workflow_name.as_deref().unwrap_or("Supervisor");
-        format!("supervisor · {workflow} · reviewing")
     }
 
     pub(super) fn resolved_title(&self) -> String {
@@ -408,6 +404,7 @@ pub(super) enum CellKind {
     Tool { id: String },
     PatchDiff { id: String },
     Supervisor { id: String },
+    SupervisorStream { id: String },
     SubSession { id: String },
     TodoState,
     Approval { id: String },
@@ -533,6 +530,21 @@ impl HistoryCell {
         }
     }
 
+    pub(super) fn supervisor_stream(
+        id: String,
+        title: String,
+        body: String,
+        status: ToolVisualStatus,
+    ) -> Self {
+        Self {
+            kind: CellKind::SupervisorStream { id },
+            title,
+            body,
+            meta: String::new(),
+            status,
+        }
+    }
+
     pub(super) fn sub_session(
         id: String,
         title: String,
@@ -609,6 +621,11 @@ impl HistoryCell {
                 Style::default().fg(CODEX_DIM),
             ),
             CellKind::Supervisor { .. } => (
+                "⌁",
+                self.status.style().add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            ),
+            CellKind::SupervisorStream { .. } => (
                 "⌁",
                 self.status.style().add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::White),
@@ -1035,41 +1052,6 @@ pub(super) fn keyed_stream_event(event: &str) -> Option<String> {
     None
 }
 
-pub(super) fn supervisor_event_display(event: &SupervisorTraceEvent) -> SupervisorEventDisplay {
-    match event {
-        SupervisorTraceEvent::Thinking { content } => SupervisorEventDisplay {
-            kind: "thinking",
-            label: "thinking".to_string(),
-            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
-        },
-        SupervisorTraceEvent::ToolCall { name, args } => SupervisorEventDisplay {
-            kind: "tool_call",
-            label: format!("calling {name}"),
-            body: truncate_chars(&format_json_summary(args), MAX_TOOL_BODY_CHARS),
-        },
-        SupervisorTraceEvent::ToolResult { name, result } => SupervisorEventDisplay {
-            kind: "tool_result",
-            label: format!("{name} result"),
-            body: truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS),
-        },
-        SupervisorTraceEvent::OutputDelta { content } => SupervisorEventDisplay {
-            kind: "output",
-            label: "output".to_string(),
-            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
-        },
-        SupervisorTraceEvent::Output { content } => SupervisorEventDisplay {
-            kind: "json",
-            label: "final json".to_string(),
-            body: truncate_chars(content, MAX_TOOL_BODY_CHARS),
-        },
-        SupervisorTraceEvent::AgentMessage { content } => SupervisorEventDisplay {
-            kind: "agent_message",
-            label: "agent message".to_string(),
-            body: truncate_chars(&single_line(content), MAX_TOOL_BODY_CHARS),
-        },
-    }
-}
-
 #[cfg(test)]
 pub(super) fn format_sub_session_title(event: &SubSessionEvent) -> String {
     let prefix = format_sub_session_prefix(event);
@@ -1267,10 +1249,6 @@ pub(super) fn format_sub_session_event(event: &SubSessionEvent) -> Option<String
     }
 }
 
-pub(super) fn format_json_summary(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
 pub(super) fn format_elapsed(ms: u64) -> String {
     if ms < 1_000 {
         format!("{ms}ms")
@@ -1344,14 +1322,14 @@ pub(super) fn approval_options() -> [ApprovalOption; 4] {
             decision: ToolApprovalDecision::AllowOnce,
         },
         ApprovalOption {
-            label: "Yes, and don't ask again in this session",
+            label: "Always allow same command in this session",
             key: "s/p",
-            decision: ToolApprovalDecision::AllowSession,
+            decision: ToolApprovalDecision::AllowSameCommandSession,
         },
         ApprovalOption {
-            label: "Yes, and keep only low-risk tools auto-approved this session",
+            label: "Always allow this risk level in this session (low/medium)",
             key: "m",
-            decision: ToolApprovalDecision::AllowSessionModelAuto,
+            decision: ToolApprovalDecision::AllowRiskLevelSession,
         },
         ApprovalOption {
             label: "No, and tell Remi what to do differently",

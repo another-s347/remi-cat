@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,6 +11,26 @@ pub enum ToolRiskLevel {
     Low,
     Medium,
     High,
+}
+
+impl ToolRiskLevel {
+    pub fn allows(self, risk: ToolRiskLevel) -> bool {
+        self.rank() >= risk.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRiskAssessment {
+    Known(ToolRiskLevel),
+    NeedsModelReview { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +50,10 @@ pub struct ToolApprovalRequest {
     pub risk: ToolRiskLevel,
     pub args_summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_review_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ToolRiskReview>,
@@ -39,8 +64,10 @@ pub struct ToolApprovalRequest {
 pub enum ToolApprovalDecision {
     Deny,
     AllowOnce,
-    AllowSession,
-    AllowSessionModelAuto,
+    #[serde(alias = "allow_session")]
+    AllowSameCommandSession,
+    #[serde(alias = "allow_session_model_auto")]
+    AllowRiskLevelSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,34 +82,30 @@ pub enum ApprovalWait {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionGrant {
-    AllowAll,
-    ModelAuto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalSessionPolicy {
-    Ask,
-    AllowAll,
-    ModelAuto,
+    Low,
+    Medium,
 }
 
 impl ApprovalSessionPolicy {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Ask => "ask",
-            Self::AllowAll => "allow",
-            Self::ModelAuto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Ask => "low risk auto-runs; medium/high ask for approval",
-            Self::AllowAll => "all tool requests auto-run in this session",
-            Self::ModelAuto => {
-                "only low risk auto-runs after risk review; medium/high ask for approval"
-            }
+            Self::Low => "low risk tool requests auto-run; medium/high ask for approval",
+            Self::Medium => "low and medium risk tool requests auto-run; high asks for approval",
+        }
+    }
+
+    fn max_risk(self) -> ToolRiskLevel {
+        match self {
+            Self::Low => ToolRiskLevel::Low,
+            Self::Medium => ToolRiskLevel::Medium,
         }
     }
 }
@@ -96,7 +119,8 @@ struct PendingApproval {
 #[derive(Debug, Default)]
 struct ApprovalState {
     pending: HashMap<String, PendingApproval>,
-    grants: HashMap<String, SessionGrant>,
+    policies: HashMap<String, ApprovalSessionPolicy>,
+    allowed_command_keys: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -134,11 +158,11 @@ impl ToolApprovalManager {
         let session_id = session_id.into();
         let mut state = self.state.lock().await;
         state
-            .grants
-            .insert(session_id.clone(), SessionGrant::AllowAll);
+            .policies
+            .insert(session_id.clone(), ApprovalSessionPolicy::Medium);
         tracing::info!(
             session_id = %session_id,
-            grant = "allow_all",
+            grant = "medium",
             "tool_approval.session_grant"
         );
     }
@@ -150,21 +174,7 @@ impl ToolApprovalManager {
     ) {
         let session_id = session_id.into();
         let mut state = self.state.lock().await;
-        match policy {
-            ApprovalSessionPolicy::Ask => {
-                state.grants.remove(&session_id);
-            }
-            ApprovalSessionPolicy::AllowAll => {
-                state
-                    .grants
-                    .insert(session_id.clone(), SessionGrant::AllowAll);
-            }
-            ApprovalSessionPolicy::ModelAuto => {
-                state
-                    .grants
-                    .insert(session_id.clone(), SessionGrant::ModelAuto);
-            }
-        }
+        state.policies.insert(session_id.clone(), policy);
         tracing::info!(
             session_id = %session_id,
             policy = policy.label(),
@@ -174,11 +184,11 @@ impl ToolApprovalManager {
 
     pub async fn session_policy(&self, session_id: &str) -> ApprovalSessionPolicy {
         let state = self.state.lock().await;
-        match state.grants.get(session_id) {
-            Some(SessionGrant::AllowAll) => ApprovalSessionPolicy::AllowAll,
-            Some(SessionGrant::ModelAuto) => ApprovalSessionPolicy::ModelAuto,
-            None => ApprovalSessionPolicy::Ask,
-        }
+        state
+            .policies
+            .get(session_id)
+            .copied()
+            .unwrap_or(ApprovalSessionPolicy::Low)
     }
 
     pub async fn request(
@@ -186,11 +196,21 @@ impl ToolApprovalManager {
         request: ToolApprovalRequest,
     ) -> (ApprovalResolution, Vec<ApprovalEvent>) {
         let (wait, mut events) = self.start_request(request.clone()).await;
+        let current_request = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ApprovalEvent::Requested(request) | ApprovalEvent::Updated(request) => {
+                    Some(request.clone())
+                }
+                ApprovalEvent::Resolved { request, .. } => Some(request.clone()),
+            })
+            .unwrap_or(request);
         match wait {
             ApprovalWait::Immediate(resolution) => (resolution, events),
             ApprovalWait::Pending(rx) => {
                 let decision = rx.await.unwrap_or(ToolApprovalDecision::Deny);
-                let (resolution, event) = self.finish_request(&request, decision).await;
+                let (resolution, event) = self.finish_request(&current_request, decision).await;
                 events.push(event);
                 (resolution, events)
             }
@@ -202,27 +222,13 @@ impl ToolApprovalManager {
         mut request: ToolApprovalRequest,
     ) -> (ApprovalWait, Vec<ApprovalEvent>) {
         let mut events = Vec::new();
-        if request.risk == ToolRiskLevel::Low {
+        if self.session_command_auto_approves(&request).await {
             tracing::info!(
                 approval_id = %request.id,
                 session_id = %request.session_id,
                 tool_name = %request.tool_name,
                 risk = ?request.risk,
-                reason = "low_risk",
-                "tool_approval.immediate"
-            );
-            return (
-                ApprovalWait::Immediate(ApprovalResolution::Approved),
-                events,
-            );
-        }
-        if self.session_allow_all(&request.session_id).await {
-            tracing::info!(
-                approval_id = %request.id,
-                session_id = %request.session_id,
-                tool_name = %request.tool_name,
-                risk = ?request.risk,
-                reason = "session_allow_all",
+                reason = "command_key",
                 "tool_approval.immediate"
             );
             return (
@@ -231,8 +237,26 @@ impl ToolApprovalManager {
             );
         }
 
-        let review = review_tool_risk(&request.tool_name, &request.args_summary, request.risk);
+        let review = request.review.clone().unwrap_or_else(|| {
+            review_tool_risk(&request.tool_name, &request.args_summary, request.risk)
+        });
+        request.risk = review.risk;
         request.review = Some(review.clone());
+        if self.session_policy_auto_approves(&request).await {
+            tracing::info!(
+                approval_id = %request.id,
+                session_id = %request.session_id,
+                tool_name = %request.tool_name,
+                risk = ?request.risk,
+                reason = "session_policy",
+                "tool_approval.immediate"
+            );
+            return (
+                ApprovalWait::Immediate(ApprovalResolution::Approved),
+                events,
+            );
+        }
+
         events.push(ApprovalEvent::Requested(request.clone()));
         events.push(ApprovalEvent::Updated(request.clone()));
 
@@ -276,8 +300,8 @@ impl ToolApprovalManager {
         let resolution = match decision {
             ToolApprovalDecision::Deny => ApprovalResolution::Denied,
             ToolApprovalDecision::AllowOnce
-            | ToolApprovalDecision::AllowSession
-            | ToolApprovalDecision::AllowSessionModelAuto => ApprovalResolution::Approved,
+            | ToolApprovalDecision::AllowSameCommandSession
+            | ToolApprovalDecision::AllowRiskLevelSession => ApprovalResolution::Approved,
         };
         tracing::info!(
             approval_id = %request.id,
@@ -290,12 +314,24 @@ impl ToolApprovalManager {
         (resolution, event)
     }
 
-    async fn session_allow_all(&self, session_id: &str) -> bool {
+    async fn session_command_auto_approves(&self, request: &ToolApprovalRequest) -> bool {
         let state = self.state.lock().await;
-        state
-            .grants
-            .get(session_id)
-            .is_some_and(|grant| *grant == SessionGrant::AllowAll)
+        request.command_key.as_deref().is_some_and(|key| {
+            state
+                .allowed_command_keys
+                .get(&request.session_id)
+                .is_some_and(|keys| keys.contains(key))
+        })
+    }
+
+    async fn session_policy_auto_approves(&self, request: &ToolApprovalRequest) -> bool {
+        let state = self.state.lock().await;
+        let policy = state
+            .policies
+            .get(&request.session_id)
+            .copied()
+            .unwrap_or(ApprovalSessionPolicy::Low);
+        policy.max_risk().allows(request.risk)
     }
 
     async fn apply_decision(&self, request: &ToolApprovalRequest, decision: ToolApprovalDecision) {
@@ -303,15 +339,26 @@ impl ToolApprovalManager {
         match decision {
             ToolApprovalDecision::Deny => {}
             ToolApprovalDecision::AllowOnce => {}
-            ToolApprovalDecision::AllowSession => {
-                state
-                    .grants
-                    .insert(request.session_id.clone(), SessionGrant::AllowAll);
+            ToolApprovalDecision::AllowSameCommandSession => {
+                if let Some(command_key) = request.command_key.clone() {
+                    state
+                        .allowed_command_keys
+                        .entry(request.session_id.clone())
+                        .or_default()
+                        .insert(command_key);
+                }
             }
-            ToolApprovalDecision::AllowSessionModelAuto => {
-                state
-                    .grants
-                    .insert(request.session_id.clone(), SessionGrant::ModelAuto);
+            ToolApprovalDecision::AllowRiskLevelSession => {
+                if request.risk != ToolRiskLevel::High {
+                    state.policies.insert(
+                        request.session_id.clone(),
+                        match request.risk {
+                            ToolRiskLevel::Low => ApprovalSessionPolicy::Low,
+                            ToolRiskLevel::Medium => ApprovalSessionPolicy::Medium,
+                            ToolRiskLevel::High => ApprovalSessionPolicy::Medium,
+                        },
+                    );
+                }
             }
         }
     }
@@ -328,39 +375,99 @@ pub enum ApprovalEvent {
 }
 
 pub fn classify_tool_risk(tool_name: &str, args: &serde_json::Value) -> ToolRiskLevel {
+    match classify_tool_risk_assessment(tool_name, args) {
+        ToolRiskAssessment::Known(risk) => risk,
+        ToolRiskAssessment::NeedsModelReview { .. } => ToolRiskLevel::Medium,
+    }
+}
+
+pub fn classify_tool_risk_assessment(
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> ToolRiskAssessment {
+    let risk = match classify_known_tool_risk(tool_name, args) {
+        Some(risk) => risk,
+        None => {
+            return ToolRiskAssessment::NeedsModelReview {
+                reason: format!("No hard-coded approval rule matched `{tool_name}`."),
+            };
+        }
+    };
+    ToolRiskAssessment::Known(risk)
+}
+
+fn classify_known_tool_risk(tool_name: &str, args: &serde_json::Value) -> Option<ToolRiskLevel> {
     match tool_name {
         "fs_read" | "fs_ls" | "rg" | "search" | "skill__get" | "skill__search"
         | "memory__get_detail" | "memory__recall" | "todo__list" | "trigger__list"
         | "web_search" | "now" | "instant" | "lazy_wait" | "sleep" | "ask_user_question" => {
-            ToolRiskLevel::Low
+            Some(ToolRiskLevel::Low)
         }
-        "fetch" => classify_fetch_risk(args),
-        "workspace_bash" | "bash" => classify_bash_risk(args),
-        "ssh" => classify_ssh_risk(args),
-        "fs_remove" => classify_fs_remove_risk(args),
-        "fs_write" | "fs_create" | "fs_mkdir" | "apply_patch" => ToolRiskLevel::Medium,
-        "manage_yourself" => classify_manage_yourself_risk(args),
+        "fetch" => Some(classify_fetch_risk(args)),
+        "workspace_bash" | "bash" => Some(classify_bash_risk(args)),
+        "ssh" => Some(classify_ssh_risk(args)),
+        "fs_remove" => Some(classify_fs_remove_risk(args)),
+        "fs_write" | "fs_create" | "fs_mkdir" | "apply_patch" => Some(ToolRiskLevel::Medium),
+        "manage_yourself" => Some(classify_manage_yourself_risk(args)),
         name if name.starts_with("im__") || name.contains("send") || name.contains("upload") => {
-            ToolRiskLevel::Medium
+            Some(ToolRiskLevel::Medium)
         }
-        "codex" => ToolRiskLevel::Medium,
-        name if name.starts_with("acp__") => ToolRiskLevel::Medium,
-        name if name.starts_with("agent__") || name.starts_with("trigger__") => {
-            ToolRiskLevel::Medium
-        }
+        name if name.starts_with("agent__") => Some(ToolRiskLevel::Low),
+        "codex" => Some(ToolRiskLevel::Medium),
+        name if name.starts_with("acp__") => Some(ToolRiskLevel::Medium),
+        name if name.starts_with("trigger__") => Some(ToolRiskLevel::Medium),
         name if name.starts_with("memory__")
             || name.starts_with("todo__")
             || name.starts_with("skill__") =>
         {
-            ToolRiskLevel::Medium
+            Some(ToolRiskLevel::Medium)
         }
-        _ => ToolRiskLevel::Medium,
+        _ => None,
+    }
+}
+
+pub fn command_key(tool_name: &str, args: &serde_json::Value) -> String {
+    let canonical_args = canonical_json(args);
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(canonical_args.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let body = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into()),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        serde_json::Value::Array(values) => {
+            let body = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{body}]")
+        }
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
     }
 }
 
 fn classify_bash_risk(args: &serde_json::Value) -> ToolRiskLevel {
-    let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
-        return ToolRiskLevel::High;
+    let Some(command) = shell_command_arg(args) else {
+        return ToolRiskLevel::Medium;
     };
     if is_readonly_shell_command(command) {
         return ToolRiskLevel::Low;
@@ -369,6 +476,12 @@ fn classify_bash_risk(args: &serde_json::Value) -> ToolRiskLevel {
         return ToolRiskLevel::High;
     }
     ToolRiskLevel::Medium
+}
+
+fn shell_command_arg(args: &serde_json::Value) -> Option<&str> {
+    args.get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(|value| value.as_str())
 }
 
 fn classify_ssh_risk(args: &serde_json::Value) -> ToolRiskLevel {
@@ -387,7 +500,7 @@ fn classify_ssh_risk(args: &serde_json::Value) -> ToolRiskLevel {
         return match action {
             "poll" => ToolRiskLevel::Low,
             "cancel" => ToolRiskLevel::Medium,
-            _ => ToolRiskLevel::High,
+            _ => ToolRiskLevel::Medium,
         };
     }
     classify_bash_risk(args)
@@ -411,30 +524,127 @@ fn is_readonly_shell_command(command: &str) -> bool {
         return false;
     }
     let mut segments = split_readonly_shell_segments(command)
+        .into_iter()
         .filter(|segment| !segment.trim().is_empty())
         .peekable();
     segments.peek().is_some() && segments.all(|segment| is_readonly_command_segment(segment.trim()))
 }
 
 fn command_has_non_readonly_shell_syntax(command: &str) -> bool {
-    let mut chars = command.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut quote = ShellQuote::None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
         match ch {
-            '<' | '>' | '`' => return true,
-            '&' => return true,
-            '$' if chars.peek().is_some_and(|next| *next == '(') => return true,
+            '\\' if quote != ShellQuote::Single => {
+                let _ = chars.next();
+                continue;
+            }
+            '\'' if quote == ShellQuote::None => {
+                quote = ShellQuote::Single;
+                continue;
+            }
+            '\'' if quote == ShellQuote::Single => {
+                quote = ShellQuote::None;
+                continue;
+            }
+            '"' if quote == ShellQuote::None => {
+                quote = ShellQuote::Double;
+                continue;
+            }
+            '"' if quote == ShellQuote::Double => {
+                quote = ShellQuote::None;
+                continue;
+            }
+            _ => {}
+        }
+
+        match ch {
+            '<' | '>' if quote == ShellQuote::None => return true,
+            '`' if quote != ShellQuote::Single => return true,
+            '&' if quote == ShellQuote::None => {
+                if chars.peek().is_some_and(|(_, next)| *next == '&') {
+                    let _ = chars.next();
+                } else {
+                    return true;
+                }
+            }
+            '$' if quote != ShellQuote::Single
+                && chars.peek().is_some_and(|(_, next)| *next == '(') =>
+            {
+                return true;
+            }
             _ => {}
         }
     }
     false
 }
 
-fn split_readonly_shell_segments(command: &str) -> impl Iterator<Item = &str> {
-    command.split(|ch| matches!(ch, '|' | ';'))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellQuote {
+    None,
+    Single,
+    Double,
+}
+
+fn split_readonly_shell_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = ShellQuote::None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' if quote != ShellQuote::Single => {
+                let _ = chars.next();
+                continue;
+            }
+            '\'' if quote == ShellQuote::None => {
+                quote = ShellQuote::Single;
+                continue;
+            }
+            '\'' if quote == ShellQuote::Single => {
+                quote = ShellQuote::None;
+                continue;
+            }
+            '"' if quote == ShellQuote::None => {
+                quote = ShellQuote::Double;
+                continue;
+            }
+            '"' if quote == ShellQuote::Double => {
+                quote = ShellQuote::None;
+                continue;
+            }
+            _ => {}
+        }
+        if quote != ShellQuote::None {
+            continue;
+        }
+
+        let split_len = match ch {
+            '|' => {
+                if chars.peek().is_some_and(|(_, next)| *next == '|') {
+                    let _ = chars.next();
+                    2
+                } else {
+                    1
+                }
+            }
+            '&' if chars.peek().is_some_and(|(_, next)| *next == '&') => {
+                let _ = chars.next();
+                2
+            }
+            ';' => 1,
+            _ => continue,
+        };
+        segments.push(&command[start..index]);
+        start = index + split_len;
+    }
+    segments.push(&command[start..]);
+    segments
 }
 
 fn is_destructive_shell_command(command: &str) -> bool {
     split_readonly_shell_segments(command)
+        .into_iter()
         .filter(|segment| !segment.trim().is_empty())
         .any(|segment| {
             let Some(words) = shlex::split(segment.trim()) else {
@@ -453,7 +663,18 @@ fn is_readonly_command_segment(segment: &str) -> bool {
     };
     match program {
         "pwd" | "ls" | "cat" | "head" | "tail" | "wc" | "nl" | "sort" | "uniq" | "cut" | "tr"
-        | "file" | "stat" | "du" | "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" => true,
+        | "file" | "stat" | "du" | "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" | "find"
+        | "sed" | "git" | "cd" | "date" | "env" | "printenv" | "which" | "whereis" | "type"
+        | "command" | "ps" | "df" | "free" | "uname" | "id" | "whoami" | "hostname"
+        | "realpath" | "readlink" | "basename" | "dirname" | "jq" | "tree" => {
+            is_readonly_program_invocation(program, &words)
+        }
+        _ => false,
+    }
+}
+
+fn is_readonly_program_invocation(program: &str, words: &[String]) -> bool {
+    match program {
         "find" => !words.iter().any(|word| {
             matches!(
                 word.as_str(),
@@ -476,9 +697,22 @@ fn is_readonly_command_segment(segment: &str) -> bool {
                     | "branch"
                     | "rev-parse"
                     | "describe"
+                    | "blame"
+                    | "shortlog"
+            ) || words.get(1..=2).is_some_and(
+                |parts| matches!(parts, [sub, action] if sub == "worktree" && action == "list"),
+            ) || words.get(1..=2).is_some_and(
+                |parts| matches!(parts, [sub, action] if sub == "stash" && action == "list"),
+            ) || words.get(1..=2).is_some_and(
+                |parts| matches!(parts, [sub, flag] if sub == "remote" && flag == "-v"),
             )
         }),
-        _ => false,
+        "cd" => words.len() <= 2,
+        "command" => words
+            .get(1)
+            .is_some_and(|arg| matches!(arg.as_str(), "-v" | "-V")),
+        "type" => !words.iter().skip(1).any(|word| word == "-p"),
+        _ => true,
     }
 }
 
@@ -505,10 +739,10 @@ fn classify_fs_remove_risk(args: &serde_json::Value) -> ToolRiskLevel {
 
 fn classify_manage_yourself_risk(args: &serde_json::Value) -> ToolRiskLevel {
     let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
-        return ToolRiskLevel::High;
+        return ToolRiskLevel::Medium;
     };
     let Some(words) = shlex::split(command) else {
-        return ToolRiskLevel::High;
+        return ToolRiskLevel::Medium;
     };
     match words.as_slice() {
         [top] if top == "tools" => ToolRiskLevel::Low,
@@ -758,6 +992,95 @@ pub fn parse_review_json(value: &str) -> ToolRiskReview {
         })
 }
 
+#[derive(Clone)]
+pub struct ModelApprovalReviewer {
+    client: reqwest::Client,
+    profile: crate::model_profile::ModelProfileConfig,
+    api_key: String,
+}
+
+impl ModelApprovalReviewer {
+    pub fn new(profile: crate::model_profile::ModelProfileConfig, api_key: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            profile,
+            api_key,
+        }
+    }
+
+    pub async fn review(&self, request: &ToolApprovalRequest) -> ToolRiskReview {
+        let endpoint = format!(
+            "{}/chat/completions",
+            approval_model_base_url(&self.profile)
+        );
+        let prompt = approval_review_prompt(request);
+        let body = serde_json::json!({
+            "model": self.profile.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You review tool calls for a coding agent. Return only compact JSON with keys risk, reason, concerns. risk must be low, medium, or high."
+                },
+                { "role": "user", "content": prompt }
+            ],
+            "temperature": 0,
+            "max_tokens": 300
+        });
+        let result = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .and_then(|response| response.error_for_status());
+        let Ok(response) = result else {
+            return ToolRiskReview {
+                risk: ToolRiskLevel::High,
+                reason: "Approval model request failed.".to_string(),
+                concerns: vec!["Requires explicit human confirmation.".to_string()],
+            };
+        };
+        let Ok(value) = response.json::<serde_json::Value>().await else {
+            return ToolRiskReview {
+                risk: ToolRiskLevel::High,
+                reason: "Approval model response could not be parsed.".to_string(),
+                concerns: vec!["Requires explicit human confirmation.".to_string()],
+            };
+        };
+        let content = value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .unwrap_or_default();
+        parse_review_json(content)
+    }
+}
+
+fn approval_model_base_url(profile: &crate::model_profile::ModelProfileConfig) -> String {
+    profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn approval_review_prompt(request: &ToolApprovalRequest) -> String {
+    format!(
+        "Classify this tool call risk.\n\nTool: {}\nPlatform: {}\nHard-coded rule result: {}\nArguments:\n{}\n\nReturn JSON like {{\"risk\":\"medium\",\"reason\":\"...\",\"concerns\":[\"...\"]}}.",
+        request.tool_name,
+        request.platform.as_deref().unwrap_or("unknown"),
+        request
+            .model_review_reason
+            .as_deref()
+            .unwrap_or("No hard-coded rule matched."),
+        request.args_summary
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +1129,14 @@ mod tests {
             ),
             ToolRiskLevel::Low
         );
+        assert_eq!(
+            classify_tool_risk("agent__explorer", &serde_json::json!({ "task": "inspect" })),
+            ToolRiskLevel::Low
+        );
+        assert_eq!(
+            classify_tool_risk("agent__coder", &serde_json::json!({ "task": "edit" })),
+            ToolRiskLevel::Low
+        );
 
         for (tool, args) in [
             ("apply_patch", serde_json::json!({ "patch": "..." })),
@@ -825,8 +1156,6 @@ mod tests {
             ("todo__remove", serde_json::json!({ "id": "1" })),
             ("trigger__upsert", serde_json::json!({ "id": "x" })),
             ("trigger__delete", serde_json::json!({ "id": "x" })),
-            ("agent__explorer", serde_json::json!({ "task": "inspect" })),
-            ("agent__coder", serde_json::json!({ "task": "edit" })),
             ("codex", serde_json::json!({ "message": "work" })),
             ("im__send_text", serde_json::json!({ "text": "hello" })),
         ] {
@@ -889,6 +1218,13 @@ mod tests {
                 "{command}"
             );
         }
+        assert_eq!(
+            classify_tool_risk(
+                "bash",
+                &serde_json::json!({ "cmd": "grep needle file.txt" })
+            ),
+            ToolRiskLevel::Low
+        );
 
         for command in [
             "profile create dev",
@@ -924,6 +1260,17 @@ mod tests {
             "rg needle",
             "ripgrep needle",
             "rg needle | head",
+            r#"grep -n "tracing::info\|tracing::warn\|log::info\|println!" src/app.rs | head -20"#,
+            "cd /workspace",
+            "cd /workspace && pwd",
+            "ls && pwd",
+            "git worktree list",
+            "git remote -v",
+            "date",
+            "whoami",
+            "ps -ef",
+            "df -h",
+            "jq . package.json",
             "grep needle file.txt | wc -l",
             "git status --short",
             "git diff -- src/main.rs",
@@ -951,7 +1298,6 @@ mod tests {
         }
 
         for command in [
-            "ls && pwd",
             "rm file.txt",
             "sed -i s/a/b/ .env",
             "grep $(whoami) file.txt",
@@ -1020,6 +1366,11 @@ mod tests {
             args_summary:
                 r#"{"command":"rg classify_tool_risk crates/bot-core/src/approval.rs | head"}"#
                     .to_string(),
+            command_key: Some(command_key(
+                "bash",
+                &serde_json::json!({ "command": "rg classify_tool_risk crates/bot-core/src/approval.rs | head" }),
+            )),
+            model_review_reason: None,
             platform: Some("test".to_string()),
             review: None,
         };
@@ -1042,6 +1393,11 @@ mod tests {
                 &serde_json::json!({ "command": "cargo test -p bot-core" }),
             ),
             args_summary: r#"{"command":"cargo test -p bot-core"}"#.to_string(),
+            command_key: Some(command_key(
+                "bash",
+                &serde_json::json!({ "command": "cargo test -p bot-core" }),
+            )),
+            model_review_reason: None,
             platform: Some("test".to_string()),
             review: None,
         };
@@ -1064,6 +1420,18 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_requests_model_review() {
+        assert!(matches!(
+            classify_tool_risk_assessment("custom__danger_or_safe", &serde_json::json!({})),
+            ToolRiskAssessment::NeedsModelReview { .. }
+        ));
+        assert_eq!(
+            classify_tool_risk("custom__danger_or_safe", &serde_json::json!({})),
+            ToolRiskLevel::Medium
+        );
+    }
+
+    #[test]
     fn summarize_tool_args_truncates_multibyte_text_without_panicking() {
         let summary = summarize_tool_args(&serde_json::json!({
             "comment": "审批通过".repeat(600),
@@ -1075,7 +1443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_model_auto_does_not_auto_approve_medium() {
+    async fn same_command_session_grant_only_approves_matching_command() {
         let manager = ToolApprovalManager::new();
         let first = ToolApprovalRequest {
             id: "a1".into(),
@@ -1085,12 +1453,14 @@ mod tests {
             tool_name: "fetch".into(),
             risk: ToolRiskLevel::Medium,
             args_summary: "{}".into(),
+            command_key: Some("fetch:{}:one".into()),
+            model_review_reason: None,
             platform: None,
             review: None,
         };
         let (wait, _) = manager.start_request(first.clone()).await;
         let _ = manager
-            .decide("a1", ToolApprovalDecision::AllowSessionModelAuto)
+            .decide("a1", ToolApprovalDecision::AllowSameCommandSession)
             .await;
         let decision = match wait {
             ApprovalWait::Pending(rx) => rx.await.expect("decision should be delivered"),
@@ -1106,30 +1476,85 @@ mod tests {
                 ..first.clone()
             })
             .await;
-        assert!(matches!(wait, ApprovalWait::Pending(_)));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                ApprovalEvent::Updated(request)
-                    if request.review.as_ref().is_some_and(|review| review.risk == ToolRiskLevel::Medium)
-            )
-        }));
+        assert!(matches!(
+            wait,
+            ApprovalWait::Immediate(ApprovalResolution::Approved)
+        ));
+        assert!(events.is_empty());
 
-        let high = ToolApprovalRequest {
+        let different = ToolApprovalRequest {
             id: "a3".into(),
             tool_call_id: "t3".into(),
-            tool_name: "bash".into(),
-            risk: ToolRiskLevel::High,
-            ..first
+            command_key: Some("fetch:{}:different".into()),
+            ..first.clone()
         };
-        let (wait, _) = manager.start_request(high.clone()).await;
+        let (wait, _) = manager.start_request(different.clone()).await;
         let _ = manager.decide("a3", ToolApprovalDecision::Deny).await;
         let decision = match wait {
             ApprovalWait::Pending(rx) => rx.await.expect("decision should be delivered"),
-            ApprovalWait::Immediate(_) => panic!("high request should wait"),
+            ApprovalWait::Immediate(_) => panic!("different command should wait"),
         };
-        let (resolution, _) = manager.finish_request(&high, decision).await;
+        let (resolution, _) = manager.finish_request(&different, decision).await;
         assert_eq!(resolution, ApprovalResolution::Denied);
+    }
+
+    #[tokio::test]
+    async fn risk_level_session_grant_uses_reviewed_risk_for_later_auto_approval() {
+        let manager = ToolApprovalManager::new();
+        let first = ToolApprovalRequest {
+            id: "reviewed-a1".into(),
+            session_id: "reviewed-session".into(),
+            run_id: "r1".into(),
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            risk: ToolRiskLevel::High,
+            args_summary: r#"{"cmd":"cargo test -p bot-core"}"#.into(),
+            command_key: Some("bash:cargo-test:first".into()),
+            model_review_reason: None,
+            platform: None,
+            review: Some(ToolRiskReview {
+                risk: ToolRiskLevel::Medium,
+                reason: "Reviewed as medium.".into(),
+                concerns: Vec::new(),
+            }),
+        };
+
+        let (wait, events) = manager.start_request(first.clone()).await;
+        let reviewed_first = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ApprovalEvent::Requested(request) | ApprovalEvent::Updated(request) => {
+                    Some(request.clone())
+                }
+                ApprovalEvent::Resolved { .. } => None,
+            })
+            .expect("pending approval should publish reviewed request");
+        assert_eq!(reviewed_first.risk, ToolRiskLevel::Medium);
+
+        let _ = manager
+            .decide("reviewed-a1", ToolApprovalDecision::AllowRiskLevelSession)
+            .await;
+        let decision = match wait {
+            ApprovalWait::Pending(rx) => rx.await.expect("decision should be delivered"),
+            ApprovalWait::Immediate(_) => panic!("first reviewed medium request should wait"),
+        };
+        let (resolution, _) = manager.finish_request(&reviewed_first, decision).await;
+        assert_eq!(resolution, ApprovalResolution::Approved);
+
+        let (wait, events) = manager
+            .start_request(ToolApprovalRequest {
+                id: "reviewed-a2".into(),
+                tool_call_id: "t2".into(),
+                command_key: Some("bash:cargo-test:second".into()),
+                ..first
+            })
+            .await;
+        assert!(matches!(
+            wait,
+            ApprovalWait::Immediate(ApprovalResolution::Approved)
+        ));
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -1137,15 +1562,15 @@ mod tests {
         let manager = ToolApprovalManager::new();
         assert_eq!(
             manager.session_policy("s1").await,
-            ApprovalSessionPolicy::Ask
+            ApprovalSessionPolicy::Low
         );
 
         manager
-            .set_session_policy("s1", ApprovalSessionPolicy::ModelAuto)
+            .set_session_policy("s1", ApprovalSessionPolicy::Low)
             .await;
         assert_eq!(
             manager.session_policy("s1").await,
-            ApprovalSessionPolicy::ModelAuto
+            ApprovalSessionPolicy::Low
         );
         let (wait, events) = manager
             .start_request(ToolApprovalRequest {
@@ -1156,6 +1581,8 @@ mod tests {
                 tool_name: "fs_write".into(),
                 risk: ToolRiskLevel::Medium,
                 args_summary: "{}".into(),
+                command_key: Some("fs_write:{}:one".into()),
+                model_review_reason: None,
                 platform: None,
                 review: None,
             })
@@ -1168,11 +1595,11 @@ mod tests {
         )));
 
         manager
-            .set_session_policy("s1", ApprovalSessionPolicy::AllowAll)
+            .set_session_policy("s1", ApprovalSessionPolicy::Medium)
             .await;
         assert_eq!(
             manager.session_policy("s1").await,
-            ApprovalSessionPolicy::AllowAll
+            ApprovalSessionPolicy::Medium
         );
         let (resolution, events) = manager
             .request(ToolApprovalRequest {
@@ -1181,8 +1608,10 @@ mod tests {
                 run_id: "r1".into(),
                 tool_call_id: "t2".into(),
                 tool_name: "bash".into(),
-                risk: ToolRiskLevel::High,
+                risk: ToolRiskLevel::Medium,
                 args_summary: "{}".into(),
+                command_key: Some("bash:{}:one".into()),
+                model_review_reason: None,
                 platform: None,
                 review: None,
             })
@@ -1190,12 +1619,29 @@ mod tests {
         assert_eq!(resolution, ApprovalResolution::Approved);
         assert!(events.is_empty());
 
+        let (wait, _) = manager
+            .start_request(ToolApprovalRequest {
+                id: "p3".into(),
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                tool_call_id: "t3".into(),
+                tool_name: "bash".into(),
+                risk: ToolRiskLevel::High,
+                args_summary: "{}".into(),
+                command_key: Some("bash:{}:high".into()),
+                model_review_reason: None,
+                platform: None,
+                review: None,
+            })
+            .await;
+        assert!(matches!(wait, ApprovalWait::Pending(_)));
+
         manager
-            .set_session_policy("s1", ApprovalSessionPolicy::Ask)
+            .set_session_policy("s1", ApprovalSessionPolicy::Low)
             .await;
         assert_eq!(
             manager.session_policy("s1").await,
-            ApprovalSessionPolicy::Ask
+            ApprovalSessionPolicy::Low
         );
     }
 }

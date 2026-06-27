@@ -357,9 +357,11 @@ mod tests {
         let store = Arc::new(BuiltinSkillStore::new(
             FileSkillStore::with_roots([]),
             [BuiltinSkill {
-                name: "trigger",
-                description: "Builtin trigger capability reference",
-                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nSecret body".to_string(),
+                name: "docs",
+                description: "Builtin docs capability reference",
+                content:
+                    "---\nname: docs\ndescription: Builtin docs capability reference\n---\n\nSecret body"
+                        .to_string(),
             }],
         ));
         let tool = SkillGetTool { store };
@@ -367,8 +369,8 @@ mod tests {
             .extra_prompt(&ToolDefinitionContext::default())
             .expect("skill__get should always advertise discovery guidance");
 
-        assert!(prompt.contains("trigger"));
-        assert!(prompt.contains("Builtin trigger capability reference"));
+        assert!(prompt.contains("docs"));
+        assert!(prompt.contains("Builtin docs capability reference"));
         assert!(!prompt.contains("Secret body"));
     }
 

@@ -30,6 +30,11 @@ pub(crate) fn spawn_local_trigger_scheduler(
     data_dir: PathBuf,
     dispatch_tx: mpsc::UnboundedSender<LocalTriggerDispatch>,
 ) {
+    if !bot_core::trigger::TRIGGER_CAPABILITY_ENABLED {
+        info!("local trigger scheduler disabled");
+        return;
+    }
+
     tokio::spawn(async move {
         loop {
             if dispatch_tx.is_closed() {
@@ -48,6 +53,10 @@ async fn tick(
     data_dir: &Path,
     dispatch_tx: &mpsc::UnboundedSender<LocalTriggerDispatch>,
 ) -> Result<()> {
+    if !bot_core::trigger::TRIGGER_CAPABILITY_ENABLED {
+        return Ok(());
+    }
+
     for db_path in discover_trigger_dbs(data_dir)? {
         let user_key = db_path
             .parent()
@@ -200,7 +209,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn scheduler_dispatches_due_local_timer_trigger() {
+    async fn scheduler_skips_due_local_timer_trigger_when_disabled() {
         let data_dir = std::env::temp_dir().join(format!(
             "remi-local-trigger-scheduler-test-{}",
             Uuid::new_v4()
@@ -310,14 +319,7 @@ mod tests {
         drop(sdk);
         let (tx, mut rx) = mpsc::unbounded_channel();
         tick(&data_dir, &tx).await.expect("scheduler tick");
-        let dispatch = rx.try_recv().expect("dispatch should be emitted");
-
-        assert_eq!(dispatch.trigger_uuid, trigger_uuid);
-        assert_eq!(dispatch.trigger_name, "Check job");
-        assert_eq!(dispatch.thread_id, "thread-1");
-        assert_eq!(dispatch.request, "Check the job now.");
-        assert_eq!(dispatch.owner_user_id, "web-local");
-        assert_eq!(dispatch.platform.as_deref(), Some("web"));
+        assert!(rx.try_recv().is_err());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

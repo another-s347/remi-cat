@@ -465,7 +465,7 @@ async fn handle_acp_approval_request(
 
     let decision = match wait {
         ApprovalWait::Immediate(ApprovalResolution::Approved) => {
-            ToolApprovalDecision::AllowSessionModelAuto
+            ToolApprovalDecision::AllowRiskLevelSession
         }
         ApprovalWait::Immediate(ApprovalResolution::Denied) => ToolApprovalDecision::Deny,
         ApprovalWait::Pending(rx) => {
@@ -533,6 +533,12 @@ fn normalize_acp_approval_request(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .or_else(|| Some("cli".to_string()));
+    }
+    if request.command_key.is_none() {
+        request.command_key = Some(crate::approval::command_key(
+            &request.tool_name,
+            &serde_json::json!({ "summary": request.args_summary }),
+        ));
     }
     request
 }

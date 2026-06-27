@@ -45,8 +45,8 @@ pub mod user_question;
 
 pub use agent::CatAgent;
 pub use approval::{
-    ApprovalResolution, ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
-    ToolRiskLevel, ToolRiskReview,
+    ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
+    ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
 pub use events::{
     CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,

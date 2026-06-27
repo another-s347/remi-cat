@@ -342,7 +342,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 Some(FeishuGateway::new(app_id, app_secret))
             }
             _ => {
-                info!("Feishu credentials are absent; starting in Web-only mode");
+                warn!("Feishu credentials are not configured — running in Web-only mode");
                 None
             }
         }
@@ -373,7 +373,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
     let (trigger_dispatch_tx, trigger_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
-    if !cli.once.is_some() && !cli.pure_prompt {
+    if bot_core::trigger::TRIGGER_CAPABILITY_ENABLED && !cli.once.is_some() && !cli.pure_prompt {
         local_trigger_scheduler::spawn_local_trigger_scheduler(
             data_dir.clone(),
             trigger_dispatch_tx,

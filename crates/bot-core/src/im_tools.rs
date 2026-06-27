@@ -459,6 +459,10 @@ impl Tool for FetchTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description = format!(
+            "{} Defaults to fetch/downloads/<suggested_name>.",
+            workspace_path_description(&self.path_rules, "Optional destination path")
+        );
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -480,7 +484,7 @@ impl Tool for FetchTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional destination path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file. Defaults to fetch/downloads/<suggested_name>."
+                    "description": path_description
                 },
                 "overwrite": {
                     "type": "boolean",
@@ -663,12 +667,14 @@ impl Tool for ImUploadTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description =
+            workspace_path_description(&self.path_rules, "Local file path to upload");
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Local file path to upload. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file."
+                    "description": path_description
                 },
                 "file_name": {
                     "type": "string",
@@ -1425,6 +1431,21 @@ fn is_html_content_type(content_type: &str) -> bool {
 struct WorkspacePathRules {
     workspace_root_label: String,
     allow_host_absolute: bool,
+}
+
+fn workspace_path_description(rules: &WorkspacePathRules, subject: &str) -> String {
+    let label = rules.workspace_root_label.trim();
+    if label == "/workspace" {
+        format!(
+            "{subject}. Use workspace-relative paths, or paths under the container workspace root such as /workspace/file."
+        )
+    } else if rules.allow_host_absolute {
+        format!(
+            "{subject}. Use workspace-relative paths. Host absolute paths are also accepted in no_sandbox mode."
+        )
+    } else {
+        format!("{subject}. Use workspace-relative paths.")
+    }
 }
 
 #[derive(Debug, Clone)]

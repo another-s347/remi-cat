@@ -31,7 +31,7 @@ pub(crate) async fn run_dispatch(
         trigger_uuid = %dispatch.trigger_uuid,
         trigger_name = %dispatch.trigger_name,
         thread_id = %dispatch.thread_id,
-        "running local trigger dispatch"
+        "executing local trigger dispatch"
     );
     if let Some(tx) = &output_tx {
         let _ = tx.send(format!(

@@ -798,4 +798,79 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // ── Delete mechanics (used by TUI empty-session cleanup) ─────────────
+
+    #[test]
+    fn delete_removes_session_and_channel_index() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let session = runtime
+            .create_channel("tui", "tui:abc", "default", None)
+            .unwrap();
+
+        assert!(runtime.get(&session.id).is_some());
+        assert!(runtime.channel_session_id("tui", "tui:abc").is_some());
+
+        let deleted = runtime.delete(&session.id).unwrap();
+        assert!(deleted.is_some());
+        assert_eq!(deleted.unwrap().id, session.id);
+
+        // session and channel index entry both gone
+        assert!(runtime.get(&session.id).is_none());
+        assert!(runtime.channel_session_id("tui", "tui:abc").is_none());
+        assert!(runtime.list().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_nonexistent_session_returns_none() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        assert!(runtime.delete("no-such-id").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_one_session_leaves_others_intact() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let a = runtime
+            .create_channel("tui", "ch-a", "default", Some("Session A".into()))
+            .unwrap();
+        let b = runtime
+            .create_channel("tui", "ch-b", "default", Some("Session B".into()))
+            .unwrap();
+
+        runtime.delete(&a.id).unwrap();
+
+        assert!(runtime.get(&a.id).is_none());
+        assert!(runtime.channel_session_id("tui", "ch-a").is_none());
+        assert_eq!(
+            runtime.get(&b.id).unwrap().title.as_deref(),
+            Some("Session B")
+        );
+        assert_eq!(runtime.list().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_persists_across_reload() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let session = runtime
+            .create_channel("tui", "ephemeral", "default", None)
+            .unwrap();
+        let id = session.id.clone();
+        runtime.delete(&id).unwrap();
+
+        // reload from disk — deleted session must not reappear
+        let reloaded = SessionRuntime::load(&dir).unwrap();
+        assert!(reloaded.get(&id).is_none());
+        assert!(reloaded.list().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

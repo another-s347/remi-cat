@@ -81,12 +81,23 @@ pub enum SupervisorTraceEvent {
     Thinking {
         content: String,
     },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        id: String,
+        delta: String,
+    },
     ToolCall {
+        id: String,
         name: String,
         args: serde_json::Value,
     },
     ToolResult {
+        id: String,
         name: String,
+        args: serde_json::Value,
         result: String,
     },
     OutputDelta {

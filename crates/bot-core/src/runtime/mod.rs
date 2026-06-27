@@ -13,6 +13,7 @@ use remi_agentloop::prelude::{
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::approval::ModelApprovalReviewer;
 use crate::hooks::HookContext;
 use crate::memory::{build_injected_history, LlmCompressor};
 use crate::sandbox::SandboxConfig;
@@ -84,7 +85,7 @@ pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &
 }
 
 pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) -> bool {
-    metadata_flag_enabled(metadata, TRIGGER_RUN_META_KEY)
+    !trigger::TRIGGER_CAPABILITY_ENABLED || metadata_flag_enabled(metadata, TRIGGER_RUN_META_KEY)
 }
 
 // -- StreamOptions ----------------------------------------------------------
@@ -777,6 +778,32 @@ impl CatBot {
     ) -> impl Stream<Item = CatEvent> + 'a {
         let thread_id_owned = thread_id.to_string();
         stream! {
+            // Enrich workflow context with current session metadata so the
+            // supervisor has visibility into the session configuration.
+            let mut context = context;
+            if let Some(obj) = context.as_object_mut() {
+                if let Some(ref id) = opts.model_profile_id {
+                    obj.insert("session_model_profile_id".into(), serde_json::Value::String(id.clone()));
+                }
+                if let Some(ref id) = opts.agent_id {
+                    obj.insert("session_agent_id".into(), serde_json::Value::String(id.clone()));
+                }
+                if let Some(effort) = opts.reasoning_effort {
+                    obj.insert("session_reasoning_effort".into(), serde_json::Value::String(effort.as_str().to_string()));
+                }
+                if let Some(ref platform) = opts.platform {
+                    obj.insert("session_platform".into(), serde_json::Value::String(platform.clone()));
+                }
+                if let Some(ref chat_type) = opts.chat_type {
+                    obj.insert("session_chat_type".into(), serde_json::Value::String(chat_type.clone()));
+                }
+                if let Some(ref sender) = opts.sender_user_id {
+                    obj.insert("session_sender_user_id".into(), serde_json::Value::String(sender.clone()));
+                }
+                if let Some(ref username) = opts.sender_username {
+                    obj.insert("session_sender_username".into(), serde_json::Value::String(username.clone()));
+                }
+            }
             let instance = match self
                 .start_workflow_by_id(
                     &thread_id_owned,
@@ -1302,6 +1329,8 @@ impl CatBot {
                 .stream_with_input_and_tool_allowlist(input, Some(vec!["rg".to_string()])));
             let mut output = String::new();
             let mut trace = Vec::new();
+            let mut tool_args_by_id: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
             while let Some(event) = stream.next().await {
                 match event {
                     CatEvent::Text(delta) => {
@@ -1313,13 +1342,34 @@ impl CatBot {
                         let _ = progress.send(event.clone());
                         trace.push(event);
                     }
-                    CatEvent::ToolCall { name, args, .. } => {
-                        let event = SupervisorTraceEvent::ToolCall { name, args };
+                    CatEvent::ToolCallStart { id, name } => {
+                        let event = SupervisorTraceEvent::ToolCallStart { id, name };
                         let _ = progress.send(event.clone());
                         trace.push(event);
                     }
-                    CatEvent::ToolCallResult { name, result, .. } => {
-                        let event = SupervisorTraceEvent::ToolResult { name, result };
+                    CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                        let event = SupervisorTraceEvent::ToolCallArgumentsDelta { id, delta };
+                        let _ = progress.send(event.clone());
+                        trace.push(event);
+                    }
+                    CatEvent::ToolCall { id, name, args } => {
+                        tool_args_by_id.insert(id.clone(), args.clone());
+                        let event = SupervisorTraceEvent::ToolCall { id, name, args };
+                        let _ = progress.send(event.clone());
+                        trace.push(event);
+                    }
+                    CatEvent::ToolCallResult {
+                        id, name, result, ..
+                    } => {
+                        let args = tool_args_by_id
+                            .remove(&id)
+                            .unwrap_or(serde_json::Value::Null);
+                        let event = SupervisorTraceEvent::ToolResult {
+                            id,
+                            name,
+                            args,
+                            result,
+                        };
                         let _ = progress.send(event.clone());
                         trace.push(event);
                     }
@@ -2182,6 +2232,7 @@ struct LocalToolDeps {
     im_bridge: Option<Arc<dyn ImFileBridge>>,
     active_agent_id: String,
     approval_manager: Arc<ToolApprovalManager>,
+    approval_reviewer: Option<Arc<ModelApprovalReviewer>>,
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
     overflow_bytes: usize,
@@ -2212,6 +2263,7 @@ impl LocalToolDeps {
             im_bridge: self.im_bridge.clone(),
             active_agent_id: self.active_agent_id.clone(),
             approval_manager: Arc::clone(&self.approval_manager),
+            approval_reviewer: self.approval_reviewer.clone(),
             user_question_manager: Arc::clone(&self.user_question_manager),
             hook_manager: Arc::clone(&self.hook_manager),
             overflow_bytes: self.overflow_bytes,
@@ -2278,6 +2330,7 @@ pub struct CatBotBuilder {
     delegate_ids: Vec<String>,
     active_agent_id: String,
     model_bindings: AgentModelBindings,
+    approval_model_profile_id: Option<String>,
     agents_dir: PathBuf,
     max_turns: Option<usize>,
     model_registry: Arc<ModelProfileRegistry>,
@@ -2332,6 +2385,10 @@ impl CatBotBuilder {
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: std::env::var("REMI_APPROVAL_MODEL_PROFILE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             agents_dir: data_dir.join("agents"),
             max_turns: None,
             model_registry,
@@ -2385,6 +2442,12 @@ impl CatBotBuilder {
         self
     }
 
+    pub fn approval_model_profile(mut self, profile_id: impl Into<String>) -> Self {
+        let profile_id = profile_id.into();
+        self.approval_model_profile_id = Some(profile_id);
+        self
+    }
+
     pub fn agent_profile(mut self, profile: AgentProfile) -> anyhow::Result<Self> {
         if !self.runtime_model_locked {
             if let Some(model_profile_id) = profile.models.primary.as_deref() {
@@ -2432,10 +2495,26 @@ impl CatBotBuilder {
             .unwrap_or_else(|| context_percent_tokens(&profile, auto_compress_context_percent));
         let overflow_bytes = self.overflow_bytes.unwrap_or(profile.overflow_bytes);
         let resolved_base_url = profile.base_url.clone();
+        let approval_profile = if let Some(profile_id) = self.approval_model_profile_id.as_deref() {
+            self.model_registry
+                .get(profile_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("approval model profile `{profile_id}` was not found")
+                })?
+        } else {
+            profile.clone()
+        };
+        let approval_api_key = api_key_from_env(&approval_profile)?;
+        let approval_reviewer = Arc::new(ModelApprovalReviewer::new(
+            approval_profile.clone(),
+            approval_api_key,
+        ));
 
         tracing::debug!(
             model = %profile.model,
             profile = %profile.id,
+            approval_model_profile = %approval_profile.id,
             helper_model_profile = self.model_bindings.helper.as_deref().unwrap_or(""),
             vision_model_profile = self.model_bindings.vision.as_deref().unwrap_or(""),
             context_tokens = profile.context_tokens,
@@ -2558,6 +2637,7 @@ impl CatBotBuilder {
             im_bridge: self.im_bridge.clone(),
             active_agent_id: active_agent_id.clone(),
             approval_manager: Arc::clone(&approval_manager),
+            approval_reviewer: Some(Arc::clone(&approval_reviewer)),
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             overflow_bytes,
@@ -2591,6 +2671,7 @@ impl CatBotBuilder {
                 im_bridge: self.im_bridge.clone(),
                 tool_allowlist: self.tool_allowlist.clone(),
                 approval_manager: Arc::clone(&approval_manager),
+                approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
             },
@@ -2614,6 +2695,7 @@ impl CatBotBuilder {
             im_bridge: self.im_bridge.clone(),
             active_agent_id: active_agent_id.clone(),
             approval_manager: Arc::clone(&approval_manager),
+            approval_reviewer: Some(Arc::clone(&approval_reviewer)),
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             overflow_bytes,
@@ -2654,6 +2736,7 @@ impl CatBotBuilder {
                         im_bridge: self.im_bridge.clone(),
                         tool_allowlist: self.tool_allowlist.clone(),
                         approval_manager: Arc::clone(&approval_manager),
+                        approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                         user_question_manager: Arc::clone(&user_question_manager),
                         hook_manager: Arc::clone(&hook_manager),
                     },
@@ -2708,6 +2791,7 @@ impl CatBotBuilder {
                 im_bridge: self.im_bridge.clone(),
                 active_agent_id: agent_profile.id.clone(),
                 approval_manager: Arc::clone(&approval_manager),
+                approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
                 overflow_bytes,
@@ -2745,6 +2829,7 @@ impl CatBotBuilder {
                             im_bridge: self.im_bridge.clone(),
                             tool_allowlist: Some(agent_tool_allowlist),
                             approval_manager: Arc::clone(&approval_manager),
+                            approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                             user_question_manager: Arc::clone(&user_question_manager),
                             hook_manager: Arc::clone(&hook_manager),
                         },
@@ -2767,6 +2852,7 @@ impl CatBotBuilder {
                 im_bridge: self.im_bridge,
                 tool_allowlist: self.tool_allowlist,
                 approval_manager: Arc::clone(&approval_manager),
+                approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
             },
@@ -3024,6 +3110,7 @@ impl Tool for RemiSubAgentTool {
             im_bridge: None,
             tool_allowlist: Some(self.tool_allowlist.clone()),
             approval_manager: Arc::clone(&self.deps.approval_manager),
+            approval_reviewer: self.deps.approval_reviewer.clone(),
             user_question_manager: Arc::clone(&self.deps.user_question_manager),
             hook_manager: Arc::clone(&self.deps.hook_manager),
         };
@@ -3717,6 +3804,7 @@ mod tests {
             delegate_ids: vec!["explorer".to_string()],
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir: agents_dir.clone(),
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -3787,6 +3875,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -3905,6 +3994,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -4032,6 +4122,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
@@ -4094,6 +4185,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
@@ -4134,6 +4226,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -4372,6 +4465,7 @@ You are Remi.
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
             agents_dir,
             max_turns: Some(8),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),

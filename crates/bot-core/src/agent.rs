@@ -24,8 +24,9 @@ use remi_agentloop::types::{AgentEvent, ResumePayload};
 use tokio::sync::mpsc;
 
 use crate::approval::{
-    classify_tool_risk, summarize_tool_args, ApprovalEvent, ApprovalResolution, ApprovalWait,
-    ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
+    classify_tool_risk_assessment, command_key, review_tool_risk, summarize_tool_args,
+    ApprovalEvent, ApprovalResolution, ApprovalWait, ModelApprovalReviewer, ToolApprovalDecision,
+    ToolApprovalManager, ToolApprovalRequest, ToolRiskAssessment, ToolRiskLevel, ToolRiskReview,
 };
 use crate::events::CatEvent;
 use crate::hooks::{
@@ -145,6 +146,8 @@ pub struct CatAgent<I> {
     pub tool_allowlist: Option<Vec<String>>,
     /// Shared in-memory approval manager for risky tool calls.
     pub approval_manager: Arc<ToolApprovalManager>,
+    /// Optional model-backed reviewer for tool calls not covered by hard-coded rules.
+    pub approval_reviewer: Option<Arc<ModelApprovalReviewer>>,
     /// Shared in-memory user-question manager for interactive clarification.
     pub user_question_manager: Arc<UserQuestionManager>,
     /// Codex-compatible hook runner.
@@ -178,6 +181,7 @@ where
         let overflow_bytes = self.overflow_bytes;
         let tool_allowlist = tool_allowlist_override.or_else(|| self.tool_allowlist.clone());
         let hook_manager = Arc::clone(&self.hook_manager);
+        let approval_reviewer = self.approval_reviewer.clone();
         let tool_def_ctx = build_tool_definition_ctx(&input);
         let supervisor_run =
             crate::metadata_flag_enabled(tool_def_ctx.metadata.as_ref(), "supervisor_run");
@@ -368,12 +372,14 @@ where
                                         });
                                         continue;
                                     }
-                                    let mut approval_request = approval_request_for_tool(
+                                    let mut approval_request = prepare_approval_request_for_tool(
                                         &tc,
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
-                                    );
+                                        approval_reviewer.as_deref(),
+                                    )
+                                    .await;
                                     let (wait, approval_events) = self
                                         .approval_manager
                                         .start_request(approval_request.clone())
@@ -702,12 +708,14 @@ where
                                         });
                                         continue;
                                     }
-                                    let mut approval_request = approval_request_for_tool(
+                                    let mut approval_request = prepare_approval_request_for_tool(
                                         &tc,
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
-                                    );
+                                        approval_reviewer.as_deref(),
+                                    )
+                                    .await;
                                     let (wait, approval_events) = self
                                         .approval_manager
                                         .start_request(approval_request.clone())
@@ -1333,7 +1341,6 @@ fn approval_request_for_tool(
     run_id: &str,
     metadata: Option<&serde_json::Value>,
 ) -> ToolApprovalRequest {
-    let internal_supervisor = crate::metadata_flag_enabled(metadata, "supervisor_run");
     let approval_session_id = metadata
         .and_then(|value| value.get("thread_id"))
         .and_then(|value| value.as_str())
@@ -1345,17 +1352,59 @@ fn approval_request_for_tool(
         run_id: run_id.to_string(),
         tool_call_id: tc.id.clone(),
         tool_name: tc.name.clone(),
-        risk: if internal_supervisor {
-            crate::approval::ToolRiskLevel::Low
-        } else {
-            classify_tool_risk(&tc.name, &tc.arguments)
-        },
+        risk: ToolRiskLevel::Medium,
         args_summary: summarize_tool_args(&tc.arguments),
+        command_key: Some(command_key(&tc.name, &tc.arguments)),
+        model_review_reason: None,
         platform: metadata
             .and_then(|value| value.get("platform"))
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
         review: None,
+    }
+}
+
+async fn prepare_approval_request_for_tool(
+    tc: &ParsedToolCall,
+    session_id: &str,
+    run_id: &str,
+    metadata: Option<&serde_json::Value>,
+    reviewer: Option<&ModelApprovalReviewer>,
+) -> ToolApprovalRequest {
+    let mut request = approval_request_for_tool(tc, session_id, run_id, metadata);
+    if crate::metadata_flag_enabled(metadata, "supervisor_run") {
+        request.risk = ToolRiskLevel::Low;
+        request.review = Some(review_tool_risk(
+            &request.tool_name,
+            &request.args_summary,
+            request.risk,
+        ));
+        return request;
+    }
+    match classify_tool_risk_assessment(&tc.name, &tc.arguments) {
+        ToolRiskAssessment::Known(risk) => {
+            request.risk = risk;
+            request.review = Some(review_tool_risk(
+                &request.tool_name,
+                &request.args_summary,
+                request.risk,
+            ));
+            request
+        }
+        ToolRiskAssessment::NeedsModelReview { reason } => {
+            request.model_review_reason = Some(reason);
+            let review = match reviewer {
+                Some(reviewer) => reviewer.review(&request).await,
+                None => ToolRiskReview {
+                    risk: ToolRiskLevel::High,
+                    reason: "No approval model reviewer is configured.".to_string(),
+                    concerns: vec!["Requires explicit human confirmation.".to_string()],
+                },
+            };
+            request.risk = review.risk;
+            request.review = Some(review);
+            request
+        }
     }
 }
 
@@ -2364,6 +2413,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };
@@ -2407,6 +2457,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };
@@ -2449,6 +2500,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };
@@ -2479,6 +2531,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };
@@ -2532,6 +2585,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };
@@ -2580,6 +2634,7 @@ mod tests {
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
         };

@@ -2049,8 +2049,8 @@ mod tests {
         assert!(encoded.contains(r#""approval_id":"approval-123""#));
         for decision in [
             "allow_once",
-            "allow_session",
-            "allow_session_model_auto",
+            "allow_same_command_session",
+            "allow_risk_level_session",
             "deny",
         ] {
             assert!(encoded.contains(&format!(r#""decision":"{decision}""#)));
@@ -2297,14 +2297,14 @@ pub fn build_tool_approval_card(
                 "weight": 1,
                 "elements": [{
                     "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Allow session" },
+                    "text": { "tag": "plain_text", "content": "Allow same command" },
                     "type": "default",
                     "behaviors": [{
                         "type": "callback",
                         "value": {
                             "action": "approval_decide",
                             "approval_id": approval_id,
-                            "decision": "allow_session"
+                            "decision": "allow_same_command_session"
                         }
                     }]
                 }]
@@ -2315,14 +2315,14 @@ pub fn build_tool_approval_card(
                 "weight": 1,
                 "elements": [{
                     "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Model auto" },
+                    "text": { "tag": "plain_text", "content": "Allow level (low/medium)" },
                     "type": "default",
                     "behaviors": [{
                         "type": "callback",
                         "value": {
                             "action": "approval_decide",
                             "approval_id": approval_id,
-                            "decision": "allow_session_model_auto"
+                            "decision": "allow_risk_level_session"
                         }
                     }]
                 }]

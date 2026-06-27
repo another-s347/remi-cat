@@ -116,8 +116,12 @@ fn parse_tool_approval_decision(value: &str) -> Option<ToolApprovalDecision> {
     match value {
         "deny" => Some(ToolApprovalDecision::Deny),
         "allow_once" => Some(ToolApprovalDecision::AllowOnce),
-        "allow_session" => Some(ToolApprovalDecision::AllowSession),
-        "allow_session_model_auto" => Some(ToolApprovalDecision::AllowSessionModelAuto),
+        "allow_same_command_session" | "allow_session" => {
+            Some(ToolApprovalDecision::AllowSameCommandSession)
+        }
+        "allow_risk_level_session" | "allow_session_model_auto" => {
+            Some(ToolApprovalDecision::AllowRiskLevelSession)
+        }
         _ => None,
     }
 }

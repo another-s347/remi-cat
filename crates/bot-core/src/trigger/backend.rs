@@ -44,7 +44,7 @@ impl TriggerBackend {
     }
 
     pub fn is_configured(&self) -> bool {
-        true
+        super::TRIGGER_CAPABILITY_ENABLED
     }
 
     pub async fn refresh_thread_user_state(
@@ -850,6 +850,13 @@ fn next_local_id(triggers: &[TriggerItem]) -> u64 {
 }
 
 fn ensure_trigger_tools_allowed(ctx: &ToolContext) -> Result<(), AgentError> {
+    if !super::TRIGGER_CAPABILITY_ENABLED {
+        return Err(AgentError::tool(
+            "trigger",
+            "trigger capability is currently disabled",
+        ));
+    }
+
     let enabled = ctx
         .metadata
         .as_ref()

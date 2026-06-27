@@ -163,6 +163,7 @@ pub trait Sandbox: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxMetadata {
     pub len: u64,
+    pub is_dir: bool,
     pub modified_ms: Option<u64>,
 }
 
@@ -174,6 +175,7 @@ fn sandbox_metadata_from_std(metadata: std::fs::Metadata) -> SandboxMetadata {
         .map(|duration| duration.as_millis() as u64);
     SandboxMetadata {
         len: metadata.len(),
+        is_dir: metadata.is_dir(),
         modified_ms,
     }
 }

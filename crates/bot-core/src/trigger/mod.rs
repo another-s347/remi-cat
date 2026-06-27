@@ -14,10 +14,16 @@ use std::sync::Arc;
 
 use crate::events::TriggerEvent;
 
+pub const TRIGGER_CAPABILITY_ENABLED: bool = false;
+
 pub fn register_trigger_tools(
     registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry,
     backend: Arc<TriggerBackend>,
 ) {
+    if !TRIGGER_CAPABILITY_ENABLED {
+        return;
+    }
+
     registry.register(TriggerUpsertTool::new(Arc::clone(&backend)));
     registry.register(TriggerListTool::new(Arc::clone(&backend)));
     registry.register(TriggerDeleteTool::new(backend));

@@ -5,8 +5,8 @@
 //! registration APIs.
 
 pub use crate::approval::{
-    ApprovalResolution, ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
-    ToolRiskLevel, ToolRiskReview,
+    ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
+    ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
 pub use crate::im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use crate::search::SearchTool;

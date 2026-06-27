@@ -314,11 +314,11 @@ function ApprovalPart({ args, result }: ToolCallMessagePartProps) {
           <button type="button" disabled={disabled} onClick={() => submit("allow_once")}>
             Allow once
           </button>
-          <button type="button" disabled={disabled} onClick={() => submit("allow_session")}>
-            Allow session
+          <button type="button" disabled={disabled} onClick={() => submit("allow_same_command_session")}>
+            Always allow same command
           </button>
-          <button type="button" disabled={disabled} onClick={() => submit("allow_session_model_auto")}>
-            Model auto
+          <button type="button" disabled={disabled} onClick={() => submit("allow_risk_level_session")}>
+            Always allow this level (low/medium)
           </button>
           <button type="button" disabled={disabled} className="danger" onClick={() => submit("deny")}>
             Deny

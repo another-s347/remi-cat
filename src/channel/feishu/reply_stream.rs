@@ -285,8 +285,8 @@ fn tool_approval_decision_value(decision: ToolApprovalDecision) -> &'static str 
     match decision {
         ToolApprovalDecision::Deny => "deny",
         ToolApprovalDecision::AllowOnce => "allow_once",
-        ToolApprovalDecision::AllowSession => "allow_session",
-        ToolApprovalDecision::AllowSessionModelAuto => "allow_session_model_auto",
+        ToolApprovalDecision::AllowSameCommandSession => "allow_same_command_session",
+        ToolApprovalDecision::AllowRiskLevelSession => "allow_risk_level_session",
     }
 }
 

@@ -526,14 +526,14 @@ async fn handle_permissions_command(
 
     let policy = match rest {
         "" | "status" => None,
-        "ask" | "default" | "prompt" | "reset" => Some(ApprovalSessionPolicy::Ask),
-        "auto" | "medium" | "model-auto" | "model_auto" => Some(ApprovalSessionPolicy::ModelAuto),
+        "low" | "ask" | "default" | "prompt" | "reset" => Some(ApprovalSessionPolicy::Low),
+        "medium" | "auto" | "model-auto" | "model_auto" => Some(ApprovalSessionPolicy::Medium),
         "allow" | "allow-session" | "allow_session" | "bypass" | "trusted" => {
-            Some(ApprovalSessionPolicy::AllowAll)
+            Some(ApprovalSessionPolicy::Medium)
         }
         _ => {
             return Ok(format!(
-                "用法：/permissions status | ask | auto | allow\n\n{}",
+                "用法：/permissions status | low | medium\n\n{}",
                 format_permissions_status(session_id, manager.session_policy(session_id).await)
             ));
         }
@@ -554,7 +554,7 @@ fn format_permissions_status(
     policy: bot_core::approval::ApprovalSessionPolicy,
 ) -> String {
     format!(
-        "**permissions**\n\nsession_id: `{session_id}`\nmode: `{}`\n{}\n\nmodes:\n- `ask`: low 自动通过；medium/high 请求审批\n- `auto` / `medium`: 仅 low 自动通过；medium/high 请求审批\n- `allow`: 本 session 所有 tool request 自动通过",
+        "**permissions**\n\nsession_id: `{session_id}`\nmode: `{}`\n{}\n\nmodes:\n- `low`: low 自动通过；medium/high 请求审批\n- `medium`: low/medium 自动通过；high 请求审批",
         policy.label(),
         policy.description()
     )

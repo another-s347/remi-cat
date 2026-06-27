@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bot_core::{
-    model_profile_key_status, CatEvent, ContextCompactionEvent, ContextCompactionStatus, Message,
-    ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, SupervisorTraceEvent,
-    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
-    UserQuestionRequest, UserQuestionResponse, UserQuestionStatus, WorkflowReport,
+    model_profile_key_status, tool_success, CatEvent, ContextCompactionEvent,
+    ContextCompactionStatus, Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus,
+    ReasoningEffort, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
+    ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
+    WorkflowReport, WorkflowStatus,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -98,10 +99,17 @@ pub(crate) async fn run_tui(
             .id
     };
 
-    let mut app = TuiApp::new(runtime, cli, session_id.clone(), trigger_rx).await;
+    let mut app = TuiApp::new(runtime, cli.clone(), session_id.clone(), trigger_rx).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
-    eprintln!("\nYou can resume this session using `remi-cat --resume {session_id}`");
+    if should_cleanup_session_on_exit(app.has_activity, cli.resume) {
+        let _ = app.runtime.sessions.lock().await.delete(&session_id);
+    } else {
+        let exe = std::env::current_exe()?;
+        let resume_args = tui_resume_command_args(&exe, &session_id, &cli);
+        let resume_command = shell_join_command(&resume_args);
+        eprintln!("\nYou can resume this session using: {resume_command}");
+    }
     result
 }
 
@@ -476,6 +484,7 @@ struct TuiApp {
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: Option<String>,
+    history_browsing: bool,
     status: StatusLine,
     last_stats_snapshot: TokenStatsSnapshot,
     pending_token_delta: TokenDelta,
@@ -499,6 +508,7 @@ struct TuiApp {
     latest_active_todo_label: Option<String>,
     loaded_thread_history_len: usize,
     sub_session_event_log_lines: usize,
+    has_activity: bool,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
     trigger_rx:
@@ -545,6 +555,7 @@ impl TuiApp {
             input_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            history_browsing: false,
             status: StatusLine::default(),
             last_stats_snapshot: TokenStatsSnapshot::default(),
             pending_token_delta: TokenDelta::default(),
@@ -568,6 +579,7 @@ impl TuiApp {
             latest_active_todo_label: None,
             loaded_thread_history_len: 0,
             sub_session_event_log_lines: 0,
+            has_activity: false,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
             trigger_rx: trigger_rx.map(UnboundedReceiverStream::new),
@@ -674,12 +686,12 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('2') => {
-                    self.decide_pending_approval(ToolApprovalDecision::AllowSession)
+                    self.decide_pending_approval(ToolApprovalDecision::AllowSameCommandSession)
                         .await;
                     return Ok(false);
                 }
                 KeyCode::Char('3') => {
-                    self.decide_pending_approval(ToolApprovalDecision::AllowSessionModelAuto)
+                    self.decide_pending_approval(ToolApprovalDecision::AllowRiskLevelSession)
                         .await;
                     return Ok(false);
                 }
@@ -694,17 +706,17 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    self.decide_pending_approval(ToolApprovalDecision::AllowSession)
+                    self.decide_pending_approval(ToolApprovalDecision::AllowSameCommandSession)
                         .await;
                     return Ok(false);
                 }
                 KeyCode::Char('m') | KeyCode::Char('M') => {
-                    self.decide_pending_approval(ToolApprovalDecision::AllowSessionModelAuto)
+                    self.decide_pending_approval(ToolApprovalDecision::AllowRiskLevelSession)
                         .await;
                     return Ok(false);
                 }
                 KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.decide_pending_approval(ToolApprovalDecision::AllowSession)
+                    self.decide_pending_approval(ToolApprovalDecision::AllowSameCommandSession)
                         .await;
                     return Ok(false);
                 }
@@ -789,6 +801,7 @@ impl TuiApp {
                 self.show_shortcuts = false;
                 self.quit_hint_until = None;
                 self.popup_selected = 0;
+                self.reset_history_navigation();
                 Ok(false)
             }
             KeyCode::Char('?') if self.composer.is_empty() => {
@@ -810,7 +823,9 @@ impl TuiApp {
                 Ok(false)
             }
             KeyCode::Up => {
-                if self.popup_visible() {
+                if self.history_browsing {
+                    self.recall_history(-1);
+                } else if self.popup_visible() {
                     self.move_popup_selection(-1);
                 } else if self.composer.display_text().contains('\n') {
                     self.move_input_cursor_vertical(-1);
@@ -820,13 +835,19 @@ impl TuiApp {
                 Ok(false)
             }
             KeyCode::Down => {
-                if self.popup_visible() {
+                if self.history_browsing {
+                    self.recall_history(1);
+                } else if self.popup_visible() {
                     self.move_popup_selection(1);
                 } else if self.composer.display_text().contains('\n') {
                     self.move_input_cursor_vertical(1);
                 } else {
                     self.recall_history(1);
                 }
+                Ok(false)
+            }
+            KeyCode::Tab if self.history_browsing && self.popup_visible() => {
+                self.history_browsing = false;
                 Ok(false)
             }
             KeyCode::Tab if self.popup_visible() => {
@@ -841,6 +862,7 @@ impl TuiApp {
                 self.cycle_agent().await?;
                 Ok(false)
             }
+            KeyCode::Enter if self.history_browsing => self.submit().await,
             KeyCode::Enter if self.popup_visible() => {
                 match self.active_popup() {
                     Some(PopupKind::Command) if self.selected_command_accepts_arguments() => {
@@ -904,8 +926,7 @@ impl TuiApp {
             return Ok(false);
         }
         self.composer.clear();
-        self.history_index = None;
-        self.history_draft = None;
+        self.reset_history_navigation();
         self.scroll = 0;
         self.popup_selected = 0;
         self.show_shortcuts = false;
@@ -927,6 +948,7 @@ impl TuiApp {
             self.queued_inputs.push_back(text);
             return Ok(false);
         }
+        self.has_activity = true;
         self.start_turn(text);
         Ok(false)
     }
@@ -1010,7 +1032,10 @@ impl TuiApp {
     }
 
     async fn replace_current_session(&mut self, session_id: String, message: String) {
+        let old_session_id = self.session_id.clone();
+        let old_had_activity = self.has_activity;
         self.session_id = session_id;
+        self.has_activity = false;
         self.cells.clear();
         self.composer.clear();
         self.scroll = 0;
@@ -1047,6 +1072,9 @@ impl TuiApp {
             self.session_id
         )));
         self.load_thread_history().await;
+        if should_cleanup_old_session_on_switch(old_had_activity) {
+            let _ = self.runtime.sessions.lock().await.delete(&old_session_id);
+        }
     }
 
     fn start_turn(&mut self, text: String) {
@@ -1504,6 +1532,7 @@ impl TuiApp {
                 self.latest_active_todo_label = None;
             }
             BotEvent::Error(message) => {
+                self.has_activity = true;
                 self.status.last_error = Some(message.clone());
                 self.cells.push(HistoryCell::error(message));
                 self.running = false;
@@ -1519,6 +1548,7 @@ impl TuiApp {
                 self.status.state = "error".to_string();
             }
             BotEvent::Done => {
+                self.has_activity = true;
                 self.running = false;
                 self.interrupt_requested = false;
                 self.cancel = None;
@@ -1658,6 +1688,7 @@ impl TuiApp {
             return;
         };
         self.composer.set_text(command.value.clone());
+        self.reset_history_navigation();
     }
 
     fn selected_command_accepts_arguments(&self) -> bool {
@@ -1680,6 +1711,7 @@ impl TuiApp {
         self.file_query = None;
         self.file_matches.clear();
         self.popup_selected = 0;
+        self.reset_history_navigation();
     }
 
     fn move_popup_selection(&mut self, direction: isize) {
@@ -1777,6 +1809,7 @@ impl TuiApp {
         );
         self.history_index = history_index;
         self.history_draft = history_draft;
+        self.history_browsing = self.history_index.is_some();
         self.composer.set_text(input);
         self.popup_selected = 0;
         self.refresh_file_matches();
@@ -1785,6 +1818,7 @@ impl TuiApp {
     fn reset_history_navigation(&mut self) {
         self.history_index = None;
         self.history_draft = None;
+        self.history_browsing = false;
     }
 
     fn refresh_command_catalog(&mut self) {
@@ -2129,28 +2163,67 @@ impl TuiApp {
             .active_supervisor_id
             .clone()
             .unwrap_or_else(|| "supervisor".to_string());
-        let event = supervisor_event_display(&progress);
-        let state = self.supervisors.entry(id.clone()).or_default();
-        state.push_event(event);
-        let title = state.running_title();
-        let body = state.body();
-        let meta = state.meta();
-        if let Some(cell) = self.cells.iter_mut().rev().find(
-            |cell| matches!(&cell.kind, CellKind::Supervisor { id: cell_id } if cell_id == &id),
-        ) {
-            cell.title = title;
-            cell.body = body;
-            cell.status = ToolVisualStatus::Running;
-            cell.meta = meta;
-        } else {
-            self.cells.push(HistoryCell::supervisor(
-                id,
-                title,
-                body,
-                meta,
-                ToolVisualStatus::Running,
-            ));
+        match progress {
+            SupervisorTraceEvent::Thinking { content } => {
+                self.upsert_supervisor_stream_cell(
+                    format!("{id}:thinking"),
+                    "supervisor thinking".to_string(),
+                    content,
+                    true,
+                    ToolVisualStatus::Running,
+                );
+            }
+            SupervisorTraceEvent::OutputDelta { content } => {
+                self.upsert_supervisor_stream_cell(
+                    format!("{id}:output"),
+                    "supervisor output".to_string(),
+                    content,
+                    true,
+                    ToolVisualStatus::Running,
+                );
+            }
+            SupervisorTraceEvent::Output { content } => {
+                self.upsert_supervisor_stream_cell(
+                    format!("{id}:output"),
+                    "supervisor output".to_string(),
+                    pretty_supervisor_output(&content),
+                    false,
+                    ToolVisualStatus::Success,
+                );
+            }
+            SupervisorTraceEvent::AgentMessage { content } => {
+                self.upsert_supervisor_stream_cell(
+                    format!("{id}:agent-message"),
+                    "supervisor message".to_string(),
+                    content,
+                    false,
+                    ToolVisualStatus::Success,
+                );
+            }
+            SupervisorTraceEvent::ToolCallStart { .. }
+            | SupervisorTraceEvent::ToolCallArgumentsDelta { .. }
+            | SupervisorTraceEvent::ToolCall { .. }
+            | SupervisorTraceEvent::ToolResult { .. } => {}
         }
+    }
+
+    fn upsert_supervisor_stream_cell(
+        &mut self,
+        id: String,
+        title: String,
+        body: String,
+        append: bool,
+        status: ToolVisualStatus,
+    ) {
+        let index = push_or_update_current_supervisor_stream_cell(
+            &mut self.cells,
+            id,
+            title,
+            body,
+            append,
+            status,
+        );
+        self.mark_token_cell(index);
     }
 
     fn upsert_supervisor_report(&mut self, report: WorkflowReport) {
@@ -2161,22 +2234,19 @@ impl TuiApp {
         let state = self.supervisors.entry(id.clone()).or_default();
         state.apply_report(&report);
         let title = state.resolved_title();
+        let body = state.body();
         let meta = state.meta();
+        let status = supervisor_visual_status(&report.status);
         if let Some(cell) = self.cells.iter_mut().rev().find(
             |cell| matches!(&cell.kind, CellKind::Supervisor { id: cell_id } if cell_id == &id),
         ) {
             cell.title = title;
-            cell.body = String::new();
+            cell.body = body;
             cell.meta = meta;
-            cell.status = ToolVisualStatus::Success;
+            cell.status = status;
         } else {
-            self.cells.push(HistoryCell::supervisor(
-                id,
-                title,
-                String::new(),
-                meta,
-                ToolVisualStatus::Success,
-            ));
+            self.cells
+                .push(HistoryCell::supervisor(id, title, body, meta, status));
         }
     }
 
@@ -2897,6 +2967,7 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
             let _ = tx.send(BotEvent::SupervisorReport(report));
         }
         CatEvent::SupervisorProgress(progress) => {
+            forward_supervisor_progress_to_tui_tools(&progress, tx);
             let _ = tx.send(BotEvent::SupervisorProgress(progress));
         }
         CatEvent::ToolApprovalRequested(request) => {
@@ -2945,6 +3016,95 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
     }
     false
 }
+
+fn forward_supervisor_progress_to_tui_tools(
+    progress: &SupervisorTraceEvent,
+    tx: &mpsc::UnboundedSender<BotEvent>,
+) {
+    match progress {
+        SupervisorTraceEvent::ToolCallStart { id, name } => {
+            let _ = tx.send(BotEvent::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+            });
+        }
+        SupervisorTraceEvent::ToolCallArgumentsDelta { id, delta } => {
+            let _ = tx.send(BotEvent::ToolArgs {
+                id: id.clone(),
+                delta: delta.clone(),
+            });
+        }
+        SupervisorTraceEvent::ToolCall { id, name, args } => {
+            let _ = tx.send(BotEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.to_string(),
+            });
+        }
+        SupervisorTraceEvent::ToolResult {
+            id,
+            name,
+            args,
+            result,
+        } => {
+            let _ = tx.send(BotEvent::ToolDone {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.to_string(),
+                result: result.clone(),
+                success: tool_success(result),
+                elapsed_ms: 0,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn supervisor_visual_status(status: &WorkflowStatus) -> ToolVisualStatus {
+    match status {
+        WorkflowStatus::Active | WorkflowStatus::Paused => ToolVisualStatus::Running,
+        WorkflowStatus::Completed | WorkflowStatus::Stopped => ToolVisualStatus::Success,
+        WorkflowStatus::Error => ToolVisualStatus::Error,
+    }
+}
+
+fn push_or_update_current_supervisor_stream_cell(
+    cells: &mut Vec<HistoryCell>,
+    id: String,
+    title: String,
+    body: String,
+    append: bool,
+    status: ToolVisualStatus,
+) -> usize {
+    // Match the main agent streaming model: only the currently active last cell
+    // is extended. If any other event inserted a cell, the next stream chunk
+    // starts a fresh cell instead of rewriting older history.
+    let last_index = cells.len().saturating_sub(1);
+    if let Some(cell) = cells.last_mut() {
+        if matches!(&cell.kind, CellKind::SupervisorStream { id: cell_id } if cell_id == &id) {
+            cell.title = title;
+            cell.status = status;
+            if append {
+                cell.append(&body);
+            } else {
+                cell.body = body;
+            }
+            return last_index;
+        }
+    }
+
+    cells.push(HistoryCell::supervisor_stream(id, title, body, status));
+    cells.len().saturating_sub(1)
+}
+
+fn pretty_supervisor_output(content: &str) -> String {
+    let trimmed = content.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string());
+    }
+    trimmed.to_string()
+}
+
 async fn run_tui_fork_command(
     runtime: Rc<Runtime>,
     source_session_id: String,
@@ -3521,6 +3681,18 @@ fn is_tui_new_command(command: &str) -> bool {
 
 fn is_tui_exit_command(command: &str) -> bool {
     matches!(command, "/exit" | "/quit")
+}
+
+/// Returns `true` when the TUI session should be deleted on exit.
+/// Sessions that saw no user activity *and* were created fresh in this run
+/// (not resumed) are considered throwaway and cleaned up automatically.
+fn should_cleanup_session_on_exit(has_activity: bool, is_resume: bool) -> bool {
+    !has_activity && !is_resume
+}
+
+/// Returns `true` when the *previous* session should be deleted after `/new`.
+fn should_cleanup_old_session_on_switch(has_activity: bool) -> bool {
+    !has_activity
 }
 
 fn wrap_text(text: &str, width: u16) -> Vec<String> {
@@ -4181,6 +4353,8 @@ mod tests {
             tool_name: "fs_remove".to_string(),
             risk: bot_core::ToolRiskLevel::Medium,
             args_summary: "{\"path\":\"target/tmp\"}".to_string(),
+            command_key: Some("test-command-key".to_string()),
+            model_review_reason: None,
             platform: Some("tui".to_string()),
             review: Some(bot_core::ToolRiskReview {
                 risk: bot_core::ToolRiskLevel::Medium,
@@ -4247,20 +4421,147 @@ mod tests {
     }
 
     #[test]
-    fn resolved_supervisor_cell_collapses_to_title_only() {
+    fn resolved_supervisor_cell_keeps_report_body() {
         let cell = HistoryCell::supervisor(
             "supervisor-1".to_string(),
-            "supervisor · Goal · review -> work · Active".to_string(),
-            String::new(),
+            "supervisor · Goal · review -> work · Error".to_string(),
+            "transition: review -> work\nreason: failed".to_string(),
             "review -> work".to_string(),
-            ToolVisualStatus::Success,
+            supervisor_visual_status(&WorkflowStatus::Error),
         );
         let lines = cell.lines(100);
-        assert_eq!(lines.len(), 2);
+        assert!(lines.len() > 2);
+        assert_eq!(cell.status, ToolVisualStatus::Error);
         assert!(lines[0]
             .spans
             .iter()
             .any(|span| span.content.contains("supervisor · Goal")));
+        assert!(lines.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("reason: failed"))));
+    }
+
+    #[test]
+    fn supervisor_stream_cells_remain_separate_and_pretty_print_output() {
+        let mut cells = Vec::new();
+
+        let thinking_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:thinking".to_string(),
+            "supervisor thinking".to_string(),
+            "line one\n".to_string(),
+            true,
+            ToolVisualStatus::Running,
+        );
+        let thinking_delta_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:thinking".to_string(),
+            "supervisor thinking".to_string(),
+            "line two".to_string(),
+            true,
+            ToolVisualStatus::Running,
+        );
+        let output_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:output".to_string(),
+            "supervisor output".to_string(),
+            "{\"target_node\"".to_string(),
+            true,
+            ToolVisualStatus::Running,
+        );
+        cells.push(HistoryCell::tool(
+            "tool-1".to_string(),
+            "rg".to_string(),
+            "query: needle".to_string(),
+            "10ms".to_string(),
+            ToolVisualStatus::Success,
+        ));
+        let output_after_tool_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:output".to_string(),
+            "supervisor output".to_string(),
+            " after tool".to_string(),
+            true,
+            ToolVisualStatus::Running,
+        );
+        let next_thinking_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:thinking".to_string(),
+            "supervisor thinking".to_string(),
+            "next phase".to_string(),
+            true,
+            ToolVisualStatus::Running,
+        );
+        let final_output_index = push_or_update_current_supervisor_stream_cell(
+            &mut cells,
+            "supervisor-1:output".to_string(),
+            "supervisor output".to_string(),
+            pretty_supervisor_output("{\"target_node\":\"done\",\"reason\":\"ok\"}"),
+            false,
+            ToolVisualStatus::Success,
+        );
+        cells.push(HistoryCell::supervisor(
+            "supervisor-1".to_string(),
+            "supervisor · Plan Code Test · code -> done · Completed".to_string(),
+            "transition: code -> done\nreason: ok".to_string(),
+            "code -> done".to_string(),
+            ToolVisualStatus::Success,
+        ));
+
+        assert_eq!(thinking_index, 0);
+        assert_eq!(thinking_delta_index, 0);
+        assert_eq!(output_index, 1);
+        assert_eq!(output_after_tool_index, 3);
+        assert_eq!(next_thinking_index, 4);
+        assert_eq!(final_output_index, 5);
+        assert_eq!(cells.len(), 7);
+        assert!(matches!(cells[0].kind, CellKind::SupervisorStream { .. }));
+        assert!(matches!(cells[1].kind, CellKind::SupervisorStream { .. }));
+        assert!(matches!(cells[2].kind, CellKind::Tool { .. }));
+        assert!(matches!(cells[3].kind, CellKind::SupervisorStream { .. }));
+        assert!(matches!(cells[4].kind, CellKind::SupervisorStream { .. }));
+        assert!(matches!(cells[5].kind, CellKind::SupervisorStream { .. }));
+        assert!(matches!(cells[6].kind, CellKind::Supervisor { .. }));
+        assert_eq!(cells[0].body, "line one\nline two");
+        assert_eq!(cells[1].body, "{\"target_node\"");
+        assert_eq!(cells[3].body, " after tool");
+        assert_eq!(cells[4].body, "next phase");
+        assert!(cells[5].body.contains("\"target_node\": \"done\""));
+        assert!(cells[5].body.contains('\n'));
+        assert_eq!(cells[5].status, ToolVisualStatus::Success);
+    }
+
+    #[test]
+    fn supervisor_tool_result_forwards_args_for_pretty_printing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let progress = SupervisorTraceEvent::ToolResult {
+            id: "call-1".to_string(),
+            name: "rg".to_string(),
+            args: serde_json::json!({"query": "needle"}),
+            result: "src/lib.rs:1:needle".to_string(),
+        };
+
+        forward_supervisor_progress_to_tui_tools(&progress, &tx);
+        let event = rx.try_recv().expect("tool event should be forwarded");
+
+        match event {
+            BotEvent::ToolDone {
+                id,
+                name,
+                args,
+                result,
+                success,
+                ..
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "rg");
+                assert_eq!(args, "{\"query\":\"needle\"}");
+                assert_eq!(result, "src/lib.rs:1:needle");
+                assert!(success);
+            }
+            other => panic!("expected ToolDone, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4764,5 +5065,37 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    // ── Empty-session cleanup decision logic ──────────────────────────────
+
+    #[test]
+    fn cleanup_on_exit_skips_resume_sessions() {
+        // resumed session with no new activity → keep (user may re-resume later)
+        assert!(!should_cleanup_session_on_exit(false, true));
+    }
+
+    #[test]
+    fn cleanup_on_exit_skips_active_sessions() {
+        // fresh session that saw user interaction → keep
+        assert!(!should_cleanup_session_on_exit(true, false));
+        // resumed session that saw new interaction → keep
+        assert!(!should_cleanup_session_on_exit(true, true));
+    }
+
+    #[test]
+    fn cleanup_on_exit_removes_empty_fresh_sessions() {
+        // brand-new session, user never typed anything → delete
+        assert!(should_cleanup_session_on_exit(false, false));
+    }
+
+    #[test]
+    fn cleanup_old_on_switch_removes_empty_session() {
+        assert!(should_cleanup_old_session_on_switch(false));
+    }
+
+    #[test]
+    fn cleanup_old_on_switch_keeps_active_session() {
+        assert!(!should_cleanup_old_session_on_switch(true));
     }
 }

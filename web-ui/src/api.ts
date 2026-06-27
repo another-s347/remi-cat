@@ -145,8 +145,8 @@ export type ToolRiskLevel = "low" | "medium" | "high";
 export type ToolApprovalDecision =
   | "deny"
   | "allow_once"
-  | "allow_session"
-  | "allow_session_model_auto";
+  | "allow_same_command_session"
+  | "allow_risk_level_session";
 
 export type ToolRiskReview = {
   risk: ToolRiskLevel;
@@ -162,6 +162,8 @@ export type ToolApprovalRequest = {
   tool_name: string;
   risk: ToolRiskLevel;
   args_summary: string;
+  command_key?: string | null;
+  model_review_reason?: string | null;
   platform?: string | null;
   review?: ToolRiskReview | null;
 };

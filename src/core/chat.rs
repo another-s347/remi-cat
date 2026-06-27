@@ -129,7 +129,7 @@ impl ChatRequest {
 
     pub(crate) fn enable_sdk_todo_and_triggers(mut self) -> Self {
         self.todo_create_via_sdk = true;
-        self.trigger_tools_enabled = true;
+        self.trigger_tools_enabled = bot_core::trigger::TRIGGER_CAPABILITY_ENABLED;
         self
     }
 
@@ -378,6 +378,6 @@ mod tests {
         assert_eq!(request.chat_type.as_deref(), Some("p2p"));
         assert_eq!(request.platform.as_deref(), Some("web"));
         assert!(request.todo_create_via_sdk);
-        assert!(request.trigger_tools_enabled);
+        assert!(!request.trigger_tools_enabled);
     }
 }

@@ -262,8 +262,12 @@ impl TuiApp {
         } else {
             "Ctrl+C exit"
         };
+        let focus_hint = self.input_focus_label();
         let hints = Line::from(vec![
             Span::styled(FOOTER_INDENT, Style::default().fg(CODEX_DIM)),
+            Span::styled("focus ", Style::default().fg(CODEX_DIM)),
+            Span::styled(focus_hint, Style::default().fg(CODEX_CYAN)),
+            Span::styled(" · ", Style::default().fg(CODEX_DIM)),
             Span::styled("?", Style::default().fg(Color::White)),
             Span::styled(" for shortcuts", Style::default().fg(CODEX_DIM)),
             Span::styled(" · ", Style::default().fg(CODEX_DIM)),
@@ -278,6 +282,22 @@ impl TuiApp {
             ),
         ]);
         hints
+    }
+
+    fn input_focus_label(&self) -> &'static str {
+        if self.pending_approval.is_some() {
+            "approval"
+        } else if self.pending_user_question.is_some() {
+            "question"
+        } else if self.history_browsing {
+            "input/history"
+        } else {
+            match self.active_popup() {
+                Some(PopupKind::Command) => "command menu",
+                Some(PopupKind::File) => "file menu",
+                None => "input",
+            }
+        }
     }
 
     fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -314,7 +334,7 @@ impl TuiApp {
         if area.height == 0 {
             return;
         }
-        frame.render_widget(Paragraph::new(horizontal_rule(area.width)), area);
+        frame.render_widget(Paragraph::new(self.composer_focus_rule(area.width)), area);
         let input_area = Rect::new(
             area.x,
             area.y.saturating_add(1),
@@ -342,6 +362,34 @@ impl TuiApp {
             let (x, y) = self.cursor_position(input_area);
             frame.set_cursor_position((x, y));
         }
+    }
+
+    fn composer_focus_rule(&self, width: u16) -> Line<'static> {
+        if width == 0 {
+            return Line::default();
+        }
+        let mut label = format!(" focus {} ", self.input_focus_label());
+        let max_label_width = width.saturating_sub(2).max(1);
+        label = truncate_for_width(&label, max_label_width);
+        let label_width = label.width() as u16;
+        let prefix_width = 2_u16.min(width);
+        let suffix_width = width
+            .saturating_sub(prefix_width)
+            .saturating_sub(label_width);
+        Line::from(vec![
+            Span::styled(
+                "─".repeat(prefix_width as usize),
+                Style::default().fg(CODEX_BORDER),
+            ),
+            Span::styled(
+                label,
+                Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "─".repeat(suffix_width as usize),
+                Style::default().fg(CODEX_BORDER),
+            ),
+        ])
     }
 
     fn render_command_popup(&self, frame: &mut Frame<'_>, composer_area: Rect) {
@@ -381,7 +429,7 @@ impl TuiApp {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" slash commands ")
-                .border_style(Style::default().fg(CODEX_BORDER))
+                .border_style(self.popup_border_style(PopupKind::Command))
                 .style(Style::default()),
         );
         frame.render_widget(list, area);
@@ -422,9 +470,17 @@ impl TuiApp {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" files ")
-                .border_style(Style::default().fg(CODEX_BORDER))
+                .border_style(self.popup_border_style(PopupKind::File))
                 .style(Style::default()),
         );
         frame.render_widget(list, area);
+    }
+
+    fn popup_border_style(&self, popup: PopupKind) -> Style {
+        if !self.history_browsing && self.active_popup() == Some(popup) {
+            Style::default().fg(CODEX_CYAN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(CODEX_BORDER)
+        }
     }
 }

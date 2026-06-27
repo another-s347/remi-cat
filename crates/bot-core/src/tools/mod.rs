@@ -48,6 +48,18 @@ const FS_READ_LAST_STATE_KEY: &str = "__fs_read_last";
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
+fn workspace_path_description(sandbox: &dyn Sandbox, subject: &str) -> String {
+    match sandbox.kind() {
+        "docker" => format!(
+            "{subject}. Use workspace-relative paths, or paths under the container workspace root such as /workspace/file."
+        ),
+        "no_sandbox" => format!(
+            "{subject}. Use workspace-relative paths. Host absolute paths are also accepted in no_sandbox mode."
+        ),
+        _ => format!("{subject}. Use workspace-relative paths."),
+    }
+}
+
 fn log_preview(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for ch in value.chars().take(max_chars) {
@@ -217,6 +229,69 @@ fn fs_read_duplicate_warning(
     warning
 }
 
+fn fs_read_line_range(
+    arguments: &serde_json::Value,
+) -> Result<Option<(usize, Option<usize>)>, AgentError> {
+    let start_line = fs_read_line_arg(arguments, "start_line")?;
+    let end_line = fs_read_line_arg(arguments, "end_line")?;
+    if start_line.is_none() && end_line.is_none() {
+        return Ok(None);
+    }
+
+    let start_line = start_line.unwrap_or(1);
+    if let Some(end_line) = end_line {
+        if end_line < start_line {
+            return Err(AgentError::tool(
+                "fs_read",
+                "end_line must be greater than or equal to start_line",
+            ));
+        }
+    }
+
+    Ok(Some((start_line, end_line)))
+}
+
+fn fs_read_line_arg(
+    arguments: &serde_json::Value,
+    key: &'static str,
+) -> Result<Option<usize>, AgentError> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = value.as_i64() else {
+        return Err(AgentError::tool(
+            "fs_read",
+            format!("{key} must be a positive integer"),
+        ));
+    };
+    if number < 1 {
+        return Err(AgentError::tool("fs_read", format!("{key} must be >= 1")));
+    }
+    Ok(Some(number as usize))
+}
+
+fn fs_read_lines_text(
+    bytes: &[u8],
+    start_line: usize,
+    end_line: Option<usize>,
+) -> (String, usize, usize) {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len();
+    let requested_end = end_line.unwrap_or(total_lines);
+    let start_index = start_line.saturating_sub(1).min(total_lines);
+    let end_index = requested_end.min(total_lines);
+    let selected = if start_index >= end_index {
+        String::new()
+    } else {
+        lines[start_index..end_index].join("\n")
+    };
+    (selected, end_index, total_lines)
+}
+
 pub struct RootedFsReadTool {
     pub sandbox: Arc<dyn Sandbox>,
     pub redactor: SharedRedactor,
@@ -227,21 +302,26 @@ impl Tool for RootedFsReadTool {
         "fs_read"
     }
     fn description(&self) -> &str {
-        "Read a file in the workspace. Text files support `offset` + `length` for chunked reading. \
+        "Read a file or directory in the workspace. Text files support `offset` + `length` for byte chunks, \
+         or 1-based inclusive `start_line` + `end_line` line ranges. \
          Common images (JPEG, PNG, GIF, WebP) are auto-detected and returned inline as images; \
-         for those files `offset` and `length` are ignored. Always check `[total_bytes]` in text results \
+         for those files range arguments are ignored. Always check `[total_bytes]` in byte text results \
          and call again with offset += length if needed."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description =
+            workspace_path_description(self.sandbox.as_ref(), "File or directory path");
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":   { "type": "string",  "description": "File path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
+                "path":   { "type": "string",  "description": path_description },
                 "offset": { "type": "integer", "description": "Byte offset to start for text files (default 0)" },
                 "length": {
                     "type": "integer",
                     "description": format!("Max bytes to return for text files (default {DEFAULT_FS_READ_LENGTH})")
-                }
+                },
+                "start_line": { "type": "integer", "description": "1-based inclusive line number to start reading text files. Takes precedence over offset/length." },
+                "end_line": { "type": "integer", "description": "1-based inclusive line number to stop reading text files. If omitted with start_line, reads to EOF. If provided without start_line, starts at line 1." }
             },
             "required": ["path"]
         })
@@ -265,15 +345,62 @@ impl Tool for RootedFsReadTool {
             let length = arguments["length"]
                 .as_u64()
                 .unwrap_or(DEFAULT_FS_READ_LENGTH as u64) as usize;
+            let line_range = fs_read_line_range(&arguments)?;
             Ok(ToolResult::Output(stream! {
                 let started = Instant::now();
                 tracing::info!(
                     path = %path_str,
                     offset,
                     length,
+                    start_line = line_range.map(|(start, _)| start).unwrap_or_default(),
+                    end_line = line_range.and_then(|(_, end)| end).unwrap_or_default(),
                     sandbox_kind = %sandbox.kind(),
                     "fs_read.start"
                 );
+                let metadata = match sandbox.metadata(&path_str).await {
+                    Ok(metadata) => Some(metadata),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_str,
+                            sandbox_kind = %sandbox.kind(),
+                            error = %e,
+                            "fs_read.metadata.failed"
+                        );
+                        None
+                    }
+                };
+                if metadata.as_ref().is_some_and(|metadata| metadata.is_dir) {
+                    match sandbox.list(&path_str).await {
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path_str,
+                                sandbox_kind = %sandbox.kind(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                error = %e,
+                                "fs_read.failed"
+                            );
+                            yield ToolOutput::text(format!("error: {e:#}"));
+                        }
+                        Ok(entries) => {
+                            tracing::info!(
+                                path = %path_str,
+                                entries = entries.len(),
+                                directory = true,
+                                sandbox_kind = %sandbox.kind(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "fs_read.completed"
+                            );
+                            let listing = redactor.read().unwrap().redact(&entries.join("\n"));
+                            let mut output = format!("{path_str} is a directory; use fs_ls for directory-focused listing.");
+                            if !listing.is_empty() {
+                                output.push('\n');
+                                output.push_str(&listing);
+                            }
+                            yield ToolOutput::text(output);
+                        }
+                    }
+                    return;
+                }
                 match sandbox.read(&path_str).await {
                     Err(e) => {
                         tracing::warn!(
@@ -289,18 +416,6 @@ impl Tool for RootedFsReadTool {
                     }
                     Ok(bytes) => {
                         let total = bytes.len();
-                        let metadata = match sandbox.metadata(&path_str).await {
-                            Ok(metadata) => Some(metadata),
-                            Err(e) => {
-                                tracing::warn!(
-                                    path = %path_str,
-                                    sandbox_kind = %sandbox.kind(),
-                                    error = %e,
-                                    "fs_read.metadata.failed"
-                                );
-                                None
-                            }
-                        };
                         if let Some(mime_type) = detect_inline_image_media_type(&path_str, &bytes) {
                             tracing::info!(
                                 path = %path_str,
@@ -323,6 +438,28 @@ impl Tool for RootedFsReadTool {
                                 ContentPart::text(summary),
                                 ContentPart::image_url(data_url),
                             ]));
+                            return;
+                        }
+
+                        if let Some((start_line, end_line)) = line_range {
+                            let (text, returned_end_line, total_lines) =
+                                fs_read_lines_text(&bytes, start_line, end_line);
+                            tracing::info!(
+                                path = %path_str,
+                                start_line,
+                                end_line = returned_end_line,
+                                total_lines,
+                                inline_image = false,
+                                sandbox_kind = %sandbox.kind(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "fs_read.completed"
+                            );
+                            let text = redactor.read().unwrap().redact(&text);
+                            let mut r = text;
+                            r.push_str(&format!(
+                                "\n[start_line={start_line} end_line={returned_end_line} total_lines={total_lines}]"
+                            ));
+                            yield ToolOutput::text(r);
                             return;
                         }
 
@@ -389,10 +526,11 @@ impl Tool for RootedFsWriteTool {
          entire file after reading it."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description = workspace_path_description(self.sandbox.as_ref(), "File path");
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":    { "type": "string", "description": "File path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
+                "path":    { "type": "string", "description": path_description },
                 "content": { "type": "string", "description": "Text content to write" }
             },
             "required": ["path", "content"]
@@ -463,13 +601,32 @@ impl Tool for RootedFsApplyPatchTool {
         "apply_patch"
     }
     fn description(&self) -> &str {
-        "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
-         existing files. The patch must be a standard unified diff, such as output \
-         from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
-         hunks. Every context line, including a blank one, starts with a space. \
-         `diff --git` headers are accepted. Patch file paths may be workspace-relative; \
-         NoSandbox also accepts host absolute paths, and Docker accepts paths under the \
-         container workspace root such as /workspace/file. Each old hunk must match exactly once."
+        match self.sandbox.kind() {
+            "docker" => {
+                "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
+                 existing files. The patch must be a standard unified diff, such as output \
+                 from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
+                 hunks. Every context line, including a blank one, starts with a space. \
+                 `diff --git` headers are accepted. Patch file paths may be workspace-relative \
+                 or under the container workspace root such as /workspace/file. Each old hunk must match exactly once."
+            }
+            "no_sandbox" => {
+                "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
+                 existing files. The patch must be a standard unified diff, such as output \
+                 from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
+                 hunks. Every context line, including a blank one, starts with a space. \
+                 `diff --git` headers are accepted. Patch file paths may be workspace-relative \
+                 or host absolute paths. Each old hunk must match exactly once."
+            }
+            _ => {
+                "Apply a focused multi-file patch in the workspace. Prefer this for edits to \
+                 existing files. The patch must be a standard unified diff, such as output \
+                 from `git diff` or `diff -u`, with `---` / `+++` file headers and `@@` \
+                 hunks. Every context line, including a blank one, starts with a space. \
+                 `diff --git` headers are accepted. Patch file paths should be workspace-relative. \
+                 Each old hunk must match exactly once."
+            }
+        }
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -898,10 +1055,11 @@ impl Tool for RootedFsCreateTool {
         "Create a directory in the workspace. Set recursive=true for mkdir -p behaviour."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description = workspace_path_description(self.sandbox.as_ref(), "Directory path");
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":      { "type": "string",  "description": "Directory path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/dir." },
+                "path":      { "type": "string",  "description": path_description },
                 "recursive": { "type": "boolean", "description": "Create parent dirs (default false)" }
             },
             "required": ["path"]
@@ -971,10 +1129,11 @@ impl Tool for RootedFsRemoveTool {
         "Remove a file or directory in the workspace. Set recursive=true to remove a directory tree."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description = workspace_path_description(self.sandbox.as_ref(), "Path to remove");
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":      { "type": "string",  "description": "Path to remove. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/file." },
+                "path":      { "type": "string",  "description": path_description },
                 "recursive": { "type": "boolean", "description": "Remove directory recursively (default false)" }
             },
             "required": ["path"]
@@ -1045,10 +1204,14 @@ impl Tool for RootedFsLsTool {
         "List the contents of a directory in the workspace."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let path_description = format!(
+            "{} Defaults to '.'.",
+            workspace_path_description(self.sandbox.as_ref(), "Directory path")
+        );
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path. Use workspace-relative paths; NoSandbox also accepts host absolute paths, and Docker accepts paths under the container workspace root such as /workspace/dir. Defaults to '.'." }
+                "path": { "type": "string", "description": path_description }
             }
         })
     }
@@ -1192,8 +1355,77 @@ impl Tool for RipgrepTool {
 }
 
 fn parse_rg_query(query: &str) -> Result<Vec<String>, AgentError> {
-    shlex::split(query)
+    split_rg_query_preserving_regex_escapes(query)
         .ok_or_else(|| AgentError::tool("rg", "failed to parse query; check shell quoting"))
+}
+
+fn split_rg_query_preserving_regex_escapes(query: &str) -> Option<Vec<String>> {
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut chars = query.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => {
+                    if let Some(next) = chars.peek().copied() {
+                        if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') {
+                            current.push(next);
+                            chars.next();
+                        } else {
+                            current.push(ch);
+                        }
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+            Quote::Single => match ch {
+                '\'' => quote = Quote::None,
+                _ => current.push(ch),
+            },
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    if let Some(next) = chars.peek().copied() {
+                        if matches!(next, '"' | '\\') {
+                            current.push(next);
+                            chars.next();
+                        } else {
+                            current.push(ch);
+                        }
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote != Quote::None {
+        return None;
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    Some(args)
 }
 
 fn rg_command(query_args: &[String]) -> String {
@@ -1674,6 +1906,22 @@ mod tests {
         assert!(command.ends_with("'-t' 'rust'"));
     }
 
+    #[test]
+    fn rg_query_preserves_regex_escapes() {
+        let args = parse_rg_query(r#"info!\( src/ --max-count 10"#).expect("query should parse");
+        assert_eq!(args[0], r#"info!\("#);
+
+        let command = rg_command(&args);
+        assert!(command.contains(r#"'info!\('"#));
+    }
+
+    #[test]
+    fn rg_query_still_supports_shell_style_quotes() {
+        let args =
+            parse_rg_query(r#"alpha\ beta "quoted value" 'glob*.rs'"#).expect("query should parse");
+        assert_eq!(args, vec!["alpha beta", "quoted value", "glob*.rs"]);
+    }
+
     #[tokio::test]
     async fn rg_tool_searches_workspace() {
         let root = test_root();
@@ -1709,6 +1957,41 @@ mod tests {
         assert!(output.contains("src/lib.rs:1:4:"));
         assert!(output.contains("fn alpha() {}"));
         assert!(!output.contains("README.md"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rg_tool_preserves_regex_escape_in_search_pattern() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("src"))
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("src/lib.rs"), "info!(\"ready\");\n")
+            .await
+            .unwrap();
+        let tool = RipgrepTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let output = collect_tool_text(
+            <RipgrepTool as Tool>::execute(
+                &tool,
+                json!({
+                    "query": r#"info!\( src --max-count 10"#
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("rg should execute"),
+        )
+        .await;
+
+        assert!(output.contains("src/lib.rs:1:1:"));
+        assert!(output.contains("info!(\"ready\");"));
+        assert!(!output.contains("regex parse error"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -1857,6 +2140,172 @@ mod tests {
         let text = content.text_content();
         assert!(text.contains("world"));
         assert!(text.contains("[offset=6 length=5 total_bytes=11 remaining=0]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_supports_inclusive_line_ranges() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "one\ntwo\nthree\nfour\nfive\n")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "start_line": 2, "end_line": 4, "offset": 99, "length": 1 }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await;
+
+        let text = content.text_content();
+        assert!(text.starts_with("two\nthree\nfour\n"));
+        assert!(!text.contains("one"));
+        assert!(!text.contains("five"));
+        assert!(text.contains("[start_line=2 end_line=4 total_lines=5]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_supports_single_sided_line_ranges() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("note.txt"), "one\ntwo\nthree\nfour\n")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let from_start = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "end_line": 2 }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(from_start.starts_with("one\ntwo\n"));
+        assert!(from_start.contains("[start_line=1 end_line=2 total_lines=4]"));
+
+        let to_end = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "note.txt", "start_line": 3 }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await
+        .text_content();
+        assert!(to_end.starts_with("three\nfour\n"));
+        assert!(to_end.contains("[start_line=3 end_line=4 total_lines=4]"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_invalid_line_ranges() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("test root should be created");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let err = match <RootedFsReadTool as Tool>::execute(
+            &tool,
+            json!({ "path": "note.txt", "start_line": 3, "end_line": 2 }),
+            None,
+            &test_tool_context(),
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid line range should fail before reading"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("end_line must be greater"));
+
+        let err = match <RootedFsReadTool as Tool>::execute(
+            &tool,
+            json!({ "path": "note.txt", "start_line": 0 }),
+            None,
+            &test_tool_context(),
+        )
+        .await
+        {
+            Ok(_) => panic!("zero start_line should fail before reading"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("start_line must be >= 1"));
+
+        let err = match <RootedFsReadTool as Tool>::execute(
+            &tool,
+            json!({ "path": "note.txt", "end_line": -1 }),
+            None,
+            &test_tool_context(),
+        )
+        .await
+        {
+            Ok(_) => panic!("negative end_line should fail before reading"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("end_line must be >= 1"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_reports_directories_and_lists_entries() {
+        let root = test_root();
+        let dir = root.join("notes");
+        tokio::fs::create_dir_all(dir.join("nested"))
+            .await
+            .expect("test directory should be created");
+        tokio::fs::write(dir.join("a.txt"), "hello")
+            .await
+            .expect("text fixture should be written");
+
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+
+        let content = collect_tool_content(
+            <RootedFsReadTool as Tool>::execute(
+                &tool,
+                json!({ "path": "notes" }),
+                None,
+                &test_tool_context(),
+            )
+            .await
+            .expect("fs_read should succeed"),
+        )
+        .await
+        .text_content();
+
+        assert!(content.starts_with("notes is a directory; use fs_ls"));
+        assert!(content.contains("a.txt"));
+        assert!(content.contains("nested/"));
     }
 
     #[tokio::test]

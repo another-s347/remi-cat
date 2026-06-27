@@ -91,7 +91,7 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
     match name {
         "fs_read" => {
             let path = string_arg(args, "path").unwrap_or("文件");
-            (format!("查看 {path}"), "读取文件内容".to_string())
+            (format!("查看 {path}"), "读取文件或目录内容".to_string())
         }
         "fs_write" => {
             let path = string_arg(args, "path").unwrap_or("文件");
@@ -353,9 +353,21 @@ fn apply_patch_summary(args: &Value, result: &str) -> Option<String> {
 
 fn read_summary(args: &Value, result: &str) -> Option<String> {
     let path = string_arg(args, "path")?;
+    if result.starts_with(&format!("{path} is a directory;")) {
+        let entries = result
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        return Some(format!("已查看目录 {path}，{entries} 项"));
+    }
     let duplicate = result.contains("repeats a range already read");
-    let meta = parse_fs_read_metadata(result);
-    let mut summary = if let Some(meta) = meta {
+    let mut summary = if let Some(meta) = parse_fs_read_line_metadata(result) {
+        format!(
+            "已读取 {path} 第 {}-{} 行，共 {} 行",
+            meta.start_line, meta.end_line, meta.total_lines
+        )
+    } else if let Some(meta) = parse_fs_read_metadata(result) {
         if meta.remaining > 0 {
             format!(
                 "已读取 {path} offset={} length={}，仍有 {} 字节剩余",
@@ -384,6 +396,38 @@ struct FsReadMetadata {
     offset: usize,
     length: usize,
     remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FsReadLineMetadata {
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+}
+
+fn parse_fs_read_line_metadata(result: &str) -> Option<FsReadLineMetadata> {
+    let line = result
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[start_line=") && line.ends_with(']'))?;
+    let line = line.trim_start_matches('[').trim_end_matches(']');
+    let mut start_line = None;
+    let mut end_line = None;
+    let mut total_lines = None;
+    for part in line.split_whitespace() {
+        let (key, value) = part.split_once('=')?;
+        match key {
+            "start_line" => start_line = value.parse().ok(),
+            "end_line" => end_line = value.parse().ok(),
+            "total_lines" => total_lines = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(FsReadLineMetadata {
+        start_line: start_line?,
+        end_line: end_line?,
+        total_lines: total_lines?,
+    })
 }
 
 fn parse_fs_read_metadata(result: &str) -> Option<FsReadMetadata> {
@@ -575,6 +619,34 @@ mod tests {
             pretty.summary,
             "已读取 src/main.rs offset=0 length=626，仍有 1422 字节剩余；重复读取同一片段，文件未变化"
         );
+    }
+
+    #[test]
+    fn formats_fs_read_with_line_metadata() {
+        let pretty = PrettyToolCall::completed(
+            "1",
+            "fs_read",
+            &json!({"path":"src/main.rs", "start_line": 10, "end_line": 20}),
+            "content\n[start_line=10 end_line=20 total_lines=100]",
+            true,
+            42,
+        );
+
+        assert_eq!(pretty.summary, "已读取 src/main.rs 第 10-20 行，共 100 行");
+    }
+
+    #[test]
+    fn formats_fs_read_directory_result() {
+        let pretty = PrettyToolCall::completed(
+            "1",
+            "fs_read",
+            &json!({"path":"src"}),
+            "src is a directory; use fs_ls for directory-focused listing.\nmain.rs\nlib.rs",
+            true,
+            42,
+        );
+
+        assert_eq!(pretty.summary, "已查看目录 src，2 项");
     }
 
     #[test]

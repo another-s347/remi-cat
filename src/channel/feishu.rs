@@ -77,7 +77,7 @@ impl Channel for FeishuChannel {
 }
 
 pub(crate) async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> anyhow::Result<()> {
-    info!("remi-cat single runtime starting Feishu gateway");
+    info!("remi-cat runtime: initializing Feishu gateway connection");
     let mut rx = match feishu_transport_from_env() {
         FeishuTransport::WebSocket => gateway.start().await?,
         FeishuTransport::EventHook => {
