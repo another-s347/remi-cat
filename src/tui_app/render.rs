@@ -201,7 +201,7 @@ impl TuiApp {
                 Span::styled("  queued", Style::default().fg(CODEX_CYAN)),
                 Span::styled(" · ", Style::default().fg(CODEX_DIM)),
                 Span::styled(
-                    truncate_for_width(next, area.width.saturating_sub(14)),
+                    truncate_for_width(&next.display_text, area.width.saturating_sub(14)),
                     Style::default().fg(CODEX_DIM),
                 ),
             ]));

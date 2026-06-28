@@ -624,7 +624,8 @@ async fn run_ssh_command_with_timeout(
     timeout_ms: u64,
     tasks: SshTaskRegistry,
 ) -> anyhow::Result<SandboxBashOutput> {
-    cmd.stdout(std::process::Stdio::piped())
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().context("running ssh command")?;
     let os_pid = child.id();

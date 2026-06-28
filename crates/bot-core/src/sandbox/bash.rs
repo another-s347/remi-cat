@@ -378,7 +378,9 @@ pub(super) async fn run_command_with_timeout(
     named: Option<String>,
     tasks: BashTaskRegistry,
 ) -> Result<SandboxBashOutput> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("running sandbox command")?;
     let os_pid = child.id();
     let stdout = child

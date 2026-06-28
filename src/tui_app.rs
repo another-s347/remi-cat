@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use base64::Engine as _;
 use bot_core::{
-    model_profile_key_status, tool_success, CatEvent, ContextCompactionEvent,
+    model_profile_key_status, tool_success, CatEvent, Content, ContentPart, ContextCompactionEvent,
     ContextCompactionStatus, Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus,
     ReasoningEffort, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
     ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
@@ -72,6 +73,7 @@ const MAX_HISTORY_BODY_LINES: usize = 220;
 const QUIT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
 const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
 const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
+const MAX_TUI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -480,7 +482,7 @@ struct TuiApp {
     interrupt_requested: bool,
     cancel: Option<Arc<Notify>>,
     run_handle: Option<JoinHandle<()>>,
-    queued_inputs: VecDeque<String>,
+    queued_inputs: VecDeque<SubmittedInput>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: Option<String>,
@@ -513,6 +515,12 @@ struct TuiApp {
     bot_rx: UnboundedReceiverStream<BotEvent>,
     trigger_rx:
         Option<UnboundedReceiverStream<crate::local_trigger_scheduler::LocalTriggerDispatch>>,
+}
+
+#[derive(Clone)]
+struct SubmittedInput {
+    display_text: String,
+    content: Content,
 }
 
 impl TuiApp {
@@ -643,7 +651,7 @@ impl TuiApp {
                     self.show_shortcuts = !self.show_shortcuts;
                     return Ok(false);
                 }
-                self.insert_paste(text);
+                self.handle_paste(text).await;
                 Ok(false)
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -917,23 +925,25 @@ impl TuiApp {
     }
 
     async fn submit(&mut self) -> anyhow::Result<bool> {
-        let text = self.composer.to_text().trim().to_string();
-        if text.is_empty() {
+        if self.composer.is_empty() {
             return Ok(false);
         }
         if self.pending_user_question.is_some() {
             self.answer_pending_user_question(false).await;
             return Ok(false);
         }
+        let content = self.composer.to_content();
+        let text = self.composer.to_text().trim().to_string();
+        let display_text = self.composer.display_text().trim().to_string();
         self.composer.clear();
         self.reset_history_navigation();
         self.scroll = 0;
         self.popup_selected = 0;
         self.show_shortcuts = false;
         self.quit_hint_until = None;
-        self.record_input_history(text.clone()).await;
+        self.record_input_history(display_text.clone()).await;
         if is_tui_exit_command(&text) {
-            self.cells.push(HistoryCell::user(text));
+            self.cells.push(HistoryCell::user(display_text));
             return Ok(true);
         }
         if is_tui_fork_command(&text) {
@@ -945,11 +955,17 @@ impl TuiApp {
             return Ok(false);
         }
         if self.running {
-            self.queued_inputs.push_back(text);
+            self.queued_inputs.push_back(SubmittedInput {
+                display_text,
+                content,
+            });
             return Ok(false);
         }
         self.has_activity = true;
-        self.start_turn(text);
+        self.start_turn(SubmittedInput {
+            display_text,
+            content,
+        });
         Ok(false)
     }
 
@@ -1077,8 +1093,9 @@ impl TuiApp {
         }
     }
 
-    fn start_turn(&mut self, text: String) {
-        self.cells.push(HistoryCell::user(text.clone()));
+    fn start_turn(&mut self, input: SubmittedInput) {
+        self.cells
+            .push(HistoryCell::user(input.display_text.clone()));
         while self.cells.len() > MAX_HISTORY_CELLS {
             self.cells.remove(0);
         }
@@ -1104,7 +1121,7 @@ impl TuiApp {
             run_bot_turn(
                 runtime,
                 session_id,
-                text,
+                input.content,
                 sender_user_id,
                 sender_username,
                 cancel,
@@ -1584,8 +1601,30 @@ impl TuiApp {
         self.refresh_file_matches();
     }
 
+    async fn handle_paste(&mut self, text: String) {
+        match image_parts_from_paste(&text).await {
+            Ok(parts) if !parts.is_empty() => {
+                for part in parts {
+                    self.composer
+                        .insert_image(part.media_type, part.data, part.source.as_deref());
+                }
+                self.after_composer_insert();
+            }
+            Ok(_) => self.insert_paste(text),
+            Err(error) => {
+                self.cells
+                    .push(HistoryCell::error(format!("paste image failed: {error:#}")));
+                self.insert_paste(text);
+            }
+        }
+    }
+
     fn insert_paste(&mut self, text: String) {
         self.composer.insert_paste(text);
+        self.after_composer_insert();
+    }
+
+    fn after_composer_insert(&mut self) {
         self.popup_selected = 0;
         self.reset_history_navigation();
         self.quit_hint_until = None;
@@ -2848,17 +2887,286 @@ async fn append_sub_session_event_log(
     Ok(())
 }
 
+#[derive(Debug)]
+struct TuiImagePart {
+    media_type: String,
+    data: String,
+    source: Option<String>,
+}
+
+async fn image_parts_from_paste(text: &str) -> anyhow::Result<Vec<TuiImagePart>> {
+    let mut parts = inline_image_parts_from_paste(text)?;
+    if !parts.is_empty() {
+        return Ok(parts);
+    }
+
+    let paths = pasted_image_paths(text);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    for path in paths {
+        parts.push(image_part_from_file(&path).await?);
+    }
+    Ok(parts)
+}
+
+fn inline_image_parts_from_paste(text: &str) -> anyhow::Result<Vec<TuiImagePart>> {
+    let mut parts = Vec::new();
+    parts.extend(data_url_image_parts(text)?);
+    parts.extend(kitty_image_parts(text)?);
+    parts.extend(iterm2_image_parts(text)?);
+    Ok(parts)
+}
+
+fn data_url_image_parts(text: &str) -> anyhow::Result<Vec<TuiImagePart>> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("data:image/") {
+        rest = &rest[start + "data:".len()..];
+        let Some(marker) = rest.find(";base64,") else {
+            break;
+        };
+        let media_type = &rest[..marker];
+        let data_start = marker + ";base64,".len();
+        let data_end = rest[data_start..]
+            .find(|ch: char| !is_base64_data_char(ch))
+            .map(|offset| data_start + offset)
+            .unwrap_or(rest.len());
+        let data = rest[data_start..data_end].trim().to_string();
+        if !data.is_empty() {
+            validate_base64_image_size(&data)?;
+            parts.push(TuiImagePart {
+                media_type: media_type.to_string(),
+                data,
+                source: None,
+            });
+        }
+        rest = &rest[data_end..];
+    }
+    Ok(parts)
+}
+
+fn kitty_image_parts(text: &str) -> anyhow::Result<Vec<TuiImagePart>> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("\x1b_G") {
+        rest = &rest[start + 3..];
+        let Some(end) = rest.find("\x1b\\") else {
+            break;
+        };
+        let payload = &rest[..end];
+        if let Some((params, data)) = payload.split_once(';') {
+            let data = data.trim().to_string();
+            if !data.is_empty() {
+                validate_base64_image_size(&data)?;
+                parts.push(TuiImagePart {
+                    media_type: kitty_media_type(params).to_string(),
+                    data,
+                    source: None,
+                });
+            }
+        }
+        rest = &rest[end + 2..];
+    }
+    Ok(parts)
+}
+
+fn iterm2_image_parts(text: &str) -> anyhow::Result<Vec<TuiImagePart>> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("\x1b]1337;File=") {
+        rest = &rest[start + "\x1b]1337;File=".len()..];
+        let end = rest
+            .find('\x07')
+            .or_else(|| rest.find("\x1b\\"))
+            .unwrap_or(rest.len());
+        let payload = &rest[..end];
+        if let Some((meta, data)) = payload.split_once(':') {
+            let source = iterm2_file_name(meta);
+            let media_type = source
+                .as_deref()
+                .and_then(|name| image_media_type_for_path(Path::new(name)))
+                .unwrap_or("image/png");
+            let data = data.trim().to_string();
+            if !data.is_empty() {
+                validate_base64_image_size(&data)?;
+                parts.push(TuiImagePart {
+                    media_type: media_type.to_string(),
+                    data,
+                    source,
+                });
+            }
+        }
+        rest = &rest[end..];
+        if let Some(next) = rest.strip_prefix('\x07') {
+            rest = next;
+        } else if let Some(next) = rest.strip_prefix("\x1b\\") {
+            rest = next;
+        }
+    }
+    Ok(parts)
+}
+
+fn pasted_image_paths(text: &str) -> Vec<PathBuf> {
+    let tokens = shellish_tokens(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for token in tokens {
+        let path = if let Some(path) = token.trim().strip_prefix("file://") {
+            PathBuf::from(percent_decode_path(path))
+        } else {
+            PathBuf::from(token.trim())
+        };
+        if !path.is_file() || image_media_type_for_path(&path).is_none() {
+            return Vec::new();
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+fn shellish_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.trim().chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+async fn image_part_from_file(path: &Path) -> anyhow::Result<TuiImagePart> {
+    let media_type = image_media_type_for_path(path)
+        .ok_or_else(|| anyhow::anyhow!("unsupported image type: {}", path.display()))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() > MAX_TUI_IMAGE_BYTES {
+        anyhow::bail!(
+            "image is too large: {} ({:.1} MB, limit {:.1} MB)",
+            path.display(),
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            MAX_TUI_IMAGE_BYTES as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(TuiImagePart {
+        media_type: media_type.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        source: Some(path.to_string_lossy().to_string()),
+    })
+}
+
+fn image_media_type_for_path(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("png") => Some("image/png"),
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") =>
+        {
+            Some("image/jpeg")
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("gif") => Some("image/gif"),
+        Some(extension) if extension.eq_ignore_ascii_case("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn validate_base64_image_size(data: &str) -> anyhow::Result<()> {
+    let approx_bytes = data.len().saturating_mul(3) / 4;
+    if approx_bytes > MAX_TUI_IMAGE_BYTES {
+        anyhow::bail!(
+            "image is too large: {:.1} MB, limit {:.1} MB",
+            approx_bytes as f64 / (1024.0 * 1024.0),
+            MAX_TUI_IMAGE_BYTES as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(())
+}
+
+fn is_base64_data_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
+}
+
+fn kitty_media_type(params: &str) -> &'static str {
+    for param in params.split(',') {
+        if matches!(param.trim(), "f=100" | "f=png") {
+            return "image/png";
+        }
+    }
+    "image/png"
+}
+
+fn iterm2_file_name(meta: &str) -> Option<String> {
+    for item in meta.split(';') {
+        if let Some(encoded) = item.strip_prefix("name=") {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                if let Ok(name) = String::from_utf8(bytes) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode_path(value: &str) -> String {
+    let mut output = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    output.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).to_string()
+}
+
 async fn run_bot_turn(
     runtime: Rc<Runtime>,
     session_id: String,
-    text: String,
+    content: Content,
     sender_user_id: String,
     sender_username: String,
     cancel: Arc<Notify>,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
+    let text = content.text_content();
     let is_clear_command = text.trim() == "/clear";
     let request = ChatRequest::text(session_id.clone(), ChatChannel::Tui, text)
+        .with_content(content)
         .with_sender(sender_user_id, Some(sender_username))
         .with_message(format!("tui-msg-{}", uuid::Uuid::new_v4()), "p2p")
         .with_platform(Some(TUI_CHANNEL.to_string()))
@@ -4169,6 +4477,66 @@ mod tests {
 
         assert_eq!(input.to_text(), "ab");
         assert_eq!(input.display_text(), "ab");
+    }
+
+    #[test]
+    fn composer_images_display_as_placeholder_and_submit_as_parts() {
+        let mut input = ComposerInput::default();
+        input.insert_text("describe ");
+        input.insert_image(
+            "image/png".to_string(),
+            "YWJj".to_string(),
+            Some("/tmp/screenshot.png"),
+        );
+        input.insert_text(" please");
+
+        assert_eq!(
+            input.display_text(),
+            "describe [image png, 3 B, screenshot.png] please"
+        );
+        assert_eq!(
+            input.to_text(),
+            "describe [image png, 3 B, screenshot.png] please"
+        );
+        match input.to_content() {
+            Content::Parts(parts) => {
+                assert!(matches!(
+                    parts.first(),
+                    Some(ContentPart::Text { text }) if text == "describe "
+                ));
+                assert!(matches!(
+                    parts.get(1),
+                    Some(ContentPart::ImageBase64 { media_type, data })
+                        if media_type == "image/png" && data == "YWJj"
+                ));
+                assert!(matches!(
+                    parts.get(2),
+                    Some(ContentPart::Text { text }) if text == " please"
+                ));
+            }
+            other => panic!("expected multipart content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_data_url_image_paste() {
+        let parts = data_url_image_parts("before data:image/png;base64,YWJj after").unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].media_type, "image/png");
+        assert_eq!(parts[0].data, "YWJj");
+    }
+
+    #[test]
+    fn shellish_tokens_unquotes_dragged_paths() {
+        assert_eq!(
+            shellish_tokens(r#""/tmp/a b.png" /tmp/c\ d.jpg"#),
+            vec!["/tmp/a b.png", "/tmp/c d.jpg"]
+        );
+        assert_eq!(
+            percent_decode_path("/tmp/a%20b.png"),
+            "/tmp/a b.png".to_string()
+        );
     }
 
     #[test]

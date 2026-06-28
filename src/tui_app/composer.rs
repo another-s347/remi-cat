@@ -3,7 +3,15 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) enum InputSegment {
     Text(String),
-    Paste { text: String, label: String },
+    Paste {
+        text: String,
+        label: String,
+    },
+    Image {
+        media_type: String,
+        data: String,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,6 +38,7 @@ impl ComposerInput {
         self.segments.iter().all(|segment| match segment {
             InputSegment::Text(text) => text.is_empty(),
             InputSegment::Paste { .. } => false,
+            InputSegment::Image { .. } => false,
         })
     }
 
@@ -53,9 +62,42 @@ impl ComposerInput {
             match segment {
                 InputSegment::Text(value) => text.push_str(value),
                 InputSegment::Paste { text: value, .. } => text.push_str(value),
+                InputSegment::Image { label, .. } => text.push_str(label),
             }
         }
         text
+    }
+
+    pub(super) fn to_content(&self) -> Content {
+        if !self
+            .segments
+            .iter()
+            .any(|segment| matches!(segment, InputSegment::Image { .. }))
+        {
+            return Content::text(self.to_text());
+        }
+
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        for segment in &self.segments {
+            match segment {
+                InputSegment::Text(value) | InputSegment::Paste { text: value, .. } => {
+                    text.push_str(value);
+                }
+                InputSegment::Image {
+                    media_type, data, ..
+                } => {
+                    if !text.is_empty() {
+                        parts.push(ContentPart::text(std::mem::take(&mut text)));
+                    }
+                    parts.push(ContentPart::image_base64(media_type.clone(), data.clone()));
+                }
+            }
+        }
+        if !text.is_empty() {
+            parts.push(ContentPart::text(text));
+        }
+        Content::parts(parts)
     }
 
     pub(super) fn command_text(&self) -> Option<&str> {
@@ -64,7 +106,7 @@ impl ComposerInput {
         }
         match &self.segments[0] {
             InputSegment::Text(text) => Some(text),
-            InputSegment::Paste { .. } => None,
+            InputSegment::Paste { .. } | InputSegment::Image { .. } => None,
         }
     }
 
@@ -88,6 +130,7 @@ impl ComposerInput {
             match segment {
                 InputSegment::Text(value) => text.push_str(value),
                 InputSegment::Paste { label, .. } => text.push_str(label),
+                InputSegment::Image { label, .. } => text.push_str(label),
             }
         }
         text
@@ -112,7 +155,7 @@ impl ComposerInput {
                         }
                     }
                 }
-                InputSegment::Paste { label, .. } => {
+                InputSegment::Paste { label, .. } | InputSegment::Image { label, .. } => {
                     lines
                         .last_mut()
                         .expect("composer line exists")
@@ -167,6 +210,14 @@ impl ComposerInput {
         } else {
             self.insert_text(&text);
         }
+    }
+
+    pub(super) fn insert_image(&mut self, media_type: String, data: String, source: Option<&str>) {
+        self.insert_segment(InputSegment::Image {
+            label: image_chunk_label(&media_type, data.len(), source),
+            media_type,
+            data,
+        });
     }
 
     fn insert_segment(&mut self, segment: InputSegment) {
@@ -249,7 +300,7 @@ impl ComposerInput {
             if index == self.cursor.segment {
                 return match segment {
                     InputSegment::Text(_) => display_byte + self.cursor.offset,
-                    InputSegment::Paste { label, .. } => {
+                    InputSegment::Paste { label, .. } | InputSegment::Image { label, .. } => {
                         display_byte
                             + if self.cursor.offset == 0 {
                                 0
@@ -278,6 +329,10 @@ impl ComposerInput {
                         segment: index,
                         offset: usize::from(target.saturating_sub(display_byte) > label.len() / 2),
                     },
+                    InputSegment::Image { label, .. } => ComposerCursor {
+                        segment: index,
+                        offset: usize::from(target.saturating_sub(display_byte) > label.len() / 2),
+                    },
                 };
             }
             display_byte = next;
@@ -300,12 +355,12 @@ impl ComposerInput {
                 self.cursor = self.end_cursor();
                 after
             }
-            InputSegment::Paste { .. } if self.cursor.offset == 0 => {
+            InputSegment::Paste { .. } | InputSegment::Image { .. } if self.cursor.offset == 0 => {
                 let after = self.segments.split_off(self.cursor.segment);
                 self.cursor = self.end_cursor();
                 after
             }
-            InputSegment::Paste { .. } => {
+            InputSegment::Paste { .. } | InputSegment::Image { .. } => {
                 let after = self.segments.split_off(self.cursor.segment + 1);
                 self.cursor = self.end_cursor();
                 after
@@ -330,6 +385,9 @@ impl ComposerInput {
                     InputSegment::Paste { text, .. } => {
                         byte + if cursor.offset == 0 { 0 } else { text.len() }
                     }
+                    InputSegment::Image { label, .. } => {
+                        byte + if cursor.offset == 0 { 0 } else { label.len() }
+                    }
                 };
             }
             byte += segment.text_len();
@@ -351,6 +409,10 @@ impl ComposerInput {
                         segment: index,
                         offset: usize::from(target.saturating_sub(byte) > text.len() / 2),
                     },
+                    InputSegment::Image { label, .. } => ComposerCursor {
+                        segment: index,
+                        offset: usize::from(target.saturating_sub(byte) > label.len() / 2),
+                    },
                 };
             }
             byte = next;
@@ -370,10 +432,12 @@ impl ComposerInput {
                 segment: cursor.segment,
                 offset: previous_char_boundary(text, cursor.offset.min(text.len())),
             },
-            InputSegment::Paste { .. } if cursor.offset > 0 => ComposerCursor {
-                segment: cursor.segment,
-                offset: 0,
-            },
+            InputSegment::Paste { .. } | InputSegment::Image { .. } if cursor.offset > 0 => {
+                ComposerCursor {
+                    segment: cursor.segment,
+                    offset: 0,
+                }
+            }
             _ if cursor.segment > 0 => self.cursor_one_left_from_segment_end(cursor.segment - 1),
             _ => cursor,
         }
@@ -388,10 +452,12 @@ impl ComposerInput {
                 segment: cursor.segment,
                 offset: next_char_boundary(text, cursor.offset),
             },
-            InputSegment::Paste { .. } if cursor.offset == 0 => ComposerCursor {
-                segment: cursor.segment,
-                offset: 1,
-            },
+            InputSegment::Paste { .. } | InputSegment::Image { .. } if cursor.offset == 0 => {
+                ComposerCursor {
+                    segment: cursor.segment,
+                    offset: 1,
+                }
+            }
             _ if cursor.segment + 1 < self.segments.len() => {
                 self.cursor_one_right_from_segment_start(cursor.segment + 1)
             }
@@ -405,7 +471,9 @@ impl ComposerInput {
                 segment,
                 offset: next_char_boundary(text, 0),
             },
-            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 1 },
+            InputSegment::Paste { .. } | InputSegment::Image { .. } => {
+                ComposerCursor { segment, offset: 1 }
+            }
         }
     }
 
@@ -415,7 +483,9 @@ impl ComposerInput {
                 segment,
                 offset: previous_char_boundary(text, text.len()),
             },
-            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 0 },
+            InputSegment::Paste { .. } | InputSegment::Image { .. } => {
+                ComposerCursor { segment, offset: 0 }
+            }
         }
     }
 
@@ -425,7 +495,9 @@ impl ComposerInput {
                 segment,
                 offset: text.len(),
             },
-            InputSegment::Paste { .. } => ComposerCursor { segment, offset: 1 },
+            InputSegment::Paste { .. } | InputSegment::Image { .. } => {
+                ComposerCursor { segment, offset: 1 }
+            }
         }
     }
 
@@ -463,6 +535,7 @@ impl InputSegment {
         match self {
             InputSegment::Text(text) => text.len(),
             InputSegment::Paste { label, .. } => label.len(),
+            InputSegment::Image { label, .. } => label.len(),
         }
     }
 
@@ -470,6 +543,7 @@ impl InputSegment {
         match self {
             InputSegment::Text(text) => text.len(),
             InputSegment::Paste { text, .. } => text.len(),
+            InputSegment::Image { label, .. } => label.len(),
         }
     }
 }
@@ -506,6 +580,28 @@ fn split_segments_at(
             InputSegment::Paste { text, label } => {
                 before.push(InputSegment::Paste { text, label });
             }
+            InputSegment::Image {
+                media_type,
+                data,
+                label,
+            } if cursor.offset == 0 => {
+                after.push(InputSegment::Image {
+                    media_type,
+                    data,
+                    label,
+                });
+            }
+            InputSegment::Image {
+                media_type,
+                data,
+                label,
+            } => {
+                before.push(InputSegment::Image {
+                    media_type,
+                    data,
+                    label,
+                });
+            }
         }
     }
     (before, after)
@@ -525,6 +621,28 @@ fn paste_chunk_label(text: &str) -> String {
         format!("{bytes} B")
     };
     format!("[pasted {lines} lines, {size}]")
+}
+
+fn image_chunk_label(media_type: &str, base64_len: usize, source: Option<&str>) -> String {
+    let approx_bytes = base64_len.saturating_mul(3) / 4;
+    let size = if approx_bytes >= 1024 * 1024 {
+        format!("{:.1} MB", approx_bytes as f64 / (1024.0 * 1024.0))
+    } else if approx_bytes >= 1024 {
+        format!("{:.1} KB", approx_bytes as f64 / 1024.0)
+    } else {
+        format!("{approx_bytes} B")
+    };
+    match source.and_then(|value| std::path::Path::new(value).file_name()) {
+        Some(name) => format!(
+            "[image {}, {size}, {}]",
+            media_type.trim_start_matches("image/"),
+            name.to_string_lossy()
+        ),
+        None => format!(
+            "[image {}, {size}]",
+            media_type.trim_start_matches("image/")
+        ),
+    }
 }
 
 fn active_file_mention_token(input: &str, cursor: usize) -> Option<FileMentionToken> {
