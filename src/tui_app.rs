@@ -2771,7 +2771,7 @@ impl TuiApp {
 
     fn cursor_position(&self, area: Rect) -> (u16, u16) {
         let display = self.composer.display_text();
-        let cursor = self.composer.cursor_display_byte().min(display.len());
+        let cursor = floor_char_boundary(&display, self.composer.cursor_display_byte());
         let before = expand_tabs(&sanitize_tui_text(&display[..cursor]));
         let (row, col) = composer_visual_position(&before, area.width);
         (

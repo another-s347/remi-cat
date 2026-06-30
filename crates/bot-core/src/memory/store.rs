@@ -1200,7 +1200,7 @@ fn make_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
     let text_chars = text.chars().count();
     let mut candidates = Vec::new();
     for byte_idx in occurrences {
-        let hit_char = text[..byte_idx].chars().count();
+        let hit_char = lower[..byte_idx].chars().count().min(text_chars);
         let start = hit_char.saturating_sub(prefix_chars);
         let end = (start + window_chars).min(text_chars);
         let window: String = text.chars().skip(start).take(end - start).collect();
@@ -1532,6 +1532,17 @@ mod tests {
         let terms = query_terms("commute work minutes");
         let snippet = make_snippet(text, &terms, MEMORY_RECALL_SNIPPET_CHARS);
         assert!(snippet.contains("45 minutes each way"));
+    }
+
+    #[test]
+    fn snippet_handles_lowercase_expansion_without_slicing_original_at_lower_byte_offset() {
+        let text = "记忆：İstanbul 的偏好是坐在靠窗位置。";
+        let terms = query_terms("istanbul 靠窗");
+
+        let snippet = make_snippet(text, &terms, MEMORY_RECALL_SNIPPET_CHARS);
+
+        assert!(snippet.contains("İstanbul"));
+        assert!(snippet.contains("靠窗"));
     }
 
     #[tokio::test]

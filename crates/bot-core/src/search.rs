@@ -288,12 +288,21 @@ fn preview(text: &str) -> String {
     if text.len() <= MAX {
         return text.to_string();
     }
-    format!("{}...", &text[..MAX])
+    let end = safe_utf8_prefix_len(text, MAX);
+    format!("{}...", &text[..end])
+}
+
+fn safe_utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
+    let mut index = max_bytes.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exa_search_response, SearchTool};
+    use super::{parse_exa_search_response, preview, SearchTool};
     use crate::memory::{LlmCompressor, MemoryStore};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};
     use futures::StreamExt;
@@ -361,6 +370,16 @@ mod tests {
                     .to_string(),
             }],
         ))
+    }
+
+    #[test]
+    fn preview_truncates_on_utf8_boundary() {
+        let text = format!("{}🙂tail", "a".repeat(499));
+
+        let value = preview(&text);
+
+        assert!(value.ends_with("..."));
+        assert!(!value.contains("tail"));
     }
 
     #[tokio::test]

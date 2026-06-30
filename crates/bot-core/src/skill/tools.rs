@@ -85,7 +85,7 @@ fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     }
 
     let mut prompt = String::from(
-        "Available local skills (catalog only; full instructions are loaded by skill__get):\n",
+        "Available local skills (catalog only; full instructions are loaded by skill__get). Skill frontmatter may set pin: true to keep name and description in the pinned-skill prompt after Remi restarts:\n",
     );
     for skill in skills {
         prompt.push_str(&render_skill_summary(skill));
@@ -338,11 +338,13 @@ mod tests {
                     name: "trigger".to_string(),
                     description: "builtin trigger skill".to_string(),
                     source: "builtin".to_string(),
+                    pin: false,
                 },
                 SkillSummary {
                     name: "rust-build".to_string(),
                     description: "build help".to_string(),
                     source: ".remi-cat/skills".to_string(),
+                    pin: false,
                 },
             ],
             true,

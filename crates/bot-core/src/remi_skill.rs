@@ -195,6 +195,10 @@ cli --channel support "/tools"
 
 The same `--channel` id resumes the same local CLI session. Runtime `/help` lists slash commands; `/skill list` shows local and builtin skills.
 
+## Skill Pinning
+
+Local `SKILL.md` YAML frontmatter supports `pin: true` or `pin: false`. The default is false, so downloaded skills are not pinned unless edited locally. Pinned skills have only their name and description injected into a small pinned-skill prompt for discovery; full instructions still require `skill__get` or `/skill:<name>`. The pinned prompt is cached by the running Remi process and refreshes after restart.
+
 ## Common Procedure
 
 1. Read this skill with `skill__get` before changing Remi configuration.

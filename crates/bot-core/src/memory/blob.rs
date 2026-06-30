@@ -54,8 +54,8 @@ pub async fn extract_blobs(text: &str, blobs_dir: &Path) -> std::io::Result<Stri
 
                 let after_data = start + DATA_PREFIX.len();
 
-                // Mime types are short; search at most 100 chars ahead for ";base64,"
-                let search_bound = (after_data + 100).min(text.len());
+                // Mime types are short; search at most 100 bytes ahead for ";base64,"
+                let search_bound = floor_char_boundary(text, (after_data + 100).min(text.len()));
                 let maybe_b64 = text[after_data..search_bound].find(B64_MARKER);
 
                 if let Some(b64_rel) = maybe_b64 {
@@ -149,4 +149,27 @@ pub async fn restore_blobs(text: &str, blobs_dir: &Path) -> String {
     }
 
     result
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extract_blobs_does_not_split_utf8_when_scanning_invalid_data_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = format!("prefix data:{}🙂 suffix", "a".repeat(96));
+
+        let output = extract_blobs(&input, tmp.path()).await.unwrap();
+
+        assert_eq!(output, input);
+    }
 }

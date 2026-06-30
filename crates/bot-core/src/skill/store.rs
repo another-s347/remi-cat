@@ -13,6 +13,8 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub source: String,
+    #[serde(default)]
+    pub pin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +36,7 @@ pub struct SkillLoadDiagnostic {
 pub struct SkillDocument {
     pub name: String,
     pub description: String,
+    pub pin: bool,
     pub content: String,
     pub source: String,
     pub root: Option<PathBuf>,
@@ -63,6 +66,7 @@ impl BuiltinSkill {
         Ok(SkillDocument {
             name: parsed.name,
             description: parsed.description,
+            pin: parsed.pin,
             content: self.content.clone(),
             source: "builtin".to_string(),
             root: None,
@@ -106,6 +110,7 @@ impl<S> BuiltinSkillStore<S> {
                 name: skill.name.to_string(),
                 description: skill.description.to_string(),
                 source: "builtin".to_string(),
+                pin: false,
             })
             .collect()
     }
@@ -297,6 +302,7 @@ impl SkillStore for FileSkillStore {
         Ok(Some(SkillDocument {
             name: parsed.name,
             description: parsed.description,
+            pin: parsed.pin,
             content,
             source: entry.summary.source,
             root: Some(entry.root),
@@ -376,6 +382,7 @@ impl SkillStore for FileSkillStore {
 struct ParsedSkill {
     name: String,
     description: String,
+    pin: bool,
     warnings: Vec<String>,
 }
 
@@ -444,6 +451,7 @@ fn scan_skill_roots(roots: &[SkillRoot]) -> SkillScan {
                             name: parsed.name,
                             description: parsed.description,
                             source: root_spec.source.clone(),
+                            pin: parsed.pin,
                         },
                         path: skill_file,
                         root: skill_dir,
@@ -529,6 +537,17 @@ fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, Ag
         warnings.push("description exceeded 1024 characters; truncated".to_string());
     }
 
+    let pin = mapping
+        .and_then(|map| yaml_field(map, "pin"))
+        .map(|value| match value {
+            serde_yaml::Value::Bool(value) => *value,
+            _ => {
+                warnings.push("frontmatter field `pin` must be boolean; using false".to_string());
+                false
+            }
+        })
+        .unwrap_or(false);
+
     if let Some(map) = mapping {
         for field in ["compatibility", "metadata", "allowed-tools", "license"] {
             if let Some(value) = yaml_field(map, field) {
@@ -550,6 +569,7 @@ fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, Ag
     Ok(ParsedSkill {
         name,
         description,
+        pin,
         warnings,
     })
 }
@@ -945,6 +965,53 @@ mod tests {
             .load_diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("missing description")));
+
+        let _ = std::fs::remove_dir_all(primary);
+        let _ = std::fs::remove_dir_all(compat);
+    }
+
+    #[tokio::test]
+    async fn pin_frontmatter_is_optional_and_boolean() {
+        let primary = temp_dir();
+        let compat = temp_dir();
+        let pinned = primary.join("pinned");
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::write(
+            pinned.join("SKILL.md"),
+            "---\nname: pinned\ndescription: Pinned workflow\npin: true\n---\n\nBody",
+        )
+        .unwrap();
+        let bad_pin = primary.join("bad-pin");
+        std::fs::create_dir_all(&bad_pin).unwrap();
+        std::fs::write(
+            bad_pin.join("SKILL.md"),
+            "---\nname: bad-pin\ndescription: Bad pin\npin: \"true\"\n---\n\nBody",
+        )
+        .unwrap();
+        write_skill(
+            &primary,
+            "default-pin",
+            "default-pin",
+            "Default pin",
+            "Body",
+        );
+
+        let store = FileSkillStore::with_roots([
+            (primary.clone(), ".remi-cat/skills".to_string()),
+            (compat.clone(), ".agents/skills".to_string()),
+        ]);
+
+        assert!(store.get("pinned").await.unwrap().unwrap().pin);
+        assert!(store
+            .featured_summaries()
+            .into_iter()
+            .any(|summary| summary.name == "pinned" && summary.pin));
+        assert!(!store.get("default-pin").await.unwrap().unwrap().pin);
+        assert!(!store.get("bad-pin").await.unwrap().unwrap().pin);
+        assert!(store
+            .load_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("field `pin` must be boolean")));
 
         let _ = std::fs::remove_dir_all(primary);
         let _ = std::fs::remove_dir_all(compat);

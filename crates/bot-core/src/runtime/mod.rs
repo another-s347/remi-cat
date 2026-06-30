@@ -52,7 +52,7 @@ use model_provider::{
 pub use model_provider::{EffectiveModelProfile, EffectiveModelSource};
 pub(crate) use partial_turn::PartialTurnRecorder;
 pub(crate) use prompting::{
-    append_thread_todo_system_prompt, apply_skill_injections,
+    append_thread_todo_system_prompt, apply_skill_injections, insert_pinned_skill_prompt,
     insert_single_chat_sender_system_prompt, insert_skill_injection_prompts, is_direct_chat,
     model_input_snapshot_from_loop_input, prepend_group_sender_username, route_thread_todo_prompt,
     single_chat_sender_system_prompt, truncate_user_name,
@@ -224,6 +224,7 @@ pub struct CatBot {
     agent_profiles: HashMap<String, AgentProfile>,
     default_agent_profile: AgentProfile,
     skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
+    pinned_skill_summaries: Vec<SkillSummary>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
     trigger_backend: Arc<trigger::TriggerBackend>,
@@ -1600,6 +1601,12 @@ impl CatBot {
                 agent_header_count,
                 &round_opts.skill_injections,
             );
+            insert_pinned_skill_prompt(
+                &mut history,
+                agent_header_count,
+                &self.pinned_skill_summaries,
+                effective_model.profile.context_tokens,
+            );
             insert_single_chat_sender_system_prompt(
                 &mut history,
                 agent_header_count,
@@ -2591,6 +2598,11 @@ impl CatBotBuilder {
                 remi_skill::builtin_remi_skill(),
             ],
         ));
+        let pinned_skill_summaries = skill_store
+            .featured_summaries()
+            .into_iter()
+            .filter(|skill| skill.pin)
+            .collect::<Vec<_>>();
         let data_dir = memory.data_dir.clone();
         let sandbox = self.sandbox_config.build()?;
         let agents_dir = self.agents_dir.clone();
@@ -2861,6 +2873,7 @@ impl CatBotBuilder {
             agent_profiles,
             default_agent_profile,
             skill_store,
+            pinned_skill_summaries,
             memory,
             todo_backend,
             trigger_backend,
@@ -3820,6 +3833,76 @@ mod tests {
     }
 
     #[test]
+    fn build_caches_pinned_skill_summaries_until_next_bot_build() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let skill_dir = skills_dir.join("pinned");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pinned\ndescription: Original pinned skill\npin: true\n---\n\nBody",
+        )
+        .unwrap();
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+
+        let build_bot = || {
+            CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile: test_model_profile(),
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir: skills_dir.clone(),
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                short_term_tokens: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir: agents_dir.clone(),
+                max_turns: Some(2),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir.clone()).unwrap()),
+            }
+            .build()
+            .unwrap()
+        };
+
+        let bot = build_bot();
+        assert_eq!(bot.pinned_skill_summaries.len(), 1);
+        assert_eq!(
+            bot.pinned_skill_summaries[0].description,
+            "Original pinned skill"
+        );
+
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pinned\ndescription: Updated pinned skill\npin: true\n---\n\nBody",
+        )
+        .unwrap();
+        assert_eq!(
+            bot.pinned_skill_summaries[0].description,
+            "Original pinned skill"
+        );
+
+        let rebuilt = build_bot();
+        assert_eq!(
+            rebuilt.pinned_skill_summaries[0].description,
+            "Updated pinned skill"
+        );
+    }
+
+    #[test]
     fn persistent_delegate_agent_exposes_named_parameter() {
         let data_dir = tempfile::tempdir().unwrap();
         let skills_dir = data_dir.path().join("skills");
@@ -4497,6 +4580,97 @@ You are Remi.
             requests[3]
         );
         assert!(requests[3].contains("确认supervisor接收todo"));
+    }
+
+    #[tokio::test]
+    async fn pinned_skill_prompt_is_sent_to_model_end_to_end() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let responses = vec![sse_text("pinned prompt observed")];
+        let (base_url, requests) = start_openai_mock_server(responses).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let pinned_dir = skills_dir.join("always-handy");
+        let unpinned_dir = skills_dir.join("quiet-skill");
+        std::fs::create_dir_all(&pinned_dir).unwrap();
+        std::fs::create_dir_all(&unpinned_dir).unwrap();
+        std::fs::write(
+            pinned_dir.join("SKILL.md"),
+            "---\nname: always-handy\ndescription: Pinned discovery description\npin: true\n---\n\nPinned body must not be injected.",
+        )
+        .unwrap();
+        std::fs::write(
+            unpinned_dir.join("SKILL.md"),
+            "---\nname: quiet-skill\ndescription: Unpinned discovery description\n---\n\nQuiet body.",
+        )
+        .unwrap();
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .build()
+        .unwrap();
+
+        let events = collect_stream(bot.stream("pinned-skill-e2e", "hello")).await;
+        assert!(events.iter().any(
+            |event| matches!(event, CatEvent::Text(text) if text.contains("pinned prompt observed"))
+        ));
+
+        let requests = requests.lock().expect("request lock poisoned");
+        assert_eq!(requests.len(), 1);
+        let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let messages = request
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("request should contain messages");
+        let pinned_prompt = messages
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+            })
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .find(|content| content.contains("## Pinned Skills"))
+            .expect("request should contain pinned skill system prompt");
+        assert!(pinned_prompt.contains("always-handy"), "{pinned_prompt}");
+        assert!(
+            pinned_prompt.contains("Pinned discovery description"),
+            "{pinned_prompt}"
+        );
+        assert!(
+            !pinned_prompt.contains("Pinned body must not be injected"),
+            "{pinned_prompt}"
+        );
+        assert!(!pinned_prompt.contains("quiet-skill"), "{pinned_prompt}");
+        assert!(
+            !pinned_prompt.contains("Unpinned discovery description"),
+            "{pinned_prompt}"
+        );
     }
 
     async fn collect_stream(stream: impl futures::Stream<Item = CatEvent>) -> Vec<CatEvent> {

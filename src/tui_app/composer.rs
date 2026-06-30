@@ -775,6 +775,14 @@ pub(super) fn previous_char_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
+pub(super) fn floor_char_boundary(text: &str, mut cursor: usize) -> usize {
+    cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
 pub(super) fn next_char_boundary(text: &str, cursor: usize) -> usize {
     text[cursor..]
         .char_indices()

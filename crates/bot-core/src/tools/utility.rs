@@ -18,7 +18,7 @@ impl Tool for ManageYourselfTool {
     }
 
     fn description(&self) -> &str {
-        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. Use {\"command\":\"tools --json\"} to inspect every registered tool and configuration diagnostics, including tools outside the active allowlist. Use help commands such as {\"command\":\"help\"} or {\"command\":\"profile agent --help\"} to inspect available CLI commands. Current chat runtime settings that are slash commands, including model reasoning strength, are available to the user as commands such as `/model reasoning set high` and `/model reasoning reset`. The command is parsed as shell-like arguments but is not executed through a shell."
+        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. Use {\"command\":\"tools --json\"} to inspect every registered tool and configuration diagnostics, including tools outside the active allowlist. Use help commands such as {\"command\":\"help\"} or {\"command\":\"profile agent --help\"} to inspect available CLI commands. Local SKILL.md frontmatter can set pin: true to keep a skill's name and description in the pinned-skill prompt after Remi restarts; read the builtin remi skill for details. Current chat runtime settings that are slash commands, including model reasoning strength, are available to the user as commands such as `/model reasoning set high` and `/model reasoning reset`. The command is parsed as shell-like arguments but is not executed through a shell."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

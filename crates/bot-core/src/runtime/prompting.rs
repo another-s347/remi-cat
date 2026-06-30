@@ -1,9 +1,12 @@
 use remi_agentloop::prelude::{Content, ContentPart, LoopInput, Message, Role};
 
 use crate::{
-    estimate_model_input_tokens, skill, todo, ModelInputSegment, ModelInputSegmentCategory,
-    ModelInputSnapshot, ModelInputTotals, SkillDocument,
+    context_budget_tokens, estimate_model_input_tokens, skill, todo, ModelInputSegment,
+    ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillDocument, SkillSummary,
 };
+
+const PINNED_SKILL_PROMPT_CONTEXT_PERCENT: usize = 2;
+const PINNED_SKILLS_HEADER: &str = "## Pinned Skills";
 
 pub(crate) fn truncate_user_name(name: Option<&str>, max_chars: usize) -> Option<String> {
     let trimmed = name?.trim();
@@ -52,6 +55,83 @@ pub(crate) fn insert_skill_injection_prompts(
             Message::system(prompt),
         );
         offset += 1;
+    }
+}
+
+pub(crate) fn insert_pinned_skill_prompt(
+    history: &mut Vec<Message>,
+    insertion_index: usize,
+    skills: &[SkillSummary],
+    context_tokens: u32,
+) {
+    let Some(prompt) = pinned_skill_prompt(skills, context_tokens) else {
+        return;
+    };
+    history.insert(insertion_index.min(history.len()), Message::system(prompt));
+}
+
+pub(crate) fn pinned_skill_prompt(skills: &[SkillSummary], context_tokens: u32) -> Option<String> {
+    let mut pinned = skills
+        .iter()
+        .filter(|skill| skill.pin)
+        .cloned()
+        .collect::<Vec<_>>();
+    if pinned.is_empty() {
+        return None;
+    }
+    pinned.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
+    let budget = context_budget_tokens(context_tokens, PINNED_SKILL_PROMPT_CONTEXT_PERCENT) as u32;
+    let prompt = render_pinned_skill_prompt(&pinned, None);
+    if estimate_model_input_tokens(&prompt) <= budget {
+        return Some(prompt);
+    }
+    let fixed_tokens = estimate_model_input_tokens(&render_pinned_skill_prompt(&[], None));
+    let per_skill_budget = budget.saturating_sub(fixed_tokens) / pinned.len().max(1) as u32;
+    Some(render_pinned_skill_prompt(
+        &pinned,
+        Some(per_skill_budget.max(1)),
+    ))
+}
+
+fn render_pinned_skill_prompt(skills: &[SkillSummary], per_skill_budget: Option<u32>) -> String {
+    let mut lines = vec![PINNED_SKILLS_HEADER.to_string(), String::new()];
+    for skill in skills {
+        let description = per_skill_budget
+            .map(|budget| truncate_pinned_description(&skill.name, &skill.description, budget))
+            .unwrap_or_else(|| skill.description.clone());
+        if description.trim().is_empty() {
+            lines.push(format!("- `{}`", skill.name));
+        } else {
+            lines.push(format!("- `{}` - {}", skill.name, description));
+        }
+    }
+    lines.join("\n")
+}
+
+fn truncate_pinned_description(name: &str, description: &str, token_budget: u32) -> String {
+    let prefix_tokens = estimate_model_input_tokens(&format!("- `{name}` - "));
+    if prefix_tokens >= token_budget {
+        return String::new();
+    }
+    let description_budget = token_budget - prefix_tokens;
+    if estimate_model_input_tokens(description) <= description_budget {
+        return description.to_string();
+    }
+    let mut out = String::new();
+    for ch in description.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        candidate.push_str("...");
+        if estimate_model_input_tokens(&candidate) > description_budget {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.push_str("...");
+        out
     }
 }
 
@@ -391,4 +471,61 @@ pub(crate) fn is_direct_chat(chat_type: Option<&str>) -> bool {
     chat_type
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("p2p"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pinned_skill_prompt, PINNED_SKILLS_HEADER};
+    use crate::{estimate_model_input_tokens, SkillSummary};
+
+    fn skill(name: &str, description: &str, pin: bool) -> SkillSummary {
+        SkillSummary {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: ".remi-cat/skills".to_string(),
+            pin,
+        }
+    }
+
+    #[test]
+    fn pinned_skill_prompt_only_lists_pinned_summaries() {
+        let prompt = pinned_skill_prompt(
+            &[
+                skill("alpha", "Pinned workflow", true),
+                skill("beta", "Unpinned workflow", false),
+            ],
+            128_000,
+        )
+        .expect("pinned skill should create prompt");
+
+        assert!(prompt.contains(PINNED_SKILLS_HEADER));
+        assert!(prompt.contains("alpha"));
+        assert!(prompt.contains("Pinned workflow"));
+        assert!(!prompt.contains("beta"));
+        assert!(!prompt.contains("Unpinned workflow"));
+    }
+
+    #[test]
+    fn pinned_skill_prompt_returns_none_without_pinned_summaries() {
+        assert!(
+            pinned_skill_prompt(&[skill("beta", "Unpinned workflow", false)], 128_000).is_none()
+        );
+    }
+
+    #[test]
+    fn pinned_skill_prompt_truncates_each_skill_to_context_budget() {
+        let prompt = pinned_skill_prompt(
+            &[
+                skill("alpha", &"a".repeat(1000), true),
+                skill("beta", &"b".repeat(1000), true),
+            ],
+            2_000,
+        )
+        .expect("pinned skills should create prompt");
+
+        assert!(prompt.contains("alpha"));
+        assert!(prompt.contains("beta"));
+        assert!(prompt.contains("..."));
+        assert!(estimate_model_input_tokens(&prompt) <= 40);
+    }
 }
