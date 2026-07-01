@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.10"
+version = "0.2.11"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -20,6 +20,7 @@ members = [
     ".",
     "crates/im-feishu",
     "crates/user-store",
+    "crates/bot-runtime-core",
     "crates/bot-core",
     "crates/remi-client-sdk",
     "crates/remi-things-crdt",

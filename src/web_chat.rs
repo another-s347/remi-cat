@@ -535,11 +535,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 answer,
                 response,
             } => {
-                let request = runtime
-                    .bot
-                    .user_question_manager()
-                    .answer(&question_id, answer)
-                    .await;
+                let request = runtime.bot.answer_user_question(&question_id, answer).await;
                 tracing::info!(
                     question_id = %question_id,
                     source = "web_chat",

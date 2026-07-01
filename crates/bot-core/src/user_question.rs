@@ -230,7 +230,13 @@ impl Tool for AskUserQuestionTool {
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let manager = Arc::clone(&self.manager);
-        let thread_id = ctx.thread_id.clone();
+        let thread_id = ctx
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("thread_id"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .or_else(|| ctx.thread_id.as_ref().map(|id| id.0.clone()));
         let run_id = ctx.run_id.clone();
         async move {
             let args: AskUserQuestionArgs = serde_json::from_value(arguments)
@@ -245,7 +251,7 @@ impl Tool for AskUserQuestionTool {
             validate_question_args(&args)?;
             let session_id = thread_id
                 .as_ref()
-                .map(|id| id.0.clone())
+                .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
             let run_id_value = run_id.0.clone();
             let request = UserQuestionRequest {

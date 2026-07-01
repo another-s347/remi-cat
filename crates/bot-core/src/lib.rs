@@ -48,6 +48,7 @@ pub use approval::{
     ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
     ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
+pub use bot_runtime_core::{Content, ContentPart, Message};
 pub use events::{
     CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
     ModelInputSegment, ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillEvent,
@@ -67,7 +68,6 @@ pub use profile::{
     embedded_agent_profile, install_embedded_agent_profiles, AgentModelBindings, AgentProfile,
     AgentRegistry,
 };
-pub use remi_agentloop::prelude::{Content, ContentPart, Message};
 pub use runtime::{
     CatBot, CatBotBuilder, EffectiveModelProfile, EffectiveModelSource, RegisteredToolStatus,
     StreamOptions,

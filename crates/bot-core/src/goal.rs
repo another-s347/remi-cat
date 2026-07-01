@@ -131,6 +131,8 @@ pub async fn migrate_legacy_goal(data_dir: &Path, thread_id: &str) -> Option<Wor
         } else {
             WorkflowStatus::Active
         },
+        pause_reason: None,
+        ask_user_for_help: None,
         max_rounds: legacy.max_rounds,
         last_report,
         context: serde_json::json!({"goal": legacy.goal}),

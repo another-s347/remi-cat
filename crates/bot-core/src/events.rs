@@ -1,5 +1,4 @@
-use remi_agentloop::prelude::{AgentError, Message};
-use remi_agentloop::types::SubSessionEvent;
+use bot_runtime_core::{AgentError, Message, SubSessionEvent};
 
 use crate::approval::{ToolApprovalDecision, ToolApprovalRequest};
 use crate::supervisor_workflow::{SupervisorTraceEvent, WorkflowReport};
@@ -157,6 +156,8 @@ pub enum CatEvent {
     ModelInputSnapshot(ModelInputSnapshot),
     /// Run completed normally.
     Done,
+    /// Run was cooperatively cancelled.
+    Cancelled,
     /// An error occurred (run aborted).
     Error(AgentError),
     /// Model thinking/reasoning content (from extended thinking).

@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
+use bot_runtime_core::CoreStreamOptions;
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ResumePayload, Role,
@@ -68,7 +69,20 @@ pub(crate) use tool_status::{
 const DEFAULT_AGENT_ID: &str = "default";
 const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
+const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
+const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
 pub(crate) const TRIGGER_RUN_META_KEY: &str = "trigger_run";
+
+fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
+    let percent_budget = (profile.context_tokens as usize)
+        .saturating_mul(SUPERVISOR_PROMPT_CONTEXT_PERCENT)
+        .div_ceil(100) as u32;
+    let output_budget = profile
+        .context_tokens
+        .saturating_sub(profile.max_output_tokens)
+        .saturating_sub(SUPERVISOR_PROMPT_MARGIN_TOKENS);
+    percent_budget.min(output_budget).max(1)
+}
 
 pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &str) -> bool {
     metadata
@@ -277,6 +291,21 @@ impl CatBot {
 
     pub fn user_question_manager(&self) -> Arc<UserQuestionManager> {
         Arc::clone(&self.user_question_manager)
+    }
+
+    pub async fn answer_user_question(
+        &self,
+        question_id: &str,
+        answer: crate::user_question::UserQuestionResponse,
+    ) -> Option<crate::user_question::UserQuestionRequest> {
+        let request = self
+            .user_question_manager
+            .answer(question_id, answer)
+            .await?;
+        let _ = self
+            .resume_workflow_from_user_input(&request.session_id, 0)
+            .await;
+        Some(request)
     }
 
     pub fn hook_manager(&self) -> Arc<HookManager> {
@@ -747,6 +776,8 @@ impl CatBot {
             incoming_edge: None,
             node_message: None,
             status: WorkflowStatus::Active,
+            pause_reason: None,
+            ask_user_for_help: None,
             max_rounds,
             last_report: None,
             updated_at: chrono::Utc::now(),
@@ -912,6 +943,7 @@ impl CatBot {
             return Ok(());
         };
         instance.status = WorkflowStatus::Paused;
+        instance.pause_reason = Some(supervisor_workflow::WorkflowPauseReason::Manual);
         instance.updated_at = chrono::Utc::now();
         instance.last_report = Some(WorkflowReport {
             workflow_id: instance.definition.id.clone(),
@@ -935,6 +967,35 @@ impl CatBot {
             error: None,
         });
         self.save_workflow_instance(thread_id, &instance).await
+    }
+
+    async fn pause_workflow_for_user_input(
+        &self,
+        thread_id: &str,
+        round: u32,
+    ) -> Option<(WorkflowReport, WorkflowInstance)> {
+        let mut instance = self.workflow_status(thread_id).await?;
+        if instance.status != WorkflowStatus::Active {
+            return None;
+        }
+        let report = instance.enter_ask_user_for_help(round);
+        if let Err(err) = self.save_workflow_instance(thread_id, &instance).await {
+            tracing::warn!(thread_id, error = %err, "failed to save workflow user-input pause");
+        }
+        Some((report, instance))
+    }
+
+    async fn resume_workflow_from_user_input(
+        &self,
+        thread_id: &str,
+        round: u32,
+    ) -> Option<(WorkflowReport, WorkflowInstance)> {
+        let mut instance = self.workflow_status(thread_id).await?;
+        let report = instance.resume_from_ask_user_for_help(round)?;
+        if let Err(err) = self.save_workflow_instance(thread_id, &instance).await {
+            tracing::warn!(thread_id, error = %err, "failed to save workflow user-input resume");
+        }
+        Some((report, instance))
     }
 
     pub async fn stop_workflow(&self, thread_id: &str) -> Result<(), AgentError> {
@@ -1317,13 +1378,34 @@ impl CatBot {
         progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
     ) -> Result<WorkflowDecision, AgentError> {
         let supervisor_thread_id = format!("supervisor:{thread_id}:{}", uuid::Uuid::new_v4());
-        let prompt = supervisor_workflow::supervisor_prompt(instance, history, todo_prompt)
-            .map_err(AgentError::other)?;
-        let input = LoopInput::start(prompt).metadata(serde_json::json!({
+        let effective_model = self.effective_model_profile(model_profile_id);
+        let prompt_budget = supervisor_prompt_budget_tokens(&effective_model.profile);
+        let prompt = supervisor_workflow::supervisor_prompt_with_budget(
+            instance,
+            history,
+            todo_prompt,
+            Some(prompt_budget),
+        )
+        .map_err(AgentError::other)?;
+        if prompt.included_history_messages < prompt.original_history_messages {
+            tracing::warn!(
+                thread_id,
+                supervisor_thread_id = %supervisor_thread_id,
+                estimated_tokens = prompt.estimated_tokens,
+                budget_tokens = prompt_budget,
+                original_history_messages = prompt.original_history_messages,
+                included_history_messages = prompt.included_history_messages,
+                "trimmed old main-agent history messages from supervisor prompt"
+            );
+        }
+        let input = LoopInput::start(prompt.content).metadata(serde_json::json!({
             "thread_id": supervisor_thread_id,
             "supervisor_run": "true",
+            "supervisor_prompt_estimated_tokens": prompt.estimated_tokens,
+            "supervisor_prompt_budget_tokens": prompt_budget,
+            "supervisor_history_original_messages": prompt.original_history_messages,
+            "supervisor_history_included_messages": prompt.included_history_messages,
         }));
-        let effective_model = self.effective_model_profile(model_profile_id);
         let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
         let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
             let mut stream = std::pin::pin!(active_agent
@@ -1441,51 +1523,31 @@ impl CatBot {
     ) -> impl Stream<Item = CatEvent> + 'a {
         let thread_id_owned = thread_id.to_string();
         stream! {
-            let run_lock = self.thread_run_lock(&thread_id_owned).await;
-            let _run_guard = run_lock.lock().await;
-            let mut next_content = content;
-            let mut supervisor_round: u32 = 0;
-            let mut continuation_from_supervisor = false;
-            let mut stop_hook_active = false;
-            let turn_started = Instant::now();
+                let run_lock = self.thread_run_lock(&thread_id_owned).await;
+                let _run_guard = run_lock.lock().await;
+                let mut next_content = content;
+                let mut supervisor_round: u32 = 0;
+                let mut continuation_from_supervisor = false;
+                let mut stop_hook_active = false;
+                let turn_started = Instant::now();
 
-            'workflow_loop: loop {
-            let workflow_agent_id = self
-                .workflow_status(&thread_id_owned)
-                .await
-                .and_then(|instance| {
-                    self.workflow_node_agent(&instance)
-                        .map(ToOwned::to_owned)
-                });
-            let effective_agent = self.effective_agent_profile_for_workflow(
-                opts.agent_id.as_deref(),
-                workflow_agent_id.as_deref(),
-            );
-            if effective_agent.invalid_session_agent.is_some() && workflow_agent_id.is_some() {
-                let invalid = effective_agent.invalid_session_agent.clone().unwrap_or_default();
-                let err = AgentError::other(format!(
-                    "active workflow node references unknown agent `{invalid}`"
-                ));
-                tracing::warn!(
-                    thread_id = %thread_id_owned,
-                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                    error = %err,
-                    "agent_turn.failed"
+                'workflow_loop: loop {
+                let workflow_agent_id = self
+                    .workflow_status(&thread_id_owned)
+                    .await
+                    .and_then(|instance| {
+                        self.workflow_node_agent(&instance)
+                            .map(ToOwned::to_owned)
+                    });
+                let effective_agent = self.effective_agent_profile_for_workflow(
+                    opts.agent_id.as_deref(),
+                    workflow_agent_id.as_deref(),
                 );
-                yield CatEvent::Error(err);
-                return;
-            }
-            let effective_model = self.effective_model_profile_for_agent(
-                opts.model_profile_id.as_deref(),
-                &effective_agent.profile,
-            );
-            let effective_model = match apply_reasoning_effort_override(
-                effective_model,
-                opts.reasoning_effort,
-            ) {
-                Ok(effective) => effective,
-                Err(err) => {
-                    let err = AgentError::other(err.to_string());
+                if effective_agent.invalid_session_agent.is_some() && workflow_agent_id.is_some() {
+                    let invalid = effective_agent.invalid_session_agent.clone().unwrap_or_default();
+                    let err = AgentError::other(format!(
+                        "active workflow node references unknown agent `{invalid}`"
+                    ));
                     tracing::warn!(
                         thread_id = %thread_id_owned,
                         elapsed_ms = turn_started.elapsed().as_millis() as u64,
@@ -1495,612 +1557,713 @@ impl CatBot {
                     yield CatEvent::Error(err);
                     return;
                 }
-            };
-            let runtime_model_key =
-                model_runtime_key(&effective_model.profile.id, opts.reasoning_effort);
-            let active_agent = self.runtime_for_agent_and_model(
-                &effective_agent.profile.id,
-                &runtime_model_key,
-            );
-            tracing::info!(
-                thread_id = %thread_id_owned,
-                model_profile = %effective_model.profile.id,
-                model = %effective_model.profile.model,
-                reasoning_effort = opts.reasoning_effort.map(ReasoningEffort::as_str).unwrap_or(""),
-                model_source = ?effective_model.source,
-                agent_id = %effective_agent.profile.id,
-                agent_source = ?effective_agent.source,
-                workflow_agent_id = workflow_agent_id.as_deref().unwrap_or(""),
-                platform = opts.platform.as_deref().unwrap_or(""),
-                chat_type = opts.chat_type.as_deref().unwrap_or(""),
-                message_id = opts.message_id.as_deref().unwrap_or(""),
-                sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
-                supervisor_run = opts.supervisor_run,
-                trigger_run = opts.trigger_run,
-                "agent_turn.start"
-            );
-            // 1. Load memory context (triggers mid->long-term promotion if needed).
-            let mut ctx = match self.memory.load_context(&thread_id_owned).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        thread_id = %thread_id_owned,
-                        model_profile = %effective_model.profile.id,
-                        elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                        error = %e,
-                        "agent_turn.failed"
-                    );
-                    yield CatEvent::Error(e);
-                    return;
-                }
-            };
-
-            if let Err(err) = self
-                .todo_backend
-                .refresh_thread_user_state(
-                    &thread_id_owned,
-                    opts.sender_user_id.as_deref(),
-                    &mut ctx.user_state,
-                )
-                .await
-            {
-                tracing::warn!(
-                    thread_id = %thread_id_owned,
-                    error = %err,
-                    "failed to refresh sdk-backed todo state before turn"
+                let effective_model = self.effective_model_profile_for_agent(
+                    opts.model_profile_id.as_deref(),
+                    &effective_agent.profile,
                 );
-            }
-
-            if let Err(err) = self
-                .trigger_backend
-                .refresh_thread_user_state(
-                    &thread_id_owned,
-                    opts.sender_user_id.as_deref(),
-                    &mut ctx.user_state,
-                )
-                .await
-            {
-                tracing::warn!(
-                    thread_id = %thread_id_owned,
-                    error = %err,
-                    "failed to refresh sdk-backed trigger state before turn"
+                let effective_model = match apply_reasoning_effort_override(
+                    effective_model,
+                    opts.reasoning_effort,
+                ) {
+                    Ok(effective) => effective,
+                    Err(err) => {
+                        let err = AgentError::other(err.to_string());
+                        tracing::warn!(
+                            thread_id = %thread_id_owned,
+                            elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                            error = %err,
+                            "agent_turn.failed"
+                        );
+                        yield CatEvent::Error(err);
+                        return;
+                    }
+                };
+                let runtime_model_key =
+                    model_runtime_key(&effective_model.profile.id, opts.reasoning_effort);
+                let active_agent = self.runtime_for_agent_and_model(
+                    &effective_agent.profile.id,
+                    &runtime_model_key,
                 );
-            }
-
-            let mut round_opts = opts.clone();
-            if continuation_from_supervisor {
-                round_opts.sender_username = Some("supervisor".to_string());
-                round_opts.sender_user_id = Some("supervisor".to_string());
-                round_opts.message_id = None;
-                round_opts.im_attachments.clear();
-                round_opts.im_documents.clear();
-            }
-
-            apply_skill_injections(&mut ctx.user_state, &round_opts.skill_injections);
-            let requested_user_name = round_opts
-                .sender_username
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let injected_user_name = requested_user_name
-                .as_deref()
-                .and_then(|value| truncate_user_name(Some(value), 10));
-            let single_chat_sender_prompt = single_chat_sender_system_prompt(
-                round_opts.chat_type.as_deref(),
-                requested_user_name.as_deref(),
-                round_opts.sender_user_id.as_deref(),
-            );
-
-            // 2. Build injected history prefix; record its length to strip later.
-            let mut history = build_injected_history(&ctx);
-            let agent_header_count =
-                usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
-            insert_skill_injection_prompts(
-                &mut history,
-                agent_header_count,
-                &round_opts.skill_injections,
-            );
-            insert_pinned_skill_prompt(
-                &mut history,
-                agent_header_count,
-                &self.pinned_skill_summaries,
-                effective_model.profile.context_tokens,
-            );
-            insert_single_chat_sender_system_prompt(
-                &mut history,
-                agent_header_count,
-                single_chat_sender_prompt.clone(),
-            );
-            let active_supervisor = self
-                .workflow_status(&thread_id_owned)
-                .await
-                .is_some_and(|instance| instance.status == WorkflowStatus::Active);
-            let initial_supervisor_todo_prompt =
-                route_thread_todo_prompt(&mut history, &ctx.user_state, active_supervisor);
-            let skip_count;
-
-            // 3. Build request-level metadata (thread_id for tools);
-            //    build per-message metadata (sender identity + message id).
-            let mut meta = serde_json::json!({ "thread_id": &thread_id_owned });
-            if let Some(ref ct) = round_opts.chat_type {
-                meta["chat_type"] = serde_json::Value::String(ct.clone());
-            }
-            if let Some(ref platform) = round_opts.platform {
-                meta["platform"] = serde_json::Value::String(platform.clone());
-            }
-            if round_opts.todo_create_via_sdk {
-                meta["todo_create_via_sdk"] = serde_json::Value::String("true".to_string());
-            }
-            if round_opts.trigger_tools_enabled {
-                meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
-            }
-            if round_opts.trigger_run {
-                meta[TRIGGER_RUN_META_KEY] = serde_json::Value::String("true".to_string());
-            }
-            if round_opts.supervisor_run {
-                meta["supervisor_run"] = serde_json::Value::String("true".to_string());
-            }
-
-            let mut msg_meta = serde_json::Map::new();
-            if let Some(ref sid) = round_opts.sender_user_id {
-                msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
-                meta["sender_user_id"] = serde_json::Value::String(sid.clone());
-            }
-            if let Some(ref username) = round_opts.sender_username {
-                let username = username.trim();
-                if !username.is_empty() {
-                    let username = username.to_string();
-                    msg_meta.insert("sender_username".into(), serde_json::Value::String(username.clone()));
-                    meta["sender_username"] = serde_json::Value::String(username);
-                }
-            }
-            if let Some(ref mid) = round_opts.message_id {
-                msg_meta.insert("message_id".into(), serde_json::Value::String(mid.clone()));
-                meta["message_id"] = serde_json::Value::String(mid.clone());
-            }
-            if let Some(ref ct) = round_opts.chat_type {
-                msg_meta.insert("chat_type".into(), serde_json::Value::String(ct.clone()));
-            }
-            if let Some(ref platform) = round_opts.platform {
-                msg_meta.insert("platform".into(), serde_json::Value::String(platform.clone()));
-            }
-            if !round_opts.im_attachments.is_empty() {
-                let json_str = serde_json::to_string(&round_opts.im_attachments).unwrap_or_default();
-                let str_val = serde_json::Value::String(json_str);
-                msg_meta.insert("im_attachments".into(), str_val.clone());
-                meta["im_attachments"] = str_val;
-            }
-            if !round_opts.im_documents.is_empty() {
-                let json_str = serde_json::to_string(&round_opts.im_documents).unwrap_or_default();
-                let str_val = serde_json::Value::String(json_str);
-                msg_meta.insert("im_documents".into(), str_val.clone());
-                meta["im_documents"] = str_val;
-            }
-            let message_metadata = if msg_meta.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::Object(msg_meta))
-            };
-            let content = prepend_group_sender_username(
-                next_content.clone(),
-                round_opts.chat_type.as_deref(),
-                requested_user_name.as_deref(),
-            );
-
-            let hook_context = self.hook_context(
-                &thread_id_owned,
-                Some(effective_model.profile.model.clone()),
-                round_opts.message_id.clone(),
-            );
-            if supervisor_round == 0 && !continuation_from_supervisor {
-                let session_hook = self
-                    .hook_manager
-                    .run(
-                        HookEventName::SessionStart,
-                        Some("startup"),
-                        &hook_context,
-                        serde_json::json!({ "source": "startup" }),
-                    )
-                    .await;
-                if session_hook.blocked || session_hook.continue_flow == Some(false) {
-                    yield CatEvent::Error(AgentError::other(
-                        session_hook
-                            .reason
-                            .unwrap_or_else(|| "session start blocked by hook".to_string()),
-                    ));
-                    return;
-                }
-                for context in session_hook.additional_context {
-                    history.push(hook_context_message("SessionStart", context));
-                }
-            }
-            if !continuation_from_supervisor {
-                let user_prompt_hook = self
-                    .hook_manager
-                    .run(
-                        HookEventName::UserPromptSubmit,
-                        None,
-                        &hook_context,
-                        serde_json::json!({ "prompt": content.text_content() }),
-                    )
-                    .await;
-                if user_prompt_hook.blocked || user_prompt_hook.continue_flow == Some(false) {
-                    yield CatEvent::Error(AgentError::other(
-                        user_prompt_hook
-                            .reason
-                            .unwrap_or_else(|| "user prompt blocked by hook".to_string()),
-                    ));
-                    return;
-                }
-                for context in user_prompt_hook.additional_context {
-                    history.push(hook_context_message("UserPromptSubmit", context));
-                }
-            }
-            skip_count = history.len();
-
-            let should_log_media_input = content.is_multimodal()
-                || !round_opts.im_attachments.is_empty()
-                || !round_opts.im_documents.is_empty();
-            if should_log_media_input && !effective_model.profile.supports_images {
-                let err = AgentError::other(format!(
-                    "current model profile `{}` does not support image/document inputs; switch REMI_MODEL_PROFILE to a multimodal model",
-                    effective_model.profile.id
-                ));
-                tracing::warn!(
+                tracing::info!(
                     thread_id = %thread_id_owned,
                     model_profile = %effective_model.profile.id,
                     model = %effective_model.profile.model,
-                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                    error = %err,
-                    "agent_turn.failed"
-                );
-                yield CatEvent::Error(err);
-                return;
-            }
-            if should_log_media_input {
-                tracing::info!(
-                    thread_id = %thread_id_owned,
-                    sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
-                    message_id = opts.message_id.as_deref().unwrap_or(""),
+                    reasoning_effort = opts.reasoning_effort.map(ReasoningEffort::as_str).unwrap_or(""),
+                    model_source = ?effective_model.source,
+                    agent_id = %effective_agent.profile.id,
+                    agent_source = ?effective_agent.source,
+                    workflow_agent_id = workflow_agent_id.as_deref().unwrap_or(""),
+                    platform = opts.platform.as_deref().unwrap_or(""),
                     chat_type = opts.chat_type.as_deref().unwrap_or(""),
-                    content_summary = %summarize_content_for_log(&content),
-                    attachment_count = round_opts.im_attachments.len(),
-                    document_count = round_opts.im_documents.len(),
-                    "stream_with_options: media input"
+                    message_id = opts.message_id.as_deref().unwrap_or(""),
+                    sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
+                    supervisor_run = opts.supervisor_run,
+                    trigger_run = opts.trigger_run,
+                    "agent_turn.start"
                 );
-            }
-
-            tracing::debug!(
-                thread_id = %thread_id_owned,
-                skip_count,
-                has_message_metadata = message_metadata.is_some(),
-                has_single_chat_sender_prompt = is_direct_chat(opts.chat_type.as_deref()) && (requested_user_name.is_some() || opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
-                requested_user_name = requested_user_name.as_deref().unwrap_or(""),
-                injected_user_name = injected_user_name.as_deref().unwrap_or(""),
-                ?message_metadata,
-                "stream_with_options: building LoopInput"
-            );
-            tracing::info!(
-                thread_id = %thread_id_owned,
-                sender_user_id = round_opts.sender_user_id.as_deref().unwrap_or(""),
-                message_id = round_opts.message_id.as_deref().unwrap_or(""),
-                sender_username = requested_user_name.as_deref().unwrap_or(""),
-                injected_user_name = injected_user_name.as_deref().unwrap_or(""),
-                has_single_chat_sender_prompt = is_direct_chat(round_opts.chat_type.as_deref()) && (requested_user_name.is_some() || round_opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
-                has_sender_username = requested_user_name.is_some(),
-                has_message_metadata = message_metadata.is_some(),
-                "stream_with_options: username propagation"
-            );
-
-            let initial_user_state = ctx.user_state.clone();
-
-            let current_user_message = Message {
-                id: MessageId::new(),
-                role: Role::User,
-                content: content.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                name: injected_user_name.clone(),
-                reasoning_content: None,
-                metadata: message_metadata.clone(),
-            };
-            let mut partial_base_history = history.clone();
-            partial_base_history.push(current_user_message);
-            let mut partial_turn = PartialTurnRecorder::new(partial_base_history);
-
-            let mut input = LoopInput::start_content(content)
-                .history(history)
-                .metadata(meta)
-                .user_state(ctx.user_state);
-            if let Some(user_name) = injected_user_name {
-                input = input.user_name(user_name);
-            }
-            if let Some(mm) = message_metadata {
-                input = input.message_metadata(mm);
-            }
-
-            if let Some(snapshot) = model_input_snapshot_from_loop_input(
-                &input,
-                &thread_id_owned,
-                round_opts.message_id.as_deref(),
-                &effective_model.profile.id,
-                &effective_model.profile.model,
-            ) {
-                yield CatEvent::ModelInputSnapshot(snapshot);
-            }
-
-            yield CatEvent::StateUpdate(initial_user_state.clone());
-
-            // 4. Drive inner agent, intercept History event to persist.
-            let mut raw_history: Option<Vec<Message>> = None;
-            let mut raw_user_state: Option<serde_json::Value> = None;
-            let mut tool_elapsed_ms = HashMap::<String, u64>::new();
-            let cancel = round_opts.cancel.clone();
-            let inner_stream = active_agent.stream_with_input(input);
-            let mut inner_stream = std::pin::pin!(inner_stream);
-
-            loop {
-                // When a cancel notify is present, race the inner stream against
-                // the cancel signal so in-progress content is persisted even when
-                // the task is preempted (e.g. by a newer incoming message).
-                enum SelectOut {
-                    Event(Option<CatEvent>),
-                    Cancelled,
-                }
-                let outcome = if let Some(ref notify) = cancel {
-                    tokio::select! {
-                        ev = inner_stream.next() => SelectOut::Event(ev),
-                        _ = notify.notified() => SelectOut::Cancelled,
-                    }
-                } else {
-                    SelectOut::Event(inner_stream.next().await)
-                };
-
-                match outcome {
-                    SelectOut::Cancelled => {
-                        tracing::info!(
+                // 1. Load memory context (triggers mid->long-term promotion if needed).
+                let mut ctx = match self.memory.load_context(&thread_id_owned).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
                             thread_id = %thread_id_owned,
                             model_profile = %effective_model.profile.id,
                             elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                            "agent_turn.cancelled"
+                            error = %e,
+                            "agent_turn.failed"
                         );
-                        for event in persist_turn(
-                            &self.memory, &thread_id_owned,
-                            raw_history.take().or_else(|| partial_turn.synthesize_history()),
-                            raw_user_state.take().or_else(|| Some(initial_user_state.clone())),
-                            skip_count, &tool_elapsed_ms,
-                        ).await {
-                            yield event;
-                        }
-                        yield CatEvent::Done;
+                        yield CatEvent::Error(e);
                         return;
                     }
-                    SelectOut::Event(None) => break,
-                    SelectOut::Event(Some(ev)) => match ev {
-                        CatEvent::History(msgs, us) => {
+                };
+
+                if let Err(err) = self
+                    .todo_backend
+                    .refresh_thread_user_state(
+                        &thread_id_owned,
+                        opts.sender_user_id.as_deref(),
+                        &mut ctx.user_state,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        thread_id = %thread_id_owned,
+                        error = %err,
+                        "failed to refresh sdk-backed todo state before turn"
+                    );
+                }
+
+                if let Err(err) = self
+                    .trigger_backend
+                    .refresh_thread_user_state(
+                        &thread_id_owned,
+                        opts.sender_user_id.as_deref(),
+                        &mut ctx.user_state,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        thread_id = %thread_id_owned,
+                        error = %err,
+                        "failed to refresh sdk-backed trigger state before turn"
+                    );
+                }
+
+                let mut round_opts = opts.clone();
+                if continuation_from_supervisor {
+                    round_opts.sender_username = Some("supervisor".to_string());
+                    round_opts.sender_user_id = Some("supervisor".to_string());
+                    round_opts.message_id = None;
+                    round_opts.im_attachments.clear();
+                    round_opts.im_documents.clear();
+                }
+
+                apply_skill_injections(&mut ctx.user_state, &round_opts.skill_injections);
+                let requested_user_name = round_opts
+                    .sender_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let injected_user_name = requested_user_name
+                    .as_deref()
+                    .and_then(|value| truncate_user_name(Some(value), 10));
+                let single_chat_sender_prompt = single_chat_sender_system_prompt(
+                    round_opts.chat_type.as_deref(),
+                    requested_user_name.as_deref(),
+                    round_opts.sender_user_id.as_deref(),
+                );
+
+                // 2. Build injected history prefix; record its length to strip later.
+                let mut history = build_injected_history(&ctx);
+                let agent_header_count =
+                    usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
+                insert_skill_injection_prompts(
+                    &mut history,
+                    agent_header_count,
+                    &round_opts.skill_injections,
+                );
+                insert_pinned_skill_prompt(
+                    &mut history,
+                    agent_header_count,
+                    &self.pinned_skill_summaries,
+                    effective_model.profile.context_tokens,
+                );
+                insert_single_chat_sender_system_prompt(
+                    &mut history,
+                    agent_header_count,
+                    single_chat_sender_prompt.clone(),
+                );
+                let active_supervisor = self
+                    .workflow_status(&thread_id_owned)
+                    .await
+                    .is_some_and(|instance| instance.status == WorkflowStatus::Active);
+                let initial_supervisor_todo_prompt =
+                    route_thread_todo_prompt(&mut history, &ctx.user_state, active_supervisor);
+                let skip_count;
+
+                // 3. Build request-level metadata (thread_id for tools);
+                //    build per-message metadata (sender identity + message id).
+                let mut meta = serde_json::json!({ "thread_id": &thread_id_owned });
+                if let Some(ref ct) = round_opts.chat_type {
+                    meta["chat_type"] = serde_json::Value::String(ct.clone());
+                }
+                if let Some(ref platform) = round_opts.platform {
+                    meta["platform"] = serde_json::Value::String(platform.clone());
+                }
+                if round_opts.todo_create_via_sdk {
+                    meta["todo_create_via_sdk"] = serde_json::Value::String("true".to_string());
+                }
+                if round_opts.trigger_tools_enabled {
+                    meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
+                }
+                if round_opts.trigger_run {
+                    meta[TRIGGER_RUN_META_KEY] = serde_json::Value::String("true".to_string());
+                }
+                if round_opts.supervisor_run {
+                    meta["supervisor_run"] = serde_json::Value::String("true".to_string());
+                }
+
+                let mut msg_meta = serde_json::Map::new();
+                if let Some(ref sid) = round_opts.sender_user_id {
+                    msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
+                    meta["sender_user_id"] = serde_json::Value::String(sid.clone());
+                }
+                if let Some(ref username) = round_opts.sender_username {
+                    let username = username.trim();
+                    if !username.is_empty() {
+                        let username = username.to_string();
+                        msg_meta.insert("sender_username".into(), serde_json::Value::String(username.clone()));
+                        meta["sender_username"] = serde_json::Value::String(username);
+                    }
+                }
+                if let Some(ref mid) = round_opts.message_id {
+                    msg_meta.insert("message_id".into(), serde_json::Value::String(mid.clone()));
+                    meta["message_id"] = serde_json::Value::String(mid.clone());
+                }
+                if let Some(ref ct) = round_opts.chat_type {
+                    msg_meta.insert("chat_type".into(), serde_json::Value::String(ct.clone()));
+                }
+                if let Some(ref platform) = round_opts.platform {
+                    msg_meta.insert("platform".into(), serde_json::Value::String(platform.clone()));
+                }
+                if !round_opts.im_attachments.is_empty() {
+                    let json_str = serde_json::to_string(&round_opts.im_attachments).unwrap_or_default();
+                    let str_val = serde_json::Value::String(json_str);
+                    msg_meta.insert("im_attachments".into(), str_val.clone());
+                    meta["im_attachments"] = str_val;
+                }
+                if !round_opts.im_documents.is_empty() {
+                    let json_str = serde_json::to_string(&round_opts.im_documents).unwrap_or_default();
+                    let str_val = serde_json::Value::String(json_str);
+                    msg_meta.insert("im_documents".into(), str_val.clone());
+                    meta["im_documents"] = str_val;
+                }
+                let message_metadata = if msg_meta.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(msg_meta))
+                };
+                let content = prepend_group_sender_username(
+                    next_content.clone(),
+                    round_opts.chat_type.as_deref(),
+                    requested_user_name.as_deref(),
+                );
+
+                let hook_context = self.hook_context(
+                    &thread_id_owned,
+                    Some(effective_model.profile.model.clone()),
+                    round_opts.message_id.clone(),
+                );
+                if supervisor_round == 0 && !continuation_from_supervisor {
+                    let session_hook = self
+                        .hook_manager
+                        .run(
+                            HookEventName::SessionStart,
+                            Some("startup"),
+                            &hook_context,
+                            serde_json::json!({ "source": "startup" }),
+                        )
+                        .await;
+                    if session_hook.blocked || session_hook.continue_flow == Some(false) {
+                        yield CatEvent::Error(AgentError::other(
+                            session_hook
+                                .reason
+                                .unwrap_or_else(|| "session start blocked by hook".to_string()),
+                        ));
+                        return;
+                    }
+                    for context in session_hook.additional_context {
+                        history.push(hook_context_message("SessionStart", context));
+                    }
+                }
+                if !continuation_from_supervisor {
+                    let user_prompt_hook = self
+                        .hook_manager
+                        .run(
+                            HookEventName::UserPromptSubmit,
+                            None,
+                            &hook_context,
+                            serde_json::json!({ "prompt": content.text_content() }),
+                        )
+                        .await;
+                    if user_prompt_hook.blocked || user_prompt_hook.continue_flow == Some(false) {
+                        yield CatEvent::Error(AgentError::other(
+                            user_prompt_hook
+                                .reason
+                                .unwrap_or_else(|| "user prompt blocked by hook".to_string()),
+                        ));
+                        return;
+                    }
+                    for context in user_prompt_hook.additional_context {
+                        history.push(hook_context_message("UserPromptSubmit", context));
+                    }
+                }
+                skip_count = history.len();
+
+                let should_log_media_input = content.is_multimodal()
+                    || !round_opts.im_attachments.is_empty()
+                    || !round_opts.im_documents.is_empty();
+                if should_log_media_input && !effective_model.profile.supports_images {
+                    let err = AgentError::other(format!(
+                        "current model profile `{}` does not support image/document inputs; switch REMI_MODEL_PROFILE to a multimodal model",
+                        effective_model.profile.id
+                    ));
+                    tracing::warn!(
+                        thread_id = %thread_id_owned,
+                        model_profile = %effective_model.profile.id,
+                        model = %effective_model.profile.model,
+                        elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                        error = %err,
+                        "agent_turn.failed"
+                    );
+                    yield CatEvent::Error(err);
+                    return;
+                }
+                if should_log_media_input {
+                    tracing::info!(
+                        thread_id = %thread_id_owned,
+                        sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
+                        message_id = opts.message_id.as_deref().unwrap_or(""),
+                        chat_type = opts.chat_type.as_deref().unwrap_or(""),
+                        content_summary = %summarize_content_for_log(&content),
+                        attachment_count = round_opts.im_attachments.len(),
+                        document_count = round_opts.im_documents.len(),
+                        "stream_with_options: media input"
+                    );
+                }
+
+                tracing::debug!(
+                    thread_id = %thread_id_owned,
+                    skip_count,
+                    has_message_metadata = message_metadata.is_some(),
+                    has_single_chat_sender_prompt = is_direct_chat(opts.chat_type.as_deref()) && (requested_user_name.is_some() || opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
+                    requested_user_name = requested_user_name.as_deref().unwrap_or(""),
+                    injected_user_name = injected_user_name.as_deref().unwrap_or(""),
+                    ?message_metadata,
+                    "stream_with_options: building LoopInput"
+                );
+                tracing::info!(
+                    thread_id = %thread_id_owned,
+                    sender_user_id = round_opts.sender_user_id.as_deref().unwrap_or(""),
+                    message_id = round_opts.message_id.as_deref().unwrap_or(""),
+                    sender_username = requested_user_name.as_deref().unwrap_or(""),
+                    injected_user_name = injected_user_name.as_deref().unwrap_or(""),
+                    has_single_chat_sender_prompt = is_direct_chat(round_opts.chat_type.as_deref()) && (requested_user_name.is_some() || round_opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
+                    has_sender_username = requested_user_name.is_some(),
+                    has_message_metadata = message_metadata.is_some(),
+                    "stream_with_options: username propagation"
+                );
+
+                let initial_user_state = ctx.user_state.clone();
+
+                let current_user_message = Message {
+                    id: MessageId::new(),
+                    role: Role::User,
+                    content: content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: injected_user_name.clone(),
+                    reasoning_content: None,
+                    metadata: message_metadata.clone(),
+                };
+                let mut partial_base_history = history.clone();
+                partial_base_history.push(current_user_message);
+                let mut partial_turn = PartialTurnRecorder::new(partial_base_history);
+
+                let mut input = LoopInput::start_content(content)
+                    .history(history)
+                    .metadata(meta)
+                    .user_state(ctx.user_state);
+                if let Some(user_name) = injected_user_name {
+                    input = input.user_name(user_name);
+                }
+                if let Some(mm) = message_metadata {
+                    input = input.message_metadata(mm);
+                }
+
+                if let Some(snapshot) = model_input_snapshot_from_loop_input(
+                    &input,
+                    &thread_id_owned,
+                    round_opts.message_id.as_deref(),
+                    &effective_model.profile.id,
+                    &effective_model.profile.model,
+                ) {
+                    yield CatEvent::ModelInputSnapshot(snapshot);
+                }
+
+                yield CatEvent::StateUpdate(initial_user_state.clone());
+
+                // 4. Drive inner agent, intercept History event to persist.
+                let mut raw_history: Option<Vec<Message>> = None;
+                let mut raw_user_state: Option<serde_json::Value> = None;
+                let mut tool_elapsed_ms = HashMap::<String, u64>::new();
+                let mut user_question_requested_this_round = false;
+                let mut workflow_user_state_override: Option<WorkflowInstance> = None;
+                let inner_stream = active_agent.stream_with_input_and_options(
+                    input,
+                    CoreStreamOptions {
+                        cancel: round_opts.cancel.clone(),
+                    },
+                );
+                let mut inner_stream = std::pin::pin!(inner_stream);
+
+                while let Some(ev) = inner_stream.next().await {
+                    match ev {
+                        CatEvent::Cancelled => {
+                            tracing::info!(
+                                thread_id = %thread_id_owned,
+                                model_profile = %effective_model.profile.id,
+                                elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                                "agent_turn.cancelled"
+                            );
+                            for event in persist_turn(
+                                &self.memory, &thread_id_owned,
+                                raw_history.take().or_else(|| partial_turn.synthesize_history()),
+                                raw_user_state.take().or_else(|| Some(initial_user_state.clone())),
+                                skip_count, &tool_elapsed_ms,
+                            ).await {
+                                yield event;
+                            }
+                            yield CatEvent::Done;
+                            return;
+                        }
+                        CatEvent::History(msgs, mut us) => {
+                            if workflow_user_state_override.is_some() {
+                                if let Some(instance) = self.workflow_status(&thread_id_owned).await {
+                                    workflow_user_state_override = Some(instance);
+                                }
+                            }
+                            if let Some(instance) = workflow_user_state_override.as_ref() {
+                                if let Err(err) =
+                                    supervisor_workflow::set_instance_in_user_state(&mut us, instance)
+                                {
+                                    tracing::warn!(
+                                        thread_id = %thread_id_owned,
+                                        error = %err,
+                                        "failed to merge workflow override into history user_state"
+                                    );
+                                }
+                            }
                             raw_history = Some(msgs);
                             raw_user_state = Some(us);
                         }
-                        CatEvent::Text(text) => {
-                            partial_turn.on_text(&text);
-                            yield CatEvent::Text(text);
-                        }
-                        CatEvent::Thinking(content) => {
-                            partial_turn.on_thinking(content.clone());
-                            yield CatEvent::Thinking(content);
-                        }
-                        CatEvent::ToolCallStart { id, name } => {
-                            partial_turn.on_tool_start(id.clone(), name.clone());
-                            yield CatEvent::ToolCallStart { id, name };
-                        }
-                        CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                            partial_turn.on_tool_arguments_delta(&id, &delta);
-                            yield CatEvent::ToolCallArgumentsDelta { id, delta };
-                        }
-                        CatEvent::ToolCall { id, name, args } => {
-                            partial_turn.on_tool_call(id.clone(), name.clone(), args.clone());
-                            yield CatEvent::ToolCall { id, name, args };
-                        }
-                        // Persist user_state immediately after each tool round.
-                        CatEvent::StateUpdate(us) => {
-                            raw_user_state = Some(us.clone());
-                            yield persist_intermediate_user_state(
-                                &self.memory,
-                                &thread_id_owned,
-                                us,
-                            )
-                            .await;
-                        }
-                        CatEvent::ToolCallResult {
-                            id,
-                            name,
-                            args,
-                            result,
-                            success,
-                            elapsed_ms,
-                        } => {
-                            tool_elapsed_ms.insert(id.clone(), elapsed_ms);
-                            partial_turn.on_tool_result(
-                                id.clone(),
-                                name.clone(),
-                                args.clone(),
-                                result.clone(),
-                                success,
-                                elapsed_ms,
-                            );
-                            yield CatEvent::ToolCallResult {
+                            CatEvent::Text(text) => {
+                                partial_turn.on_text(&text);
+                                yield CatEvent::Text(text);
+                            }
+                            CatEvent::Thinking(content) => {
+                                partial_turn.on_thinking(content.clone());
+                                yield CatEvent::Thinking(content);
+                            }
+                            CatEvent::ToolCallStart { id, name } => {
+                                partial_turn.on_tool_start(id.clone(), name.clone());
+                                yield CatEvent::ToolCallStart { id, name };
+                            }
+                            CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                                partial_turn.on_tool_arguments_delta(&id, &delta);
+                                yield CatEvent::ToolCallArgumentsDelta { id, delta };
+                            }
+                            CatEvent::ToolCall { id, name, args } => {
+                                partial_turn.on_tool_call(id.clone(), name.clone(), args.clone());
+                                yield CatEvent::ToolCall { id, name, args };
+                            }
+                            // Persist user_state immediately after each tool round.
+                            CatEvent::StateUpdate(mut us) => {
+                                if workflow_user_state_override.is_some() {
+                                    if let Some(instance) = self.workflow_status(&thread_id_owned).await {
+                                        workflow_user_state_override = Some(instance);
+                                    }
+                                }
+                                if let Some(instance) = workflow_user_state_override.as_ref() {
+                                    if let Err(err) =
+                                        supervisor_workflow::set_instance_in_user_state(&mut us, instance)
+                                    {
+                                        tracing::warn!(
+                                            thread_id = %thread_id_owned,
+                                            error = %err,
+                                            "failed to merge workflow override into user_state"
+                                        );
+                                    }
+                                }
+                                raw_user_state = Some(us.clone());
+                                yield persist_intermediate_user_state(
+                                    &self.memory,
+                                    &thread_id_owned,
+                                    us,
+                                )
+                                .await;
+                            }
+                            CatEvent::ToolCallResult {
                                 id,
                                 name,
                                 args,
                                 result,
                                 success,
                                 elapsed_ms,
-                            };
-                        }
-                        CatEvent::ToolApprovalRequested(request) => {
-                            yield CatEvent::ToolApprovalRequested(request);
-                        }
-                        CatEvent::ToolApprovalUpdated(request) => {
-                            yield CatEvent::ToolApprovalUpdated(request);
-                        }
-                        CatEvent::ToolApprovalResolved { request, decision } => {
-                            yield CatEvent::ToolApprovalResolved { request, decision };
-                        }
-                        CatEvent::UserQuestionRequested(request) => {
-                            yield CatEvent::UserQuestionRequested(request);
-                        }
-                        CatEvent::UserQuestionUpdated(request) => {
-                            yield CatEvent::UserQuestionUpdated(request);
-                        }
-                        CatEvent::UserQuestionResolved { request, response } => {
-                            yield CatEvent::UserQuestionResolved { request, response };
-                        }
-                        // Save memory BEFORE yielding Done/Error — the caller drops
-                        // the stream immediately on these events, so any code after
-                        // this loop would never execute.
-                        CatEvent::Done => {
-                            let supervisor_history = raw_history.clone();
-                            let supervisor_todo_prompt = if active_supervisor {
-                                raw_user_state
-                                    .as_ref()
-                                    .and_then(|state| {
-                                        todo::latest_unfinished_batch_system_prompt(state)
-                                    })
-                                    .or(initial_supervisor_todo_prompt.clone())
-                            } else {
-                                None
-                            };
-                            for event in persist_turn(
-                                &self.memory, &thread_id_owned,
-                                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-                            ).await {
-                                yield event;
-                            }
-                            if !round_opts.supervisor_run {
-                                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-                                let evaluation = self.evaluate_workflow_after_round(
-                                    &thread_id_owned,
-                                    supervisor_history.as_deref().unwrap_or(&[]),
-                                    supervisor_todo_prompt,
-                                    supervisor_round,
-                                    round_opts.model_profile_id.as_deref(),
-                                    progress_tx,
+                            } => {
+                                tool_elapsed_ms.insert(id.clone(), elapsed_ms);
+                                partial_turn.on_tool_result(
+                                    id.clone(),
+                                    name.clone(),
+                                    args.clone(),
+                                    result.clone(),
+                                    success,
+                                    elapsed_ms,
                                 );
-                                tokio::pin!(evaluation);
-                                let outcome = loop {
-                                    tokio::select! {
-                                        outcome = &mut evaluation => break outcome,
-                                        progress = progress_rx.recv() => {
-                                            if let Some(progress) = progress {
-                                                yield CatEvent::SupervisorProgress(progress);
+                                yield CatEvent::ToolCallResult {
+                                    id,
+                                    name,
+                                    args,
+                                    result,
+                                    success,
+                                    elapsed_ms,
+                                };
+                            }
+                            CatEvent::ToolApprovalRequested(request) => {
+                                yield CatEvent::ToolApprovalRequested(request);
+                            }
+                            CatEvent::ToolApprovalUpdated(request) => {
+                                yield CatEvent::ToolApprovalUpdated(request);
+                            }
+                            CatEvent::ToolApprovalResolved { request, decision } => {
+                                yield CatEvent::ToolApprovalResolved { request, decision };
+                            }
+                            CatEvent::UserQuestionRequested(request) => {
+                                if !round_opts.supervisor_run {
+                                    user_question_requested_this_round = true;
+                                    if let Some((report, instance)) = self
+                                        .pause_workflow_for_user_input(
+                                            &thread_id_owned,
+                                            supervisor_round,
+                                        )
+                                        .await
+                                    {
+                                        workflow_user_state_override = Some(instance);
+                                        if let Some(user_state) = raw_user_state.as_mut() {
+                                            if let Some(instance) = workflow_user_state_override.as_ref() {
+                                                let _ = supervisor_workflow::set_instance_in_user_state(
+                                                    user_state,
+                                                    instance,
+                                                );
                                             }
                                         }
+                                        yield CatEvent::Supervisor(report);
                                     }
-                                };
-                                while let Ok(progress) = progress_rx.try_recv() {
-                                    yield CatEvent::SupervisorProgress(progress);
                                 }
-                                match outcome {
-                                    WorkflowRoundOutcome::NoWorkflow => {}
-                                    WorkflowRoundOutcome::Report(report) => {
+                                yield CatEvent::UserQuestionRequested(request);
+                            }
+                            CatEvent::UserQuestionUpdated(request) => {
+                                yield CatEvent::UserQuestionUpdated(request);
+                            }
+                            CatEvent::UserQuestionResolved { request, response } => {
+                                if !round_opts.supervisor_run {
+                                    if let Some((report, instance)) = self
+                                        .resume_workflow_from_user_input(
+                                            &thread_id_owned,
+                                            supervisor_round,
+                                        )
+                                        .await
+                                    {
+                                        workflow_user_state_override = Some(instance);
+                                        if let Some(user_state) = raw_user_state.as_mut() {
+                                            if let Some(instance) = workflow_user_state_override.as_ref() {
+                                                let _ = supervisor_workflow::set_instance_in_user_state(
+                                                    user_state,
+                                                    instance,
+                                                );
+                                            }
+                                        }
                                         yield CatEvent::Supervisor(report);
                                     }
-                                    WorkflowRoundOutcome::Continue { report, message } => {
-                                        yield CatEvent::Supervisor(report);
+                                }
+                                yield CatEvent::UserQuestionResolved { request, response };
+                            }
+                            // Save memory BEFORE yielding Done/Error — the caller drops
+                            // the stream immediately on these events, so any code after
+                            // this loop would never execute.
+                            CatEvent::Done => {
+                                if workflow_user_state_override.is_some() {
+                                    if let Some(instance) = self.workflow_status(&thread_id_owned).await
+                                    {
+                                        workflow_user_state_override = Some(instance);
+                                    }
+                                    if let (Some(user_state), Some(instance)) =
+                                        (raw_user_state.as_mut(), workflow_user_state_override.as_ref())
+                                    {
+                                        if let Err(err) =
+                                            supervisor_workflow::set_instance_in_user_state(
+                                                user_state, instance,
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                thread_id = %thread_id_owned,
+                                                error = %err,
+                                                "failed to merge workflow override before final persist"
+                                            );
+                                        }
+                                    }
+                                }
+                                let supervisor_history = raw_history.clone();
+                                let supervisor_todo_prompt = if active_supervisor {
+                                    raw_user_state
+                                        .as_ref()
+                                        .and_then(|state| {
+                                            todo::latest_unfinished_batch_system_prompt(state)
+                                        })
+                                        .or(initial_supervisor_todo_prompt.clone())
+                                } else {
+                                    None
+                                };
+                                for event in persist_turn(
+                                    &self.memory, &thread_id_owned,
+                                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                                ).await {
+                                    yield event;
+                                }
+                                if !round_opts.supervisor_run && !user_question_requested_this_round {
+                                    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                                    let evaluation = self.evaluate_workflow_after_round(
+                                        &thread_id_owned,
+                                        supervisor_history.as_deref().unwrap_or(&[]),
+                                        supervisor_todo_prompt,
+                                        supervisor_round,
+                                        round_opts.model_profile_id.as_deref(),
+                                        progress_tx,
+                                    );
+                                    tokio::pin!(evaluation);
+                                    let outcome = loop {
+                                        tokio::select! {
+                                            outcome = &mut evaluation => break outcome,
+                                            progress = progress_rx.recv() => {
+                                                if let Some(progress) = progress {
+                                                    yield CatEvent::SupervisorProgress(progress);
+                                                }
+                                            }
+                                        }
+                                    };
+                                    while let Ok(progress) = progress_rx.try_recv() {
+                                        yield CatEvent::SupervisorProgress(progress);
+                                    }
+                                    match outcome {
+                                        WorkflowRoundOutcome::NoWorkflow => {}
+                                        WorkflowRoundOutcome::Report(report) => {
+                                            yield CatEvent::Supervisor(report);
+                                        }
+                                        WorkflowRoundOutcome::Continue { report, message } => {
+                                            yield CatEvent::Supervisor(report);
+                                            supervisor_round = supervisor_round.saturating_add(1);
+                                            next_content = Content::text(message);
+                                            continuation_from_supervisor = true;
+                                            continue 'workflow_loop;
+                                        }
+                                    }
+                                }
+                                tracing::info!(
+                                    thread_id = %thread_id_owned,
+                                    model_profile = %effective_model.profile.id,
+                                    model = %effective_model.profile.model,
+                                    supervisor_round,
+                                    tool_calls = tool_elapsed_ms.len(),
+                                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                                    "agent_turn.completed"
+                                );
+                                if !stop_hook_active {
+                                    let last_assistant_message = supervisor_history
+                                        .as_deref()
+                                        .unwrap_or(&[])
+                                        .iter()
+                                        .rev()
+                                        .find(|message| message.role == Role::Assistant)
+                                        .map(|message| message.content.text_content())
+                                        .unwrap_or_default();
+                                    let stop_hook = self
+                                        .hook_manager
+                                        .run(
+                                            HookEventName::Stop,
+                                            None,
+                                            &hook_context,
+                                            serde_json::json!({
+                                                "stop_hook_active": false,
+                                                "last_assistant_message": last_assistant_message,
+                                            }),
+                                        )
+                                        .await;
+                                    if stop_hook.blocked || stop_hook.continue_flow == Some(false) {
                                         supervisor_round = supervisor_round.saturating_add(1);
-                                        next_content = Content::text(message);
+                                        next_content = Content::text(stop_hook.reason.unwrap_or_else(|| {
+                                            "Continue the response according to the Stop hook.".to_string()
+                                        }));
                                         continuation_from_supervisor = true;
+                                        stop_hook_active = true;
                                         continue 'workflow_loop;
                                     }
                                 }
+                                yield CatEvent::Done;
+                                return;
                             }
-                            tracing::info!(
-                                thread_id = %thread_id_owned,
-                                model_profile = %effective_model.profile.id,
-                                model = %effective_model.profile.model,
-                                supervisor_round,
-                                tool_calls = tool_elapsed_ms.len(),
-                                elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                                "agent_turn.completed"
-                            );
-                            if !stop_hook_active {
-                                let last_assistant_message = supervisor_history
-                                    .as_deref()
-                                    .unwrap_or(&[])
-                                    .iter()
-                                    .rev()
-                                    .find(|message| message.role == Role::Assistant)
-                                    .map(|message| message.content.text_content())
-                                    .unwrap_or_default();
-                                let stop_hook = self
-                                    .hook_manager
-                                    .run(
-                                        HookEventName::Stop,
-                                        None,
-                                        &hook_context,
-                                        serde_json::json!({
-                                            "stop_hook_active": false,
-                                            "last_assistant_message": last_assistant_message,
-                                        }),
-                                    )
-                                    .await;
-                                if stop_hook.blocked || stop_hook.continue_flow == Some(false) {
-                                    supervisor_round = supervisor_round.saturating_add(1);
-                                    next_content = Content::text(stop_hook.reason.unwrap_or_else(|| {
-                                        "Continue the response according to the Stop hook.".to_string()
-                                    }));
-                                    continuation_from_supervisor = true;
-                                    stop_hook_active = true;
-                                    continue 'workflow_loop;
+                            CatEvent::Error(e) => {
+                                // Best-effort save on error (partial history is better than nothing).
+                                for event in persist_turn(
+                                    &self.memory, &thread_id_owned,
+                                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                                ).await {
+                                    yield event;
                                 }
+                                tracing::warn!(
+                                    thread_id = %thread_id_owned,
+                                    model_profile = %effective_model.profile.id,
+                                    model = %effective_model.profile.model,
+                                    supervisor_round,
+                                    tool_calls = tool_elapsed_ms.len(),
+                                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                                    error = %e,
+                                    "agent_turn.failed"
+                                );
+                                yield CatEvent::Error(e);
+                                return;
                             }
-                            yield CatEvent::Done;
-                            return;
+                            other => yield other,
                         }
-                        CatEvent::Error(e) => {
-                            // Best-effort save on error (partial history is better than nothing).
-                            for event in persist_turn(
-                                &self.memory, &thread_id_owned,
-                                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-                            ).await {
-                                yield event;
-                            }
-                            tracing::warn!(
-                                thread_id = %thread_id_owned,
-                                model_profile = %effective_model.profile.id,
-                                model = %effective_model.profile.model,
-                                supervisor_round,
-                                tool_calls = tool_elapsed_ms.len(),
-                                elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                                error = %e,
-                                "agent_turn.failed"
-                            );
-                            yield CatEvent::Error(e);
-                            return;
-                        }
-                        other => yield other,
-                    },
                 }
-            }
 
-            // Fallback: stream ended without Done (shouldn't normally happen).
-            for event in persist_turn(
-                &self.memory, &thread_id_owned,
-                raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
-            ).await {
-                yield event;
-            }
-            tracing::warn!(
-                thread_id = %thread_id_owned,
-                model_profile = %effective_model.profile.id,
-                model = %effective_model.profile.model,
-                supervisor_round,
-                tool_calls = tool_elapsed_ms.len(),
-                elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                "agent_turn.failed"
-            );
-            break 'workflow_loop;
+                // Fallback: stream ended without Done (shouldn't normally happen).
+                for event in persist_turn(
+                    &self.memory, &thread_id_owned,
+                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                ).await {
+                    yield event;
+                }
+                tracing::warn!(
+                    thread_id = %thread_id_owned,
+                    model_profile = %effective_model.profile.id,
+                    model = %effective_model.profile.model,
+                    supervisor_round,
+                    tool_calls = tool_elapsed_ms.len(),
+                    elapsed_ms = turn_started.elapsed().as_millis() as u64,
+                    "agent_turn.failed"
+                );
+                break 'workflow_loop;
             }
         }
     }
@@ -2762,21 +2925,48 @@ impl CatBotBuilder {
             .cloned()
             .map(|profile| (profile.id.clone(), profile))
             .collect::<HashMap<_, _>>();
-        agent_profiles
-            .entry(active_agent_id.clone())
-            .or_insert_with(|| AgentProfile {
-                id: active_agent_id.clone(),
-                name: active_agent_id.clone(),
-                description: "Runtime default agent".to_string(),
-                model: None,
-                base_url: None,
-                models: self.model_bindings.clone(),
-                tools: self.tool_allowlist.clone().unwrap_or_default(),
-                delegates: self.delegate_ids.clone(),
-                max_turns: self.max_turns,
-                persistent_sessions: false,
-                system_prompt: system_prompt.clone(),
-            });
+        let active_profile_from_builder = |existing: Option<&AgentProfile>| AgentProfile {
+            id: active_agent_id.clone(),
+            name: existing
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| active_agent_id.clone()),
+            description: existing
+                .map(|profile| profile.description.clone())
+                .unwrap_or_else(|| "Runtime default agent".to_string()),
+            model: existing.and_then(|profile| profile.model.clone()),
+            base_url: existing.and_then(|profile| profile.base_url.clone()),
+            models: self.model_bindings.clone(),
+            tools: self.tool_allowlist.clone().unwrap_or_default(),
+            delegates: self.delegate_ids.clone(),
+            max_turns: self.max_turns,
+            persistent_sessions: existing
+                .map(|profile| profile.persistent_sessions)
+                .unwrap_or(false),
+            system_prompt: system_prompt.clone(),
+        };
+        if self.tool_allowlist.is_some() {
+            let existing = agent_profiles.get(&active_agent_id).cloned();
+            agent_profiles.insert(
+                active_agent_id.clone(),
+                active_profile_from_builder(existing.as_ref()),
+            );
+        } else {
+            agent_profiles
+                .entry(active_agent_id.clone())
+                .or_insert_with(|| AgentProfile {
+                    id: active_agent_id.clone(),
+                    name: active_agent_id.clone(),
+                    description: "Runtime default agent".to_string(),
+                    model: None,
+                    base_url: None,
+                    models: self.model_bindings.clone(),
+                    tools: Vec::new(),
+                    delegates: Vec::new(),
+                    max_turns: self.max_turns,
+                    persistent_sessions: false,
+                    system_prompt: system_prompt.clone(),
+                });
+        }
         let default_agent_profile = agent_profiles
             .get(&active_agent_id)
             .cloned()
@@ -3691,15 +3881,16 @@ mod tests {
         thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
         GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
         PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, ThreadRunLocks,
-        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        WorkflowStatus, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
+    use crate::supervisor_workflow;
     use crate::todo::tools::TodoItem;
+    use crate::user_question::{UserQuestionResponse, UserQuestionStatus};
     use crate::{estimate_model_input_tokens, ModelInputSegmentCategory};
     use futures::StreamExt as _;
     use remi_agentloop::prelude::Role;
-    use remi_agentloop::tool::registry::ToolRegistry;
     use remi_agentloop::types::{FunctionCall, RunId, ThreadId, ToolCallMessage};
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
@@ -3904,6 +4095,7 @@ mod tests {
 
     #[test]
     fn persistent_delegate_agent_exposes_named_parameter() {
+        std::env::set_var("OPENAI_API_KEY", "test");
         let data_dir = tempfile::tempdir().unwrap();
         let skills_dir = data_dir.path().join("skills");
         let agents_dir = data_dir.path().join("agents");
@@ -3968,7 +4160,7 @@ You are Remi.
         .build()
         .unwrap();
 
-        let definitions = bot.inner.local_tools.definitions(&serde_json::Value::Null);
+        let definitions = super::cat_agent_tool_definitions(&bot.inner);
         let coder = definitions
             .into_iter()
             .find(|definition| definition.function.name == "agent__coder")
@@ -4048,6 +4240,7 @@ You are Remi.
 
     #[tokio::test]
     async fn cancelled_stream_persists_partial_assistant_text() {
+        std::env::set_var("OPENAI_API_KEY", "test");
         let (base_url, _requests) = start_slow_openai_mock_server("partial answer").await;
         let data_dir = tempfile::tempdir().unwrap();
         let skills_dir = data_dir.path().join("skills");
@@ -4580,6 +4773,130 @@ You are Remi.
             requests[3]
         );
         assert!(requests[3].contains("确认supervisor接收todo"));
+    }
+
+    #[tokio::test]
+    async fn user_question_moves_workflow_through_ask_user_for_help_without_supervisor_stop() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let responses = vec![
+            sse_tool_call(
+                "call_ask",
+                "ask_user_question",
+                json!({
+                    "question": "Need user input?",
+                    "allow_free_text": true
+                }),
+            ),
+            sse_text("Thanks, continuing with the answer."),
+        ];
+        let (base_url, requests) = start_openai_mock_server(responses).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(8),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+        }
+        .build()
+        .unwrap();
+
+        let thread_id = "ask-user-supervisor-control-node";
+        bot.set_goal(
+            thread_id,
+            "complete after user input",
+            GoalMaxRounds::Limited(1),
+        )
+        .await
+        .unwrap();
+        let mut stream = std::pin::pin!(bot.stream(thread_id, "ask if needed"));
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let CatEvent::Error(err) = &event {
+                panic!("stream error: {err}");
+            }
+            if let CatEvent::UserQuestionRequested(request) = &event {
+                assert_eq!(request.session_id, thread_id);
+                bot.answer_user_question(
+                    &request.id,
+                    UserQuestionResponse {
+                        question_id: request.id.clone(),
+                        status: UserQuestionStatus::Answered,
+                        selected_option_ids: Vec::new(),
+                        free_text: Some("user supplied detail".to_string()),
+                        answer_text: Some("user supplied detail".to_string()),
+                        answered_at: None,
+                        source: Some("test".to_string()),
+                    },
+                )
+                .await;
+            }
+            let done = matches!(event, CatEvent::Done);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        let supervisor_events = events
+            .iter()
+            .filter_map(|event| match event {
+                CatEvent::Supervisor(report) => Some(format!(
+                    "{} -> {} ({:?}) {}",
+                    report.from_node, report.to_node, report.status, report.reason
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CatEvent::Supervisor(report)
+                    if report.to_node == supervisor_workflow::ASK_USER_FOR_HELP_NODE
+                        && report.status == WorkflowStatus::Paused
+            )),
+            "supervisor events: {supervisor_events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report) if report.status == WorkflowStatus::Completed
+        )));
+        let instance = bot.workflow_status(thread_id).await.unwrap();
+        assert_eq!(instance.status, WorkflowStatus::Active);
+        assert_eq!(instance.current_node, "review");
+        assert!(instance.ask_user_for_help.is_none());
+
+        let requests = requests.lock().expect("request lock poisoned");
+        assert_eq!(
+            requests.len(),
+            2,
+            "supervisor evaluation should be skipped after user-question round"
+        );
     }
 
     #[tokio::test]

@@ -7,16 +7,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::stream;
 use futures::{future::join_all, Stream, StreamExt};
 use tracing::debug;
 
+use bot_runtime_core::{
+    build_tool_definition_ctx, inject_extra_tools, tool_ctx_from_state, CoreAgentLoop,
+    CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreStreamOptions, CoreUsageStats,
+};
 use remi_agentloop::prelude::{
-    AgentConfig, AgentError, Content, ContentPart, LoopInput, Message, ParsedToolCall,
-    ToolCallOutcome, ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    AgentError, Content, ContentPart, LoopInput, Message, ParsedToolCall, ToolCallOutcome,
+    ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
@@ -43,17 +47,36 @@ const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
     &["trigger__upsert", "trigger__list", "trigger__delete"];
 const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
 
-fn stats_event(
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    max_prompt_tokens: u32,
-    run_start: Instant,
-) -> CatEvent {
+#[derive(Debug, Clone, Copy)]
+enum UnavailableToolReason {
+    NotFound,
+    NotAllowed,
+}
+
+impl UnavailableToolReason {
+    fn error_message(self, tool_name: &str) -> String {
+        match self {
+            Self::NotFound => format!("error: tool not found: {tool_name}"),
+            Self::NotAllowed => {
+                format!("error: tool is not allowed for current agent: {tool_name}")
+            }
+        }
+    }
+
+    fn tool_kind(self) -> &'static str {
+        match self {
+            Self::NotFound => "missing",
+            Self::NotAllowed => "not_allowed",
+        }
+    }
+}
+
+fn stats_event(stats: CoreUsageStats) -> CatEvent {
     CatEvent::Stats {
-        prompt_tokens,
-        completion_tokens,
-        max_prompt_tokens,
-        elapsed_ms: run_start.elapsed().as_millis() as u64,
+        prompt_tokens: stats.prompt_tokens,
+        completion_tokens: stats.completion_tokens,
+        max_prompt_tokens: stats.max_prompt_tokens,
+        elapsed_ms: stats.elapsed_ms,
     }
 }
 
@@ -166,13 +189,38 @@ where
     ///
     /// Called by `CatBot::stream()` in lib.rs after injecting memory context.
     pub fn stream_with_input<'a>(&'a self, input: LoopInput) -> impl Stream<Item = CatEvent> + 'a {
-        self.stream_with_input_and_tool_allowlist(input, None)
+        self.stream_with_input_and_tool_allowlist_and_options(
+            input,
+            None,
+            CoreStreamOptions::default(),
+        )
     }
 
     pub fn stream_with_input_and_tool_allowlist<'a>(
         &'a self,
         input: LoopInput,
         tool_allowlist_override: Option<Vec<String>>,
+    ) -> impl Stream<Item = CatEvent> + 'a {
+        self.stream_with_input_and_tool_allowlist_and_options(
+            input,
+            tool_allowlist_override,
+            CoreStreamOptions::default(),
+        )
+    }
+
+    pub fn stream_with_input_and_options<'a>(
+        &'a self,
+        input: LoopInput,
+        options: CoreStreamOptions,
+    ) -> impl Stream<Item = CatEvent> + 'a {
+        self.stream_with_input_and_tool_allowlist_and_options(input, None, options)
+    }
+
+    pub fn stream_with_input_and_tool_allowlist_and_options<'a>(
+        &'a self,
+        input: LoopInput,
+        tool_allowlist_override: Option<Vec<String>>,
+        options: CoreStreamOptions,
     ) -> impl Stream<Item = CatEvent> + 'a {
         let data_dir = self.data_dir.clone();
         let workspace_root = self.workspace_root.clone();
@@ -228,10 +276,10 @@ where
                 allowlist = ?tool_allowlist,
                 "agent_run.start"
             );
-            let mut total_prompt_tokens: u32 = 0;
-            let mut total_completion_tokens: u32 = 0;
-            let mut max_prompt_tokens: u32 = 0;
-            let mut tool_rounds: usize = 0;
+            let mut agent_loop = CoreAgentLoop::new(CoreDriveConfig {
+                cancel: options.cancel,
+                max_tool_rounds: supervisor_run.then_some(SUPERVISOR_MAX_TOOL_ROUNDS),
+            });
 
             let mut current = inject_extra_tools(input, extra_defs);
             let mut last_messages: Vec<Message> = vec![];
@@ -253,54 +301,51 @@ where
                         return;
                     }
                 };
-                let mut inner_stream = std::pin::pin!(inner_stream);
+                let mut inner_stream = std::pin::pin!(agent_loop.drive(inner_stream));
                 let mut next_input: Option<LoopInput> = None;
 
                 while let Some(ev) = inner_stream.next().await {
                     match ev {
-                        AgentEvent::TextDelta(t) => yield CatEvent::Text(t),
-                        AgentEvent::ThinkingEnd { content } => {
+                        CoreDriveEvent::Text(t) => yield CatEvent::Text(t),
+                        CoreDriveEvent::Thinking(content) => {
                             yield CatEvent::Thinking(content);
                         }
-                        AgentEvent::ToolCallStart { id, name } => {
+                        CoreDriveEvent::ToolCallStart { id, name } => {
                             yield CatEvent::ToolCallStart { id, name };
                         }
-                        AgentEvent::ToolCallArgumentsDelta { id, delta } => {
+                        CoreDriveEvent::ToolCallArgumentsDelta { id, delta } => {
                             yield CatEvent::ToolCallArgumentsDelta { id, delta };
                         }
-                        AgentEvent::Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                        } => {
-                            total_prompt_tokens += prompt_tokens;
-                            total_completion_tokens += completion_tokens;
-                            max_prompt_tokens = max_prompt_tokens.max(prompt_tokens);
-                            yield stats_event(
-                                total_prompt_tokens,
-                                total_completion_tokens,
-                                max_prompt_tokens,
-                                run_start,
-                            );
+                        CoreDriveEvent::Usage(stats) => {
+                            yield stats_event(stats);
                         }
-                        AgentEvent::NeedToolExecution {
+                        CoreDriveEvent::ToolDispatch(bot_runtime_core::CoreToolDispatch {
                             mut state,
                             tool_calls,
                             completed_results,
-                        } => {
-                            tool_rounds = tool_rounds.saturating_add(1);
-                            if supervisor_run && tool_rounds > SUPERVISOR_MAX_TOOL_ROUNDS {
-                                yield CatEvent::Error(AgentError::other(format!(
-                                    "supervisor exceeded the maximum of {SUPERVISOR_MAX_TOOL_ROUNDS} tool rounds"
-                                )));
-                                return;
+                            stats,
+                            ..
+                        }) => {
+                            let mut local = Vec::new();
+                            let mut dynamic = Vec::new();
+                            let mut unavailable = Vec::new();
+                            for tc in tool_calls.iter().cloned() {
+                                let is_runtime_tool = runtime_tools_contains(
+                                    &self.local_tools,
+                                    self.model_tools.as_ref(),
+                                    &tc.name,
+                                );
+                                let is_dynamic_tool = dynamic_tools.contains(&tc.name);
+                                if !is_runtime_tool && !is_dynamic_tool {
+                                    unavailable.push((tc, UnavailableToolReason::NotFound));
+                                } else if !tool_allowed(tool_allowlist.as_deref(), &tc.name) {
+                                    unavailable.push((tc, UnavailableToolReason::NotAllowed));
+                                } else if is_runtime_tool {
+                                    local.push(tc);
+                                } else {
+                                    dynamic.push(tc);
+                                }
                             }
-                            let (local, remaining): (Vec<_>, Vec<_>) = tool_calls
-                                .iter()
-                                .cloned()
-                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && runtime_tools_contains(&self.local_tools, self.model_tools.as_ref(), &tc.name));
-                            let (dynamic, external): (Vec<_>, Vec<_>) = remaining
-                                .into_iter()
-                                .partition(|tc| tool_allowed(tool_allowlist.as_deref(), &tc.name) && dynamic_tools.contains(&tc.name));
 
                             if !local.is_empty() {
                                 let names: Vec<&str> = local.iter().map(|t| t.name.as_str()).collect();
@@ -311,7 +356,7 @@ where
                                 debug!(tools = ?names, "agent: dispatching dynamic tools");
                             }
 
-                            let tool_ctx = build_tool_ctx(&state);
+                            let tool_ctx = tool_ctx_from_state(&state);
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
 
                             if !local.is_empty() {
@@ -359,12 +404,7 @@ where
                                             success: false,
                                             elapsed_ms: 0,
                                         };
-                                        yield stats_event(
-                                            total_prompt_tokens,
-                                            total_completion_tokens,
-                                            max_prompt_tokens,
-                                            run_start,
-                                        );
+                                        yield stats_event(stats);
                                         all_outcomes.push(ToolCallOutcome::Error {
                                             tool_call_id: tc.id.clone(),
                                             tool_name: tc.name.clone(),
@@ -498,12 +538,7 @@ where
                                             tool_name = %tc.name,
                                             "tool_approval.denied_abort"
                                         );
-                                        yield stats_event(
-                                            total_prompt_tokens,
-                                            total_completion_tokens,
-                                            max_prompt_tokens,
-                                            run_start,
-                                        );
+                                        yield stats_event(stats);
                                         yield CatEvent::Done;
                                         return;
                                     }
@@ -565,12 +600,7 @@ where
                                                     tool_kind = "local",
                                                     "tool_approval.denied_side_event_abort"
                                                 );
-                                                yield stats_event(
-                                                    total_prompt_tokens,
-                                                    total_completion_tokens,
-                                                    max_prompt_tokens,
-                                                    run_start,
-                                                );
+                                                yield stats_event(stats);
                                                 yield CatEvent::Done;
                                                 return;
                                             }
@@ -626,12 +656,7 @@ where
                                         success,
                                         elapsed_ms,
                                     };
-                                    yield stats_event(
-                                        total_prompt_tokens,
-                                        total_completion_tokens,
-                                        max_prompt_tokens,
-                                        run_start,
-                                    );
+                                    yield stats_event(stats);
 
                                     for side_ev in make_side_events(tc, &collected.preview) {
                                         yield side_ev;
@@ -695,12 +720,7 @@ where
                                             success: false,
                                             elapsed_ms: 0,
                                         };
-                                        yield stats_event(
-                                            total_prompt_tokens,
-                                            total_completion_tokens,
-                                            max_prompt_tokens,
-                                            run_start,
-                                        );
+                                        yield stats_event(stats);
                                         all_outcomes.push(ToolCallOutcome::Error {
                                             tool_call_id: tc.id.clone(),
                                             tool_name: tc.name.clone(),
@@ -834,12 +854,7 @@ where
                                             tool_name = %tc.name,
                                             "tool_approval.denied_abort"
                                         );
-                                        yield stats_event(
-                                            total_prompt_tokens,
-                                            total_completion_tokens,
-                                            max_prompt_tokens,
-                                            run_start,
-                                        );
+                                        yield stats_event(stats);
                                         yield CatEvent::Done;
                                         return;
                                     }
@@ -896,12 +911,7 @@ where
                                                     tool_kind = "dynamic",
                                                     "tool_approval.denied_side_event_abort"
                                                 );
-                                                yield stats_event(
-                                                    total_prompt_tokens,
-                                                    total_completion_tokens,
-                                                    max_prompt_tokens,
-                                                    run_start,
-                                                );
+                                                yield stats_event(stats);
                                                 yield CatEvent::Done;
                                                 return;
                                             }
@@ -957,12 +967,7 @@ where
                                         success,
                                         elapsed_ms,
                                     };
-                                    yield stats_event(
-                                        total_prompt_tokens,
-                                        total_completion_tokens,
-                                        max_prompt_tokens,
-                                        run_start,
-                                    );
+                                    yield stats_event(stats);
                                     for side_ev in collected.side_events.clone() {
                                         yield side_ev;
                                     }
@@ -975,24 +980,23 @@ where
                                 }
                             }
 
-                            if !external.is_empty() {
-                                let names = external
+                            if !unavailable.is_empty() {
+                                let names = unavailable
                                     .iter()
-                                    .map(|t| t.name.as_str())
+                                    .map(|(t, _)| t.name.as_str())
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 tracing::warn!(
                                     thread_id = %state.thread_id.0,
                                     run_id = %state.run_id.0,
                                     tool_names = %names,
-                                    tool_count = external.len(),
+                                    tool_count = unavailable.len(),
                                     "tool_call.failed"
                                 );
-                                for tc in &external {
-                                    let result =
-                                        format!("error: unhandled external tool: {}", tc.name);
+                                for (tc, reason) in &unavailable {
+                                    let result = reason.error_message(&tc.name);
                                     log_tool_call_started(
-                                        "external",
+                                        reason.tool_kind(),
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         tc,
@@ -1010,12 +1014,7 @@ where
                                         success: false,
                                         elapsed_ms: 0,
                                     };
-                                    yield stats_event(
-                                        total_prompt_tokens,
-                                        total_completion_tokens,
-                                        max_prompt_tokens,
-                                        run_start,
-                                    );
+                                    yield stats_event(stats);
                                     all_outcomes.push(ToolCallOutcome::Error {
                                         tool_call_id: tc.id.clone(),
                                         tool_name: tc.name.clone(),
@@ -1038,63 +1037,78 @@ where
                             });
                             break;
                         }
-                        AgentEvent::Checkpoint(cp) => {
-                            last_messages = cp.state.messages.clone();
-                            last_user_state = cp.state.user_state.clone();
+                        CoreDriveEvent::Checkpoint { state } => {
+                            last_messages = state.messages.clone();
+                            last_user_state = state.user_state.clone();
                         }
-                        AgentEvent::Done => {
-                            let elapsed_ms = run_start.elapsed().as_millis() as u64;
+                        CoreDriveEvent::Done {
+                            stats,
+                            tool_rounds,
+                            ..
+                        } => {
                             tracing::info!(
                                 thread_id = %log_thread_id,
                                 run_id = %log_run_id,
                                 supervisor_run,
                                 tool_rounds,
-                                prompt_tokens = total_prompt_tokens,
-                                completion_tokens = total_completion_tokens,
-                                max_prompt_tokens,
-                                elapsed_ms,
+                                prompt_tokens = stats.prompt_tokens,
+                                completion_tokens = stats.completion_tokens,
+                                max_prompt_tokens = stats.max_prompt_tokens,
+                                elapsed_ms = stats.elapsed_ms,
                                 "agent_run.completed"
                             );
-                            yield CatEvent::Stats {
-                                prompt_tokens: total_prompt_tokens,
-                                completion_tokens: total_completion_tokens,
-                                max_prompt_tokens,
-                                elapsed_ms,
-                            };
+                            yield stats_event(stats);
                             yield CatEvent::History(last_messages.clone(), last_user_state.clone());
                             yield CatEvent::Done;
                             return;
                         }
-                        AgentEvent::Error(e) => {
+                        CoreDriveEvent::Error {
+                            error: e,
+                            stats,
+                            tool_rounds,
+                            ..
+                        } => {
                             tracing::warn!(
                                 thread_id = %log_thread_id,
                                 run_id = %log_run_id,
                                 supervisor_run,
                                 tool_rounds,
-                                prompt_tokens = total_prompt_tokens,
-                                completion_tokens = total_completion_tokens,
-                                max_prompt_tokens,
-                                elapsed_ms = run_start.elapsed().as_millis() as u64,
+                                prompt_tokens = stats.prompt_tokens,
+                                completion_tokens = stats.completion_tokens,
+                                max_prompt_tokens = stats.max_prompt_tokens,
+                                elapsed_ms = stats.elapsed_ms,
                                 error = %e,
                                 "agent_run.failed"
                             );
                             yield CatEvent::Error(e);
                             return;
                         }
-                        AgentEvent::Cancelled => {
+                        CoreDriveEvent::Cancelled {
+                            kind,
+                            stats,
+                            tool_rounds,
+                            ..
+                        } => {
                             tracing::info!(
                                 thread_id = %log_thread_id,
                                 run_id = %log_run_id,
                                 supervisor_run,
                                 tool_rounds,
-                                elapsed_ms = run_start.elapsed().as_millis() as u64,
+                                elapsed_ms = stats.elapsed_ms,
                                 "agent_run.cancelled"
                             );
+                            if kind == CoreCancelKind::Signal {
+                                yield CatEvent::Cancelled;
+                                return;
+                            }
                             yield CatEvent::History(last_messages.clone(), last_user_state.clone());
                             yield CatEvent::Done;
                             return;
                         }
-                        _ => {}
+                        CoreDriveEvent::ToolResult { .. }
+                        | CoreDriveEvent::SubSession(_)
+                        | CoreDriveEvent::ToolDelta { .. }
+                        | CoreDriveEvent::Ignored => {}
                     }
                 }
 
@@ -1108,61 +1122,6 @@ where
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn inject_extra_tools(
-    input: LoopInput,
-    extra: Vec<remi_agentloop::prelude::ToolDefinition>,
-) -> LoopInput {
-    match input {
-        LoopInput::Start {
-            content,
-            history,
-            mut extra_tools,
-            model,
-            temperature,
-            max_tokens,
-            user_name,
-            metadata,
-            message_metadata,
-            user_state,
-        } => {
-            extra_tools.extend(extra);
-            LoopInput::Start {
-                content,
-                history,
-                extra_tools,
-                model,
-                temperature,
-                max_tokens,
-                user_name,
-                metadata,
-                message_metadata,
-                user_state,
-            }
-        }
-        other => other,
-    }
-}
-
-fn build_tool_definition_ctx(input: &LoopInput) -> ToolDefinitionContext {
-    match input {
-        LoopInput::Start {
-            metadata,
-            user_state,
-            ..
-        } => ToolDefinitionContext {
-            metadata: metadata.clone(),
-            user_state: user_state.clone().unwrap_or(serde_json::Value::Null),
-            ..ToolDefinitionContext::default()
-        },
-        LoopInput::Resume { state, .. } | LoopInput::Cancel { state } => ToolDefinitionContext {
-            thread_id: Some(state.thread_id.clone()),
-            run_id: Some(state.run_id.clone()),
-            metadata: state.config.metadata.clone(),
-            user_state: state.user_state.clone(),
-        },
-    }
-}
 
 fn merge_runtime_tool_definitions(
     local_tools: &DefaultToolRegistry,
@@ -1293,16 +1252,6 @@ fn tool_allowed(tool_allowlist: Option<&[String]>, name: &str) -> bool {
     tool_allowlist
         .map(|allowlist| allowlist.iter().any(|tool| tool == name))
         .unwrap_or(true)
-}
-
-fn build_tool_ctx(state: &remi_agentloop::prelude::AgentState) -> ToolContext {
-    ToolContext {
-        config: AgentConfig::default(),
-        thread_id: Some(state.thread_id.clone()),
-        run_id: state.run_id.clone(),
-        metadata: state.config.metadata.clone(),
-        user_state: Arc::new(RwLock::new(state.user_state.clone())),
-    }
 }
 
 fn hook_context_from_state(state: &remi_agentloop::prelude::AgentState, cwd: &Path) -> HookContext {
@@ -2137,9 +2086,9 @@ mod tests {
         }
     }
 
-    struct UnhandledExternalToolInnerAgent;
+    struct MissingToolInnerAgent;
 
-    impl Agent for UnhandledExternalToolInnerAgent {
+    impl Agent for MissingToolInnerAgent {
         type Request = LoopInput;
         type Response = remi_agentloop::types::AgentEvent;
         type Error = AgentError;
@@ -2158,6 +2107,49 @@ mod tests {
                             arguments: serde_json::json!({
                                 "path": "/home/skye/remi-cat/.remi-cat/agents/explorer.md"
                             }),
+                        }],
+                        completed_results: vec![],
+                    },
+                ])),
+                LoopInput::Resume { results, .. } => {
+                    let error = results
+                        .iter()
+                        .find_map(|result| match result {
+                            ToolCallOutcome::Error { error, .. } => Some(error.clone()),
+                            ToolCallOutcome::Result { .. } => None,
+                        })
+                        .unwrap_or_default();
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::TextDelta(error),
+                        remi_agentloop::types::AgentEvent::Done,
+                    ]))
+                }
+                LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
+        }
+    }
+
+    struct DisallowedToolInnerAgent;
+
+    impl Agent for DisallowedToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::NeedToolExecution {
+                        state: AgentState::new(StepConfig::new("test-model")),
+                        tool_calls: vec![ParsedToolCall {
+                            id: "instant-call".to_string(),
+                            name: "instant".to_string(),
+                            arguments: serde_json::json!({}),
                         }],
                         completed_results: vec![],
                     },
@@ -2518,9 +2510,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unhandled_external_tool_emits_failed_tool_result_and_resumes() {
+    async fn missing_tool_emits_precise_failed_tool_result_and_resumes() {
         let agent = CatAgent {
-            inner: UnhandledExternalToolInnerAgent,
+            inner: MissingToolInnerAgent,
             local_tools: Arc::new(DefaultToolRegistry::new()),
             model_tools: None,
             data_dir: test_root(),
@@ -2554,13 +2546,67 @@ mod tests {
                     if id == "read-call"
                         && name == "read"
                         && !success
-                        && result.contains("unhandled external tool: read")
+                        && result.contains("tool not found: read")
             )
         }));
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                CatEvent::Text(text) if text.contains("unhandled external tool: read")
+                CatEvent::Text(text) if text.contains("tool not found: read")
+            )
+        }));
+        assert!(events.iter().any(|event| matches!(event, CatEvent::Done)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn disallowed_tool_emits_precise_failed_tool_result_and_resumes() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(InstantTool);
+        let agent = CatAgent {
+            inner: DisallowedToolInnerAgent,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: Some(vec!["rg".to_string()]),
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("call instant"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::ToolCall { id, name, .. } if id == "instant-call" && name == "instant"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::ToolCallResult { id, name, success, result, .. }
+                    if id == "instant-call"
+                        && name == "instant"
+                        && !success
+                        && result.contains("tool is not allowed for current agent: instant")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CatEvent::Text(text) if text.contains("tool is not allowed for current agent: instant")
             )
         }));
         assert!(events.iter().any(|event| matches!(event, CatEvent::Done)));

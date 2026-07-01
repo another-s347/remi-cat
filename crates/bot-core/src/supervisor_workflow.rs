@@ -5,6 +5,10 @@ use chrono::{DateTime, Utc};
 use remi_agentloop::prelude::Message;
 use serde::{Deserialize, Serialize};
 
+use crate::estimate_model_input_tokens;
+
+pub const ASK_USER_FOR_HELP_NODE: &str = "ask_user_for_help";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum WorkflowMaxRounds {
@@ -57,6 +61,22 @@ pub enum WorkflowStatus {
     Completed,
     Stopped,
     Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPauseReason {
+    Manual,
+    WaitingForUserInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskUserForHelpState {
+    pub return_node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_incoming_edge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_node_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,11 +168,102 @@ pub struct WorkflowInstance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_message: Option<String>,
     pub status: WorkflowStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<WorkflowPauseReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_user_for_help: Option<AskUserForHelpState>,
     #[serde(default)]
     pub max_rounds: WorkflowMaxRounds,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_report: Option<WorkflowReport>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorPrompt {
+    pub content: String,
+    pub estimated_tokens: u32,
+    pub budget_tokens: Option<u32>,
+    pub original_history_messages: usize,
+    pub included_history_messages: usize,
+}
+
+impl WorkflowInstance {
+    pub fn enter_ask_user_for_help(&mut self, round: u32) -> WorkflowReport {
+        let from_node = self.current_node.clone();
+        self.ask_user_for_help = Some(AskUserForHelpState {
+            return_node: from_node.clone(),
+            return_incoming_edge: self.incoming_edge.clone(),
+            return_node_message: self.node_message.clone(),
+        });
+        self.current_node = ASK_USER_FOR_HELP_NODE.to_string();
+        self.incoming_edge = Some(ASK_USER_FOR_HELP_NODE.to_string());
+        self.node_message = Some("Waiting for user input.".to_string());
+        self.status = WorkflowStatus::Paused;
+        self.pause_reason = Some(WorkflowPauseReason::WaitingForUserInput);
+        self.updated_at = Utc::now();
+
+        let report = WorkflowReport {
+            workflow_id: self.definition.id.clone(),
+            workflow_name: self.definition.name.clone(),
+            from_node: from_node.clone(),
+            edge: Some(ASK_USER_FOR_HELP_NODE.to_string()),
+            to_node: ASK_USER_FOR_HELP_NODE.to_string(),
+            path_edges: vec![ASK_USER_FOR_HELP_NODE.to_string()],
+            path_nodes: vec![from_node, ASK_USER_FOR_HELP_NODE.to_string()],
+            status: WorkflowStatus::Paused,
+            reason: "waiting for user input".to_string(),
+            agent_message: None,
+            next_node_message: self.node_message.clone(),
+            supervisor_trace: Vec::new(),
+            round,
+            max_rounds: self.max_rounds.clone(),
+            error: None,
+        };
+        self.last_report = Some(report.clone());
+        report
+    }
+
+    pub fn resume_from_ask_user_for_help(&mut self, round: u32) -> Option<WorkflowReport> {
+        if self.status != WorkflowStatus::Paused
+            || self.pause_reason != Some(WorkflowPauseReason::WaitingForUserInput)
+            || self.current_node != ASK_USER_FOR_HELP_NODE
+        {
+            return None;
+        }
+        let ask_state = self.ask_user_for_help.take()?;
+        let from_node = self.current_node.clone();
+        self.current_node = ask_state.return_node;
+        self.incoming_edge = ask_state.return_incoming_edge;
+        self.node_message = ask_state.return_node_message;
+        self.status = WorkflowStatus::Active;
+        self.pause_reason = None;
+        self.updated_at = Utc::now();
+
+        let resume_edge = format!("{ASK_USER_FOR_HELP_NODE}_resume");
+        let report = WorkflowReport {
+            workflow_id: self.definition.id.clone(),
+            workflow_name: self.definition.name.clone(),
+            from_node,
+            edge: Some(resume_edge.clone()),
+            to_node: self.current_node.clone(),
+            path_edges: vec![resume_edge],
+            path_nodes: vec![
+                ASK_USER_FOR_HELP_NODE.to_string(),
+                self.current_node.clone(),
+            ],
+            status: WorkflowStatus::Active,
+            reason: "user answered; resuming workflow".to_string(),
+            agent_message: None,
+            next_node_message: self.node_message.clone(),
+            supervisor_trace: Vec::new(),
+            round,
+            max_rounds: self.max_rounds.clone(),
+            error: None,
+        };
+        self.last_report = Some(report.clone());
+        Some(report)
+    }
 }
 
 impl WorkflowDefinition {
@@ -662,6 +773,39 @@ pub fn supervisor_prompt(
     history: &[Message],
     todo_prompt: Option<&str>,
 ) -> Result<String, String> {
+    Ok(supervisor_prompt_with_budget(instance, history, todo_prompt, None)?.content)
+}
+
+pub fn supervisor_prompt_with_budget(
+    instance: &WorkflowInstance,
+    history: &[Message],
+    todo_prompt: Option<&str>,
+    budget_tokens: Option<u32>,
+) -> Result<SupervisorPrompt, String> {
+    let original_history_messages = history.len();
+    let mut history = history.to_vec();
+    loop {
+        let content = render_supervisor_prompt(instance, &history, todo_prompt)?;
+        let estimated_tokens = estimate_model_input_tokens(&content);
+        let within_budget = budget_tokens.is_none_or(|budget| estimated_tokens <= budget);
+        if within_budget || history.len() <= 1 {
+            return Ok(SupervisorPrompt {
+                content,
+                estimated_tokens,
+                budget_tokens,
+                original_history_messages,
+                included_history_messages: history.len(),
+            });
+        }
+        history.remove(0);
+    }
+}
+
+fn render_supervisor_prompt(
+    instance: &WorkflowInstance,
+    history: &[Message],
+    todo_prompt: Option<&str>,
+) -> Result<String, String> {
     let definition = &instance.definition;
     let node = definition
         .node(&instance.current_node)
@@ -882,6 +1026,8 @@ mod tests {
             incoming_edge: Some("continue".into()),
             node_message: Some("check the tests next".into()),
             status: WorkflowStatus::Active,
+            pause_reason: None,
+            ask_user_for_help: None,
             max_rounds: WorkflowMaxRounds::default(),
             last_report: None,
             updated_at: Utc::now(),
@@ -901,6 +1047,38 @@ mod tests {
         assert!(prompt.contains("\"allowed_subtree\""));
         assert!(prompt.contains("\"allowed_jump_targets\""));
         assert!(prompt.contains("\"main_agent_history\": []"));
+    }
+
+    #[test]
+    fn prompt_budget_trims_old_history_messages_first() {
+        let instance = WorkflowInstance {
+            definition: embedded_goal_definition(),
+            context: serde_json::json!({"goal": "ship it"}),
+            current_node: "review".into(),
+            incoming_edge: None,
+            node_message: None,
+            status: WorkflowStatus::Active,
+            pause_reason: None,
+            ask_user_for_help: None,
+            max_rounds: WorkflowMaxRounds::default(),
+            last_report: None,
+            updated_at: Utc::now(),
+        };
+        let history = vec![
+            Message::user(format!("old session message {}", "a".repeat(2_000))),
+            Message::assistant(format!("middle session message {}", "b".repeat(2_000))),
+            Message::user("latest session message".to_string()),
+        ];
+        let latest_only = supervisor_prompt(&instance, &history[2..], None).unwrap();
+        let budget = estimate_model_input_tokens(&latest_only).saturating_add(10);
+
+        let prompt =
+            supervisor_prompt_with_budget(&instance, &history, None, Some(budget)).unwrap();
+
+        assert!(prompt.included_history_messages < prompt.original_history_messages);
+        assert!(prompt.content.contains("latest session message"));
+        assert!(!prompt.content.contains("old session message"));
+        assert!(prompt.estimated_tokens <= budget);
     }
 
     #[test]
@@ -953,6 +1131,8 @@ mod tests {
             incoming_edge: None,
             node_message: None,
             status: WorkflowStatus::Active,
+            pause_reason: None,
+            ask_user_for_help: None,
             max_rounds: WorkflowMaxRounds::default(),
             last_report: None,
             updated_at: Utc::now(),
@@ -1049,6 +1229,36 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_for_help_pauses_and_resumes_to_original_node() {
+        let mut instance = workflow_instance(embedded_goal_definition());
+        instance.current_node = "review".into();
+        instance.incoming_edge = Some("continue".into());
+        instance.node_message = Some("keep checking".into());
+
+        let pause_report = instance.enter_ask_user_for_help(2);
+
+        assert_eq!(pause_report.from_node, "review");
+        assert_eq!(pause_report.to_node, ASK_USER_FOR_HELP_NODE);
+        assert_eq!(instance.current_node, ASK_USER_FOR_HELP_NODE);
+        assert_eq!(instance.status, WorkflowStatus::Paused);
+        assert_eq!(
+            instance.pause_reason,
+            Some(WorkflowPauseReason::WaitingForUserInput)
+        );
+
+        let resume_report = instance.resume_from_ask_user_for_help(2).unwrap();
+
+        assert_eq!(resume_report.from_node, ASK_USER_FOR_HELP_NODE);
+        assert_eq!(resume_report.to_node, "review");
+        assert_eq!(instance.current_node, "review");
+        assert_eq!(instance.incoming_edge.as_deref(), Some("continue"));
+        assert_eq!(instance.node_message.as_deref(), Some("keep checking"));
+        assert_eq!(instance.status, WorkflowStatus::Active);
+        assert_eq!(instance.pause_reason, None);
+        assert!(instance.ask_user_for_help.is_none());
+    }
+
+    #[test]
     fn rejects_non_descendant_target() {
         let mut instance = workflow_instance(linear_definition());
 
@@ -1104,6 +1314,8 @@ mod tests {
             incoming_edge: None,
             node_message: None,
             status: WorkflowStatus::Active,
+            pause_reason: None,
+            ask_user_for_help: None,
             max_rounds: WorkflowMaxRounds::default(),
             last_report: None,
             updated_at: Utc::now(),

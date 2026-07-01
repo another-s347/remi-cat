@@ -2172,8 +2172,7 @@ impl TuiApp {
         let answered = self
             .runtime
             .bot
-            .user_question_manager()
-            .answer(&request.id, response)
+            .answer_user_question(&request.id, response)
             .await
             .is_some();
         tracing::info!(

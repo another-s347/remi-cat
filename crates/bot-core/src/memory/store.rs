@@ -1494,6 +1494,8 @@ mod tests {
             incoming_edge: None,
             node_message: None,
             status: crate::supervisor_workflow::WorkflowStatus::Paused,
+            pause_reason: None,
+            ask_user_for_help: None,
             max_rounds: crate::supervisor_workflow::WorkflowMaxRounds::Limited(20),
             last_report: None,
             updated_at: Utc::now(),

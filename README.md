@@ -259,6 +259,12 @@ It selects an edge and may send instructions back to the main agent.
 
 `/goal set ...` remains available and uses the built-in two-node goal workflow.
 
+When the main agent asks the user for help via `ask_user_question`, the active
+workflow automatically moves through the built-in control node
+`ask_user_for_help`. The workflow is paused while waiting for the answer, then
+resumes at the node it came from. This node is managed by the runtime and does
+not need to be declared in workflow JSON.
+
 ## Model Profiles
 
 Each model is configured by one YAML file under `.remi-cat/models`:
