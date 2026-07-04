@@ -285,6 +285,22 @@ export const api = {
     }),
   cancelSessionRun: (sessionId: string) =>
     fetch(`/api/v1/chat/sessions/${sessionId}/runs`, { method: "DELETE" }),
+  steerRun: async (sessionId: string, runId: string, text: string) => {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const response = await fetch(`/api/v1/chat/sessions/${sessionId}/steers`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ run_id: runId, text }),
+      });
+      if (response.ok) return;
+      if (response.status === 409 && attempt < 7) {
+        await sleep(75);
+        continue;
+      }
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error ?? `steer failed: ${response.status}`);
+    }
+  },
   cancelRun: (runId: string) =>
     fetch(`/api/v1/chat/runs/${runId}`, { method: "DELETE" }),
   decideApproval: (id: string, decision: ToolApprovalDecision) =>
@@ -330,17 +346,14 @@ export async function* streamRun(
   runId: string,
   text: string,
   signal: AbortSignal,
+  onOpen?: () => void,
 ): AsyncGenerator<ChatEvent> {
-  let response = await postRun(sessionId, runId, text, signal);
-  if (response.status === 409) {
-    await api.cancelSessionRun(sessionId).catch(() => undefined);
-    await sleep(250);
-    response = await postRun(sessionId, runId, text, signal);
-  }
+  const response = await postRun(sessionId, runId, text, signal);
   if (!response.ok || !response.body) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.error ?? `run failed: ${response.status}`);
   }
+  onOpen?.();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";

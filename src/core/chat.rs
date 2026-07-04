@@ -1,7 +1,9 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use bot_core::{CatEvent, Content, ImAttachment, ImDocument, StreamOptions};
+use bot_core::{
+    CatEvent, Content, ImAttachment, ImDocument, SteerInput, SteerSubmitResult, StreamOptions,
+};
 use futures::{Stream, StreamExt};
 
 use super::{
@@ -19,7 +21,6 @@ pub(crate) enum ChatChannel {
     Tui,
     Feishu,
     Web,
-    LocalTrigger,
 }
 
 impl ChatChannel {
@@ -29,7 +30,6 @@ impl ChatChannel {
             Self::Tui => Some("tui".to_string()),
             Self::Feishu => Some("feishu".to_string()),
             Self::Web => Some("web".to_string()),
-            Self::LocalTrigger => None,
         }
     }
 }
@@ -44,9 +44,6 @@ pub(crate) struct ChatRequest {
     pub(crate) message_id: Option<String>,
     pub(crate) chat_type: Option<String>,
     pub(crate) platform: Option<String>,
-    pub(crate) todo_create_via_sdk: bool,
-    pub(crate) trigger_tools_enabled: bool,
-    pub(crate) trigger_run: bool,
     pub(crate) im_attachments: Vec<ImAttachment>,
     pub(crate) im_documents: Vec<ImDocument>,
     pub(crate) cancel: Option<Arc<tokio::sync::Notify>>,
@@ -69,27 +66,12 @@ impl ChatRequest {
             message_id: None,
             chat_type: None,
             platform: None,
-            todo_create_via_sdk: false,
-            trigger_tools_enabled: false,
-            trigger_run: false,
             im_attachments: Vec::new(),
             im_documents: Vec::new(),
             cancel: None,
             command_preprocess: true,
             sub_session_routing: true,
         }
-    }
-
-    pub(crate) fn trigger_text(
-        session_id: impl Into<String>,
-        channel: ChatChannel,
-        text: impl Into<String>,
-    ) -> Self {
-        let mut request = Self::text(session_id, channel, text);
-        request.command_preprocess = false;
-        request.sub_session_routing = false;
-        request.trigger_run = true;
-        request
     }
 
     pub(crate) fn with_content(mut self, content: Content) -> Self {
@@ -127,14 +109,7 @@ impl ChatRequest {
         self
     }
 
-    pub(crate) fn enable_sdk_todo_and_triggers(mut self) -> Self {
-        self.todo_create_via_sdk = true;
-        self.trigger_tools_enabled = bot_core::trigger::TRIGGER_CAPABILITY_ENABLED;
-        self
-    }
-
-    pub(crate) fn enable_sdk_todo(mut self) -> Self {
-        self.todo_create_via_sdk = true;
+    pub(crate) fn enable_sdk_todo(self) -> Self {
         self
     }
 
@@ -153,6 +128,20 @@ impl ChatRequest {
     }
 }
 
+impl From<ChatRequest> for SteerInput {
+    fn from(request: ChatRequest) -> Self {
+        Self {
+            session_id: request.session_id,
+            content: request.content,
+            sender_user_id: request.sender_user_id,
+            sender_username: request.sender_username,
+            message_id: request.message_id,
+            chat_type: request.chat_type,
+            platform: request.platform.or_else(|| request.channel.as_platform()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum CoreChatEvent {
     Prefix(String),
@@ -162,9 +151,27 @@ pub(crate) enum CoreChatEvent {
 }
 
 impl Runtime {
+    pub(crate) fn submit_steer(&self, request: ChatRequest) -> SteerSubmitResult {
+        self.bot.submit_steer(request.into())
+    }
+
     pub(crate) fn chat(self: Rc<Self>, request: ChatRequest) -> impl Stream<Item = CoreChatEvent> {
         async_stream::stream! {
             let user_text = request.content.text_content();
+            if !user_text.trim_start().starts_with('/') {
+                match self.submit_steer(request.clone()) {
+                    SteerSubmitResult::Queued(event) => {
+                        yield CoreChatEvent::Bot(CatEvent::SteerQueued(event.clone()));
+                        yield CoreChatEvent::Reply(format!(
+                            "Steer 已接收，将在下一次模型/工具空隙注入。id: {}",
+                            event.steer_id
+                        ));
+                        yield CoreChatEvent::Done;
+                        return;
+                    }
+                    SteerSubmitResult::NotRunning => {}
+                }
+            }
             let mut session_id = request.session_id.clone();
             let mut content = request.content.clone();
             let mut skill_injections = Vec::new();
@@ -225,9 +232,6 @@ impl Runtime {
                                 message_id: request.message_id,
                                 chat_type: request.chat_type,
                                 platform,
-                                todo_create_via_sdk: request.todo_create_via_sdk,
-                                trigger_tools_enabled: request.trigger_tools_enabled,
-                                trigger_run: request.trigger_run,
                                 im_attachments: request.im_attachments,
                                 im_documents: request.im_documents,
                                 cancel: request.cancel,
@@ -291,9 +295,6 @@ impl Runtime {
                 message_id: request.message_id,
                 chat_type: request.chat_type,
                 platform,
-                todo_create_via_sdk: request.todo_create_via_sdk,
-                trigger_tools_enabled: request.trigger_tools_enabled,
-                trigger_run: request.trigger_run,
                 im_attachments: request.im_attachments,
                 im_documents: request.im_documents,
                 cancel: request.cancel,
@@ -340,20 +341,7 @@ mod tests {
         assert_eq!(request.content.text_content(), "hello");
         assert!(request.command_preprocess);
         assert!(request.sub_session_routing);
-        assert!(!request.trigger_run);
         assert_eq!(request.platform(), Some("tui".to_string()));
-    }
-
-    #[test]
-    fn trigger_request_keeps_dispatch_on_target_thread() {
-        let request = ChatRequest::trigger_text("thread-1", ChatChannel::LocalTrigger, "run");
-
-        assert_eq!(request.session_id, "thread-1");
-        assert_eq!(request.content.text_content(), "run");
-        assert!(!request.command_preprocess);
-        assert!(!request.sub_session_routing);
-        assert!(request.trigger_run);
-        assert_eq!(request.platform(), None);
     }
 
     #[test]
@@ -369,15 +357,12 @@ mod tests {
         let request = ChatRequest::text("thread-1", ChatChannel::Web, "hello")
             .with_sender("user-1", Some("User One".to_string()))
             .with_message("msg-1", "p2p")
-            .with_platform(Some("web".to_string()))
-            .enable_sdk_todo_and_triggers();
+            .with_platform(Some("web".to_string()));
 
         assert_eq!(request.sender_user_id.as_deref(), Some("user-1"));
         assert_eq!(request.sender_username.as_deref(), Some("User One"));
         assert_eq!(request.message_id.as_deref(), Some("msg-1"));
         assert_eq!(request.chat_type.as_deref(), Some("p2p"));
         assert_eq!(request.platform.as_deref(), Some("web"));
-        assert!(request.todo_create_via_sdk);
-        assert!(!request.trigger_tools_enabled);
     }
 }

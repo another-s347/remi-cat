@@ -7,7 +7,7 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 
 use crate::cli::{FeedbackCommand, GitHubIssueCreateRequest, GitHubIssueCreateResponse};
-use crate::command::{sandbox_doctor_report, sdk_doctor_report};
+use crate::command::sandbox_doctor_report;
 use crate::config::{detect_setup_state, SetupState};
 use crate::instance_profile::InstanceProfile;
 use crate::secret_store::{redaction_entries, SecretStore};
@@ -101,14 +101,13 @@ fn build_feedback_issue_body(
         SetupState::Uninitialized { .. } => "uninitialized",
     };
     let mut body = format!(
-        "{}\n\n---\n\n### Diagnostics\n\n```text\nremi-cat_version: {}\nos: {}\narch: {}\nprofile: {}\nsetup_state: {}\n{}\n{}\n```\n",
+        "{}\n\n---\n\n### Diagnostics\n\n```text\nremi-cat_version: {}\nos: {}\narch: {}\nprofile: {}\nsetup_state: {}\n{}\n```\n",
         user_body.trim(),
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         profile.label(),
         setup_label,
-        sdk_doctor_report(data_dir),
         sandbox_doctor_report(data_dir, &setup_state),
     );
     if include_logs {

@@ -58,7 +58,7 @@ use crate::profile_command::{
 };
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::SessionRuntime;
-use crate::{host_admin, local_trigger, local_trigger_scheduler, web_chat};
+use crate::{host_admin, web_chat};
 use bot_core::im_tools::ImFileBridge;
 use bot_core::{install_embedded_agent_profiles, install_embedded_model_profiles, CatBotBuilder};
 use im_feishu::FeishuGateway;
@@ -372,13 +372,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
-    let (trigger_dispatch_tx, trigger_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
-    if bot_core::trigger::TRIGGER_CAPABILITY_ENABLED && !cli.once.is_some() && !cli.pure_prompt {
-        local_trigger_scheduler::spawn_local_trigger_scheduler(
-            data_dir.clone(),
-            trigger_dispatch_tx,
-        );
-    }
     if !cli.pure_prompt && !cli.tui {
         let workspace_dir = current_workspace_dir(&data_dir);
         maybe_start_admin(host_admin::AdminState {
@@ -398,19 +391,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let local_set = tokio::task::LocalSet::new();
     local_set
         .run_until(async move {
-            let mut trigger_dispatch_rx = Some(trigger_dispatch_rx);
             tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
-            if !cli.tui {
-                tokio::task::spawn_local(local_trigger::run_dispatcher(
-                    Rc::clone(&runtime),
-                    trigger_dispatch_rx
-                        .take()
-                        .expect("trigger dispatcher receiver should be available"),
-                    None,
-                ));
-            }
             if cli.tui {
-                return crate::channel::tui::TuiChannel::new(cli, trigger_dispatch_rx.take())
+                return crate::channel::tui::TuiChannel::new(cli)
                     .run_once(runtime)
                     .await;
             }
@@ -1362,7 +1345,7 @@ mod cli_tests {
             "call-1",
             "manage_yourself",
             &serde_json::json!({"command": "profile agent list default"}),
-            "default\tRemi\tdefault\tsearch, skill__get, todo__add, todo__list, todo__complete, todo__update, todo__remove, trigger__upsert, trigger__list, trigger__delete, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, codex, manage_yourself",
+            "default\tRemi\tdefault\tsearch, skill__get, todo__add, todo__list, todo__complete, todo__update, todo__remove, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, codex, manage_yourself",
             true,
             511,
         );

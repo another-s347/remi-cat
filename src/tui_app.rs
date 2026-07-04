@@ -12,9 +12,9 @@ use base64::Engine as _;
 use bot_core::{
     model_profile_key_status, tool_success, CatEvent, Content, ContentPart, ContextCompactionEvent,
     ContextCompactionStatus, Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus,
-    ReasoningEffort, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
-    ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
-    WorkflowReport, WorkflowStatus,
+    ReasoningEffort, SteerSubmitResult, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage,
+    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
+    UserQuestionStatus, WorkflowReport, WorkflowStatus,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -74,34 +74,41 @@ const QUIT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
 const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
 const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 const MAX_TUI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const TUI_WORKSPACE_DIR_METADATA_KEY: &str = "tui_workspace_dir";
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-pub(crate) async fn run_tui(
-    runtime: Rc<Runtime>,
-    cli: CliConfig,
-    trigger_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::local_trigger_scheduler::LocalTriggerDispatch>,
-    >,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Result<()> {
+    let current_workspace_dir = current_tui_workspace_dir()?;
     let mut terminal = TerminalGuard::enter()?;
     let session_id = if cli.resume {
         if let Some(selector) = cli.resume_session_id.as_deref() {
-            resolve_resume_session_id(&runtime, selector).await?
+            let session_id = resolve_resume_session_id(&runtime, selector).await?;
+            confirm_resume_workspace_if_mismatched(
+                &runtime,
+                &mut terminal.terminal,
+                &session_id,
+                &current_workspace_dir,
+            )
+            .await?;
+            session_id
         } else {
-            select_resume_session_id(&runtime, &mut terminal.terminal).await?
+            select_resume_session_id(&runtime, &mut terminal.terminal, &current_workspace_dir)
+                .await?
         }
     } else {
         let session_channel = tui_start_channel_id(&cli.channel_id);
-        runtime
+        let session_id = runtime
             .sessions
             .lock()
             .await
             .create_channel(TUI_CHANNEL, &session_channel, &runtime.root_agent_id, None)?
-            .id
+            .id;
+        ensure_tui_session_workspace_binding(&runtime, &session_id, &current_workspace_dir).await?;
+        session_id
     };
 
-    let mut app = TuiApp::new(runtime, cli.clone(), session_id.clone(), trigger_rx).await;
+    let mut app = TuiApp::new(runtime, cli.clone(), session_id.clone()).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
     if should_cleanup_session_on_exit(app.has_activity, cli.resume) {
@@ -123,14 +130,191 @@ fn tui_start_channel_id(cli_channel_id: &str) -> String {
     }
 }
 
+fn current_tui_workspace_dir() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolve current working directory")?;
+    Ok(cwd.canonicalize().unwrap_or(cwd))
+}
+
+fn workspace_metadata_value(workspace_dir: &Path) -> String {
+    workspace_dir.display().to_string()
+}
+
+async fn ensure_tui_session_workspace_binding(
+    runtime: &Rc<Runtime>,
+    session_id: &str,
+    current_workspace_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut sessions = runtime.sessions.lock().await;
+    if sessions
+        .metadata_string(session_id, TUI_WORKSPACE_DIR_METADATA_KEY)
+        .is_none()
+    {
+        sessions.set_metadata_string(
+            session_id,
+            TUI_WORKSPACE_DIR_METADATA_KEY,
+            &workspace_metadata_value(current_workspace_dir),
+        )?;
+    }
+    Ok(())
+}
+
+fn tui_session_workspace_dir(session: &Session) -> Option<&str> {
+    session
+        .metadata
+        .get(TUI_WORKSPACE_DIR_METADATA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn resume_sessions_for_workspace(
+    sessions: Vec<Session>,
+    current_workspace_dir: &Path,
+) -> Vec<Session> {
+    let current_workspace = workspace_metadata_value(current_workspace_dir);
+    let mut current = Vec::new();
+    let mut legacy = Vec::new();
+
+    for session in sessions {
+        if session.channel_binding.platform != TUI_CHANNEL {
+            continue;
+        }
+        match tui_session_workspace_dir(&session) {
+            Some(workspace) if workspace == current_workspace => current.push(session),
+            None => legacy.push(session),
+            _ => {}
+        }
+    }
+
+    current.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    legacy.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    current.extend(legacy);
+    current
+}
+
+fn resume_session_workspace_label(session: &Session, current_workspace_dir: &Path) -> String {
+    match tui_session_workspace_dir(session) {
+        Some(workspace) if workspace == workspace_metadata_value(current_workspace_dir) => {
+            format!("cwd {}", compact_workspace_label(workspace))
+        }
+        Some(workspace) => format!("cwd {}", compact_workspace_label(workspace)),
+        None => "legacy/no cwd".to_string(),
+    }
+}
+
+fn resume_workspace_mismatch(session: &Session, current_workspace_dir: &Path) -> Option<String> {
+    let session_workspace = tui_session_workspace_dir(session)?;
+    let current_workspace = workspace_metadata_value(current_workspace_dir);
+    if session_workspace == current_workspace {
+        None
+    } else {
+        Some(session_workspace.to_string())
+    }
+}
+
+async fn confirm_resume_workspace_if_mismatched(
+    runtime: &Rc<Runtime>,
+    terminal: &mut CrosstermTerminal,
+    session_id: &str,
+    current_workspace_dir: &Path,
+) -> anyhow::Result<()> {
+    let session = runtime
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .with_context(|| format!("session `{session_id}` disappeared before resume"))?;
+    let Some(session_workspace) = resume_workspace_mismatch(&session, current_workspace_dir) else {
+        return Ok(());
+    };
+
+    let mut events = EventStream::new();
+    loop {
+        terminal
+            .draw(|frame| {
+                render_resume_workspace_mismatch_warning(
+                    frame,
+                    &session,
+                    current_workspace_dir,
+                    &session_workspace,
+                )
+            })
+            .context("draw resume workspace warning")?;
+
+        let Some(event) = events.next().await else {
+            anyhow::bail!("resume selection ended");
+        };
+        match event.context("read resume workspace warning event")? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(()),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    anyhow::bail!("resume cancelled")
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn render_resume_workspace_mismatch_warning(
+    frame: &mut Frame<'_>,
+    session: &Session,
+    current_workspace_dir: &Path,
+    session_workspace: &str,
+) {
+    let area = frame.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Length(10),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Workspace differs");
+    let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("session ", Style::default().fg(CODEX_DIM)),
+            Span::styled(&session.id, Style::default().fg(CODEX_CYAN)),
+        ]),
+        Line::from(format!("title: {title}")),
+        Line::from(format!(
+            "session cwd: {}",
+            sanitize_tui_text(session_workspace)
+        )),
+        Line::from(format!(
+            "current cwd: {}",
+            sanitize_tui_text(&workspace_metadata_value(current_workspace_dir))
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press Enter to resume anyway, or Esc/q to cancel.",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    frame.render_widget(Clear, layout[1]);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        layout[1],
+    );
+}
+
 async fn select_resume_session_id(
     runtime: &Rc<Runtime>,
     terminal: &mut CrosstermTerminal,
+    current_workspace_dir: &Path,
 ) -> anyhow::Result<String> {
-    let mut sessions = runtime.sessions.lock().await.list();
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let sessions =
+        resume_sessions_for_workspace(runtime.sessions.lock().await.list(), current_workspace_dir);
     if sessions.is_empty() {
-        anyhow::bail!("no sessions available to resume");
+        anyhow::bail!(
+            "no TUI sessions available to resume for current directory `{}`",
+            workspace_metadata_value(current_workspace_dir)
+        );
     }
 
     let mut events = EventStream::new();
@@ -138,7 +322,7 @@ async fn select_resume_session_id(
 
     loop {
         terminal
-            .draw(|frame| render_resume_selector(frame, &sessions, selected))
+            .draw(|frame| render_resume_selector(frame, &sessions, selected, current_workspace_dir))
             .context("draw resume selector")?;
 
         let Some(event) = events.next().await else {
@@ -183,7 +367,12 @@ async fn select_resume_session_id(
     }
 }
 
-fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected: usize) {
+fn render_resume_selector(
+    frame: &mut Frame<'_>,
+    sessions: &[Session],
+    selected: usize,
+    current_workspace_dir: &Path,
+) {
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -202,7 +391,10 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "  choose a previous conversation",
+                    format!(
+                        "  {}",
+                        compact_workspace_label(&workspace_metadata_value(current_workspace_dir))
+                    ),
                     Style::default().fg(CODEX_DIM),
                 ),
             ]),
@@ -225,6 +417,7 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
         .take(list_height)
         .map(|(index, session)| {
             let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
+            let workspace = resume_session_workspace_label(session, current_workspace_dir);
             let marker = if index == selected { "›" } else { " " };
             let prefix = if index < 9 {
                 format!("{marker} {}. ", index + 1)
@@ -246,6 +439,8 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
                     Style::default().fg(CODEX_DIM),
                 ),
                 Span::raw("  "),
+                Span::styled(workspace, Style::default().fg(CODEX_DIM)),
+                Span::raw("  "),
                 Span::raw(truncate_for_width(&title, 36)),
                 Span::styled(
                     format!("  {}", session.updated_at),
@@ -261,6 +456,7 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
 
     let session = &sessions[selected];
     let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
+    let workspace = resume_session_workspace_label(session, current_workspace_dir);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -268,9 +464,10 @@ fn render_resume_selector(frame: &mut Frame<'_>, sessions: &[Session], selected:
                 Span::styled(&session.id, Style::default().fg(CODEX_CYAN)),
             ]),
             Line::from(format!(
-                "{}:{} · {} · {}",
+                "{}:{} · {} · {} · {}",
                 session.channel_binding.platform,
                 session.channel_binding.channel_id,
+                workspace,
                 title,
                 session.updated_at
             )),
@@ -513,8 +710,6 @@ struct TuiApp {
     has_activity: bool,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
-    trigger_rx:
-        Option<UnboundedReceiverStream<crate::local_trigger_scheduler::LocalTriggerDispatch>>,
 }
 
 #[derive(Clone)]
@@ -524,16 +719,7 @@ struct SubmittedInput {
 }
 
 impl TuiApp {
-    async fn new(
-        runtime: Rc<Runtime>,
-        cli: CliConfig,
-        session_id: String,
-        trigger_rx: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                crate::local_trigger_scheduler::LocalTriggerDispatch,
-            >,
-        >,
-    ) -> Self {
+    async fn new(runtime: Rc<Runtime>, cli: CliConfig, session_id: String) -> Self {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
@@ -590,7 +776,6 @@ impl TuiApp {
             has_activity: false,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
-            trigger_rx: trigger_rx.map(UnboundedReceiverStream::new),
         };
         app.refresh_command_catalog();
         app.load_input_history().await;
@@ -628,11 +813,6 @@ impl TuiApp {
                 }
                 Some(event) = self.bot_rx.next() => {
                     self.handle_bot_event(event).await;
-                }
-                maybe_trigger = next_trigger_dispatch(&mut self.trigger_rx) => {
-                    if let Some(dispatch) = maybe_trigger {
-                        self.start_trigger_turn(dispatch);
-                    }
                 }
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
@@ -955,10 +1135,30 @@ impl TuiApp {
             return Ok(false);
         }
         if self.running {
-            self.queued_inputs.push_back(SubmittedInput {
-                display_text,
-                content,
-            });
+            let request = ChatRequest::text(self.session_id.clone(), ChatChannel::Tui, text)
+                .with_content(content.clone())
+                .with_sender(self.cli.user_id.clone(), Some(self.cli.username.clone()))
+                .with_message(format!("tui-steer-{}", uuid::Uuid::new_v4()), "p2p")
+                .with_platform(Some(TUI_CHANNEL.to_string()));
+            match self.runtime.submit_steer(request) {
+                SteerSubmitResult::Queued(event) => {
+                    self.has_activity = true;
+                    self.cells.push(HistoryCell::user(display_text));
+                    self.cells.push(HistoryCell::system(format!(
+                        "Steer 已接收，将在下一次模型/工具空隙注入。id: {}",
+                        event.steer_id
+                    )));
+                }
+                SteerSubmitResult::NotRunning => {
+                    self.queued_inputs.push_back(SubmittedInput {
+                        display_text,
+                        content,
+                    });
+                    self.cells.push(HistoryCell::system(
+                        "当前 run 尚未开放 steer 队列，已暂存到下一轮输入队列。",
+                    ));
+                }
+            }
             return Ok(false);
         }
         self.has_activity = true;
@@ -1128,37 +1328,6 @@ impl TuiApp {
                 tx,
             )
             .await;
-        }));
-    }
-
-    fn start_trigger_turn(
-        &mut self,
-        dispatch: crate::local_trigger_scheduler::LocalTriggerDispatch,
-    ) {
-        self.cells.push(HistoryCell::system(format!(
-            "触发器「{}」已触发，开始执行。",
-            dispatch.trigger_name
-        )));
-        while self.cells.len() > MAX_HISTORY_CELLS {
-            self.cells.remove(0);
-        }
-
-        let cancel = Arc::new(Notify::new());
-        self.cancel = Some(Arc::clone(&cancel));
-        self.running = true;
-        self.run_started_at = Some(Instant::now());
-        self.interrupt_requested = false;
-        self.status.state = "running".to_string();
-        self.status.last_error = None;
-        self.last_stats_snapshot = TokenStatsSnapshot::default();
-        self.pending_token_delta = TokenDelta::default();
-        self.last_token_cell_index = None;
-        self.active_supervisor_id = Some(format!("supervisor-{}", uuid::Uuid::new_v4()));
-
-        let runtime = Rc::clone(&self.runtime);
-        let tx = self.bot_tx.clone();
-        self.run_handle = Some(tokio::task::spawn_local(async move {
-            run_tui_trigger_turn(runtime, dispatch, cancel, tx).await;
         }));
     }
 
@@ -1518,6 +1687,12 @@ impl TuiApp {
                     response.answer_text.clone(),
                     Some(response.status),
                 ));
+            }
+            BotEvent::SteerInjected { count, preview } => {
+                self.cells.push(HistoryCell::system(format!(
+                    "Steer 已注入（{} 条）：{}",
+                    count, preview
+                )));
             }
             BotEvent::Stats {
                 prompt_tokens,
@@ -2812,6 +2987,13 @@ async fn ensure_tui_sub_session_channel_session(
         Ok(session) => session,
         Err(_) => return None,
     };
+    if session.channel_binding.platform == TUI_CHANNEL {
+        if let Ok(current_workspace_dir) = current_tui_workspace_dir() {
+            let _ =
+                ensure_tui_session_workspace_binding(runtime, &session.id, &current_workspace_dir)
+                    .await;
+        }
+    }
 
     let mut sessions = runtime.sessions.lock().await;
     if existing_binding.is_none() {
@@ -2847,17 +3029,6 @@ async fn ensure_tui_sub_session_channel_session(
         }
     }
     Some(session.id)
-}
-
-async fn next_trigger_dispatch(
-    trigger_rx: &mut Option<
-        UnboundedReceiverStream<crate::local_trigger_scheduler::LocalTriggerDispatch>,
-    >,
-) -> Option<crate::local_trigger_scheduler::LocalTriggerDispatch> {
-    match trigger_rx {
-        Some(rx) => rx.next().await,
-        None => std::future::pending().await,
-    }
 }
 
 fn sub_session_event_log_path(data_dir: &Path, session_id: &str) -> PathBuf {
@@ -3169,35 +3340,10 @@ async fn run_bot_turn(
         .with_sender(sender_user_id, Some(sender_username))
         .with_message(format!("tui-msg-{}", uuid::Uuid::new_v4()), "p2p")
         .with_platform(Some(TUI_CHANNEL.to_string()))
-        .enable_sdk_todo_and_triggers()
         .with_cancel(cancel);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     while let Some(event) = stream.next().await {
         if forward_core_event_to_tui(event, &tx, is_clear_command) {
-            break;
-        }
-    }
-    let _ = tx.send(BotEvent::Done);
-}
-
-async fn run_tui_trigger_turn(
-    runtime: Rc<Runtime>,
-    dispatch: crate::local_trigger_scheduler::LocalTriggerDispatch,
-    cancel: Arc<Notify>,
-    tx: mpsc::UnboundedSender<BotEvent>,
-) {
-    let request = ChatRequest::trigger_text(dispatch.thread_id, ChatChannel::Tui, dispatch.request)
-        .with_sender(dispatch.owner_user_id, dispatch.owner_username)
-        .with_message(
-            format!("trigger-{}", uuid::Uuid::new_v4()),
-            dispatch.chat_type.unwrap_or_else(|| "p2p".to_string()),
-        )
-        .with_platform(dispatch.platform.or_else(|| Some(TUI_CHANNEL.to_string())))
-        .enable_sdk_todo()
-        .with_cancel(cancel);
-    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
-    while let Some(event) = stream.next().await {
-        if forward_core_event_to_tui(event, &tx, false) {
             break;
         }
     }
@@ -3294,6 +3440,12 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
         }
         CatEvent::UserQuestionResolved { request, response } => {
             let _ = tx.send(BotEvent::UserQuestionResolved { request, response });
+        }
+        CatEvent::SteerInjected(event) => {
+            let _ = tx.send(BotEvent::SteerInjected {
+                count: event.count,
+                preview: event.preview,
+            });
         }
         CatEvent::StateUpdate(user_state) => {
             let items = bot_core::todo::todos_from_user_state(&user_state);
@@ -3520,6 +3672,14 @@ async fn run_tui_new_command(
             return;
         }
     };
+    if let Ok(current_workspace_dir) = current_tui_workspace_dir() {
+        if let Err(error) =
+            ensure_tui_session_workspace_binding(&runtime, &session.id, &current_workspace_dir)
+                .await
+        {
+            send_progress(format!("new: session cwd 绑定失败: {error:#}"));
+        }
+    }
     let shown_title = session.title.as_deref().unwrap_or(&title).to_string();
     send_progress(format!(
         "new: 已创建空 session。\n新 session: {}\n标题: {}\n正在打开新 pane...",
@@ -3608,6 +3768,10 @@ enum BotEvent {
     UserQuestionResolved {
         request: UserQuestionRequest,
         response: UserQuestionResponse,
+    },
+    SteerInjected {
+        count: usize,
+        preview: String,
     },
     Stats {
         prompt_tokens: u32,
@@ -5277,9 +5441,6 @@ mod tests {
                 batch_id: Some(7),
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(0),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             },
             bot_core::todo::TodoItem {
                 id: 2,
@@ -5289,9 +5450,6 @@ mod tests {
                 batch_id: None,
                 batch_title: None,
                 batch_index: None,
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             },
         ];
         let rendered = format_todo_state(&items);
@@ -5311,9 +5469,6 @@ mod tests {
                 batch_id: Some(7),
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(0),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             },
             bot_core::todo::TodoItem {
                 id: 2,
@@ -5323,9 +5478,6 @@ mod tests {
                 batch_id: None,
                 batch_title: None,
                 batch_index: None,
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             },
             bot_core::todo::TodoItem {
                 id: 3,
@@ -5335,9 +5487,6 @@ mod tests {
                 batch_id: Some(7),
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(1),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             },
         ];
 
@@ -5390,6 +5539,105 @@ mod tests {
         assert!(second.starts_with("tui:"));
         assert_ne!(first, second);
         assert_eq!(tui_start_channel_id("desk"), "desk");
+    }
+
+    fn test_session(
+        id: &str,
+        platform: &str,
+        channel_id: &str,
+        updated_at: &str,
+        workspace_dir: Option<&str>,
+    ) -> Session {
+        let mut metadata = serde_json::Map::new();
+        if let Some(workspace_dir) = workspace_dir {
+            metadata.insert(
+                TUI_WORKSPACE_DIR_METADATA_KEY.to_string(),
+                serde_json::Value::String(workspace_dir.to_string()),
+            );
+        }
+        Session {
+            id: id.to_string(),
+            channel_binding: ChannelBinding {
+                platform: platform.to_string(),
+                channel_id: channel_id.to_string(),
+            },
+            root_agent_id: "default".to_string(),
+            title: Some(format!("Session {id}")),
+            metadata,
+            sub_sessions: Vec::new(),
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn resume_sessions_for_workspace_filters_to_current_tui_sessions_and_legacy() {
+        let current_workspace = PathBuf::from("/repo/current");
+        let sessions = vec![
+            test_session(
+                "current-old",
+                TUI_CHANNEL,
+                "tui:1",
+                "2026-01-01T00:00:00Z",
+                Some("/repo/current"),
+            ),
+            test_session(
+                "other-workspace",
+                TUI_CHANNEL,
+                "tui:2",
+                "2026-01-04T00:00:00Z",
+                Some("/repo/other"),
+            ),
+            test_session("legacy", TUI_CHANNEL, "tui:3", "2026-01-03T00:00:00Z", None),
+            test_session(
+                "web",
+                "web",
+                "web:1",
+                "2026-01-05T00:00:00Z",
+                Some("/repo/current"),
+            ),
+            test_session(
+                "current-new",
+                TUI_CHANNEL,
+                "tui:4",
+                "2026-01-02T00:00:00Z",
+                Some("/repo/current"),
+            ),
+        ];
+
+        let ids = resume_sessions_for_workspace(sessions, &current_workspace)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["current-new", "current-old", "legacy"]);
+    }
+
+    #[test]
+    fn resume_workspace_mismatch_only_reports_different_bound_workspace() {
+        let current_workspace = PathBuf::from("/repo/current");
+        let same = test_session(
+            "same",
+            TUI_CHANNEL,
+            "tui:1",
+            "2026-01-01T00:00:00Z",
+            Some("/repo/current"),
+        );
+        let other = test_session(
+            "other",
+            TUI_CHANNEL,
+            "tui:2",
+            "2026-01-01T00:00:00Z",
+            Some("/repo/other"),
+        );
+        let legacy = test_session("legacy", TUI_CHANNEL, "tui:3", "2026-01-01T00:00:00Z", None);
+
+        assert_eq!(resume_workspace_mismatch(&same, &current_workspace), None);
+        assert_eq!(
+            resume_workspace_mismatch(&other, &current_workspace).as_deref(),
+            Some("/repo/other")
+        );
+        assert_eq!(resume_workspace_mismatch(&legacy, &current_workspace), None);
     }
 
     fn test_cli_config() -> CliConfig {

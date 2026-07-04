@@ -1223,17 +1223,15 @@ mod tests {
         let store = BuiltinSkillStore::new(
             inner,
             [BuiltinSkill {
-                name: "trigger",
-                description: "Builtin trigger capability reference",
-                content: "---\nname: trigger\ndescription: Builtin trigger capability reference\n---\n\nTrigger body".to_string(),
+                name: "docs",
+                description: "Builtin docs capability reference",
+                content: "---\nname: docs\ndescription: Builtin docs capability reference\n---\n\nDocs body"
+                    .to_string(),
             }],
         );
 
-        let results = store.search("trigger").await.unwrap();
-        assert_eq!(results[0].name, "trigger");
-        assert_eq!(
-            store.get("trigger").await.unwrap().unwrap().source,
-            "builtin"
-        );
+        let results = store.search("docs").await.unwrap();
+        assert_eq!(results[0].name, "docs");
+        assert_eq!(store.get("docs").await.unwrap().unwrap().source, "builtin");
     }
 }

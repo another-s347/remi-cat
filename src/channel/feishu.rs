@@ -272,7 +272,7 @@ async fn collect_bot_reply(
         .with_sender(msg.sender_user_id.clone(), sender_username)
         .with_message(msg.message_id.clone(), msg.chat_type.clone())
         .with_platform(Some(platform.to_string()))
-        .enable_sdk_todo_and_triggers()
+        .enable_sdk_todo()
         .with_im_context(im_attachments, im_documents);
     let debug_enabled = runtime
         .sessions

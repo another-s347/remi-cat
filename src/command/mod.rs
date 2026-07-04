@@ -10,7 +10,7 @@ mod update;
 
 pub(crate) use doctor::{
     command_doctor_report, print_registered_tools, run_acp_command, run_codex_command, run_doctor,
-    sandbox_doctor_report, sdk_doctor_report,
+    sandbox_doctor_report,
 };
 pub(crate) use feedback::run_feedback_command;
 #[cfg(test)]
@@ -231,7 +231,7 @@ pub(crate) async fn handle_runtime_command(
     if command == "/clear" {
         runtime.bot.clear_memory(session_id).await?;
         return Ok(Some(RuntimeCommandResult::Reply(
-            "已清空当前 session 的历史会话。Todo/trigger 等工具状态已保留。".to_string(),
+            "已清空当前 session 的历史会话。Todo 等工具状态已保留。".to_string(),
         )));
     }
     if command == "/doctor" {

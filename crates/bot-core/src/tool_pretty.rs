@@ -145,7 +145,6 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             )
         }
         value if value.starts_with("memory__") => ("检索/更新记忆".to_string(), value.to_string()),
-        value if value.starts_with("trigger__") => ("管理触发器".to_string(), value.to_string()),
         "codex" => (
             "调用 Codex 子会话".to_string(),
             "等待 Codex 回复".to_string(),

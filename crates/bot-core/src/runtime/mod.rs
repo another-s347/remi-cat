@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
-use bot_runtime_core::CoreStreamOptions;
+use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ResumePayload, Role,
@@ -23,13 +24,14 @@ use crate::tools::{BashMode, SecretRedactor};
 use crate::{
     acp, api_key_from_env, embedded_agent_profile, goal, install_embedded_agent_profiles,
     install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
-    sandbox, skill, supervisor_workflow, todo, trigger, AccountUsage, AgentModelBindings,
-    AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
-    FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument,
-    ImFileBridge, MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
-    SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SupervisorTraceEvent,
-    ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager, WorkflowDecision,
-    WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
+    sandbox, skill, supervisor_workflow, todo, AccountUsage, AgentModelBindings, AgentProfile,
+    AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart, FileSkillStore,
+    GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument, ImFileBridge,
+    MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
+    SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SteerQueuedEvent,
+    SupervisorTraceEvent, ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager,
+    WorkflowDecision, WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport,
+    WorkflowStatus,
 };
 
 mod approval_markers;
@@ -71,7 +73,6 @@ const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
-pub(crate) const TRIGGER_RUN_META_KEY: &str = "trigger_run";
 
 fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
     let percent_budget = (profile.context_tokens as usize)
@@ -98,8 +99,44 @@ pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &
         .unwrap_or(false)
 }
 
-pub(crate) fn suppress_trigger_management(metadata: Option<&serde_json::Value>) -> bool {
-    !trigger::TRIGGER_CAPABILITY_ENABLED || metadata_flag_enabled(metadata, TRIGGER_RUN_META_KEY)
+fn steer_preview(content: &Content) -> String {
+    let text = content.text_content();
+    let trimmed = text.trim();
+    let mut preview = trimmed.chars().take(120).collect::<String>();
+    if trimmed.chars().count() > 120 {
+        preview.push('…');
+    }
+    preview
+}
+
+fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("steer".into(), serde_json::Value::Bool(true));
+    if let Some(value) = input.message_id.as_deref() {
+        map.insert(
+            "message_id".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = input.chat_type.as_deref() {
+        map.insert(
+            "chat_type".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = input.platform.as_deref() {
+        map.insert(
+            "platform".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = input.sender_user_id.as_deref() {
+        map.insert(
+            "sender_user_id".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Some(serde_json::Value::Object(map))
 }
 
 // -- StreamOptions ----------------------------------------------------------
@@ -127,13 +164,6 @@ pub struct StreamOptions {
     pub chat_type: Option<String>,
     /// Current IM platform identifier (for example `feishu`).
     pub platform: Option<String>,
-    /// Route newly-created todo batches to the remi-sdk backend when true.
-    pub todo_create_via_sdk: bool,
-    /// Enable trigger management tools for the current turn.
-    pub trigger_tools_enabled: bool,
-    /// Marks the request as an automatic trigger execution.
-    /// Trigger management tools and the builtin trigger skill are hidden for these runs.
-    pub trigger_run: bool,
     /// Marks the request as an internal supervisor run.
     /// Goal supervision is disabled for these runs to avoid recursive loops.
     pub supervisor_run: bool,
@@ -152,11 +182,50 @@ pub struct StreamOptions {
 
 type ThreadRunLock = Arc<AsyncMutex<()>>;
 type ThreadRunLocks = Arc<AsyncMutex<HashMap<String, ThreadRunLock>>>;
+type ActiveSteerQueues = Arc<StdMutex<HashMap<String, Arc<CoreSteerQueue>>>>;
+
+#[derive(Debug, Clone)]
+pub struct SteerInput {
+    pub session_id: String,
+    pub content: Content,
+    pub sender_user_id: Option<String>,
+    pub sender_username: Option<String>,
+    pub message_id: Option<String>,
+    pub chat_type: Option<String>,
+    pub platform: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SteerSubmitResult {
+    Queued(SteerQueuedEvent),
+    NotRunning,
+}
 
 struct LocalAcpAgentRunner {
     agent: CatAgent<InnerAgent>,
     memory: Arc<MemoryStore>,
     run_locks: ThreadRunLocks,
+}
+
+struct SteerQueueRegistration {
+    session_id: String,
+    queue: Arc<CoreSteerQueue>,
+    active: ActiveSteerQueues,
+}
+
+impl Drop for SteerQueueRegistration {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("active steer queue lock poisoned");
+        if active
+            .get(&self.session_id)
+            .is_some_and(|queue| Arc::ptr_eq(queue, &self.queue))
+        {
+            active.remove(&self.session_id);
+        }
+    }
 }
 
 fn local_acp_thread_id(session_id: &str) -> String {
@@ -241,12 +310,12 @@ pub struct CatBot {
     pinned_skill_summaries: Vec<SkillSummary>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
-    trigger_backend: Arc<trigger::TriggerBackend>,
     acp_backend: Arc<acp::AcpBackend>,
     approval_manager: Arc<ToolApprovalManager>,
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
     run_locks: ThreadRunLocks,
+    active_steers: ActiveSteerQueues,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
     /// Shared secret redactor — updated via `update_secret_redactor`.
@@ -281,6 +350,51 @@ pub enum EffectiveAgentSource {
 }
 
 impl CatBot {
+    fn register_steer_queue(
+        &self,
+        session_id: &str,
+    ) -> (Arc<CoreSteerQueue>, SteerQueueRegistration) {
+        let queue = Arc::new(CoreSteerQueue::new());
+        self.active_steers
+            .lock()
+            .expect("active steer queue lock poisoned")
+            .insert(session_id.to_string(), Arc::clone(&queue));
+        let guard = SteerQueueRegistration {
+            session_id: session_id.to_string(),
+            queue: Arc::clone(&queue),
+            active: Arc::clone(&self.active_steers),
+        };
+        (queue, guard)
+    }
+
+    pub fn submit_steer(&self, input: SteerInput) -> SteerSubmitResult {
+        let queue = {
+            self.active_steers
+                .lock()
+                .expect("active steer queue lock poisoned")
+                .get(&input.session_id)
+                .cloned()
+        };
+        let Some(queue) = queue else {
+            return SteerSubmitResult::NotRunning;
+        };
+        let steer_id = uuid::Uuid::new_v4().to_string();
+        let preview = steer_preview(&input.content);
+        let message_metadata = steer_message_metadata(&input);
+        queue.push(CoreSteerInput {
+            id: steer_id.clone(),
+            content: input.content,
+            preview: preview.clone(),
+            message_metadata,
+            user_name: input.sender_username.clone(),
+        });
+        SteerSubmitResult::Queued(SteerQueuedEvent {
+            steer_id,
+            session_id: input.session_id,
+            preview,
+        })
+    }
+
     pub fn model_context_tokens(&self) -> u32 {
         self.model_profile.context_tokens
     }
@@ -670,10 +784,6 @@ impl CatBot {
             .delete_thread(thread_id, user_id)
             .await
             .map_err(|err| AgentError::other(format!("delete thread todos: {err:#}")))?;
-        self.trigger_backend
-            .delete_thread(thread_id, user_id)
-            .await
-            .map_err(|err| AgentError::other(format!("delete thread triggers: {err:#}")))?;
         self.memory.delete_thread(thread_id).await?;
         let _ = supervisor_workflow::clear_instance(&self.memory.data_dir, thread_id).await;
         Ok(())
@@ -717,10 +827,6 @@ impl CatBot {
             .fork_thread_user_state(source_thread_id, target_thread_id, user_id, &mut user_state)
             .await
             .map_err(|err| AgentError::other(format!("fork thread todos: {err:#}")))?;
-        self.trigger_backend
-            .fork_thread_user_state(source_thread_id, target_thread_id, user_id, &mut user_state)
-            .await
-            .map_err(|err| AgentError::other(format!("fork thread triggers: {err:#}")))?;
         self.memory
             .save_user_state(target_thread_id, &user_state)
             .await?;
@@ -1035,42 +1141,6 @@ impl CatBot {
         running
     }
 
-    /// List triggers for the current thread without invoking the LLM.
-    pub async fn trigger_list_command(
-        &self,
-        thread_id: &str,
-        opts: StreamOptions,
-    ) -> Result<String, remi_agentloop::prelude::AgentError> {
-        let ctx = trigger_command_tool_ctx(thread_id, &opts);
-        let items = self.trigger_backend.list(&ctx).await?;
-        if items.is_empty() {
-            Ok("当前线程没有触发器。".to_string())
-        } else {
-            Ok(format!(
-                "**当前线程的触发器：**\n\n{}",
-                crate::trigger::tools::format_trigger_list(&items)
-            ))
-        }
-    }
-
-    /// Delete one trigger for the current thread without invoking the LLM.
-    pub async fn trigger_delete_command(
-        &self,
-        thread_id: &str,
-        id: u64,
-        opts: StreamOptions,
-    ) -> Result<String, remi_agentloop::prelude::AgentError> {
-        let ctx = trigger_command_tool_ctx(thread_id, &opts);
-        let result = self.trigger_backend.delete(&ctx, id).await?;
-        if result.starts_with("Removed trigger #") {
-            Ok(format!("✅ 已删除触发器 #{id}。"))
-        } else if result.contains("not found") {
-            Ok(format!("❌ 触发器 #{id} 不存在。"))
-        } else {
-            Ok(result)
-        }
-    }
-
     pub async fn acp_bound_message(
         &self,
         session_id: &str,
@@ -1114,33 +1184,6 @@ impl CatBot {
         } else {
             Ok("当前频道没有绑定 ACP session。".to_string())
         }
-    }
-
-    /// Create or update one trigger from a JSON payload without invoking the LLM.
-    pub async fn trigger_upsert_command(
-        &self,
-        thread_id: &str,
-        arguments_json: &str,
-        opts: StreamOptions,
-    ) -> Result<String, remi_agentloop::prelude::AgentError> {
-        let args = serde_json::from_str(arguments_json).map_err(|err| {
-            remi_agentloop::prelude::AgentError::tool(
-                "trigger",
-                format!("invalid trigger JSON: {err}"),
-            )
-        })?;
-        let request = crate::trigger::tools::parse_upsert_request(args)?;
-        let ctx = trigger_command_tool_ctx(thread_id, &opts);
-        let result = self.trigger_backend.upsert(&ctx, request).await?;
-        let action = if result.operation == "updated" {
-            "已更新"
-        } else {
-            "已创建"
-        };
-        Ok(format!(
-            "✅ {action}触发器。\n\n{}",
-            crate::trigger::tools::format_trigger_item(&result.item)
-        ))
     }
 
     /// Rebuild the secret redactor from a new `key → value` map.
@@ -1525,6 +1568,13 @@ impl CatBot {
         stream! {
                 let run_lock = self.thread_run_lock(&thread_id_owned).await;
                 let _run_guard = run_lock.lock().await;
+                let steer_registration = if opts.supervisor_run {
+                    None
+                } else {
+                    let (queue, guard) = self.register_steer_queue(&thread_id_owned);
+                    Some((queue, guard))
+                };
+                let steer_queue = steer_registration.as_ref().map(|(queue, _)| Arc::clone(queue));
                 let mut next_content = content;
                 let mut supervisor_round: u32 = 0;
                 let mut continuation_from_supervisor = false;
@@ -1598,7 +1648,6 @@ impl CatBot {
                     message_id = opts.message_id.as_deref().unwrap_or(""),
                     sender_user_id = opts.sender_user_id.as_deref().unwrap_or(""),
                     supervisor_run = opts.supervisor_run,
-                    trigger_run = opts.trigger_run,
                     "agent_turn.start"
                 );
                 // 1. Load memory context (triggers mid->long-term promotion if needed).
@@ -1629,23 +1678,7 @@ impl CatBot {
                     tracing::warn!(
                         thread_id = %thread_id_owned,
                         error = %err,
-                        "failed to refresh sdk-backed todo state before turn"
-                    );
-                }
-
-                if let Err(err) = self
-                    .trigger_backend
-                    .refresh_thread_user_state(
-                        &thread_id_owned,
-                        opts.sender_user_id.as_deref(),
-                        &mut ctx.user_state,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        thread_id = %thread_id_owned,
-                        error = %err,
-                        "failed to refresh sdk-backed trigger state before turn"
+                        "failed to refresh todo state before turn"
                     );
                 }
 
@@ -1710,15 +1743,6 @@ impl CatBot {
                 }
                 if let Some(ref platform) = round_opts.platform {
                     meta["platform"] = serde_json::Value::String(platform.clone());
-                }
-                if round_opts.todo_create_via_sdk {
-                    meta["todo_create_via_sdk"] = serde_json::Value::String("true".to_string());
-                }
-                if round_opts.trigger_tools_enabled {
-                    meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
-                }
-                if round_opts.trigger_run {
-                    meta[TRIGGER_RUN_META_KEY] = serde_json::Value::String("true".to_string());
                 }
                 if round_opts.supervisor_run {
                     meta["supervisor_run"] = serde_json::Value::String("true".to_string());
@@ -1924,6 +1948,7 @@ impl CatBot {
                     input,
                     CoreStreamOptions {
                         cancel: round_opts.cancel.clone(),
+                        steer: steer_queue.clone(),
                     },
                 );
                 let mut inner_stream = std::pin::pin!(inner_stream);
@@ -2325,43 +2350,6 @@ fn preview_url_header(url: &str) -> &str {
     }
 }
 
-fn trigger_command_tool_ctx(thread_id: &str, opts: &StreamOptions) -> ToolContext {
-    ToolContext {
-        config: AgentConfig::default(),
-        thread_id: Some(
-            serde_json::from_value(serde_json::json!(thread_id))
-                .expect("thread_id should deserialize"),
-        ),
-        run_id: serde_json::from_value(serde_json::json!(format!("trigger-command:{thread_id}")))
-            .expect("run_id should deserialize"),
-        metadata: Some(trigger_command_metadata(thread_id, opts)),
-        user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-    }
-}
-
-fn trigger_command_metadata(thread_id: &str, opts: &StreamOptions) -> serde_json::Value {
-    let mut meta = serde_json::json!({ "thread_id": thread_id });
-    if let Some(ref sender_user_id) = opts.sender_user_id {
-        meta["sender_user_id"] = serde_json::Value::String(sender_user_id.clone());
-    }
-    if let Some(ref sender_username) = opts.sender_username {
-        meta["sender_username"] = serde_json::Value::String(sender_username.clone());
-    }
-    if let Some(ref message_id) = opts.message_id {
-        meta["message_id"] = serde_json::Value::String(message_id.clone());
-    }
-    if let Some(ref chat_type) = opts.chat_type {
-        meta["chat_type"] = serde_json::Value::String(chat_type.clone());
-    }
-    if let Some(ref platform) = opts.platform {
-        meta["platform"] = serde_json::Value::String(platform.clone());
-    }
-    if opts.trigger_tools_enabled {
-        meta["trigger_tools_enabled"] = serde_json::Value::String("true".to_string());
-    }
-    meta
-}
-
 fn cat_agent_tool_definitions(
     agent: &CatAgent<InnerAgent>,
 ) -> Vec<remi_agentloop::tool::ToolDefinition> {
@@ -2389,7 +2377,6 @@ struct LocalToolDeps {
     skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
     memory: Arc<MemoryStore>,
     todo_backend: Arc<todo::HybridTodoBackend>,
-    trigger_backend: Arc<trigger::TriggerBackend>,
     acp_backend: Arc<acp::AcpBackend>,
     sandbox: Arc<dyn sandbox::Sandbox>,
     bash_enabled: bool,
@@ -2420,7 +2407,6 @@ impl LocalToolDeps {
             skill_store: Arc::clone(&self.skill_store),
             memory: Arc::clone(&self.memory),
             todo_backend: Arc::clone(&self.todo_backend),
-            trigger_backend: Arc::clone(&self.trigger_backend),
             acp_backend: Arc::clone(&self.acp_backend),
             sandbox: Arc::clone(&self.sandbox),
             bash_enabled: self.bash_enabled,
@@ -2444,7 +2430,6 @@ impl LocalToolDeps {
         let mut local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut local_tools, Arc::clone(&self.skill_store));
         todo::register_todo_tools(&mut local_tools, Arc::clone(&self.todo_backend));
-        trigger::register_trigger_tools(&mut local_tools, Arc::clone(&self.trigger_backend));
         if include_acp {
             acp::register_acp_tools(
                 &mut local_tools,
@@ -2756,10 +2741,7 @@ impl CatBotBuilder {
         let workspace_root = self.sandbox_config.host_dir().to_path_buf();
         let skill_store = Arc::new(BuiltinSkillStore::new(
             FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone()),
-            [
-                trigger::builtin_trigger_skill(),
-                remi_skill::builtin_remi_skill(),
-            ],
+            [remi_skill::builtin_remi_skill()],
         ));
         let pinned_skill_summaries = skill_store
             .featured_summaries()
@@ -2772,7 +2754,6 @@ impl CatBotBuilder {
         install_embedded_agent_profiles(&agents_dir)?;
         let active_agent_id = self.active_agent_id.clone();
         let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
-        let trigger_backend = Arc::new(trigger::TriggerBackend::new(data_dir.clone()));
         let approval_manager = ToolApprovalManager::new();
         let user_question_manager = UserQuestionManager::new();
         let hook_manager = HookManager::new(workspace_root.clone(), data_dir.clone());
@@ -2799,7 +2780,6 @@ impl CatBotBuilder {
             skill_store: Arc::clone(&skill_store),
             memory: Arc::clone(&memory),
             todo_backend: Arc::clone(&todo_backend),
-            trigger_backend: Arc::clone(&trigger_backend),
             acp_backend: Arc::clone(&acp_backend),
             sandbox: Arc::clone(&sandbox),
             bash_enabled: self.sandbox_config.bash_enabled(),
@@ -2820,7 +2800,6 @@ impl CatBotBuilder {
         let mut acp_local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
         todo::register_todo_tools(&mut acp_local_tools, Arc::clone(&todo_backend));
-        trigger::register_trigger_tools(&mut acp_local_tools, Arc::clone(&trigger_backend));
         register_delegate_agent_tools(
             &mut acp_local_tools,
             &acp_tool_deps,
@@ -2833,6 +2812,7 @@ impl CatBotBuilder {
         );
         register_runtime_tools(&mut acp_local_tools, &acp_tool_deps, &active_agent_id, true);
         let run_locks: ThreadRunLocks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let active_steers: ActiveSteerQueues = Arc::new(StdMutex::new(HashMap::new()));
         acp_backend.set_local_runner(Arc::new(LocalAcpAgentRunner {
             agent: CatAgent {
                 inner: acp_local_inner,
@@ -2857,7 +2837,6 @@ impl CatBotBuilder {
             skill_store: Arc::clone(&skill_store),
             memory: Arc::clone(&memory),
             todo_backend: Arc::clone(&todo_backend),
-            trigger_backend: Arc::clone(&trigger_backend),
             acp_backend: Arc::clone(&acp_backend),
             sandbox: Arc::clone(&sandbox),
             bash_enabled: self.sandbox_config.bash_enabled(),
@@ -2980,7 +2959,6 @@ impl CatBotBuilder {
                 skill_store: Arc::clone(&skill_store),
                 memory: Arc::clone(&memory),
                 todo_backend: Arc::clone(&todo_backend),
-                trigger_backend: Arc::clone(&trigger_backend),
                 acp_backend: Arc::clone(&acp_backend),
                 sandbox: Arc::clone(&sandbox),
                 bash_enabled: self.sandbox_config.bash_enabled(),
@@ -3066,12 +3044,12 @@ impl CatBotBuilder {
             pinned_skill_summaries,
             memory,
             todo_backend,
-            trigger_backend,
             acp_backend,
             approval_manager,
             user_question_manager,
             hook_manager,
             run_locks,
+            active_steers,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
             redactor,
@@ -4615,9 +4593,6 @@ You are Remi.
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(0),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             }]
         });
         let ctx = MemoryContext {
@@ -4669,9 +4644,6 @@ You are Remi.
                 batch_id: Some(1),
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(0),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             }]
         });
 
@@ -4694,6 +4666,7 @@ You are Remi.
 
     #[tokio::test]
     async fn active_supervisor_routes_existing_todo_only_to_supervisor_end_to_end() {
+        std::env::set_var("OPENAI_API_KEY", "test");
         let responses = vec![
             sse_tool_call(
                 "call_add",
@@ -5208,9 +5181,6 @@ You are Remi.
                 batch_id: Some(1),
                 batch_title: Some("Knowledge synthesis".to_string()),
                 batch_index: Some(0),
-                storage_kind: Default::default(),
-                collection_uuid: None,
-                thing_uuid: None,
             }]
         });
 

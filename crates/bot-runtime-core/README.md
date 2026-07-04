@@ -1,14 +1,27 @@
 # bot-runtime-core
 
-Reusable runtime primitives for running markdown-defined agents with injected tools.
+Reusable loop-driving primitives for markdown-defined agents.
+
+This crate owns the low-level runtime boundary:
+
+- parse markdown agent profiles
+- apply profile defaults to `LoopInput`
+- inject model-facing tool definitions
+- drive model streams through `CoreAgentLoop`
+- surface `CoreDriveEvent::ToolDispatch` when the model needs tools
+
+It does not execute tools or emit product-level UI events. Callers such as `bot-core`
+own approval, hooks, local/dynamic tool routing, `ToolCallResult` events, history,
+state persistence, and channel-specific rendering.
 
 ```rust,no_run
 use bot_runtime_core::{
-    AgentBuilder, AgentConfig, CoreAgent, CoreAgentEvent, CoreStreamOptions, DefaultToolRegistry,
-    OpenAIClient,
+    apply_profile_to_input, build_tool_definition_ctx, effective_agent_config,
+    filter_tool_definitions, inject_extra_tools, AgentBuilder, AgentConfig, AgentProfile,
+    CoreAgentLoop, CoreDriveConfig, CoreDriveEvent, DefaultToolRegistry, LoopInput,
+    OpenAIClient, ToolRegistry,
 };
 use futures::StreamExt;
-use std::sync::Arc;
 
 # async fn run() -> anyhow::Result<()> {
 let markdown = r#"---
@@ -21,37 +34,40 @@ tools:
 You are a concise helper.
 "#;
 
+let profile = AgentProfile::from_markdown(markdown)?;
 let tools = DefaultToolRegistry::new();
-let core = CoreAgent::from_markdown(AgentConfig::from_env(), markdown, tools)?;
-let model = OpenAIClient::from_config(&core.effective_agent_config());
+let config = effective_agent_config(&AgentConfig::from_env(), &profile);
+let model = OpenAIClient::from_config(&config);
 let inner = AgentBuilder::new().model(model).build();
-let cancel = Arc::new(tokio::sync::Notify::new());
-let options = CoreStreamOptions::new().with_cancel(Arc::clone(&cancel));
-let mut events = Box::pin(core.stream_text_with_options(inner, "hello", Vec::new(), options));
 
+let input = apply_profile_to_input(LoopInput::start("hello"), &profile, &config);
+let tool_def_ctx = build_tool_definition_ctx(&input);
+let tool_definitions =
+    filter_tool_definitions(tools.definitions_with_context(&tool_def_ctx), &profile.tools);
+let run_input = inject_extra_tools(input, tool_definitions);
+let inner_events = inner.chat(run_input).await?;
+
+let mut loop_driver = CoreAgentLoop::new(CoreDriveConfig::default());
+let mut events = Box::pin(loop_driver.drive(inner_events));
 while let Some(event) = events.next().await {
     match event {
-        CoreAgentEvent::Text(delta) => print!("{delta}"),
-        CoreAgentEvent::Cancelled => break,
-        CoreAgentEvent::Done { state } => {
+        CoreDriveEvent::Text(delta) => print!("{delta}"),
+        CoreDriveEvent::ToolDispatch(dispatch) => {
+            // Execute tools in the caller, then resume the model with ToolCallOutcome values.
+            let _tool_calls = dispatch.tool_calls;
+            break;
+        }
+        CoreDriveEvent::Done { state, .. } => {
             let _latest_state = state;
             break;
         }
-        CoreAgentEvent::Error(error) => return Err(error.into()),
+        CoreDriveEvent::Error { error, .. } => return Err(error.into()),
         _ => {}
     }
 }
 # Ok(())
 # }
 ```
-
-Register any `bot_runtime_core::Tool` in `DefaultToolRegistry` before constructing `CoreAgent`.
-When a markdown profile lists `tools`, only those tool names are exposed and executable. If the
-list is empty, all registered tools are available. `CoreAgent` owns the parsed markdown profile and
-tool registry, so keep it around and call `stream_text`, `stream_content`, or `stream_loop_input`
-for each new turn. Use the `_with_options` variants with `CoreStreamOptions` when the caller needs
-to pass a cooperative cancel signal. `CoreAgentEvent::Done` carries the latest checkpoint state
-when the underlying agent emitted one, so callers can persist it for resume.
 
 For externally executed tools, register existing model-facing definitions with
 `register_dynamic_tool_definitions` or wrap a single definition with `DynamicTool`.

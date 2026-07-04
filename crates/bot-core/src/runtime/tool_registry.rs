@@ -10,7 +10,7 @@ use crate::tools::{
     RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
     SleepTool, WorkspaceBashTool, WorkspaceSshTool,
 };
-use crate::{skill, todo, trigger, AgentProfile, AskUserQuestionTool};
+use crate::{skill, todo, AgentProfile, AskUserQuestionTool};
 
 use super::LocalToolDeps;
 
@@ -94,7 +94,6 @@ pub(super) fn build_subagent_tools(
     let mut local_tools = DefaultToolRegistry::new();
     skill::register_skill_tools(&mut local_tools, Arc::clone(&deps.skill_store));
     todo::register_todo_tools(&mut local_tools, Arc::clone(&deps.todo_backend));
-    trigger::register_trigger_tools(&mut local_tools, Arc::clone(&deps.trigger_backend));
     register_runtime_tools(&mut local_tools, deps, &profile.id, true);
     local_tools
 }

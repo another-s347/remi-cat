@@ -1,14 +1,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use bot_core::{
-    todo::TodoItem, CatEvent, ContextMetrics, ModelInputSnapshot, ThreadHistoryMessage, TokenUsage,
-    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
+    todo::TodoItem, CatEvent, ContextMetrics, ModelInputSnapshot, SteerSubmitResult,
+    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
+    UserQuestionRequest, UserQuestionResponse,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -16,11 +16,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::{
-    ChatChannel, ChatRequest, CoreChatEvent, Runtime, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_MODEL_PROFILE_METADATA_KEY,
+    model_input_store::upsert_model_input_snapshot_json, ChatChannel, ChatRequest, CoreChatEvent,
+    Runtime, SESSION_AGENT_ID_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
 };
-
-const SDK_DB_FILE_NAME: &str = "todo-sdk.db";
 
 pub const WEB_CHANNEL: &str = "web";
 pub const WEB_USER_ID: &str = "web-local";
@@ -48,6 +46,12 @@ pub(crate) enum WebChatCommand {
         run_id: String,
         text: String,
         response: oneshot::Sender<anyhow::Result<WebRun>>,
+    },
+    Steer {
+        session_id: String,
+        run_id: String,
+        text: String,
+        response: oneshot::Sender<anyhow::Result<()>>,
     },
     Cancel {
         run_id: String,
@@ -104,6 +108,7 @@ struct ActiveRun {
     started_at: String,
     cancel: Arc<Notify>,
     handle: JoinHandle<()>,
+    direct: mpsc::Sender<ChatEventV1>,
     log: Rc<RefCell<Vec<ChatEventV1>>>,
     broadcast: broadcast::Sender<ChatEventV1>,
 }
@@ -164,6 +169,26 @@ impl WebChatHandle {
             .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("web chat runtime dropped run response"))?
+    }
+
+    pub async fn steer(
+        &self,
+        session_id: String,
+        run_id: String,
+        text: String,
+    ) -> anyhow::Result<()> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::Steer {
+                session_id,
+                run_id,
+                text,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped steer response"))?
     }
 
     pub async fn cancel(&self, run_id: String) -> anyhow::Result<bool> {
@@ -349,6 +374,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 let cancel = Arc::new(Notify::new());
                 let log = Rc::new(RefCell::new(Vec::new()));
                 let (events_tx, events_rx) = mpsc::channel(128);
+                let sink_direct = events_tx.clone();
                 let (broadcast_tx, _) = broadcast::channel(512);
                 let started_at = chrono::Utc::now().to_rfc3339();
                 let _ = response.send(Ok(WebRun { events: events_rx }));
@@ -386,10 +412,57 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                         started_at,
                         cancel: Arc::clone(&cancel),
                         handle,
+                        direct: sink_direct,
                         log: Rc::clone(&log),
                         broadcast: broadcast_tx.clone(),
                     },
                 );
+            }
+            WebChatCommand::Steer {
+                session_id,
+                run_id,
+                text,
+                response,
+            } => {
+                let run_matches_session = active
+                    .borrow()
+                    .get(&run_id)
+                    .is_some_and(|run| run.session_id == session_id);
+                if !run_matches_session {
+                    let _ = response.send(Err(anyhow::anyhow!(
+                        "no matching active run for this session"
+                    )));
+                    continue;
+                }
+                let request = ChatRequest::text(session_id.clone(), ChatChannel::Web, text.clone())
+                    .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
+                    .with_message(format!("web-steer-{}", uuid::Uuid::new_v4()), "p2p")
+                    .with_platform(Some(WEB_CHANNEL.to_string()));
+                match runtime.submit_steer(request) {
+                    SteerSubmitResult::Queued(event) => {
+                        if let Some(run) = active.borrow().get(&run_id) {
+                            let sequence = run.log.borrow().len() as u64;
+                            let web_event = ChatEventV1::new(
+                                "steer_queued",
+                                &run_id,
+                                &session_id,
+                                sequence,
+                                Some(
+                                    serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+                                ),
+                            );
+                            run.log.borrow_mut().push(web_event.clone());
+                            let _ = run.broadcast.send(web_event.clone());
+                            let _ = run.direct.try_send(web_event);
+                        }
+                        let _ = response.send(Ok(()));
+                    }
+                    SteerSubmitResult::NotRunning => {
+                        let _ = response.send(Err(anyhow::anyhow!(
+                            "active run ended before steer could be queued"
+                        )));
+                    }
+                }
             }
             WebChatCommand::Cancel { run_id, response } => {
                 let cancelled = active.borrow_mut().remove(&run_id).map(|run| {
@@ -684,28 +757,11 @@ fn persist_model_input_snapshot(
             return;
         }
     };
-    let created_at_ms = chrono::DateTime::parse_from_rfc3339(&snapshot.created_at)
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
-    let db_path = web_sdk_db_path(&runtime.data_dir, WEB_USER_ID);
-    let sdk = match remi_client_sdk::TriggerSdk::initialize(&db_path) {
-        Ok(sdk) => sdk,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                run_id = %snapshot.run_id,
-                db_path = %db_path.display(),
-                error = %err,
-                "failed to initialize sdk storage for model input snapshot"
-            );
-            return;
-        }
-    };
-    if let Err(err) = sdk.upsert_chat_model_input_json(
-        session_id.to_string(),
-        snapshot.run_id.clone(),
-        created_at_ms,
-        snapshot_json,
+    if let Err(err) = upsert_model_input_snapshot_json(
+        &runtime.data_dir,
+        session_id,
+        &snapshot.run_id,
+        &snapshot_json,
     ) {
         tracing::warn!(
             session_id,
@@ -981,6 +1037,14 @@ impl WebCoreEventMapper {
                     }),
                 )
             }
+            CatEvent::SteerQueued(event) => WebEventMap::Emit(
+                "steer_queued",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::SteerInjected(event) => WebEventMap::Emit(
+                "steer_injected",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            ),
             CatEvent::Stats {
                 prompt_tokens,
                 completion_tokens,
@@ -1042,28 +1106,6 @@ impl WebCoreEventMapper {
         self.model_elapsed_ms = elapsed_ms;
         WebEventMap::Emit("stats", self.stats_payload())
     }
-}
-
-pub(crate) fn web_sdk_db_path(data_dir: &Path, user_key: &str) -> PathBuf {
-    data_dir
-        .join("sdk")
-        .join(sdk_user_key(user_key))
-        .join("todo")
-        .join(SDK_DB_FILE_NAME)
-}
-
-fn sdk_user_key(user_id: &str) -> String {
-    let raw = user_id.trim();
-    let raw = if raw.is_empty() { "anonymous" } else { raw };
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 async fn run_turn(
@@ -1159,7 +1201,6 @@ async fn run_turn(
         .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
         .with_message(run_id.to_string(), "p2p")
         .with_platform(Some(WEB_CHANNEL.to_string()))
-        .enable_sdk_todo_and_triggers()
         .with_cancel(cancel);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let timeout = tokio::time::sleep(Duration::from_secs(300));

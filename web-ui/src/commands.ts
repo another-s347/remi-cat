@@ -66,7 +66,7 @@ export const CHAT_COMMANDS: ChatCommand[] = [
   {
     value: "/clear",
     label: "清空历史",
-    description: "清空当前会话历史，保留 Todo 和 Trigger 状态",
+    description: "清空当前会话历史，保留 Todo 状态",
     keywords: ["clear", "history", "清空", "历史"],
   },
   {

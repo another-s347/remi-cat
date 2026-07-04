@@ -115,18 +115,19 @@ pub enum TodoEvent {
     Removed { id: u64 },
 }
 
-// ── Trigger events ───────────────────────────────────────────────────────────
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SteerQueuedEvent {
+    pub steer_id: String,
+    pub session_id: String,
+    pub preview: String,
+}
 
-#[derive(Debug, Clone)]
-pub enum TriggerEvent {
-    Upserted {
-        id: u64,
-        name: String,
-        enabled: bool,
-    },
-    Deleted {
-        id: u64,
-    },
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SteerInjectedEvent {
+    pub steer_ids: Vec<String>,
+    pub session_id: String,
+    pub preview: String,
+    pub count: usize,
 }
 
 // ── Top-level CatEvent ───────────────────────────────────────────────────────
@@ -142,8 +143,6 @@ pub enum CatEvent {
     Skill(SkillEvent),
     /// A todo tool mutated the todo list.
     Todo(TodoEvent),
-    /// A trigger tool mutated thread trigger state.
-    Trigger(TriggerEvent),
     /// A nested ACP or sub-agent session emitted observable progress.
     SubSession(SubSessionEvent),
     /// Supervisor evaluated the active workflow after a main-agent round.
@@ -154,6 +153,10 @@ pub enum CatEvent {
     ContextCompaction(ContextCompactionEvent),
     /// Full model input snapshot captured before the request is sent.
     ModelInputSnapshot(ModelInputSnapshot),
+    /// User input was accepted into the active run's steer queue.
+    SteerQueued(SteerQueuedEvent),
+    /// Queued steer input was injected into the active model run.
+    SteerInjected(SteerInjectedEvent),
     /// Run completed normally.
     Done,
     /// Run was cooperatively cancelled.

@@ -1,7 +1,9 @@
 use bot_runtime_core::{
-    Agent, AgentConfig, AgentError, AgentEvent, AgentState, Content, CoreAgent, CoreAgentEvent,
-    DefaultToolRegistry, LoopInput, ParsedToolCall, StepConfig, Tool, ToolCallOutcome, ToolContext,
-    ToolOutput, ToolResult,
+    apply_profile_to_input, build_tool_definition_ctx, effective_agent_config,
+    filter_tool_definitions, inject_extra_tools, Agent, AgentConfig, AgentError, AgentEvent,
+    AgentProfile, AgentState, Content, CoreAgentLoop, CoreDriveConfig, CoreDriveEvent,
+    DefaultToolRegistry, LoopInput, ParsedToolCall, StepConfig, Tool, ToolContext, ToolOutput,
+    ToolRegistry, ToolResult,
 };
 use futures::{stream, Stream, StreamExt};
 
@@ -40,54 +42,40 @@ impl Agent for PublicInnerAgent {
     type Error = AgentError;
 
     async fn chat(&self, req: Self::Request) -> Result<impl Stream<Item = AgentEvent>, AgentError> {
-        match req {
-            LoopInput::Start {
-                history,
-                extra_tools,
-                model,
-                ..
-            } => {
-                assert_eq!(model.as_deref(), Some("integration-model"));
-                assert!(history.iter().any(|message| {
-                    matches!(&message.content, Content::Text(text) if text == "Public markdown prompt.")
-                }));
-                assert_eq!(
-                    extra_tools
-                        .iter()
-                        .map(|definition| definition.function.name.as_str())
-                        .collect::<Vec<_>>(),
-                    vec!["public_echo"]
-                );
-                Ok(stream::iter(vec![AgentEvent::NeedToolExecution {
-                    state: AgentState::new(StepConfig::new("integration-model")),
-                    tool_calls: vec![ParsedToolCall {
-                        id: "call-public-echo".to_string(),
-                        name: "public_echo".to_string(),
-                        arguments: serde_json::json!({}),
-                    }],
-                    completed_results: Vec::new(),
-                }]))
-            }
-            LoopInput::Resume { results, .. } => {
-                let text = results
-                    .into_iter()
-                    .find_map(|result| match result {
-                        ToolCallOutcome::Result { content, .. } => Some(content.text_content()),
-                        ToolCallOutcome::Error { .. } => None,
-                    })
-                    .unwrap_or_default();
-                Ok(stream::iter(vec![
-                    AgentEvent::TextDelta(text),
-                    AgentEvent::Done,
-                ]))
-            }
-            LoopInput::Cancel { .. } => Ok(stream::iter(vec![AgentEvent::Cancelled])),
-        }
+        let LoopInput::Start {
+            history,
+            extra_tools,
+            model,
+            ..
+        } = req
+        else {
+            panic!("expected start input");
+        };
+        assert_eq!(model.as_deref(), Some("integration-model"));
+        assert!(history.iter().any(|message| {
+            matches!(&message.content, Content::Text(text) if text == "Public markdown prompt.")
+        }));
+        assert_eq!(
+            extra_tools
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public_echo"]
+        );
+        Ok(stream::iter(vec![AgentEvent::NeedToolExecution {
+            state: AgentState::new(StepConfig::new("integration-model")),
+            tool_calls: vec![ParsedToolCall {
+                id: "call-public-echo".to_string(),
+                name: "public_echo".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            completed_results: Vec::new(),
+        }]))
     }
 }
 
 #[tokio::test]
-async fn external_style_markdown_agent_with_injected_tool_runs() {
+async fn markdown_profile_feeds_core_loop_tool_dispatch() {
     let markdown = r#"---
 id: integration
 name: Integration Agent
@@ -97,19 +85,26 @@ tools:
 ---
 Public markdown prompt.
 "#;
+    let profile = AgentProfile::from_markdown(markdown).unwrap();
     let mut tools = DefaultToolRegistry::new();
     tools.register(PublicEchoTool);
-    let core = CoreAgent::from_markdown(AgentConfig::default(), markdown, tools).unwrap();
+    let effective_config = effective_agent_config(&AgentConfig::default(), &profile);
+    let input = apply_profile_to_input(LoopInput::start("hello"), &profile, &effective_config);
+    let tool_def_ctx = build_tool_definition_ctx(&input);
+    let tool_definitions = filter_tool_definitions(
+        tools.definitions_with_context(&tool_def_ctx),
+        &profile.tools,
+    );
+    let run_input = inject_extra_tools(input, tool_definitions);
+    let inner_events = PublicInnerAgent.chat(run_input).await.unwrap();
+    let mut agent_loop = CoreAgentLoop::new(CoreDriveConfig::default());
+    let events = agent_loop.drive(inner_events).collect::<Vec<_>>().await;
 
-    let events = core
-        .stream_text(PublicInnerAgent, "hello", Vec::new())
-        .collect::<Vec<_>>()
-        .await;
-
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, CoreAgentEvent::Text(text) if text == "public-tool-output")));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, CoreAgentEvent::Done { .. })));
+    assert!(matches!(
+        events.as_slice(),
+        [CoreDriveEvent::ToolDispatch(dispatch)]
+            if dispatch.tool_calls.len() == 1
+                && dispatch.tool_calls[0].id == "call-public-echo"
+                && dispatch.tool_calls[0].name == "public_echo"
+    ));
 }

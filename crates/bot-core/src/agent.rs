@@ -16,11 +16,12 @@ use tracing::debug;
 
 use bot_runtime_core::{
     build_tool_definition_ctx, inject_extra_tools, tool_ctx_from_state, CoreAgentLoop,
-    CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreStreamOptions, CoreUsageStats,
+    CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreSteerBatch, CoreStreamOptions,
+    CoreUsageStats,
 };
 use remi_agentloop::prelude::{
-    AgentError, Content, ContentPart, LoopInput, Message, ParsedToolCall, ToolCallOutcome,
-    ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    AgentError, AgentState, Content, ContentPart, LoopInput, Message, ParsedToolCall,
+    ToolCallOutcome, ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
@@ -40,11 +41,8 @@ use crate::hooks::{
 use crate::im_tools::{register_im_tools, ImFileBridge};
 use crate::skill;
 use crate::todo;
-use crate::trigger;
 use crate::user_question::UserQuestionManager;
 
-const TRIGGER_MANAGEMENT_TOOL_NAMES: &[&str] =
-    &["trigger__upsert", "trigger__list", "trigger__delete"];
 const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
@@ -281,12 +279,13 @@ where
                 max_tool_rounds: supervisor_run.then_some(SUPERVISOR_MAX_TOOL_ROUNDS),
             });
 
-            let mut current = inject_extra_tools(input, extra_defs);
+            let mut current = input;
             let mut last_messages: Vec<Message> = vec![];
             let mut last_user_state: serde_json::Value = serde_json::Value::Null;
 
             loop {
-                let inner_stream = match self.inner.chat(current).await {
+                let run_input = inject_extra_tools(current, extra_defs.clone());
+                let inner_stream = match self.inner.chat(run_input).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(
@@ -303,10 +302,27 @@ where
                 };
                 let mut inner_stream = std::pin::pin!(agent_loop.drive(inner_stream));
                 let mut next_input: Option<LoopInput> = None;
+                let mut last_checkpoint_state: Option<remi_agentloop::prelude::AgentState> = None;
 
                 while let Some(ev) = inner_stream.next().await {
                     match ev {
-                        CoreDriveEvent::Text(t) => yield CatEvent::Text(t),
+                        CoreDriveEvent::Text(t) => {
+                            yield CatEvent::Text(t);
+                            if let (Some(steer), Some(state)) =
+                                (options.steer.as_ref(), last_checkpoint_state.clone())
+                            {
+                                if let Some(batch) = steer.drain_batch() {
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                        steer_ids: batch.ids.clone(),
+                                        session_id: state.thread_id.0.clone(),
+                                        preview: batch.preview.clone(),
+                                        count: batch.count,
+                                    });
+                                    next_input = Some(steer_start_input(state, batch));
+                                    break;
+                                }
+                            }
+                        }
                         CoreDriveEvent::Thinking(content) => {
                             yield CatEvent::Thinking(content);
                         }
@@ -1031,6 +1047,20 @@ where
                                 tool_allowlist.as_deref(),
                             );
 
+                            if let Some(steer) = options.steer.as_ref() {
+                                if let Some(batch) = steer.drain_batch() {
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                        steer_ids: batch.ids.clone(),
+                                        session_id: state.thread_id.0.clone(),
+                                        preview: batch.preview.clone(),
+                                        count: batch.count,
+                                    });
+                                    next_input =
+                                        Some(steer_start_input_after_tool_results(state, all_outcomes, batch));
+                                    break;
+                                }
+                            }
+
                             next_input = Some(LoopInput::Resume {
                                 state,
                                 results: all_outcomes,
@@ -1038,8 +1068,21 @@ where
                             break;
                         }
                         CoreDriveEvent::Checkpoint { state } => {
+                            if let Some(steer) = options.steer.as_ref() {
+                                if let Some(batch) = steer.drain_batch() {
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                        steer_ids: batch.ids.clone(),
+                                        session_id: state.thread_id.0.clone(),
+                                        preview: batch.preview.clone(),
+                                        count: batch.count,
+                                    });
+                                    next_input = Some(steer_start_input(state, batch));
+                                    break;
+                                }
+                            }
                             last_messages = state.messages.clone();
                             last_user_state = state.user_state.clone();
+                            last_checkpoint_state = Some(state);
                         }
                         CoreDriveEvent::Done {
                             stats,
@@ -1123,6 +1166,51 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn steer_start_input(state: AgentState, batch: CoreSteerBatch) -> LoopInput {
+    let mut input = LoopInput::start_content(batch.content)
+        .history(state.messages)
+        .user_state(state.user_state);
+    if let Some(metadata) = state.config.metadata {
+        input = input.metadata(metadata);
+    }
+    if let Some(message_metadata) = batch.message_metadata {
+        input = input.message_metadata(message_metadata);
+    }
+    if let Some(user_name) = batch.user_name {
+        input = input.user_name(user_name);
+    }
+    input
+}
+
+fn steer_start_input_after_tool_results(
+    mut state: AgentState,
+    results: Vec<ToolCallOutcome>,
+    batch: CoreSteerBatch,
+) -> LoopInput {
+    append_tool_results_to_history(&mut state.messages, results);
+    steer_start_input(state, batch)
+}
+
+fn append_tool_results_to_history(messages: &mut Vec<Message>, results: Vec<ToolCallOutcome>) {
+    for result in results {
+        match result {
+            ToolCallOutcome::Result {
+                tool_call_id,
+                content,
+                ..
+            } => messages.push(Message::tool_result_content(tool_call_id, content)),
+            ToolCallOutcome::Error {
+                tool_call_id,
+                error,
+                ..
+            } => messages.push(Message::tool_result(
+                tool_call_id,
+                format!("error: {error}"),
+            )),
+        }
+    }
+}
+
 fn merge_runtime_tool_definitions(
     local_tools: &DefaultToolRegistry,
     model_tools: Option<&DefaultToolRegistry>,
@@ -1137,7 +1225,6 @@ fn merge_runtime_tool_definitions(
     }
     defs.extend(dynamic_tools.definitions_with_context(ctx));
     defs.extend_from_slice(external_defs);
-    let defs = filter_trigger_management_tool_definitions(ctx, defs);
     filter_tool_allowlist(tool_allowlist, defs)
 }
 
@@ -1219,21 +1306,6 @@ async fn execute_runtime_tools<'a>(
         results.push((call.id.clone(), result));
     }
     results
-}
-
-fn filter_trigger_management_tool_definitions(
-    ctx: &ToolDefinitionContext,
-    defs: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    if !crate::suppress_trigger_management(ctx.metadata.as_ref()) {
-        return defs;
-    }
-
-    defs.into_iter()
-        .filter(|definition| {
-            !TRIGGER_MANAGEMENT_TOOL_NAMES.contains(&definition.function.name.as_str())
-        })
-        .collect()
 }
 
 fn filter_tool_allowlist(
@@ -1715,9 +1787,6 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
     for ev in todo::make_todo_events(tc, result_str) {
         evs.push(CatEvent::Todo(ev));
     }
-    for ev in trigger::make_trigger_events(tc, result_str) {
-        evs.push(CatEvent::Trigger(ev));
-    }
     evs
 }
 
@@ -1730,6 +1799,7 @@ mod tests {
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
     use crate::user_question::UserQuestionManager;
+    use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, Checkpoint, CheckpointStatus, Content, ContentPart,
@@ -1739,6 +1809,7 @@ mod tests {
     use remi_agentloop::tool::{
         registry::DefaultToolRegistry, BoxedToolResult, BoxedToolStream, Tool,
     };
+    use remi_agentloop::types::{FunctionCall, ToolCallMessage};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2341,6 +2412,114 @@ mod tests {
         }
     }
 
+    struct SteerDuringToolInnerAgent;
+
+    impl Agent for SteerDuringToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start {
+                    content,
+                    history,
+                    extra_tools,
+                    ..
+                } if content.text_content().contains("while-tool steer") => {
+                    assert!(
+                        history.iter().any(|message| {
+                            message.tool_call_id.as_deref() == Some("steer-call")
+                                && message.content.text_content() == "tool done"
+                        }),
+                        "tool result should be materialized into history before steer turn"
+                    );
+                    assert!(
+                        extra_tools
+                            .iter()
+                            .any(|definition| definition.function.name == "instant"),
+                        "steer turn should retain injected tool definitions"
+                    );
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::TextDelta("steered".to_string()),
+                        remi_agentloop::types::AgentEvent::Done,
+                    ]))
+                }
+                LoopInput::Start { .. } => {
+                    let mut state = AgentState::new(StepConfig::new("test-model"));
+                    state.messages = vec![Message::assistant_with_tool_calls(
+                        "",
+                        vec![ToolCallMessage {
+                            id: "steer-call".to_string(),
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: "instant".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        }],
+                        None,
+                    )];
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::NeedToolExecution {
+                            state,
+                            tool_calls: vec![ParsedToolCall {
+                                id: "steer-call".to_string(),
+                                name: "instant".to_string(),
+                                arguments: serde_json::json!({}),
+                            }],
+                            completed_results: vec![],
+                        },
+                    ]))
+                }
+                LoopInput::Resume { .. } => {
+                    panic!("tool-gap steer should start a steer turn instead of resuming")
+                }
+                LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
+        }
+    }
+
+    struct SteerPushingTool {
+        queue: Arc<CoreSteerQueue>,
+    }
+
+    impl Tool for SteerPushingTool {
+        fn name(&self) -> &str {
+            "instant"
+        }
+
+        fn description(&self) -> &str {
+            "Queues steer while the tool is running."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _resume: Option<remi_agentloop::types::ResumePayload>,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+            self.queue.push(CoreSteerInput {
+                id: "queued-while-tool".to_string(),
+                content: Content::text("while-tool steer"),
+                preview: "while-tool steer".to_string(),
+                message_metadata: None,
+                user_name: None,
+            });
+            Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
+                "tool done",
+            )])))
+        }
+    }
+
     struct UsageThenDoneInnerAgent;
 
     impl Agent for UsageThenDoneInnerAgent {
@@ -2507,6 +2686,49 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
+    }
+
+    #[tokio::test]
+    async fn cat_agent_injects_steer_after_tool_results_at_tool_gap() {
+        let queue = Arc::new(CoreSteerQueue::new());
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(SteerPushingTool {
+            queue: Arc::clone(&queue),
+        });
+        let agent = CatAgent {
+            inner: SteerDuringToolInnerAgent,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+        };
+
+        let events = agent
+            .stream_with_input_and_options(
+                LoopInput::start("start"),
+                CoreStreamOptions::new().with_steer(queue),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CatEvent::SteerInjected(event) if event.count == 1)),
+            "{events:#?}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));
     }
 
     #[tokio::test]

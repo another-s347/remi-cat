@@ -11,8 +11,6 @@ use std::sync::Arc;
 use super::store::{
     canonical_name, SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, SkillStore, SkillSummary,
 };
-use crate::{suppress_trigger_management, trigger::BUILTIN_TRIGGER_SKILL_NAME};
-
 pub const READ_SKILLS_STATE_KEY: &str = "__read_skills";
 const LEGACY_ACTIVATED_SKILLS_STATE_KEY: &str = "__activated_skills";
 
@@ -97,21 +95,6 @@ fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     prompt
 }
 
-fn filter_trigger_skill(skills: Vec<SkillSummary>, suppress: bool) -> Vec<SkillSummary> {
-    if !suppress {
-        return skills;
-    }
-
-    skills
-        .into_iter()
-        .filter(|skill| skill.name != BUILTIN_TRIGGER_SKILL_NAME)
-        .collect()
-}
-
-fn hides_trigger_skill(name: &str, suppress: bool) -> bool {
-    suppress && name.trim() == BUILTIN_TRIGGER_SKILL_NAME
-}
-
 pub fn read_skill_names(user_state: &serde_json::Value) -> Vec<String> {
     let mut names = Vec::new();
     for key in [READ_SKILLS_STATE_KEY, LEGACY_ACTIVATED_SKILLS_STATE_KEY] {
@@ -165,10 +148,8 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     }
 
     fn extra_prompt(&self, ctx: &ToolDefinitionContext) -> Option<String> {
-        let skills = filter_trigger_skill(
-            self.store.featured_summaries(),
-            suppress_trigger_management(ctx.metadata.as_ref()),
-        );
+        let _ = ctx;
+        let skills = self.store.featured_summaries();
         Some(render_skill_get_extra_prompt(&skills))
     }
 
@@ -192,44 +173,39 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
             .as_str()
             .ok_or_else(|| AgentError::tool("skill__get", "missing 'name'"))?
             .to_string();
-        let suppress = suppress_trigger_management(ctx.metadata.as_ref());
-        let result = if hides_trigger_skill(&name, suppress) {
-            format!("Skill '{name}' not found.")
-        } else {
-            match self.store.get(&name).await? {
-                Some(doc) => {
-                    mark_skill_read(ctx, &doc.name);
-                    let diagnostics =
-                        diagnostics_for_skill_name(&self.store.load_diagnostics(), &doc.name);
-                    let resource_hint = match (&doc.skill_file_path, &doc.resource_root_path) {
-                        (Some(skill_file), Some(resource_root)) => format!(
-                            "fs_read skill_file_path={skill_file}; resource_root_path={resource_root}"
-                        ),
-                        _ => "resources are not readable through fs_read because this skill is outside the workspace root".to_string(),
-                    };
-                    let mut text = format!(
-                        "{}\n\n[skill read: {} from {}; {}]",
-                        doc.content.trim_end(),
-                        doc.name,
-                        doc.source,
-                        resource_hint
-                    );
-                    text.push_str(&render_skill_diagnostics_summary(&diagnostics));
-                    text
-                }
-                None => {
-                    let diagnostics = self.store.load_diagnostics();
-                    let relevant = diagnostics_for_skill_name(&diagnostics, &name);
-                    let diagnostics = if relevant.is_empty() {
-                        diagnostics
-                    } else {
-                        relevant
-                    };
-                    format!(
-                        "Skill '{name}' not found.{}",
-                        render_skill_diagnostics_summary(&diagnostics)
-                    )
-                }
+        let result = match self.store.get(&name).await? {
+            Some(doc) => {
+                mark_skill_read(ctx, &doc.name);
+                let diagnostics =
+                    diagnostics_for_skill_name(&self.store.load_diagnostics(), &doc.name);
+                let resource_hint = match (&doc.skill_file_path, &doc.resource_root_path) {
+                    (Some(skill_file), Some(resource_root)) => format!(
+                        "fs_read skill_file_path={skill_file}; resource_root_path={resource_root}"
+                    ),
+                    _ => "resources are not readable through fs_read because this skill is outside the workspace root".to_string(),
+                };
+                let mut text = format!(
+                    "{}\n\n[skill read: {} from {}; {}]",
+                    doc.content.trim_end(),
+                    doc.name,
+                    doc.source,
+                    resource_hint
+                );
+                text.push_str(&render_skill_diagnostics_summary(&diagnostics));
+                text
+            }
+            None => {
+                let diagnostics = self.store.load_diagnostics();
+                let relevant = diagnostics_for_skill_name(&diagnostics, &name);
+                let diagnostics = if relevant.is_empty() {
+                    diagnostics
+                } else {
+                    relevant
+                };
+                format!(
+                    "Skill '{name}' not found.{}",
+                    render_skill_diagnostics_summary(&diagnostics)
+                )
             }
         };
         Ok(ToolResult::Output(
@@ -275,10 +251,8 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
             .ok_or_else(|| AgentError::tool("skill__search", "missing 'query'"))?
             .trim()
             .to_string();
-        let matches = filter_trigger_skill(
-            self.store.search(&query).await?,
-            suppress_trigger_management(ctx.metadata.as_ref()),
-        );
+        let _ = ctx;
+        let matches = self.store.search(&query).await?;
         let diagnostics = self.store.load_diagnostics();
         let result = if matches.is_empty() {
             format!(
@@ -303,10 +277,7 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        filter_trigger_skill, read_skill_names, render_skill_get_extra_prompt, SkillGetTool,
-        SkillSearchTool,
-    };
+    use super::{read_skill_names, render_skill_get_extra_prompt, SkillGetTool, SkillSearchTool};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, SkillSummary};
     use futures::StreamExt;
     use remi_agentloop::prelude::{
@@ -328,30 +299,6 @@ mod tests {
         assert!(prompt.contains("skill__get"));
         assert!(prompt.contains("current turn"));
         assert!(prompt.contains("fs_read"));
-    }
-
-    #[test]
-    fn filter_trigger_skill_removes_builtin_entry_when_suppressed() {
-        let filtered = filter_trigger_skill(
-            vec![
-                SkillSummary {
-                    name: "trigger".to_string(),
-                    description: "builtin trigger skill".to_string(),
-                    source: "builtin".to_string(),
-                    pin: false,
-                },
-                SkillSummary {
-                    name: "rust-build".to_string(),
-                    description: "build help".to_string(),
-                    source: ".remi-cat/skills".to_string(),
-                    pin: false,
-                },
-            ],
-            true,
-        );
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name, "rust-build");
     }
 
     #[test]

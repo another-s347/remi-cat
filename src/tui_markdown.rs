@@ -292,7 +292,7 @@ impl MarkdownRenderer {
 
     fn push_code_lines(&mut self, text: &str) {
         for line in text.split_inclusive('\n') {
-            let content = line.strip_suffix('\n').unwrap_or(line);
+            let content = expand_display_tabs(line.strip_suffix('\n').unwrap_or(line));
             let mut spans = Vec::new();
             if self.quote_depth > 0 {
                 spans.push(Span::styled(
@@ -307,6 +307,7 @@ impl MarkdownRenderer {
 
     fn push_span(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
+        let content = expand_display_tabs(&content);
         if !content.is_empty() {
             if let Some(cell) = self
                 .table
@@ -521,10 +522,20 @@ fn wrap_styled_line(line: Line<'static>, width: usize, dim: Color) -> Vec<Line<'
 
             let token_width = UnicodeWidthStr::width(token.text.as_str());
             if token.text.trim().is_empty() {
-                if at_line_start {
-                    continue;
-                }
                 if current_width + token_width > width {
+                    if at_line_start {
+                        for ch in token.text.chars() {
+                            let ch_width = ch.width().unwrap_or(0);
+                            if !at_line_start && current_width + ch_width > width {
+                                wrapped.push(Line::from(std::mem::take(&mut current)));
+                                current_width = 0;
+                            }
+                            current.push(Span::styled(ch.to_string(), token.style));
+                            current_width += ch_width;
+                            at_line_start = false;
+                        }
+                        continue;
+                    }
                     wrapped.push(Line::from(std::mem::take(&mut current)));
                     current_width = 0;
                     at_line_start = true;
@@ -652,6 +663,13 @@ fn continuation_indent(line: &Line<'static>) -> String {
     " ".repeat(leading)
 }
 
+fn expand_display_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    text.replace('\t', "    ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +744,46 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.content.as_ref() == "after")));
+    }
+
+    #[test]
+    fn preserves_code_block_indentation_and_expands_tabs() {
+        let lines = render_markdown_lines(
+            "```python\nif True:\n\tprint('tab')\n    print('spaces')\n```\n",
+            80,
+            theme(),
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|line| line == "  if True:"));
+        assert!(rendered.iter().any(|line| line == "      print('tab')"));
+        assert!(rendered.iter().any(|line| line == "      print('spaces')"));
+        assert!(!rendered.iter().any(|line| line.contains('\t')));
+    }
+
+    #[test]
+    fn preserves_nested_list_indentation() {
+        let lines = render_markdown_lines("- parent\n  - child", 80, theme());
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|line| line == "- parent"));
+        assert!(rendered.iter().any(|line| line == "    - child"));
     }
 
     #[test]

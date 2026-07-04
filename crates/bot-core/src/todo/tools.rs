@@ -23,25 +23,6 @@ const TODO_BATCH_EXECUTION_GUIDANCE: &str = "When this thread has an active plan
 // ── Todo item ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStorageKind {
-    Simple,
-    RemiSdk,
-}
-
-impl Default for TodoStorageKind {
-    fn default() -> Self {
-        Self::Simple
-    }
-}
-
-impl TodoStorageKind {
-    pub fn is_simple(&self) -> bool {
-        matches!(self, Self::Simple)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: u64,
     pub content: String,
@@ -55,24 +36,53 @@ pub struct TodoItem {
     pub batch_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_index: Option<u64>,
-    #[serde(default, skip_serializing_if = "TodoStorageKind::is_simple")]
-    pub storage_kind: TodoStorageKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collection_uuid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thing_uuid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTodoItem {
+    id: u64,
+    content: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    batch_id: Option<u64>,
+    #[serde(default)]
+    batch_title: Option<String>,
+    #[serde(default)]
+    batch_index: Option<u64>,
+    #[serde(default)]
+    storage_kind: Option<String>,
+}
+
+impl LegacyTodoItem {
+    fn into_local_todo(self) -> Option<TodoItem> {
+        if self.storage_kind.as_deref() == Some("remi_sdk") {
+            return None;
+        }
+        Some(TodoItem {
+            id: self.id,
+            content: self.content,
+            description: self.description,
+            done: self.done,
+            batch_id: self.batch_id,
+            batch_title: self.batch_title,
+            batch_index: self.batch_index,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TodoBatchAddRequest {
-    title: String,
-    items: Vec<TodoBatchAddItemRequest>,
+    pub(crate) title: String,
+    pub(crate) items: Vec<TodoBatchAddItemRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TodoBatchAddItemRequest {
-    title: String,
-    description: Option<String>,
+    pub(crate) title: String,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +125,14 @@ struct TodoBatchGroup {
 
 pub fn todos_from_user_state(user_state: &serde_json::Value) -> Vec<TodoItem> {
     match user_state.get(TODOS_STATE_KEY) {
-        Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
+        Some(v) => serde_json::from_value::<Vec<LegacyTodoItem>>(v.clone())
+            .map(|todos| {
+                todos
+                    .into_iter()
+                    .filter_map(LegacyTodoItem::into_local_todo)
+                    .collect()
+            })
+            .unwrap_or_default(),
         None => vec![],
     }
 }
@@ -202,9 +219,6 @@ pub(crate) fn add_batch_to_todos(
             batch_id: Some(batch_id),
             batch_title: Some(batch_title.clone()),
             batch_index: Some(index as u64),
-            storage_kind: TodoStorageKind::Simple,
-            collection_uuid: None,
-            thing_uuid: None,
         });
     }
 
@@ -588,7 +602,7 @@ mod tests {
     use super::{
         add_batch_to_todos, current_todo_card_markdown, fmt_todos,
         latest_unfinished_batch_system_prompt, todos_from_user_state, write_todos_to_user_state,
-        TodoBatchAddItemRequest, TodoBatchAddRequest, TodoItem, TodoStorageKind,
+        TodoBatchAddItemRequest, TodoBatchAddRequest, TodoItem,
     };
     use serde_json::json;
 
@@ -614,9 +628,6 @@ mod tests {
             batch_id: None,
             batch_title: None,
             batch_index: None,
-            storage_kind: TodoStorageKind::Simple,
-            collection_uuid: None,
-            thing_uuid: None,
         }
     }
 
@@ -683,9 +694,6 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(0),
-                storage_kind: TodoStorageKind::Simple,
-                collection_uuid: None,
-                thing_uuid: None,
             },
             TodoItem {
                 id: 2,
@@ -695,9 +703,6 @@ mod tests {
                 batch_id: Some(1),
                 batch_title: Some("Release launch".to_string()),
                 batch_index: Some(1),
-                storage_kind: TodoStorageKind::Simple,
-                collection_uuid: None,
-                thing_uuid: None,
             },
             legacy_todo(3, "Legacy follow-up"),
         ];
@@ -772,9 +777,6 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(0),
-                    storage_kind: TodoStorageKind::Simple,
-                    collection_uuid: None,
-                    thing_uuid: None,
                 },
                 TodoItem {
                     id: 2,
@@ -784,9 +786,6 @@ mod tests {
                     batch_id: None,
                     batch_title: None,
                     batch_index: None,
-                    storage_kind: TodoStorageKind::Simple,
-                    collection_uuid: None,
-                    thing_uuid: None,
                 }
             ],
         });
@@ -811,9 +810,6 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(0),
-                    storage_kind: TodoStorageKind::Simple,
-                    collection_uuid: None,
-                    thing_uuid: None,
                 },
                 TodoItem {
                     id: 2,
@@ -823,13 +819,32 @@ mod tests {
                     batch_id: Some(1),
                     batch_title: Some("Release launch".to_string()),
                     batch_index: Some(1),
-                    storage_kind: TodoStorageKind::Simple,
-                    collection_uuid: None,
-                    thing_uuid: None,
                 }
             ],
         });
 
         assert_eq!(current_todo_card_markdown(&user_state), None);
+    }
+
+    #[test]
+    fn sdk_backed_legacy_todos_are_dropped() {
+        let user_state = json!({
+            "__todos": [
+                {"id": 1, "content": "Local", "done": false},
+                {
+                    "id": 2,
+                    "content": "SDK",
+                    "done": false,
+                    "storage_kind": "remi_sdk",
+                    "collection_uuid": "collection-1",
+                    "thing_uuid": "thing-1"
+                }
+            ],
+        });
+
+        assert_eq!(
+            todos_from_user_state(&user_state),
+            vec![legacy_todo(1, "Local")]
+        );
     }
 }

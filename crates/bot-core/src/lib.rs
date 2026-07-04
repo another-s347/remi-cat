@@ -40,7 +40,6 @@ pub mod token_usage;
 pub mod tool;
 pub mod tool_pretty;
 pub mod tools;
-pub mod trigger;
 pub mod user_question;
 
 pub use agent::CatAgent;
@@ -52,7 +51,7 @@ pub use bot_runtime_core::{Content, ContentPart, Message};
 pub use events::{
     CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
     ModelInputSegment, ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillEvent,
-    TodoEvent, TriggerEvent,
+    SteerInjectedEvent, SteerQueuedEvent, TodoEvent,
 };
 pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
 pub use hooks::{HookEventName, HookManager, HookOutcome, HookPermissionDecision, HookStatus};
@@ -70,7 +69,7 @@ pub use profile::{
 };
 pub use runtime::{
     CatBot, CatBotBuilder, EffectiveModelProfile, EffectiveModelSource, RegisteredToolStatus,
-    StreamOptions,
+    SteerInput, SteerSubmitResult, StreamOptions,
 };
 pub use skill::store::{BuiltinSkillStore, FileSkillStore};
 pub use skill::store::{
@@ -91,7 +90,7 @@ pub use user_question::{
 };
 
 pub(crate) use runtime::{
-    cat_event_from_subagent_approval_marker, metadata_flag_enabled, suppress_trigger_management,
-    tool_approval_requested_marker, tool_approval_resolved_marker, tool_approval_updated_marker,
-    user_question_requested_marker, user_question_resolved_marker, user_question_updated_marker,
+    cat_event_from_subagent_approval_marker, metadata_flag_enabled, tool_approval_requested_marker,
+    tool_approval_resolved_marker, tool_approval_updated_marker, user_question_requested_marker,
+    user_question_resolved_marker, user_question_updated_marker,
 };

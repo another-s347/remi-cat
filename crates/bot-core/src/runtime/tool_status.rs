@@ -45,9 +45,6 @@ pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] 
         ("todo__list", "List todo items."),
         ("todo__remove", "Remove a todo item."),
         ("todo__update", "Update a todo item."),
-        ("trigger__delete", "Delete a semantic trigger."),
-        ("trigger__list", "List semantic triggers."),
-        ("trigger__upsert", "Create or update a semantic trigger."),
         ("web_search", "Search the web with Exa."),
     ]
 }
@@ -56,22 +53,6 @@ pub(crate) fn tool_warnings(name: &str) -> Vec<String> {
     match name {
         "search" | "web_search" if !env_present("EXA_API_KEY") => {
             vec!["web search is unavailable until EXA_API_KEY is set; local memory/skill search still works".to_string()]
-        }
-        "trigger__delete" | "trigger__list" | "trigger__upsert"
-            if !(env_present("REMI_APP_KEY") && env_present("REMI_PUBLIC_GRPC_ADDR")) =>
-        {
-            vec![
-                "remote trigger sync is disabled until REMI_APP_KEY and REMI_PUBLIC_GRPC_ADDR are both set; local-only triggers still work"
-                    .to_string(),
-            ]
-        }
-        "todo__add" | "todo__complete" | "todo__list" | "todo__remove" | "todo__update"
-            if !(env_present("REMI_APP_KEY") && env_present("REMI_PUBLIC_GRPC_ADDR")) =>
-        {
-            vec![
-                "remote todo sync is disabled until REMI_APP_KEY and REMI_PUBLIC_GRPC_ADDR are both set; local-only todos still work"
-                    .to_string(),
-            ]
         }
         _ => Vec::new(),
     }

@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package remi.options;
-
-import "google/protobuf/descriptor.proto";
-
-extend google.protobuf.FieldOptions {
-  bool remi_skip_log = 50001;
-}

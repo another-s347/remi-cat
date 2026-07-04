@@ -84,7 +84,6 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
             "missing"
         }
     );
-    println!("{}", sdk_doctor_report(data_dir));
     println!("{}", sandbox_doctor_report(data_dir, &setup_state));
 
     if let SetupState::Initialized { config, .. } = &setup_state {
@@ -124,17 +123,6 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
                         "todo__update",
                         "todo__remove",
                     ],
-                ) {
-                    "enabled"
-                } else {
-                    "missing"
-                }
-            );
-            println!(
-                "tool_trigger: {}",
-                if has_all_tools(
-                    &agent.tools,
-                    &["trigger__upsert", "trigger__list", "trigger__delete"],
                 ) {
                     "enabled"
                 } else {
@@ -972,41 +960,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub(crate) fn sdk_doctor_report(data_dir: &Path) -> String {
-    let remote_ready = env_var_present("REMI_APP_KEY") && env_var_present("REMI_PUBLIC_GRPC_ADDR");
-    let partial_remote = env_var_present("REMI_APP_KEY") ^ env_var_present("REMI_PUBLIC_GRPC_ADDR");
-    let mode = if remote_ready {
-        "local+remote-sync"
-    } else {
-        "local-only"
-    };
-    let mut lines = vec![
-        "remi_sdk: enabled".to_string(),
-        format!("remi_sdk_mode: {mode}"),
-        format!(
-            "remi_sdk_remote_config: {}",
-            if remote_ready {
-                "complete"
-            } else if partial_remote {
-                "partial"
-            } else {
-                "missing"
-            }
-        ),
-        format!(
-            "remi_sdk_user_data: {}",
-            data_dir.join("sdk").join("<sender_user_id>").display()
-        ),
-    ];
-    if !remote_ready {
-        lines.push(
-            "remi_sdk_note: local SDK todo/trigger works; remote sync is disabled until REMI_APP_KEY and REMI_PUBLIC_GRPC_ADDR are both set"
-                .to_string(),
-        );
-    }
-    lines.join("\n")
-}
-
 pub(crate) fn command_doctor_report(runtime: &Runtime) -> String {
     let tools = runtime
         .bot
@@ -1024,16 +977,10 @@ pub(crate) fn command_doctor_report(runtime: &Runtime) -> String {
             "todo__remove",
         ],
     );
-    let trigger_enabled = has_all_tools(
-        &tools,
-        &["trigger__upsert", "trigger__list", "trigger__delete"],
-    );
     format!(
-        "**remi-cat doctor**\n\n```text\n{}\nroot_agent_id: {}\ntool_todo: {}\ntool_trigger: {}\n```",
-        sdk_doctor_report(&runtime.data_dir),
+        "**remi-cat doctor**\n\n```text\nroot_agent_id: {}\ntool_todo: {}\n```",
         runtime.root_agent_id,
         if todo_enabled { "enabled" } else { "missing" },
-        if trigger_enabled { "enabled" } else { "missing" },
     )
 }
 
@@ -1071,10 +1018,4 @@ pub(crate) fn print_registered_tools(bot: &CatBot, json: bool) -> anyhow::Result
         }
     }
     Ok(())
-}
-
-fn env_var_present(key: &str) -> bool {
-    std::env::var(key)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
 }

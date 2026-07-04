@@ -821,7 +821,7 @@ impl MemoryStore {
     }
 
     /// Clear conversational history for a thread while preserving tool-managed
-    /// `user_state.json` such as todos and triggers.
+    /// `user_state.json` such as todos.
     pub async fn clear_thread(&self, thread_id: &str) -> Result<(), AgentError> {
         let short_path = self.short_term_path(thread_id);
         Self::write_short_term(&short_path, &[]).await?;

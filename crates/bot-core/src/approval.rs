@@ -399,10 +399,8 @@ pub fn classify_tool_risk_assessment(
 fn classify_known_tool_risk(tool_name: &str, args: &serde_json::Value) -> Option<ToolRiskLevel> {
     match tool_name {
         "fs_read" | "fs_ls" | "rg" | "search" | "skill__get" | "skill__search"
-        | "memory__get_detail" | "memory__recall" | "todo__list" | "trigger__list"
-        | "web_search" | "now" | "instant" | "lazy_wait" | "sleep" | "ask_user_question" => {
-            Some(ToolRiskLevel::Low)
-        }
+        | "memory__get_detail" | "memory__recall" | "todo__list" | "web_search" | "now"
+        | "instant" | "lazy_wait" | "sleep" | "ask_user_question" => Some(ToolRiskLevel::Low),
         "fetch" => Some(classify_fetch_risk(args)),
         "workspace_bash" | "bash" => Some(classify_bash_risk(args)),
         "ssh" => Some(classify_ssh_risk(args)),
@@ -415,7 +413,6 @@ fn classify_known_tool_risk(tool_name: &str, args: &serde_json::Value) -> Option
         name if name.starts_with("agent__") => Some(ToolRiskLevel::Low),
         "codex" => Some(ToolRiskLevel::Medium),
         name if name.starts_with("acp__") => Some(ToolRiskLevel::Medium),
-        name if name.starts_with("trigger__") => Some(ToolRiskLevel::Medium),
         name if name.starts_with("memory__")
             || name.starts_with("todo__")
             || name.starts_with("skill__") =>
@@ -934,9 +931,6 @@ fn review_reason(tool_name: &str, args_summary: &str, risk: ToolRiskLevel) -> St
         {
             "The request delegates work to another agent and should be reviewed before running.".to_string()
         }
-        ToolRiskLevel::Medium if tool_name.starts_with("trigger__") => {
-            "The request changes automation state and should be reviewed before running.".to_string()
-        }
         ToolRiskLevel::Medium => {
             format!(
                 "The `{tool_name}` request is not classified as read-only; review the summarized arguments before allowing it."
@@ -1154,8 +1148,6 @@ mod tests {
             ),
             ("todo__complete", serde_json::json!({ "id": "1" })),
             ("todo__remove", serde_json::json!({ "id": "1" })),
-            ("trigger__upsert", serde_json::json!({ "id": "x" })),
-            ("trigger__delete", serde_json::json!({ "id": "x" })),
             ("codex", serde_json::json!({ "message": "work" })),
             ("im__send_text", serde_json::json!({ "text": "hello" })),
         ] {

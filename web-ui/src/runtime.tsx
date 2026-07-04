@@ -31,6 +31,19 @@ function contentText(content: AppendMessage["content"]) {
     .join("");
 }
 
+type PendingSteer = {
+  messageId: string;
+  text: string;
+};
+
+type ActiveRunState = {
+  id: string;
+  controller: AbortController;
+  ready: boolean;
+  pendingSteers: PendingSteer[];
+  flushing: boolean;
+};
+
 export function toInitialMessages(history: HistoryMessage[]): ThreadMessageLike[] {
   const messages: ThreadMessageLike[] = [];
   const toolIndexes = new Map<string, { messageIndex: number; partIndex: number }>();
@@ -384,7 +397,7 @@ export function RemiRuntimeProvider({
     toInitialMessages(history),
   );
   const [isRunning, setIsRunning] = useState(false);
-  const activeRunRef = useRef<{ id: string; controller: AbortController } | undefined>(undefined);
+  const activeRunRef = useRef<ActiveRunState | undefined>(undefined);
   const resumedRunId = useRef<string | undefined>(undefined);
   const onFinishedRef = useRef(onFinished);
   const onStartedRef = useRef(onStarted);
@@ -400,13 +413,103 @@ export function RemiRuntimeProvider({
     onSessionForkedRef.current = onSessionForked;
   }, [onFinished, onSessionForked, onStarted, onStatsChanged, onTodosChanged]);
 
+  const completeSteerMessage = useCallback((messageId: string) => {
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === messageId
+          ? { ...item, status: { type: "complete", reason: "stop" } }
+          : item,
+      ),
+    );
+  }, []);
+
+  const failSteerMessage = useCallback((messageId: string, error: unknown) => {
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === messageId
+          ? {
+              ...item,
+              status: {
+                type: "incomplete",
+                reason: "error",
+                error: String(error),
+              },
+            }
+          : item,
+      ),
+    );
+  }, []);
+
+  const failPendingSteers = useCallback((run: ActiveRunState, error: unknown) => {
+    const pending = run.pendingSteers.splice(0);
+    if (!pending.length) return;
+    const pendingIds = new Set(pending.map((item) => item.messageId));
+    setMessages((current) =>
+      current.map((item) =>
+        item.id !== undefined && pendingIds.has(item.id)
+          ? {
+              ...item,
+              status: {
+                type: "incomplete",
+                reason: "error",
+                error: String(error),
+              },
+            }
+          : item,
+      ),
+    );
+  }, []);
+
+  const sendSteer = useCallback(
+    async (runId: string, messageId: string, text: string) => {
+      try {
+        await api.steerRun(sessionId, runId, text);
+        completeSteerMessage(messageId);
+      } catch (error) {
+        failSteerMessage(messageId, error);
+        throw error;
+      }
+    },
+    [completeSteerMessage, failSteerMessage, sessionId],
+  );
+
+  const flushPendingSteers = useCallback(
+    (run: ActiveRunState) => {
+      if (run.flushing) return;
+      run.flushing = true;
+      void (async () => {
+        try {
+          while (
+            activeRunRef.current === run &&
+            run.ready &&
+            run.pendingSteers.length > 0
+          ) {
+            const pending = run.pendingSteers.shift();
+            if (!pending) continue;
+            await sendSteer(run.id, pending.messageId, pending.text).catch(() => undefined);
+          }
+        } finally {
+          run.flushing = false;
+        }
+      })();
+    },
+    [sendSteer],
+  );
+
   useEffect(() => {
     if (!activeRun || resumedRunId.current === activeRun.run_id) return;
     resumedRunId.current = activeRun.run_id;
     const runId = activeRun.run_id;
     const assistantId = crypto.randomUUID();
     const controller = new AbortController();
-    activeRunRef.current = { id: runId, controller };
+    const runState: ActiveRunState = {
+      id: runId,
+      controller,
+      ready: false,
+      pendingSteers: [],
+      flushing: false,
+    };
+    activeRunRef.current = runState;
     setIsRunning(true);
     onStartedRef.current();
     setMessages((current) => [
@@ -460,249 +563,15 @@ export function RemiRuntimeProvider({
 
     void (async () => {
       try {
-        for await (const event of streamRun(sessionId, runId, activeRun.text, controller.signal)) {
-          const data = event.data ?? {};
-          switch (event.event) {
-            case "text_delta": {
-              const text = String(data.text ?? "");
-              const last = parts.at(-1);
-              if (last?.type === "text") {
-                parts[parts.length - 1] = { ...last, text: last.text + text };
-              } else {
-                parts.push({ type: "text", text });
-              }
-              break;
-            }
-            case "thinking_delta": {
-              const text = String(data.text ?? "");
-              const last = parts.at(-1);
-              if (last?.type === "reasoning") {
-                parts[parts.length - 1] = { ...last, text: last.text + text };
-              } else {
-                parts.push({ type: "reasoning", text });
-              }
-              break;
-            }
-            case "tool_started": {
-              const toolName = String(data.tool_name ?? "tool");
-              if (toolName.startsWith("todo__")) break;
-              const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
-              const pretty = data.pretty as PrettyToolCall | undefined;
-              const args = (data.args ?? {}) as Extract<
-                ThreadAssistantMessagePart,
-                { type: "tool-call" }
-              >["args"];
-              const existingIndex = toolIndexes.get(toolCallId);
-              if (existingIndex !== undefined) {
-                const part = parts[existingIndex];
-                if (part?.type === "tool-call") {
-                  const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
-                  const runningPretty = pretty
-                    ? { ...pretty, started_at_ms: existingPretty?.started_at_ms ?? performance.now() }
-                    : existingPretty;
-                  parts[existingIndex] = {
-                    ...part,
-                    toolName,
-                    args: { raw: args, pretty: runningPretty } as never,
-                    argsText: pretty ? "" : JSON.stringify(args, null, 2),
-                  };
-                }
-                break;
-              }
-              const runningPretty = pretty
-                ? { ...pretty, started_at_ms: performance.now() }
-                : undefined;
-              toolIndexes.set(toolCallId, parts.length);
-              runningToolIds.add(toolCallId);
-              startTicker();
-              parts.push({
-                type: "tool-call",
-                toolCallId,
-                toolName,
-                args: { raw: args, pretty: runningPretty } as never,
-                argsText: pretty ? "" : JSON.stringify(args, null, 2),
-              });
-              break;
-            }
-            case "tool_completed": {
-              const toolName = String(data.tool_name ?? "tool");
-              if (toolName.startsWith("todo__")) break;
-              const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
-              runningToolIds.delete(toolCallId);
-              const index = toolIndexes.get(toolCallId);
-              if (index === undefined) break;
-              const part = parts[index];
-              if (part?.type === "tool-call") {
-                parts[index] = {
-                  ...part,
-                  result: {
-                    raw: data.result,
-                    pretty: data.pretty as PrettyToolCall | undefined,
-                  },
-                };
-              }
-              break;
-            }
-            case "approval_requested":
-            case "approval_updated": {
-              upsertApprovalPart(
-                parts,
-                toolIndexes,
-                data as unknown as ToolApprovalRequest,
-              );
-              break;
-            }
-            case "approval_resolved": {
-              upsertApprovalPart(
-                parts,
-                toolIndexes,
-                data.request as ToolApprovalRequest,
-                data.decision as ToolApprovalDecision,
-              );
-              break;
-            }
-            case "user_question_requested":
-            case "user_question_updated": {
-              upsertUserQuestionPart(
-                parts,
-                toolIndexes,
-                data as unknown as UserQuestionRequest,
-              );
-              break;
-            }
-            case "user_question_resolved": {
-              upsertUserQuestionPart(
-                parts,
-                toolIndexes,
-                data.request as UserQuestionRequest,
-                data.response as UserQuestionResponse,
-              );
-              break;
-            }
-            case "supervisor_progress": {
-              supervisorIndex = appendSupervisorProgress(parts, supervisorIndex, runId, data);
-              break;
-            }
-            case "supervisor_report": {
-              supervisorIndex = applySupervisorReport(parts, supervisorIndex, runId, data);
-              break;
-            }
-            case "sub_session": {
-              appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
-              break;
-            }
-            case "context_compaction": {
-              upsertContextCompactionPart(
-                parts,
-                toolIndexes,
-                data as unknown as ContextCompactionEvent,
-              );
-              break;
-            }
-            case "stats":
-              onStatsChangedRef.current(data as DebugStats);
-              break;
-            case "todo_state":
-              onTodosChangedRef.current((data.items ?? []) as TodoItem[]);
-              break;
-            case "session_forked":
-              onSessionForkedRef.current(data as Session);
-              break;
-            case "error":
-              throw new Error(String(data.message ?? "run failed"));
-          }
-          updateAssistant({ type: "running" });
-        }
-        updateAssistant({ type: "complete", reason: "stop" });
-      } catch (error) {
-        if (controller.signal.aborted) {
-          updateAssistant({ type: "incomplete", reason: "cancelled" });
-        } else {
-          updateAssistant({
-            type: "incomplete",
-            reason: "error",
-            error: String(error),
-          });
-        }
-      } finally {
-        runningToolIds.clear();
-        stopTicker();
-        activeRunRef.current = undefined;
-        setIsRunning(false);
-        onFinishedRef.current();
-      }
-    })();
-
-    return () => {
-      controller.abort();
-      stopTicker();
-    };
-  }, [activeRun, sessionId]);
-
-  const onNew = useCallback(
-    async (message: AppendMessage) => {
-      const runId = crypto.randomUUID();
-      const assistantId = crypto.randomUUID();
-      const controller = new AbortController();
-      activeRunRef.current = { id: runId, controller };
-      setIsRunning(true);
-      onStartedRef.current();
-      setMessages((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          role: "user",
-          content: message.content,
-          createdAt: new Date(),
-        },
-        {
-          id: assistantId,
-          role: "assistant",
-          content: [],
-          createdAt: new Date(),
-          status: { type: "running" },
-        },
-      ]);
-
-      const parts: ThreadAssistantMessagePart[] = [];
-      const toolIndexes = new Map<string, number>();
-      const runningToolIds = new Set<string>();
-      let ticker: number | undefined;
-      let supervisorIndex: number | undefined;
-      const subSessionIndexes = new Map<string, number>();
-      const updateAssistant = (status: ThreadMessageLike["status"]) => {
-        setMessages((current) =>
-          current.map((item) =>
-            item.id === assistantId
-              ? { ...item, content: [...parts], status }
-              : item,
-          ),
-        );
-      };
-      const stopTicker = () => {
-        if (ticker !== undefined) {
-          window.clearInterval(ticker);
-          ticker = undefined;
-        }
-      };
-      const startTicker = () => {
-        if (ticker !== undefined) return;
-        ticker = window.setInterval(() => {
-          if (!runningToolIds.size) {
-            stopTicker();
-            return;
-          }
-          updateAssistant({ type: "running" });
-        }, TOOL_TICK_MS);
-      };
-
-      try {
-        void api.appendInputHistory(sessionId, contentText(message.content)).catch(() => undefined);
         for await (const event of streamRun(
           sessionId,
           runId,
-          contentText(message.content),
+          activeRun.text,
           controller.signal,
+          () => {
+            runState.ready = true;
+            flushPendingSteers(runState);
+          },
         )) {
           const data = event.data ?? {};
           switch (event.event) {
@@ -842,6 +711,309 @@ export function RemiRuntimeProvider({
               );
               break;
             }
+            case "steer_injected": {
+              const count = Number(data.count ?? 1);
+              const preview = String(data.preview ?? "");
+              parts.push({
+                type: "text",
+                text: `\n\n[Steer injected: ${count}${preview ? ` - ${preview}` : ""}]\n\n`,
+              });
+              break;
+            }
+            case "stats":
+              onStatsChangedRef.current(data as DebugStats);
+              break;
+            case "todo_state":
+              onTodosChangedRef.current((data.items ?? []) as TodoItem[]);
+              break;
+            case "session_forked":
+              onSessionForkedRef.current(data as Session);
+              break;
+            case "error":
+              throw new Error(String(data.message ?? "run failed"));
+          }
+          updateAssistant({ type: "running" });
+        }
+        updateAssistant({ type: "complete", reason: "stop" });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          updateAssistant({ type: "incomplete", reason: "cancelled" });
+        } else {
+          updateAssistant({
+            type: "incomplete",
+            reason: "error",
+            error: String(error),
+          });
+        }
+      } finally {
+        runningToolIds.clear();
+        stopTicker();
+        if (activeRunRef.current?.id === runId) {
+          failPendingSteers(
+            activeRunRef.current,
+            controller.signal.aborted
+              ? "run cancelled before steer could be sent"
+              : "run finished before steer could be sent",
+          );
+          activeRunRef.current = undefined;
+        }
+        setIsRunning(false);
+        onFinishedRef.current();
+      }
+    })();
+
+    return () => {
+      controller.abort();
+      stopTicker();
+    };
+  }, [activeRun, failPendingSteers, flushPendingSteers, sessionId]);
+
+  const onNew = useCallback(
+    async (message: AppendMessage) => {
+      const activeRun = activeRunRef.current;
+      if (activeRun) {
+        const text = contentText(message.content);
+        const steerId = crypto.randomUUID();
+        setMessages((current) => [
+          ...current,
+          {
+            id: steerId,
+            role: "user",
+            content: message.content,
+            createdAt: new Date(),
+            status: { type: "running" },
+          },
+        ]);
+        void api.appendInputHistory(sessionId, text).catch(() => undefined);
+        if (!activeRun.ready || activeRun.flushing || activeRun.pendingSteers.length > 0) {
+          activeRun.pendingSteers.push({ messageId: steerId, text });
+          if (activeRun.ready) flushPendingSteers(activeRun);
+          return;
+        }
+        await sendSteer(activeRun.id, steerId, text);
+        return;
+      }
+      const runId = crypto.randomUUID();
+      const assistantId = crypto.randomUUID();
+      const controller = new AbortController();
+      const runState: ActiveRunState = {
+        id: runId,
+        controller,
+        ready: false,
+        pendingSteers: [],
+        flushing: false,
+      };
+      activeRunRef.current = runState;
+      setIsRunning(true);
+      onStartedRef.current();
+      setMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          content: message.content,
+          createdAt: new Date(),
+        },
+        {
+          id: assistantId,
+          role: "assistant",
+          content: [],
+          createdAt: new Date(),
+          status: { type: "running" },
+        },
+      ]);
+
+      const parts: ThreadAssistantMessagePart[] = [];
+      const toolIndexes = new Map<string, number>();
+      const runningToolIds = new Set<string>();
+      let ticker: number | undefined;
+      let supervisorIndex: number | undefined;
+      const subSessionIndexes = new Map<string, number>();
+      const updateAssistant = (status: ThreadMessageLike["status"]) => {
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === assistantId
+              ? { ...item, content: [...parts], status }
+              : item,
+          ),
+        );
+      };
+      const stopTicker = () => {
+        if (ticker !== undefined) {
+          window.clearInterval(ticker);
+          ticker = undefined;
+        }
+      };
+      const startTicker = () => {
+        if (ticker !== undefined) return;
+        ticker = window.setInterval(() => {
+          if (!runningToolIds.size) {
+            stopTicker();
+            return;
+          }
+          updateAssistant({ type: "running" });
+        }, TOOL_TICK_MS);
+      };
+
+      try {
+        void api.appendInputHistory(sessionId, contentText(message.content)).catch(() => undefined);
+        for await (const event of streamRun(
+          sessionId,
+          runId,
+          contentText(message.content),
+          controller.signal,
+          () => {
+            runState.ready = true;
+            flushPendingSteers(runState);
+          },
+        )) {
+          const data = event.data ?? {};
+          switch (event.event) {
+            case "text_delta": {
+              const text = String(data.text ?? "");
+              const last = parts.at(-1);
+              if (last?.type === "text") {
+                parts[parts.length - 1] = { ...last, text: last.text + text };
+              } else {
+                parts.push({ type: "text", text });
+              }
+              break;
+            }
+            case "thinking_delta": {
+              const text = String(data.text ?? "");
+              const last = parts.at(-1);
+              if (last?.type === "reasoning") {
+                parts[parts.length - 1] = { ...last, text: last.text + text };
+              } else {
+                parts.push({ type: "reasoning", text });
+              }
+              break;
+            }
+            case "tool_started": {
+              const toolName = String(data.tool_name ?? "tool");
+              if (toolName.startsWith("todo__")) break;
+              const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
+              const pretty = data.pretty as PrettyToolCall | undefined;
+              const args = (data.args ?? {}) as Extract<
+                ThreadAssistantMessagePart,
+                { type: "tool-call" }
+              >["args"];
+              const existingIndex = toolIndexes.get(toolCallId);
+              if (existingIndex !== undefined) {
+                const part = parts[existingIndex];
+                if (part?.type === "tool-call") {
+                  const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
+                  const runningPretty = pretty
+                    ? { ...pretty, started_at_ms: existingPretty?.started_at_ms ?? performance.now() }
+                    : existingPretty;
+                  parts[existingIndex] = {
+                    ...part,
+                    toolName,
+                    args: { raw: args, pretty: runningPretty } as never,
+                    argsText: pretty ? "" : JSON.stringify(args, null, 2),
+                  };
+                }
+                break;
+              }
+              const runningPretty = pretty
+                ? { ...pretty, started_at_ms: performance.now() }
+                : undefined;
+              toolIndexes.set(toolCallId, parts.length);
+              runningToolIds.add(toolCallId);
+              startTicker();
+              parts.push({
+                type: "tool-call",
+                toolCallId,
+                toolName,
+                args: { raw: args, pretty: runningPretty } as never,
+                argsText: pretty ? "" : JSON.stringify(args, null, 2),
+              });
+              break;
+            }
+            case "tool_completed": {
+              const toolName = String(data.tool_name ?? "tool");
+              if (toolName.startsWith("todo__")) break;
+              const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
+              runningToolIds.delete(toolCallId);
+              const index = toolIndexes.get(toolCallId);
+              if (index === undefined) break;
+              const part = parts[index];
+              if (part?.type === "tool-call") {
+                parts[index] = {
+                  ...part,
+                  result: {
+                    raw: data.result,
+                    pretty: data.pretty as PrettyToolCall | undefined,
+                  },
+                };
+              }
+              break;
+            }
+            case "approval_requested":
+            case "approval_updated": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data as unknown as ToolApprovalRequest,
+              );
+              break;
+            }
+            case "approval_resolved": {
+              upsertApprovalPart(
+                parts,
+                toolIndexes,
+                data.request as ToolApprovalRequest,
+                data.decision as ToolApprovalDecision,
+              );
+              break;
+            }
+            case "user_question_requested":
+            case "user_question_updated": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data as unknown as UserQuestionRequest,
+              );
+              break;
+            }
+            case "user_question_resolved": {
+              upsertUserQuestionPart(
+                parts,
+                toolIndexes,
+                data.request as UserQuestionRequest,
+                data.response as UserQuestionResponse,
+              );
+              break;
+            }
+            case "supervisor_progress": {
+              supervisorIndex = appendSupervisorProgress(parts, supervisorIndex, runId, data);
+              break;
+            }
+            case "supervisor_report": {
+              supervisorIndex = applySupervisorReport(parts, supervisorIndex, runId, data);
+              break;
+            }
+            case "sub_session": {
+              appendSubSessionEvent(parts, subSessionIndexes, runId, event.sequence, data);
+              break;
+            }
+            case "context_compaction": {
+              upsertContextCompactionPart(
+                parts,
+                toolIndexes,
+                data as unknown as ContextCompactionEvent,
+              );
+              break;
+            }
+            case "steer_injected": {
+              const count = Number(data.count ?? 1);
+              const preview = String(data.preview ?? "");
+              parts.push({
+                type: "text",
+                text: `\n\n[Steer injected: ${count}${preview ? ` - ${preview}` : ""}]\n\n`,
+              });
+              break;
+            }
             case "stats": {
               onStatsChanged(data as DebugStats);
               break;
@@ -874,12 +1046,29 @@ export function RemiRuntimeProvider({
       } finally {
         runningToolIds.clear();
         stopTicker();
-        activeRunRef.current = undefined;
+        if (activeRunRef.current?.id === runId) {
+          failPendingSteers(
+            activeRunRef.current,
+            controller.signal.aborted
+              ? "run cancelled before steer could be sent"
+              : "run finished before steer could be sent",
+          );
+          activeRunRef.current = undefined;
+        }
         setIsRunning(false);
         onFinished();
       }
     },
-    [onFinished, onSessionForked, onStatsChanged, onTodosChanged, sessionId],
+    [
+      failPendingSteers,
+      flushPendingSteers,
+      onFinished,
+      onSessionForked,
+      onStatsChanged,
+      onTodosChanged,
+      sendSteer,
+      sessionId,
+    ],
   );
 
   const onCancel = useCallback(async () => {

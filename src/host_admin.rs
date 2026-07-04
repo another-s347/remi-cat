@@ -9,16 +9,19 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bot_core::skill::store::SkillStore;
 use bot_core::{
-    remi_skill, trigger, AgentProfile, AgentRegistry, BuiltinSkillStore, FileSkillStore,
-    ModelInputSnapshot, ToolApprovalDecision,
+    remi_skill, AgentProfile, AgentRegistry, BuiltinSkillStore, FileSkillStore, ModelInputSnapshot,
+    ToolApprovalDecision,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::model_input_store::{
+    delete_model_input_snapshots, get_model_input_snapshot_json, list_model_input_snapshot_json,
+};
 use crate::runtime_config::SetupState;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::{Session, SessionRuntime};
-use crate::web_chat::{web_sdk_db_path, WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
+use crate::web_chat::{WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
 use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
@@ -89,6 +92,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/chat/sessions/{id}/runs",
             post(start_web_run).delete(cancel_web_session_run),
         )
+        .route("/api/v1/chat/sessions/{id}/steers", post(steer_web_run))
         .route(
             "/api/v1/chat/sessions/{id}/runs/active",
             get(active_web_session_run),
@@ -168,10 +172,7 @@ async fn command_catalog(State(state): State<AdminState>) -> Json<Vec<CommandCat
     let mut entries = static_command_catalog();
     let store = BuiltinSkillStore::new(
         FileSkillStore::new(state.skills_dir),
-        [
-            trigger::builtin_trigger_skill(),
-            remi_skill::builtin_remi_skill(),
-        ],
+        [remi_skill::builtin_remi_skill()],
     );
     let mut skills = store.featured_summaries();
     skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
@@ -253,7 +254,7 @@ fn static_command_catalog() -> Vec<CommandCatalogEntry> {
         (
             "/clear",
             "清空历史",
-            "清空当前会话历史，保留 Todo 和 Trigger 状态",
+            "清空当前会话历史，保留 Todo 状态",
             false,
         ),
         ("/doctor", "运行诊断", "显示 Remi 运行环境与配置诊断", false),
@@ -626,9 +627,8 @@ async fn list_web_model_inputs(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Vec<ModelInputSummary>>, AdminError> {
     require_web_session(&state, &id).await?;
-    let sdk = web_model_input_sdk(&state)?;
-    let items = sdk
-        .list_chat_model_input_json(&id, Some(100))?
+    let data_dir = admin_data_dir(&state);
+    let items = list_model_input_snapshot_json(&data_dir, &id, Some(100))?
         .into_iter()
         .filter_map(|json| serde_json::from_str::<ModelInputSnapshot>(&json).ok())
         .map(model_input_summary)
@@ -641,9 +641,8 @@ async fn get_web_model_input(
     AxumPath((id, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<ModelInputSnapshot>, AdminError> {
     require_web_session(&state, &id).await?;
-    let sdk = web_model_input_sdk(&state)?;
-    let json = sdk
-        .get_chat_model_input_json(&id, &run_id)?
+    let data_dir = admin_data_dir(&state);
+    let json = get_model_input_snapshot_json(&data_dir, &id, &run_id)?
         .ok_or_else(|| AdminError::not_found("model input snapshot not found".into()))?;
     let snapshot = serde_json::from_str::<ModelInputSnapshot>(&json)
         .map_err(|err| AdminError::bad_request(format!("stored model input is invalid: {err}")))?;
@@ -801,6 +800,33 @@ async fn start_web_run(
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
     Ok(response)
+}
+
+async fn steer_web_run(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<StartRunRequest>,
+) -> Result<StatusCode, AdminError> {
+    require_web_session(&state, &id).await?;
+    if request.text.trim().is_empty() {
+        return Err(AdminError::bad_request("message may not be empty".into()));
+    }
+    uuid::Uuid::parse_str(&request.run_id)
+        .map_err(|_| AdminError::bad_request("run_id must be a UUID".into()))?;
+    web_handle(&state)?
+        .steer(id, request.run_id, request.text)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("no matching active run")
+                || message.contains("active run ended before steer could be queued")
+            {
+                AdminError::conflict(error.to_string())
+            } else {
+                AdminError::from(error)
+            }
+        })?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn cancel_web_session_run(
@@ -999,12 +1025,6 @@ fn web_handle(state: &AdminState) -> Result<&WebChatHandle, AdminError> {
     })
 }
 
-fn web_model_input_sdk(state: &AdminState) -> Result<remi_client_sdk::TriggerSdk, AdminError> {
-    let data_dir = admin_data_dir(state);
-    let db_path = web_sdk_db_path(&data_dir, WEB_USER_ID);
-    remi_client_sdk::TriggerSdk::initialize(&db_path).map_err(AdminError::from)
-}
-
 fn admin_data_dir(state: &AdminState) -> PathBuf {
     match &state.setup_state {
         SetupState::Initialized { config, .. } => PathBuf::from(&config.data_dir),
@@ -1019,23 +1039,13 @@ fn admin_data_dir(state: &AdminState) -> PathBuf {
 }
 
 fn delete_web_model_inputs_for_session(state: &AdminState, session_id: &str) {
-    match web_model_input_sdk(state) {
-        Ok(sdk) => {
-            if let Err(err) = sdk.delete_chat_model_inputs(session_id) {
-                tracing::warn!(
-                    session_id,
-                    error = %err,
-                    "failed to delete web model input snapshots"
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err.message,
-                "failed to initialize sdk while deleting web model input snapshots"
-            );
-        }
+    let data_dir = admin_data_dir(state);
+    if let Err(err) = delete_model_input_snapshots(&data_dir, session_id) {
+        tracing::warn!(
+            session_id,
+            error = %err,
+            "failed to delete web model input snapshots"
+        );
     }
 }
 
