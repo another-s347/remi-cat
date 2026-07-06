@@ -1651,6 +1651,9 @@ impl TuiApp {
                     self.pending_approval = None;
                 }
                 self.approval_state = "resolved";
+                if decision == ToolApprovalDecision::Deny {
+                    self.cancel_active_tool_cells("tool approval denied by user");
+                }
                 self.upsert_approval_cell(approval_cell(
                     &request,
                     "resolved",
@@ -1981,6 +1984,18 @@ impl TuiApp {
         false
     }
 
+    fn cancel_active_tool_cells(&mut self, reason: &str) {
+        let ids = self
+            .active_tool_started_at
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        mark_tool_cells_cancelled(&mut self.cells, &ids, reason);
+        self.active_tool_args.clear();
+        self.active_tool_names.clear();
+        self.active_tool_started_at.clear();
+    }
+
     fn request_cancel_current_run(&mut self) {
         if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
             self.status.state = "cancelling".to_string();
@@ -1990,9 +2005,7 @@ impl TuiApp {
             cancel.notify_waiters();
         }
         self.status.state = "cancelling".to_string();
-        self.active_tool_args.clear();
-        self.active_tool_names.clear();
-        self.active_tool_started_at.clear();
+        self.cancel_active_tool_cells("cancelled by user");
         self.sub_tool_args.clear();
         self.sub_tool_names.clear();
         self.sub_sessions.clear();
@@ -3541,7 +3554,8 @@ fn forward_supervisor_progress_to_tui_tools(
 
 fn supervisor_visual_status(status: &WorkflowStatus) -> ToolVisualStatus {
     match status {
-        WorkflowStatus::Active | WorkflowStatus::Paused => ToolVisualStatus::Running,
+        WorkflowStatus::Active => ToolVisualStatus::Running,
+        WorkflowStatus::Paused => ToolVisualStatus::Neutral,
         WorkflowStatus::Completed | WorkflowStatus::Stopped => ToolVisualStatus::Success,
         WorkflowStatus::Error => ToolVisualStatus::Error,
     }
@@ -3574,6 +3588,24 @@ fn push_or_update_current_supervisor_stream_cell(
 
     cells.push(HistoryCell::supervisor_stream(id, title, body, status));
     cells.len().saturating_sub(1)
+}
+
+fn mark_tool_cells_cancelled(cells: &mut [HistoryCell], ids: &[String], reason: &str) {
+    for id in ids {
+        for cell in cells
+            .iter_mut()
+            .filter(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+        {
+            cell.status = ToolVisualStatus::Error;
+            cell.meta = preserve_token_meta("cancelled".to_string(), &cell.meta);
+            if !reason.trim().is_empty() && !cell.body.contains(reason) {
+                if !cell.body.trim().is_empty() {
+                    cell.body.push_str("\n\n");
+                }
+                cell.body.push_str(reason);
+            }
+        }
+    }
 }
 
 fn pretty_supervisor_output(content: &str) -> String {
@@ -4934,6 +4966,39 @@ mod tests {
     }
 
     #[test]
+    fn active_tool_cells_are_marked_cancelled() {
+        let mut cells = vec![
+            HistoryCell::tool(
+                "call-1".to_string(),
+                "执行 bash".to_string(),
+                "$ sleep 10".to_string(),
+                "12.3s".to_string(),
+                ToolVisualStatus::Running,
+            ),
+            HistoryCell::tool(
+                "call-2".to_string(),
+                "读取当前时间".to_string(),
+                "获取系统时间".to_string(),
+                "11.9s".to_string(),
+                ToolVisualStatus::Running,
+            ),
+        ];
+        mark_tool_cells_cancelled(
+            &mut cells,
+            &["call-1".to_string(), "call-2".to_string()],
+            "tool approval denied by user",
+        );
+
+        assert!(cells
+            .iter()
+            .all(|cell| cell.status == ToolVisualStatus::Error));
+        assert!(cells.iter().all(|cell| cell.meta.contains("cancelled")));
+        assert!(cells
+            .iter()
+            .all(|cell| cell.body.contains("tool approval denied by user")));
+    }
+
+    #[test]
     fn supervisor_state_keeps_recent_events_and_report_summary() {
         let mut state = SupervisorUiState::default();
         for index in 0..5 {
@@ -4991,6 +5056,14 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.content.contains("reason: failed"))));
+    }
+
+    #[test]
+    fn paused_supervisor_is_not_rendered_as_running() {
+        assert_eq!(
+            supervisor_visual_status(&WorkflowStatus::Paused),
+            ToolVisualStatus::Neutral
+        );
     }
 
     #[test]

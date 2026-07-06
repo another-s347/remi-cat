@@ -667,7 +667,31 @@ pub fn apply_decision(
     let from_node = instance.current_node.clone();
     let path_edges = if let Some(target_node) = decision.target_node.as_deref() {
         if target_node == from_node {
-            return Err(format!("target_node `{target_node}` is the current node"));
+            let agent_message = decision
+                .agent_message
+                .ok_or_else(|| "current-node continuation requires agent_message".to_string())?;
+            instance.status = WorkflowStatus::Active;
+            instance.node_message = decision.next_node_message.clone();
+            instance.updated_at = Utc::now();
+            let report = WorkflowReport {
+                workflow_id: instance.definition.id.clone(),
+                workflow_name: instance.definition.name.clone(),
+                from_node: from_node.clone(),
+                edge: decision.edge,
+                to_node: from_node.clone(),
+                path_edges: Vec::new(),
+                path_nodes: vec![from_node],
+                status: instance.status.clone(),
+                reason: decision.reason,
+                agent_message: Some(agent_message.clone()),
+                next_node_message: instance.node_message.clone(),
+                supervisor_trace: decision.trace,
+                round,
+                max_rounds: instance.max_rounds.clone(),
+                error: None,
+            };
+            instance.last_report = Some(report.clone());
+            return Ok((report, Some(agent_message)));
         }
         let targets = instance
             .definition
@@ -1227,6 +1251,34 @@ mod tests {
         assert_eq!(report.edge.as_deref(), Some("to_verify"));
         assert_eq!(report.path_edges, vec!["to_implement", "to_verify"]);
         assert_eq!(report.path_nodes, vec!["review", "implement", "verify"]);
+    }
+
+    #[test]
+    fn current_target_node_continues_current_node_without_error() {
+        let mut instance = workflow_instance(embedded_goal_definition());
+        instance.current_node = "review".into();
+
+        let (report, message) = apply_decision(
+            &mut instance,
+            WorkflowDecision {
+                edge: Some("continue".into()),
+                target_node: Some("review".into()),
+                agent_message: Some("try the requested tools again".into()),
+                next_node_message: None,
+                reason: "goal still needs current node work".into(),
+                trace: Vec::new(),
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(message.as_deref(), Some("try the requested tools again"));
+        assert_eq!(instance.current_node, "review");
+        assert_eq!(instance.status, WorkflowStatus::Active);
+        assert_eq!(report.status, WorkflowStatus::Active);
+        assert_eq!(report.to_node, "review");
+        assert_eq!(report.path_nodes, vec!["review"]);
+        assert!(report.path_edges.is_empty());
     }
 
     #[test]
