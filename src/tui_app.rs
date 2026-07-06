@@ -677,6 +677,7 @@ struct TuiApp {
     running: bool,
     run_started_at: Option<Instant>,
     interrupt_requested: bool,
+    exit_after_run: bool,
     cancel: Option<Arc<Notify>>,
     run_handle: Option<JoinHandle<()>>,
     queued_inputs: VecDeque<SubmittedInput>,
@@ -743,6 +744,7 @@ impl TuiApp {
             running: false,
             run_started_at: None,
             interrupt_requested: false,
+            exit_after_run: false,
             cancel: None,
             run_handle: None,
             queued_inputs: VecDeque::new(),
@@ -813,6 +815,9 @@ impl TuiApp {
                 }
                 Some(event) = self.bot_rx.next() => {
                     self.handle_bot_event(event).await;
+                    if self.exit_after_run && !self.running {
+                        break;
+                    }
                 }
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
@@ -1124,6 +1129,14 @@ impl TuiApp {
         self.record_input_history(display_text.clone()).await;
         if is_tui_exit_command(&text) {
             self.cells.push(HistoryCell::user(display_text));
+            if self.running {
+                self.exit_after_run = true;
+                self.request_cancel_current_run();
+                self.cells.push(HistoryCell::system(
+                    "收到退出请求，正在取消当前 run 并保存已产生的对话...",
+                ));
+                return Ok(false);
+            }
             return Ok(true);
         }
         if is_tui_fork_command(&text) {
@@ -1305,6 +1318,7 @@ impl TuiApp {
         self.running = true;
         self.run_started_at = Some(Instant::now());
         self.interrupt_requested = false;
+        self.exit_after_run = false;
         self.status.state = "running".to_string();
         self.status.last_error = None;
         self.last_stats_snapshot = TokenStatsSnapshot::default();
@@ -1753,7 +1767,9 @@ impl TuiApp {
                 self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
                 self.refresh_command_catalog();
-                if let Some(next) = self.queued_inputs.pop_front() {
+                if self.exit_after_run {
+                    self.queued_inputs.clear();
+                } else if let Some(next) = self.queued_inputs.pop_front() {
                     self.start_turn(next);
                 }
             }
@@ -1955,27 +1971,7 @@ impl TuiApp {
             return false;
         }
         if self.running {
-            if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
-                self.status.state = "cancelling".to_string();
-                return false;
-            }
-            if let Some(cancel) = &self.cancel {
-                cancel.notify_waiters();
-            }
-            self.status.state = "cancelling".to_string();
-            self.active_tool_args.clear();
-            self.active_tool_names.clear();
-            self.active_tool_started_at.clear();
-            self.sub_tool_args.clear();
-            self.sub_tool_names.clear();
-            self.sub_sessions.clear();
-            self.opened_sub_session_panes.clear();
-            self.supervisors.clear();
-            self.pending_approval = None;
-            self.approval_selected = 0;
-            self.approval_state = "waiting";
-            self.active_supervisor_id = None;
-            self.refresh_command_catalog();
+            self.request_cancel_current_run();
             return false;
         }
         if self.quit_hint_active() {
@@ -1983,6 +1979,30 @@ impl TuiApp {
         }
         self.quit_hint_until = Some(Instant::now() + QUIT_HINT_TIMEOUT);
         false
+    }
+
+    fn request_cancel_current_run(&mut self) {
+        if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
+            self.status.state = "cancelling".to_string();
+            return;
+        }
+        if let Some(cancel) = &self.cancel {
+            cancel.notify_waiters();
+        }
+        self.status.state = "cancelling".to_string();
+        self.active_tool_args.clear();
+        self.active_tool_names.clear();
+        self.active_tool_started_at.clear();
+        self.sub_tool_args.clear();
+        self.sub_tool_names.clear();
+        self.sub_sessions.clear();
+        self.opened_sub_session_panes.clear();
+        self.supervisors.clear();
+        self.pending_approval = None;
+        self.approval_selected = 0;
+        self.approval_state = "waiting";
+        self.active_supervisor_id = None;
+        self.refresh_command_catalog();
     }
 
     fn quit_hint_active(&self) -> bool {

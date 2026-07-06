@@ -161,6 +161,8 @@ pub enum CatEvent {
     Done,
     /// Run was cooperatively cancelled.
     Cancelled,
+    /// A user action intentionally interrupted the run without treating it as an error.
+    UserInterrupted { reason: String },
     /// An error occurred (run aborted).
     Error(AgentError),
     /// Model thinking/reasoning content (from extended thinking).

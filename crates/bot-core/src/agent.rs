@@ -11,7 +11,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::stream;
-use futures::{future::join_all, Stream, StreamExt};
+use futures::{
+    future::{FutureExt, LocalBoxFuture},
+    stream::FuturesUnordered,
+    Stream, StreamExt,
+};
 use tracing::debug;
 
 use bot_runtime_core::{
@@ -264,6 +268,7 @@ where
 
         stream! {
             let run_start = Instant::now();
+            let cancel_signal = options.cancel.clone();
             tracing::info!(
                 thread_id = %log_thread_id,
                 run_id = %log_run_id,
@@ -275,7 +280,7 @@ where
                 "agent_run.start"
             );
             let mut agent_loop = CoreAgentLoop::new(CoreDriveConfig {
-                cancel: options.cancel,
+                cancel: cancel_signal.clone(),
                 max_tool_rounds: supervisor_run.then_some(SUPERVISOR_MAX_TOOL_ROUNDS),
             });
 
@@ -379,17 +384,6 @@ where
                                 let mut approved_local = Vec::new();
                                 for original_tc in &local {
                                     let mut tc = original_tc.clone();
-                                    log_tool_call_started(
-                                        "local",
-                                        &state.thread_id.0,
-                                        &state.run_id.0,
-                                        &tc,
-                                    );
-                                    yield CatEvent::ToolCall {
-                                        id: tc.id.clone(),
-                                        name: tc.name.clone(),
-                                        args: tc.arguments.clone(),
-                                    };
                                     let hook_context = hook_context_from_state(
                                         &state,
                                         &workspace_root,
@@ -456,6 +450,7 @@ where
                                             }
                                         }
                                     }
+                                    let mut user_interrupted_by_approval_deny = false;
                                     let approval_resolution = match wait {
                                         ApprovalWait::Immediate(resolution) => {
                                             tracing::info!(
@@ -523,6 +518,8 @@ where
                                             } else {
                                                 crate::approval::ToolApprovalDecision::Deny
                                             };
+                                            user_interrupted_by_approval_deny = should_wait
+                                                && decision == crate::approval::ToolApprovalDecision::Deny;
                                             tracing::info!(
                                                 thread_id = %state.thread_id.0,
                                                 run_id = %state.run_id.0,
@@ -545,6 +542,17 @@ where
                                         }
                                     };
                                     if approval_resolution == ApprovalResolution::Approved {
+                                        log_tool_call_started(
+                                            "local",
+                                            &state.thread_id.0,
+                                            &state.run_id.0,
+                                            &tc,
+                                        );
+                                        yield CatEvent::ToolCall {
+                                            id: tc.id.clone(),
+                                            name: tc.name.clone(),
+                                            args: tc.arguments.clone(),
+                                        };
                                         approved_local.push(tc.clone());
                                     } else {
                                         tracing::info!(
@@ -555,6 +563,11 @@ where
                                             "tool_approval.denied_abort"
                                         );
                                         yield stats_event(stats);
+                                        if user_interrupted_by_approval_deny {
+                                            yield CatEvent::UserInterrupted {
+                                                reason: "tool approval denied by user".to_string(),
+                                            };
+                                        }
                                         yield CatEvent::Done;
                                         return;
                                     }
@@ -579,14 +592,33 @@ where
                                     "tool_batch.execute_start"
                                 );
                                 let batch_started = Instant::now();
-                                let results = execute_runtime_tools(
+                                let execute_fut = execute_runtime_tools(
                                     &self.local_tools,
                                     self.model_tools.as_ref(),
                                     &approved_local,
                                     &resume_map,
                                     &tool_ctx,
-                                )
-                                .await;
+                                );
+                                tokio::pin!(execute_fut);
+                                let results = if let Some(cancel) = cancel_signal.as_ref() {
+                                    tokio::select! {
+                                        _ = cancel.notified() => {
+                                            tracing::info!(
+                                                thread_id = %state.thread_id.0,
+                                                run_id = %state.run_id.0,
+                                                tool_kind = "local",
+                                                approved_count = approved_local.len(),
+                                                elapsed_ms = batch_started.elapsed().as_millis() as u64,
+                                                "tool_batch.cancelled"
+                                            );
+                                            yield CatEvent::Cancelled;
+                                            return;
+                                        }
+                                        results = &mut execute_fut => results,
+                                    }
+                                } else {
+                                    execute_fut.await
+                                };
                                 tracing::info!(
                                     thread_id = %state.thread_id.0,
                                     run_id = %state.run_id.0,
@@ -597,14 +629,15 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
-                                let mut collect_fut = std::pin::pin!(collect_tool_results_parallel(
+                                let mut pending_results = collect_tool_result_futures(
                                     results,
                                     &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
-                                ));
-                                let collected_results = loop {
+                                );
+                                let mut completed_contents: HashMap<String, Content> = HashMap::new();
+                                while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
@@ -621,71 +654,88 @@ where
                                                 return;
                                             }
                                         }
-                                        collected = &mut collect_fut => {
-                                            break collected;
+                                        Some((call_id, mut collected)) = pending_results.next() => {
+                                            let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
+                                            let elapsed_ms = started_at
+                                                .get(&call_id)
+                                                .map(|instant| instant.elapsed().as_millis() as u64)
+                                                .unwrap_or(0);
+                                            let hook_context = hook_context_from_state(
+                                                &state,
+                                                &workspace_root,
+                                            );
+                                            let post_hook = hook_manager
+                                                .run_tool(
+                                                    HookEventName::PostToolUse,
+                                                    &hook_context,
+                                                    &tool_hook_context(
+                                                        tc,
+                                                        Some(serde_json::Value::String(collected.preview.clone())),
+                                                    ),
+                                                )
+                                                .await;
+                                            if post_hook.blocked {
+                                                let blocked = post_hook
+                                                    .reason
+                                                    .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
+                                                collected = CollectedToolResult::text(blocked);
+                                            }
+                                            let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
+                                            log_tool_call_finished(
+                                                "local",
+                                                &state.thread_id.0,
+                                                &state.run_id.0,
+                                                tc,
+                                                &collected,
+                                                success,
+                                                elapsed_ms,
+                                            );
+
+                                            yield CatEvent::ToolCallResult {
+                                                id: call_id.clone(),
+                                                name: tc.name.clone(),
+                                                args: tc.arguments.clone(),
+                                                result: collected.preview.clone(),
+                                                success,
+                                                elapsed_ms,
+                                            };
+                                            yield stats_event(stats);
+
+                                            for side_ev in make_side_events(tc, &collected.preview) {
+                                                yield side_ev;
+                                            }
+                                            for side_ev in collected.side_events.clone() {
+                                                yield side_ev;
+                                            }
+
+                                            completed_contents.insert(call_id, collected.content);
+                                        }
+                                        _ = async {
+                                            if let Some(cancel) = cancel_signal.as_ref() {
+                                                cancel.notified().await;
+                                            } else {
+                                                std::future::pending::<()>().await;
+                                            }
+                                        } => {
+                                            tracing::info!(
+                                                thread_id = %state.thread_id.0,
+                                                run_id = %state.run_id.0,
+                                                tool_kind = "local",
+                                                "tool_result_collection.cancelled"
+                                            );
+                                            yield CatEvent::Cancelled;
+                                            return;
                                         }
                                     }
-                                };
-
-                                for (call_id, mut collected) in collected_results {
-                                    let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
-                                    let elapsed_ms = started_at
-                                        .get(&call_id)
-                                        .map(|instant| instant.elapsed().as_millis() as u64)
-                                        .unwrap_or(0);
-                                    let hook_context = hook_context_from_state(
-                                        &state,
-                                        &workspace_root,
-                                    );
-                                    let post_hook = hook_manager
-                                        .run_tool(
-                                            HookEventName::PostToolUse,
-                                            &hook_context,
-                                            &tool_hook_context(
-                                                tc,
-                                                Some(serde_json::Value::String(collected.preview.clone())),
-                                            ),
-                                        )
-                                        .await;
-                                    if post_hook.blocked {
-                                        let blocked = post_hook
-                                            .reason
-                                            .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
-                                        collected = CollectedToolResult::text(blocked);
+                                }
+                                for tc in &approved_local {
+                                    if let Some(content) = completed_contents.remove(&tc.id) {
+                                        all_outcomes.push(ToolCallOutcome::Result {
+                                            tool_call_id: tc.id.clone(),
+                                            tool_name: tc.name.clone(),
+                                            content,
+                                        });
                                     }
-                                    let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
-                                    log_tool_call_finished(
-                                        "local",
-                                        &state.thread_id.0,
-                                        &state.run_id.0,
-                                        tc,
-                                        &collected,
-                                        success,
-                                        elapsed_ms,
-                                    );
-
-                                    yield CatEvent::ToolCallResult {
-                                        id: call_id.clone(),
-                                        name: tc.name.clone(),
-                                        args: tc.arguments.clone(),
-                                        result: collected.preview.clone(),
-                                        success,
-                                        elapsed_ms,
-                                    };
-                                    yield stats_event(stats);
-
-                                    for side_ev in make_side_events(tc, &collected.preview) {
-                                        yield side_ev;
-                                    }
-                                    for side_ev in collected.side_events.clone() {
-                                        yield side_ev;
-                                    }
-
-                                    all_outcomes.push(ToolCallOutcome::Result {
-                                        tool_call_id: call_id,
-                                        tool_name: tc.name.clone(),
-                                        content: collected.content,
-                                    });
                                 }
                                 state.user_state = tool_ctx.user_state.read().unwrap().clone();
                                 yield CatEvent::StateUpdate(state.user_state.clone());
@@ -695,17 +745,6 @@ where
                                 let mut approved_dynamic = Vec::new();
                                 for original_tc in &dynamic {
                                     let mut tc = original_tc.clone();
-                                    log_tool_call_started(
-                                        "dynamic",
-                                        &state.thread_id.0,
-                                        &state.run_id.0,
-                                        &tc,
-                                    );
-                                    yield CatEvent::ToolCall {
-                                        id: tc.id.clone(),
-                                        name: tc.name.clone(),
-                                        args: tc.arguments.clone(),
-                                    };
                                     let hook_context = hook_context_from_state(
                                         &state,
                                         &workspace_root,
@@ -772,6 +811,7 @@ where
                                             }
                                         }
                                     }
+                                    let mut user_interrupted_by_approval_deny = false;
                                     let approval_resolution = match wait {
                                         ApprovalWait::Immediate(resolution) => {
                                             tracing::info!(
@@ -839,6 +879,8 @@ where
                                             } else {
                                                 crate::approval::ToolApprovalDecision::Deny
                                             };
+                                            user_interrupted_by_approval_deny = should_wait
+                                                && decision == crate::approval::ToolApprovalDecision::Deny;
                                             tracing::info!(
                                                 thread_id = %state.thread_id.0,
                                                 run_id = %state.run_id.0,
@@ -861,6 +903,17 @@ where
                                         }
                                     };
                                     if approval_resolution == ApprovalResolution::Approved {
+                                        log_tool_call_started(
+                                            "dynamic",
+                                            &state.thread_id.0,
+                                            &state.run_id.0,
+                                            &tc,
+                                        );
+                                        yield CatEvent::ToolCall {
+                                            id: tc.id.clone(),
+                                            name: tc.name.clone(),
+                                            args: tc.arguments.clone(),
+                                        };
                                         approved_dynamic.push(tc.clone());
                                     } else {
                                         tracing::info!(
@@ -871,6 +924,11 @@ where
                                             "tool_approval.denied_abort"
                                         );
                                         yield stats_event(stats);
+                                        if user_interrupted_by_approval_deny {
+                                            yield CatEvent::UserInterrupted {
+                                                reason: "tool approval denied by user".to_string(),
+                                            };
+                                        }
                                         yield CatEvent::Done;
                                         return;
                                     }
@@ -895,9 +953,28 @@ where
                                     "tool_batch.execute_start"
                                 );
                                 let batch_started = Instant::now();
-                                let results = dynamic_tools
-                                    .execute_parallel(&approved_dynamic, &resume_map, &tool_ctx)
-                                    .await;
+                                let execute_fut =
+                                    dynamic_tools.execute_parallel(&approved_dynamic, &resume_map, &tool_ctx);
+                                tokio::pin!(execute_fut);
+                                let results = if let Some(cancel) = cancel_signal.as_ref() {
+                                    tokio::select! {
+                                        _ = cancel.notified() => {
+                                            tracing::info!(
+                                                thread_id = %state.thread_id.0,
+                                                run_id = %state.run_id.0,
+                                                tool_kind = "dynamic",
+                                                approved_count = approved_dynamic.len(),
+                                                elapsed_ms = batch_started.elapsed().as_millis() as u64,
+                                                "tool_batch.cancelled"
+                                            );
+                                            yield CatEvent::Cancelled;
+                                            return;
+                                        }
+                                        results = &mut execute_fut => results,
+                                    }
+                                } else {
+                                    execute_fut.await
+                                };
                                 tracing::info!(
                                     thread_id = %state.thread_id.0,
                                     run_id = %state.run_id.0,
@@ -908,14 +985,15 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
-                                let mut collect_fut = std::pin::pin!(collect_tool_results_parallel(
+                                let mut pending_results = collect_tool_result_futures(
                                     results,
                                     &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
-                                ));
-                                let collected_results = loop {
+                                );
+                                let mut completed_contents: HashMap<String, Content> = HashMap::new();
+                                while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
@@ -932,67 +1010,84 @@ where
                                                 return;
                                             }
                                         }
-                                        collected = &mut collect_fut => {
-                                            break collected;
+                                        Some((call_id, mut collected)) = pending_results.next() => {
+                                            let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
+                                            let elapsed_ms = started_at
+                                                .get(&call_id)
+                                                .map(|instant| instant.elapsed().as_millis() as u64)
+                                                .unwrap_or(0);
+                                            let hook_context = hook_context_from_state(
+                                                &state,
+                                                &workspace_root,
+                                            );
+                                            let post_hook = hook_manager
+                                                .run_tool(
+                                                    HookEventName::PostToolUse,
+                                                    &hook_context,
+                                                    &tool_hook_context(
+                                                        tc,
+                                                        Some(serde_json::Value::String(collected.preview.clone())),
+                                                    ),
+                                                )
+                                                .await;
+                                            if post_hook.blocked {
+                                                let blocked = post_hook
+                                                    .reason
+                                                    .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
+                                                collected = CollectedToolResult::text(blocked);
+                                            }
+                                            let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
+                                            log_tool_call_finished(
+                                                "dynamic",
+                                                &state.thread_id.0,
+                                                &state.run_id.0,
+                                                tc,
+                                                &collected,
+                                                success,
+                                                elapsed_ms,
+                                            );
+
+                                            yield CatEvent::ToolCallResult {
+                                                id: call_id.clone(),
+                                                name: tc.name.clone(),
+                                                args: tc.arguments.clone(),
+                                                result: collected.preview.clone(),
+                                                success,
+                                                elapsed_ms,
+                                            };
+                                            yield stats_event(stats);
+                                            for side_ev in collected.side_events.clone() {
+                                                yield side_ev;
+                                            }
+
+                                            completed_contents.insert(call_id, collected.content);
+                                        }
+                                        _ = async {
+                                            if let Some(cancel) = cancel_signal.as_ref() {
+                                                cancel.notified().await;
+                                            } else {
+                                                std::future::pending::<()>().await;
+                                            }
+                                        } => {
+                                            tracing::info!(
+                                                thread_id = %state.thread_id.0,
+                                                run_id = %state.run_id.0,
+                                                tool_kind = "dynamic",
+                                                "tool_result_collection.cancelled"
+                                            );
+                                            yield CatEvent::Cancelled;
+                                            return;
                                         }
                                     }
-                                };
-
-                                for (call_id, mut collected) in collected_results {
-                                    let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
-                                    let elapsed_ms = started_at
-                                        .get(&call_id)
-                                        .map(|instant| instant.elapsed().as_millis() as u64)
-                                        .unwrap_or(0);
-                                    let hook_context = hook_context_from_state(
-                                        &state,
-                                        &workspace_root,
-                                    );
-                                    let post_hook = hook_manager
-                                        .run_tool(
-                                            HookEventName::PostToolUse,
-                                            &hook_context,
-                                            &tool_hook_context(
-                                                tc,
-                                                Some(serde_json::Value::String(collected.preview.clone())),
-                                            ),
-                                        )
-                                        .await;
-                                    if post_hook.blocked {
-                                        let blocked = post_hook
-                                            .reason
-                                            .unwrap_or_else(|| "error: tool result blocked by hook".to_string());
-                                        collected = CollectedToolResult::text(blocked);
+                                }
+                                for tc in &approved_dynamic {
+                                    if let Some(content) = completed_contents.remove(&tc.id) {
+                                        all_outcomes.push(ToolCallOutcome::Result {
+                                            tool_call_id: tc.id.clone(),
+                                            tool_name: tc.name.clone(),
+                                            content,
+                                        });
                                     }
-                                    let success = crate::tool_pretty::tool_success(&collected.preview) && !post_hook.blocked;
-                                    log_tool_call_finished(
-                                        "dynamic",
-                                        &state.thread_id.0,
-                                        &state.run_id.0,
-                                        tc,
-                                        &collected,
-                                        success,
-                                        elapsed_ms,
-                                    );
-
-                                    yield CatEvent::ToolCallResult {
-                                        id: call_id.clone(),
-                                        name: tc.name.clone(),
-                                        args: tc.arguments.clone(),
-                                        result: collected.preview.clone(),
-                                        success,
-                                        elapsed_ms,
-                                    };
-                                    yield stats_event(stats);
-                                    for side_ev in collected.side_events.clone() {
-                                        yield side_ev;
-                                    }
-
-                                    all_outcomes.push(ToolCallOutcome::Result {
-                                        tool_call_id: call_id,
-                                        tool_name: tc.name.clone(),
-                                        content: collected.content,
-                                    });
                                 }
                             }
 
@@ -1538,6 +1633,7 @@ fn preview_text_for_content(content: &Content) -> String {
     }
 }
 
+#[cfg(test)]
 async fn collect_tool_results_parallel<'a>(
     results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
     tool_names: &HashMap<String, String>,
@@ -1563,7 +1659,38 @@ async fn collect_tool_results_parallel<'a>(
             (call_id, collected)
         }
     });
-    join_all(futures).await
+    futures::future::join_all(futures).await
+}
+
+fn collect_tool_result_futures<'a>(
+    results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
+    tool_names: &HashMap<String, String>,
+    data_dir: &Path,
+    overflow_bytes: usize,
+    side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
+) -> FuturesUnordered<LocalBoxFuture<'a, (String, CollectedToolResult)>> {
+    let data_dir = data_dir.to_path_buf();
+    results
+        .into_iter()
+        .map(|(call_id, result)| {
+            let data_dir = data_dir.clone();
+            let side_event_tx = side_event_tx.clone();
+            let tool_name = tool_names.get(&call_id).cloned().unwrap_or_default();
+            async move {
+                let collected = collect_result_with_overflow(
+                    result,
+                    &data_dir,
+                    overflow_bytes,
+                    side_event_tx,
+                    Some(call_id.as_str()),
+                    tool_name.as_str(),
+                )
+                .await;
+                (call_id, collected)
+            }
+            .boxed_local()
+        })
+        .collect()
 }
 
 async fn collect_result(
@@ -2328,7 +2455,8 @@ mod tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "label": { "type": "string" }
+                    "label": { "type": "string" },
+                    "delay_ms": { "type": "integer" }
                 },
                 "required": ["label"]
             })
@@ -2345,10 +2473,51 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let delay_ms = arguments
+                .get("delay_ms")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(300);
             Ok(ToolResult::Output(async_stream::stream! {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 yield ToolOutput::text(label);
             }))
+        }
+    }
+
+    struct StaggeredParallelToolInnerAgent;
+
+    impl Agent for StaggeredParallelToolInnerAgent {
+        type Request = LoopInput;
+        type Response = remi_agentloop::types::AgentEvent;
+        type Error = AgentError;
+
+        async fn chat(
+            &self,
+            req: Self::Request,
+        ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
+            match req {
+                LoopInput::Start { .. } => Ok(stream::iter(vec![
+                    remi_agentloop::types::AgentEvent::NeedToolExecution {
+                        state: AgentState::new(StepConfig::new("test-model")),
+                        tool_calls: vec![
+                            ParsedToolCall {
+                                id: "fast-call".to_string(),
+                                name: "lazy_wait".to_string(),
+                                arguments: serde_json::json!({ "label": "fast", "delay_ms": 50 }),
+                            },
+                            ParsedToolCall {
+                                id: "slow-call".to_string(),
+                                name: "lazy_wait".to_string(),
+                                arguments: serde_json::json!({ "label": "slow", "delay_ms": 300 }),
+                            },
+                        ],
+                        completed_results: vec![],
+                    },
+                ])),
+                LoopInput::Resume { .. } | LoopInput::Cancel { .. } => {
+                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
+                }
+            }
         }
     }
 
@@ -2689,6 +2858,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cat_agent_streams_parallel_tool_results_as_each_finishes() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(LazyWaitTool);
+        let agent = CatAgent {
+            inner: StaggeredParallelToolInnerAgent,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+        };
+
+        let started = Instant::now();
+        let stream = agent.stream_with_input(LoopInput::start("run staggered tools"));
+        tokio::pin!(stream);
+        let mut saw_slow_before_fast = false;
+
+        while let Some(event) = stream.next().await {
+            match event {
+                CatEvent::ToolCallResult { id, .. } if id == "slow-call" => {
+                    saw_slow_before_fast = true;
+                }
+                CatEvent::ToolCallResult { id, result, .. } if id == "fast-call" => {
+                    assert_eq!(result, "fast");
+                    assert!(
+                        started.elapsed() < Duration::from_millis(200),
+                        "fast tool result was delayed until the slow tool finished"
+                    );
+                    assert!(!saw_slow_before_fast);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        panic!("fast tool result was not emitted");
+    }
+
+    #[tokio::test]
     async fn cat_agent_injects_steer_after_tool_results_at_tool_gap() {
         let queue = Arc::new(CoreSteerQueue::new());
         let mut local_tools = DefaultToolRegistry::new();
@@ -2874,6 +3090,9 @@ mod tests {
                         && *decision == crate::approval::ToolApprovalDecision::Deny
             )
         }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::ToolCall { id, .. } if id == "send-call")));
         assert!(!events.iter().any(
             |event| matches!(event, CatEvent::ToolCallResult { id, .. } if id == "send-call")
         ));

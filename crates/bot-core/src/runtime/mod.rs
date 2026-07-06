@@ -172,7 +172,7 @@ pub struct StreamOptions {
     /// Feishu document links referenced by the current message.
     pub im_documents: Vec<ImDocument>,
     /// Optional cooperative-cancel signal.  When the wrapped [`Notify`] is
-    /// signalled (via `notify_one()`), `stream_with_options` will persist any
+    /// signalled (via `notify_waiters()`), `stream_with_options` will persist any
     /// already-generated content and yield a final [`CatEvent::Done`] before
     /// returning — so memory is not lost on preemption.
     pub cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -205,6 +205,7 @@ struct LocalAcpAgentRunner {
     agent: CatAgent<InnerAgent>,
     memory: Arc<MemoryStore>,
     run_locks: ThreadRunLocks,
+    system_prompt: String,
 }
 
 struct SteerQueueRegistration {
@@ -252,6 +253,7 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
             let _run_guard = run_lock.lock().await;
             let mut ctx = self.memory.load_context(&thread_id).await?;
             let mut history = build_injected_history(&ctx);
+            history.insert(0, Message::system(self.system_prompt.clone()));
             append_thread_todo_system_prompt(&mut history, &ctx.user_state);
             let skip_count = history.len();
             let input = LoopInput::start(message)
@@ -1104,6 +1106,81 @@ impl CatBot {
         Some((report, instance))
     }
 
+    async fn pause_workflow_for_user_interruption(
+        &self,
+        thread_id: &str,
+        round: u32,
+        reason: &str,
+    ) -> Option<(WorkflowReport, WorkflowInstance)> {
+        let mut instance = self.workflow_status(thread_id).await?;
+        if instance.status != WorkflowStatus::Active {
+            return None;
+        }
+        instance.status = WorkflowStatus::Paused;
+        instance.pause_reason = Some(supervisor_workflow::WorkflowPauseReason::Interrupted);
+        instance.updated_at = chrono::Utc::now();
+        let report = WorkflowReport {
+            workflow_id: instance.definition.id.clone(),
+            workflow_name: instance.definition.name.clone(),
+            from_node: instance.current_node.clone(),
+            edge: None,
+            to_node: instance.current_node.clone(),
+            path_edges: Vec::new(),
+            path_nodes: Vec::new(),
+            status: WorkflowStatus::Paused,
+            reason: reason.to_string(),
+            agent_message: None,
+            next_node_message: instance.node_message.clone(),
+            supervisor_trace: Vec::new(),
+            round,
+            max_rounds: instance.max_rounds.clone(),
+            error: None,
+        };
+        instance.last_report = Some(report.clone());
+        if let Err(err) = self.save_workflow_instance(thread_id, &instance).await {
+            tracing::warn!(thread_id, error = %err, "failed to save workflow interruption pause");
+        }
+        Some((report, instance))
+    }
+
+    async fn resume_workflow_from_user_interruption(
+        &self,
+        thread_id: &str,
+        round: u32,
+    ) -> Option<(WorkflowReport, WorkflowInstance)> {
+        let mut instance = self.workflow_status(thread_id).await?;
+        if instance.status != WorkflowStatus::Paused
+            || instance.pause_reason != Some(supervisor_workflow::WorkflowPauseReason::Interrupted)
+        {
+            return None;
+        }
+        instance.status = WorkflowStatus::Active;
+        instance.pause_reason = None;
+        instance.updated_at = chrono::Utc::now();
+        let report = WorkflowReport {
+            workflow_id: instance.definition.id.clone(),
+            workflow_name: instance.definition.name.clone(),
+            from_node: instance.current_node.clone(),
+            edge: Some("interrupted_resume".to_string()),
+            to_node: instance.current_node.clone(),
+            path_edges: vec!["interrupted_resume".to_string()],
+            path_nodes: vec![instance.current_node.clone()],
+            status: WorkflowStatus::Active,
+            reason: "user input received; resuming workflow".to_string(),
+            agent_message: None,
+            next_node_message: instance.node_message.clone(),
+            supervisor_trace: Vec::new(),
+            round,
+            max_rounds: instance.max_rounds.clone(),
+            error: None,
+        };
+        instance.last_report = Some(report.clone());
+        if let Err(err) = self.save_workflow_instance(thread_id, &instance).await {
+            tracing::warn!(thread_id, error = %err, "failed to save workflow interruption resume");
+        }
+        Some((report, instance))
+    }
+
     pub async fn stop_workflow(&self, thread_id: &str) -> Result<(), AgentError> {
         self.pause_workflow(thread_id).await
     }
@@ -1579,9 +1656,19 @@ impl CatBot {
                 let mut supervisor_round: u32 = 0;
                 let mut continuation_from_supervisor = false;
                 let mut stop_hook_active = false;
+                let mut interruption_resume_checked = false;
                 let turn_started = Instant::now();
 
                 'workflow_loop: loop {
+                if !interruption_resume_checked && !opts.supervisor_run {
+                    interruption_resume_checked = true;
+                    if let Some((report, _instance)) = self
+                        .resume_workflow_from_user_interruption(&thread_id_owned, supervisor_round)
+                        .await
+                    {
+                        yield CatEvent::Supervisor(report);
+                    }
+                }
                 let workflow_agent_id = self
                     .workflow_status(&thread_id_owned)
                     .await
@@ -1709,8 +1796,12 @@ impl CatBot {
 
                 // 2. Build injected history prefix; record its length to strip later.
                 let mut history = build_injected_history(&ctx);
+                history.insert(
+                    0,
+                    Message::system(effective_agent.profile.system_prompt.clone()),
+                );
                 let agent_header_count =
-                    usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
+                    1 + usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
                 let skill_prompt_tools = skill_prompt_tool_availability(active_agent);
                 insert_skill_injection_prompts(
                     &mut history,
@@ -1946,6 +2037,7 @@ impl CatBot {
                 let mut raw_user_state: Option<serde_json::Value> = None;
                 let mut tool_elapsed_ms = HashMap::<String, u64>::new();
                 let mut user_question_requested_this_round = false;
+                let mut workflow_interrupted_this_round = false;
                 let mut workflow_user_state_override: Option<WorkflowInstance> = None;
                 let inner_stream = active_agent.stream_with_input_and_options(
                     input,
@@ -1965,6 +2057,30 @@ impl CatBot {
                                 elapsed_ms = turn_started.elapsed().as_millis() as u64,
                                 "agent_turn.cancelled"
                             );
+                            if !round_opts.supervisor_run {
+                                if let Some((report, instance)) = self
+                                    .pause_workflow_for_user_interruption(
+                                        &thread_id_owned,
+                                        supervisor_round,
+                                        "interrupted by user",
+                                    )
+                                    .await
+                                {
+                                    workflow_user_state_override = Some(instance);
+                                    if raw_user_state.is_none() {
+                                        raw_user_state = Some(initial_user_state.clone());
+                                    }
+                                    if let Some(user_state) = raw_user_state.as_mut() {
+                                        if let Some(instance) = workflow_user_state_override.as_ref() {
+                                            let _ = supervisor_workflow::set_instance_in_user_state(
+                                                user_state,
+                                                instance,
+                                            );
+                                        }
+                                    }
+                                    yield CatEvent::Supervisor(report);
+                                }
+                            }
                             for event in persist_turn(
                                 &self.memory, &thread_id_owned,
                                 raw_history.take().or_else(|| partial_turn.synthesize_history()),
@@ -1975,6 +2091,33 @@ impl CatBot {
                             }
                             yield CatEvent::Done;
                             return;
+                        }
+                        CatEvent::UserInterrupted { reason } => {
+                            if !round_opts.supervisor_run {
+                                workflow_interrupted_this_round = true;
+                                if let Some((report, instance)) = self
+                                    .pause_workflow_for_user_interruption(
+                                        &thread_id_owned,
+                                        supervisor_round,
+                                        &reason,
+                                    )
+                                    .await
+                                {
+                                    workflow_user_state_override = Some(instance);
+                                    if raw_user_state.is_none() {
+                                        raw_user_state = Some(initial_user_state.clone());
+                                    }
+                                    if let Some(user_state) = raw_user_state.as_mut() {
+                                        if let Some(instance) = workflow_user_state_override.as_ref() {
+                                            let _ = supervisor_workflow::set_instance_in_user_state(
+                                                user_state,
+                                                instance,
+                                            );
+                                        }
+                                    }
+                                    yield CatEvent::Supervisor(report);
+                                }
+                            }
                         }
                         CatEvent::History(msgs, mut us) => {
                             if workflow_user_state_override.is_some() {
@@ -2169,7 +2312,10 @@ impl CatBot {
                                 ).await {
                                     yield event;
                                 }
-                                if !round_opts.supervisor_run && !user_question_requested_this_round {
+                                if !round_opts.supervisor_run
+                                    && !user_question_requested_this_round
+                                    && !workflow_interrupted_this_round
+                                {
                                     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                                     let evaluation = self.evaluate_workflow_after_round(
                                         &thread_id_owned,
@@ -2866,6 +3012,7 @@ impl CatBotBuilder {
             },
             memory: Arc::clone(&memory),
             run_locks: Arc::clone(&run_locks),
+            system_prompt: system_prompt.clone(),
         }));
         let tool_deps = LocalToolDeps {
             skill_store: Arc::clone(&skill_store),
@@ -4332,6 +4479,248 @@ You are Remi.
         assert!(persisted.contains("partial answer"));
     }
 
+    #[tokio::test]
+    async fn cancelled_stream_pauses_active_supervisor_without_evaluation() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let (base_url, requests) = start_slow_openai_mock_server("partial answer").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
+        }
+        .build()
+        .unwrap();
+
+        let thread_id = "cancel-pauses-supervisor";
+        bot.set_goal(thread_id, "pause on cancel", GoalMaxRounds::Limited(1))
+            .await
+            .unwrap();
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let mut stream = std::pin::pin!(bot.stream_with_options(
+            thread_id,
+            Content::text("start"),
+            StreamOptions {
+                cancel: Some(Arc::clone(&cancel)),
+                ..StreamOptions::default()
+            },
+        ));
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let CatEvent::Text(text) = &event {
+                if text.contains("partial answer") {
+                    cancel.notify_one();
+                }
+            }
+            let done = matches!(event, CatEvent::Done);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report)
+                if report.status == WorkflowStatus::Paused
+                    && report.reason == "interrupted by user"
+        )));
+        let instance = bot.workflow_status(thread_id).await.unwrap();
+        assert_eq!(instance.status, WorkflowStatus::Paused);
+        assert_eq!(
+            instance.pause_reason,
+            Some(supervisor_workflow::WorkflowPauseReason::Interrupted)
+        );
+        assert_eq!(requests.lock().expect("request lock poisoned").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_denied_approval_pauses_supervisor_and_next_input_resumes() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let responses = vec![
+            sse_tool_call(
+                "call_write",
+                "fs_write",
+                json!({
+                    "path": "deny.txt",
+                    "content": "denied"
+                }),
+            ),
+            sse_text("after resume"),
+            sse_text(
+                r#"{"edge":"complete","agent_message":null,"next_node_message":null,"reason":"resumed and completed"}"#,
+            ),
+        ];
+        let (base_url, requests) = start_openai_mock_server(responses).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(4),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
+        }
+        .build()
+        .unwrap();
+
+        let thread_id = "approval-deny-pauses-supervisor";
+        bot.set_goal(
+            thread_id,
+            "pause on approval deny",
+            GoalMaxRounds::Limited(1),
+        )
+        .await
+        .unwrap();
+        let mut stream = Box::pin(bot.stream_with_options(
+            thread_id,
+            Content::text("try risky command"),
+            StreamOptions {
+                platform: Some("tui".to_string()),
+                ..StreamOptions::default()
+            },
+        ));
+        let mut first_events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("timed out waiting for first-run event: {first_events:?}")
+                });
+            let Some(event) = event else {
+                break;
+            };
+            if let CatEvent::ToolApprovalRequested(request) = &event {
+                bot.approval_manager()
+                    .decide(&request.id, crate::ToolApprovalDecision::Deny)
+                    .await;
+            }
+            let done = matches!(event, CatEvent::Done);
+            first_events.push(event);
+            if done {
+                break;
+            }
+        }
+        drop(stream);
+
+        assert!(first_events.iter().any(|event| matches!(
+            event,
+            CatEvent::ToolApprovalResolved { decision, .. }
+                if *decision == crate::ToolApprovalDecision::Deny
+        )));
+        assert!(first_events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report)
+                if report.status == WorkflowStatus::Paused
+                    && report.reason == "tool approval denied by user"
+        )));
+        assert!(!first_events.iter().any(
+            |event| matches!(event, CatEvent::ToolCallResult { name, .. } if name == "fs_write")
+        ));
+        assert_eq!(requests.lock().expect("request lock poisoned").len(), 1);
+        let instance = bot.workflow_status(thread_id).await.unwrap();
+        assert_eq!(instance.status, WorkflowStatus::Paused);
+        assert_eq!(
+            instance.pause_reason,
+            Some(supervisor_workflow::WorkflowPauseReason::Interrupted)
+        );
+
+        let mut second_stream = Box::pin(bot.stream(thread_id, "continue after denial"));
+        let mut second_events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), second_stream.next())
+                .await
+                .unwrap_or_else(|_| {
+                    let request_count = requests.lock().expect("request lock poisoned").len();
+                    panic!(
+                        "timed out waiting for resume-run event after {request_count} requests: {second_events:?}"
+                    )
+                });
+            let Some(event) = event else {
+                break;
+            };
+            if let CatEvent::Error(err) = &event {
+                panic!("resume stream error: {err}");
+            }
+            let done = matches!(event, CatEvent::Done);
+            second_events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(second_events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report)
+                if report.status == WorkflowStatus::Active
+                    && report.reason == "user input received; resuming workflow"
+        )));
+        assert!(second_events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Text(text) if text.contains("after resume"))));
+        assert!(second_events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report)
+                if report.status == WorkflowStatus::Completed
+                    && report.reason == "resumed and completed"
+        )));
+        let instance = bot.workflow_status(thread_id).await.unwrap();
+        assert_eq!(instance.status, WorkflowStatus::Completed);
+        assert_eq!(requests.lock().expect("request lock poisoned").len(), 3);
+    }
+
     #[test]
     fn context_percent_tokens_defaults_to_eighty_percent_of_context() {
         let profile = test_model_profile();
@@ -4985,6 +5374,26 @@ You are Remi.
             .get("messages")
             .and_then(serde_json::Value::as_array)
             .expect("request should contain messages");
+        let system_messages = messages
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+            })
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            system_messages
+                .iter()
+                .any(|content| content.contains("Pinned skills are only a curated subset")),
+            "request should contain updated default system prompt: {system_messages:#?}"
+        );
+        assert!(
+            system_messages
+                .iter()
+                .any(|content| content.contains("Before starting substantive work, search for")
+                    && content.contains("relevant skills and memory")),
+            "request should tell the model to search relevant skills and memory: {system_messages:#?}"
+        );
         let pinned_prompt = messages
             .iter()
             .filter(|message| {
@@ -5373,6 +5782,11 @@ fn default_system_prompt() -> String {
      saved details, or anything phrased like \"my ...\", you MUST call search with scope=memory \
      and distinctive keywords from the question before giving the final answer. Do not say prior \
      information is unavailable until you have searched memory. \
+     Pinned skills are only a curated subset of available skills. More relevant skills may exist \
+     beyond the pinned list; use search to discover skill catalog entries and saved memory. Before \
+     starting substantive work, search for relevant skills and memory so the answer is informed by \
+     reusable procedures and prior context instead of relying only on the visible pinned skills or \
+     the current conversation. \
      If the user asks you to remember, store, keep, or use a long note, transcript, document excerpt, \
      or historical conversation as future context, use memory__upsert_named to save a concise but \
      complete named memory before acknowledging it; do not rely only on short-term chat history. \

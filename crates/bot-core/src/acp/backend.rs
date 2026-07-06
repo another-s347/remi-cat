@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk, InitializeRequest,
-    LoadSessionRequest, NewSessionResponse, SessionNotification, SessionUpdate as AcpSessionUpdate,
+    LoadSessionRequest, NewSessionRequest, NewSessionResponse, SessionNotification,
+    SessionUpdate as AcpSessionUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
@@ -47,6 +48,8 @@ struct AcpSessionRecord {
     title: Option<String>,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,10 +272,26 @@ pub struct AcpSpawnedToolTask {
 pub struct PreparedToolTurn {
     pub session_id: String,
     pub sub_session_id: String,
+    pub external_session_id: Option<String>,
     pub title: Option<String>,
     pub prompt: String,
     pub message: String,
     pub startup_args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AcpInvocationResult {
+    reply: String,
+    external_session_id: Option<String>,
+}
+
+impl AcpInvocationResult {
+    fn new(reply: String) -> Self {
+        Self {
+            reply,
+            external_session_id: None,
+        }
+    }
 }
 
 pub trait AcpLocalRunner: Send + Sync {
@@ -414,6 +433,7 @@ impl AcpBackend {
                 title: request.title.clone(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
+                external_session_id: None,
                 last_summary: None,
                 bound_channel: None,
                 transcript: Vec::new(),
@@ -452,6 +472,7 @@ impl AcpBackend {
         Ok(PreparedToolTurn {
             session_id,
             sub_session_id: record.sub_session_id,
+            external_session_id: record.external_session_id,
             title: record.title,
             prompt,
             message,
@@ -490,9 +511,10 @@ impl AcpBackend {
             prompt_len = prepared.prompt.len(),
             "acp.run.start"
         );
-        let reply = match self
+        let invocation = match self
             .invoke_remote(
                 &prepared.session_id,
+                prepared.external_session_id.as_deref(),
                 &prepared.message,
                 &prepared.prompt,
                 &prepared.startup_args,
@@ -500,7 +522,7 @@ impl AcpBackend {
             )
             .await
         {
-            Ok(reply) => reply,
+            Ok(invocation) => invocation,
             Err(err) => {
                 tracing::warn!(
                     acp_session_id = %prepared.session_id,
@@ -514,6 +536,10 @@ impl AcpBackend {
                 });
             }
         };
+        let AcpInvocationResult {
+            reply,
+            external_session_id,
+        } = invocation;
         let final_summary = reply.trim().to_string();
         let response = AcpToolResponse {
             session_id: prepared.session_id.clone(),
@@ -525,6 +551,7 @@ impl AcpBackend {
             &prepared.message,
             &reply,
             &final_summary,
+            external_session_id.as_deref(),
         )
         .await?;
         tracing::info!(
@@ -563,6 +590,7 @@ impl AcpBackend {
                     invoke_local_acp_stdio(
                         local_bin,
                         &prepared.session_id,
+                        prepared.external_session_id.as_deref(),
                         &prepared.prompt,
                         local_args,
                         event_tx,
@@ -591,6 +619,7 @@ impl AcpBackend {
                 invoke_local_acp_stdio(
                     local_bin,
                     &prepared.session_id,
+                    prepared.external_session_id.as_deref(),
                     &prepared.prompt,
                     local_args,
                     event_tx,
@@ -603,21 +632,20 @@ impl AcpBackend {
                 agent_name,
                 api_key,
                 model,
-            } => {
-                invoke_remote_http(
-                    base_url,
-                    client,
-                    agent_name,
-                    api_key.as_deref(),
-                    model.as_deref(),
-                    &prepared.session_id,
-                    &prepared.prompt,
-                )
-                .await
-            }
+            } => invoke_remote_http(
+                base_url,
+                client,
+                agent_name,
+                api_key.as_deref(),
+                model.as_deref(),
+                &prepared.session_id,
+                &prepared.prompt,
+            )
+            .await
+            .map(AcpInvocationResult::new),
         };
-        let reply = match reply {
-            Ok(reply) => reply,
+        let invocation = match reply {
+            Ok(invocation) => invocation,
             Err(err) => {
                 tracing::warn!(
                     acp_session_id = %prepared.session_id,
@@ -631,6 +659,10 @@ impl AcpBackend {
                 });
             }
         };
+        let AcpInvocationResult {
+            reply,
+            external_session_id,
+        } = invocation;
         let final_summary = reply.trim().to_string();
         let response = AcpToolResponse {
             session_id: prepared.session_id.clone(),
@@ -642,6 +674,7 @@ impl AcpBackend {
             &prepared.message,
             &reply,
             &final_summary,
+            external_session_id.as_deref(),
         )
         .await?;
         tracing::info!(
@@ -882,6 +915,7 @@ impl AcpBackend {
         user_message: &str,
         assistant_reply: &str,
         summary: &str,
+        external_session_id: Option<&str>,
     ) -> Result<()> {
         let mut store = self.store.lock().await;
         let record = store
@@ -890,6 +924,12 @@ impl AcpBackend {
             .with_context(|| format!("ACP session not found while persisting: {session_id}"))?;
         let now = Utc::now().to_rfc3339();
         record.updated_at = now.clone();
+        if let Some(external_session_id) = external_session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            record.external_session_id = Some(external_session_id.to_string());
+        }
         record.last_summary = Some(summary.to_string());
         record.transcript.push(AcpTurnRecord {
             user_message: user_message.to_string(),
@@ -903,11 +943,12 @@ impl AcpBackend {
     async fn invoke_remote(
         &self,
         session_id: &str,
+        external_session_id: Option<&str>,
         message: &str,
         prompt: &str,
         startup_args: &[String],
         event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
-    ) -> Result<String> {
+    ) -> Result<AcpInvocationResult> {
         match &self.config {
             AcpConfig::Local {
                 client,
@@ -924,7 +965,12 @@ impl AcpBackend {
                             "acp.invoke.external_stdio.start"
                         );
                         return invoke_local_acp_stdio(
-                            local_bin, session_id, prompt, local_args, event_tx,
+                            local_bin,
+                            session_id,
+                            external_session_id,
+                            prompt,
+                            local_args,
+                            event_tx,
                         )
                         .await;
                     }
@@ -944,7 +990,10 @@ impl AcpBackend {
                         .ok()
                         .and_then(|slot| slot.as_ref().map(Arc::clone));
                     if let Some(runner) = runner {
-                        runner.run(session_id, message).await
+                        runner
+                            .run(session_id, message)
+                            .await
+                            .map(AcpInvocationResult::new)
                     } else {
                         anyhow::bail!(
                             "local Remi ACP runner is not installed for agent `{agent_name}`"
@@ -967,8 +1016,15 @@ impl AcpBackend {
                     let local_bin = local_bin
                         .as_deref()
                         .context("REMI_ACP_LOCAL_BIN is not configured")?;
-                    invoke_local_acp_stdio(local_bin, session_id, prompt, local_args, event_tx)
-                        .await
+                    invoke_local_acp_stdio(
+                        local_bin,
+                        session_id,
+                        external_session_id,
+                        prompt,
+                        local_args,
+                        event_tx,
+                    )
+                    .await
                 }
             },
             AcpConfig::Remote {
@@ -977,18 +1033,17 @@ impl AcpBackend {
                 agent_name,
                 api_key,
                 model,
-            } => {
-                invoke_remote_http(
-                    base_url,
-                    client,
-                    agent_name,
-                    api_key.as_deref(),
-                    model.as_deref(),
-                    session_id,
-                    prompt,
-                )
-                .await
-            }
+            } => invoke_remote_http(
+                base_url,
+                client,
+                agent_name,
+                api_key.as_deref(),
+                model.as_deref(),
+                session_id,
+                prompt,
+            )
+            .await
+            .map(AcpInvocationResult::new),
         }
     }
 }
@@ -1153,10 +1208,11 @@ fn string_array_env(key: &str) -> Vec<String> {
 async fn invoke_local_acp_stdio(
     program: &str,
     session_id: &str,
+    external_session_id: Option<&str>,
     message: &str,
     configured_startup_args: &[String],
     event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
-) -> Result<String> {
+) -> Result<AcpInvocationResult> {
     let started = Instant::now();
     let cwd = std::env::current_dir().context("failed to resolve current directory for ACP")?;
     let mut argv = Vec::with_capacity(1 + configured_startup_args.len());
@@ -1172,7 +1228,8 @@ async fn invoke_local_acp_stdio(
     );
     let agent = AcpAgent::from_args(argv).map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let prompt_text = message.to_string();
-    let session_id_owned = session_id.to_string();
+    let remi_session_id = session_id.to_string();
+    let external_session_id = external_session_id.map(str::to_string);
     let result = Client
         .builder()
         .connect_with(
@@ -1182,20 +1239,35 @@ async fn invoke_local_acp_stdio(
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                connection
-                    .send_request(LoadSessionRequest::new(session_id_owned.clone(), cwd))
-                    .block_task()
-                    .await?;
-                let mut session = connection.attach_session(
-                    NewSessionResponse::new(session_id_owned.clone()),
-                    Vec::new(),
-                )?;
+                let (mut session, actual_external_session_id) =
+                    if let Some(external_session_id) = external_session_id {
+                        connection
+                            .send_request(LoadSessionRequest::new(
+                                external_session_id.clone(),
+                                cwd.clone(),
+                            ))
+                            .block_task()
+                            .await?;
+                        let session = connection.attach_session(
+                            NewSessionResponse::new(external_session_id.clone()),
+                            Vec::new(),
+                        )?;
+                        (session, external_session_id)
+                    } else {
+                        let response = connection
+                            .send_request(NewSessionRequest::new(cwd.clone()))
+                            .block_task()
+                            .await?;
+                        let external_session_id = response.session_id.to_string();
+                        let session = connection.attach_session(response, Vec::new())?;
+                        (session, external_session_id)
+                    };
                 session.send_prompt(prompt_text)?;
                 let mut output = String::new();
                 loop {
                     let stopped = handle_external_acp_session_message(
                         session.read_update().await?,
-                        &session_id_owned,
+                        &actual_external_session_id,
                         &mut output,
                         event_tx.as_ref(),
                     )
@@ -1207,7 +1279,7 @@ async fn invoke_local_acp_stdio(
                         {
                             let _ = handle_external_acp_session_message(
                                 message,
-                                &session_id_owned,
+                                &actual_external_session_id,
                                 &mut output,
                                 event_tx.as_ref(),
                             )
@@ -1216,23 +1288,30 @@ async fn invoke_local_acp_stdio(
                         break;
                     }
                 }
-                Ok(output)
+                Ok(AcpInvocationResult {
+                    reply: output,
+                    external_session_id: Some(actual_external_session_id),
+                })
             },
         )
         .await
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let text = result.trim().to_string();
+    let text = result.reply.trim().to_string();
     if text.is_empty() {
         anyhow::bail!("external ACP agent completed without a readable final message");
     }
     tracing::info!(
         program,
-        session_id,
+        session_id = %remi_session_id,
+        external_session_id = result.external_session_id.as_deref().unwrap_or(""),
         reply_len = text.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "acp.external_stdio.completed"
     );
-    Ok(text)
+    Ok(AcpInvocationResult {
+        reply: text,
+        external_session_id: result.external_session_id,
+    })
 }
 
 async fn handle_external_acp_session_message(
@@ -1820,11 +1899,11 @@ for raw in sys.stdin:
                 "agentCapabilities": {{"loadSession": True}},
             }},
         }}), flush=True)
-    elif method == "session/load":
+    elif method == "session/new":
         print(json.dumps({{
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {{}},
+            "result": {{"sessionId": "external-session-1"}},
         }}), flush=True)
     elif method == "session/prompt":
         session_id = params["sessionId"]
@@ -1858,14 +1937,164 @@ for raw in sys.stdin:
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let program = bin_path.to_string_lossy().to_string();
-        let reply = invoke_local_acp_stdio(&program, "acp-session-1", "hello stdio", &[], Some(tx))
-            .await
-            .unwrap();
+        let result = invoke_local_acp_stdio(
+            &program,
+            "acp-session-1",
+            None,
+            "hello stdio",
+            &[],
+            Some(tx),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(reply, "external saw: hello stdio");
+        assert_eq!(result.reply, "external saw: hello stdio");
+        assert_eq!(
+            result.external_session_id.as_deref(),
+            Some("external-session-1")
+        );
         assert!(
             matches!(rx.recv().await.unwrap(), AcpToolTaskEvent::Delta(text) if text == "external saw: hello stdio")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_external_acp_persists_external_session_id_for_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ACP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("fake-acp-agent.py");
+        let log_path = dir.path().join("acp.log");
+        let mut file = std::fs::File::create(&bin_path).unwrap();
+        writeln!(
+            file,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+log_path = sys.argv[1]
+
+def log(line):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    params = msg.get("params") or {{}}
+    if method == "initialize":
+        print(json.dumps({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{
+                "protocolVersion": params.get("protocolVersion", 1),
+                "agentCapabilities": {{"loadSession": True}},
+            }},
+        }}), flush=True)
+    elif method == "session/new":
+        log("session/new")
+        print(json.dumps({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{"sessionId": "external-session-resume"}},
+        }}), flush=True)
+    elif method == "session/load":
+        log("session/load:" + params["sessionId"])
+        print(json.dumps({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{}},
+        }}), flush=True)
+    elif method == "session/prompt":
+        session_id = params["sessionId"]
+        log("session/prompt:" + session_id)
+        text = ""
+        for block in params.get("prompt", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+        print(json.dumps({{
+            "jsonrpc": "2.0",
+            "method": "sessionUpdate",
+            "params": {{
+                "sessionId": session_id,
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": "resume external saw: " + text}},
+                }},
+            }},
+        }}), flush=True)
+        print(json.dumps({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{"stopReason": "end_turn"}},
+        }}), flush=True)
+"#,
+        )
+        .unwrap();
+        drop(file);
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        unsafe {
+            std::env::set_var("REMI_ACP_CLIENT", "codex");
+            std::env::set_var("REMI_ACP_MODE", "local");
+            std::env::set_var("REMI_ACP_LOCAL_BIN", &bin_path);
+            std::env::set_var(
+                "REMI_ACP_LOCAL_ARGS",
+                serde_json::json!([log_path.to_string_lossy()]).to_string(),
+            );
+        }
+
+        let backend = AcpBackend::new(dir.path().join("store"), None);
+        let prepared = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "first external".to_string(),
+                session_id: None,
+                title: Some("external resume".to_string()),
+                current_channel: None,
+                startup_args: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let remi_session_id = prepared.session_id.clone();
+        backend.run_prepared_tool_turn(prepared).await.unwrap();
+
+        let prepared = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "second external".to_string(),
+                session_id: Some(remi_session_id.clone()),
+                title: None,
+                current_channel: None,
+                startup_args: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.external_session_id.as_deref(),
+            Some("external-session-resume")
+        );
+        backend.run_prepared_tool_turn(prepared).await.unwrap();
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "session/new");
+        assert_eq!(lines[1], "session/prompt:external-session-resume");
+        assert_eq!(lines[2], "session/load:external-session-resume");
+        assert_eq!(lines[3], "session/prompt:external-session-resume");
+        assert!(!log.contains(&format!("session/load:{remi_session_id}")));
+
+        unsafe {
+            std::env::remove_var("REMI_ACP_CLIENT");
+            std::env::remove_var("REMI_ACP_MODE");
+            std::env::remove_var("REMI_ACP_LOCAL_BIN");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
+        }
     }
 
     #[cfg(unix)]
@@ -1904,11 +2133,11 @@ for raw in sys.stdin:
                 "agentCapabilities": {{"loadSession": True}},
             }},
         }}), flush=True)
-    elif method == "session/load":
+    elif method == "session/new":
         print(json.dumps({{
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {{}},
+            "result": {{"sessionId": "slow-external-session-1"}},
         }}), flush=True)
     elif method == "session/prompt":
         time.sleep(0.1)
@@ -1986,6 +2215,10 @@ for raw in sys.stdin:
         let store = backend.store.lock().await;
         let record = store.sessions.get(&response.session_id).unwrap();
         assert_eq!(record.transcript.len(), 1);
+        assert_eq!(
+            record.external_session_id.as_deref(),
+            Some("slow-external-session-1")
+        );
 
         unsafe {
             std::env::remove_var("REMI_ACP_CLIENT");

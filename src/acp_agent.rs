@@ -712,6 +712,10 @@ impl AcpEventForwarder {
                     ))?;
                 }
                 CatEvent::Cancelled => return Ok(ForwardStatus::Cancelled),
+                CatEvent::UserInterrupted { reason } => {
+                    self.send_thought_chunk(reason)?;
+                    return Ok(ForwardStatus::Cancelled);
+                }
                 CatEvent::Error(err) => return Ok(ForwardStatus::Error(err.to_string())),
                 CatEvent::SubSession(event) => self.handle_sub_session_event(event)?,
                 CatEvent::Supervisor(event) => self.send_thought_chunk(format!("{event:?}"))?,

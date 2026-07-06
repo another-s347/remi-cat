@@ -68,6 +68,7 @@ pub enum WorkflowStatus {
 pub enum WorkflowPauseReason {
     Manual,
     WaitingForUserInput,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

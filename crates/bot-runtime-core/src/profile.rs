@@ -181,7 +181,7 @@ fn validate_required(field: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentProfile;
+    use super::{embedded_agent_profile, AgentProfile};
 
     #[test]
     fn parses_frontmatter_and_prompt() {
@@ -203,5 +203,19 @@ You are Remi.
         assert_eq!(profile.system_prompt, "You are Remi.");
         assert_eq!(profile.delegates, vec!["coder"]);
         assert!(profile.allows_tool("search"));
+    }
+
+    #[test]
+    fn embedded_default_profile_mentions_skill_and_memory_search() {
+        let profile = embedded_agent_profile("default")
+            .unwrap()
+            .expect("default profile should exist");
+        assert!(profile
+            .system_prompt
+            .contains("Pinned skills are only a curated subset"));
+        assert!(profile
+            .system_prompt
+            .contains("Before starting substantive work, search for"));
+        assert!(profile.system_prompt.contains("relevant skills and memory"));
     }
 }
