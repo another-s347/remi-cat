@@ -18,6 +18,7 @@ pub(crate) enum AppCommand {
     Profile(ProfileCommand),
     Feishu(FeishuCommand),
     Acp(AcpCommand),
+    AcpAdapter(AcpAdapterCommand),
     Codex(CodexCommand),
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
@@ -145,7 +146,7 @@ enum CliCommand {
     Doctor,
     #[command(about = "List all runtime-registered tools with configuration diagnostics")]
     Tools(ToolsArgs),
-    #[command(about = "List, trust, enable, or disable Codex-compatible hooks")]
+    #[command(about = "List, trust, enable, or disable Remi hooks")]
     Hooks(HooksArgs),
     #[command(alias = "secret", about = "List, read, set, or delete secrets")]
     Secrets(SecretsArgs),
@@ -172,6 +173,11 @@ enum CliCommand {
     Acp {
         #[command(subcommand)]
         command: AcpCliCommand,
+    },
+    #[command(about = "Run built-in ACP adapter processes")]
+    AcpAdapter {
+        #[command(subcommand)]
+        command: AcpAdapterCliCommand,
     },
     #[command(about = "Configure and inspect Codex ACP")]
     Codex {
@@ -317,11 +323,15 @@ enum FeishuCliCommand {
 #[derive(Debug, Subcommand)]
 enum CodexCliCommand {
     #[command(
-        about = "Configure local Codex as the ACP client",
-        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n  remi-cat codex setup --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThis writes `acp.mode=local`, `acp.client=codex`, and optional Codex binary/agent settings to the selected profile runtime config."
+        about = "Configure the built-in Codex ACP adapter profile",
+        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n  remi-cat codex setup --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThis writes a local ACP profile that launches `remi-cat acp-adapter codex`. `--bin` and repeated `--arg` values are stored as adapter argv, not as backend-specific Codex settings."
     )]
     Setup {
-        #[arg(long = "bin", value_name = "PATH", help = "Path to the codex binary")]
+        #[arg(
+            long = "bin",
+            value_name = "PATH",
+            help = "Path to the codex binary used by the adapter"
+        )]
         bin: Option<String>,
         #[arg(long, value_name = "NAME", help = "ACP agent name")]
         agent: Option<String>,
@@ -330,11 +340,11 @@ enum CodexCliCommand {
             value_name = "ARG",
             action = ArgAction::Append,
             allow_hyphen_values = true,
-            help = "Extra Codex startup arg inserted before `exec`; repeat to pass multiple args"
+            help = "Extra Codex startup arg passed by the adapter before `exec`; repeat to pass multiple args"
         )]
         args: Vec<String>,
     },
-    #[command(about = "Inspect Codex ACP configuration")]
+    #[command(about = "Inspect the configured Codex ACP adapter profile")]
     Doctor,
 }
 
@@ -342,7 +352,7 @@ enum CodexCliCommand {
 enum AcpCliCommand {
     #[command(
         about = "Configure an ACP client",
-        after_help = "Examples:\n  remi-cat acp setup --client codex --bin /usr/local/bin/codex --tool-name codex\n  remi-cat acp setup --client remi --tool-name acp__remi\n  remi-cat acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp\n\nThis writes generic `acp.*` runtime settings to the selected profile runtime config. `codex setup` is a compatibility wrapper over this command."
+        after_help = "Examples:\n  remi-cat acp setup --client codex --bin /usr/local/bin/codex\n  remi-cat acp setup --client remi --tool-name acp__remi\n  remi-cat acp setup --client remi --bin /path/to/remi-cat --tool-name acp__remi\n  remi-cat acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp\n\nThis writes generic `acp.*` runtime settings to the selected profile runtime config. `--client codex` uses the bundled `acp-adapter codex` profile so the backend still talks standard ACP stdio."
     )]
     Setup {
         #[arg(
@@ -385,6 +395,31 @@ enum AcpCliCommand {
     },
     #[command(about = "Inspect ACP configuration")]
     Doctor,
+    #[command(
+        about = "Run remi-cat as a standard ACP stdio agent",
+        long_about = "Run remi-cat as an Agent Client Protocol stdio agent. stdin/stdout are reserved for ACP JSON-RPC; logs are emitted on stderr."
+    )]
+    Agent,
+}
+
+#[derive(Debug, Subcommand)]
+enum AcpAdapterCliCommand {
+    #[command(
+        about = "Run Codex through a standard ACP stdio adapter",
+        after_help = "Examples:\n  remi-cat acp-adapter codex\n  remi-cat acp-adapter codex --bin /usr/local/bin/codex --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThe adapter speaks ACP on stdin/stdout and translates each prompt into `codex exec --json`."
+    )]
+    Codex {
+        #[arg(long = "bin", value_name = "PATH", help = "Path to the codex binary")]
+        bin: Option<String>,
+        #[arg(
+            long = "arg",
+            value_name = "ARG",
+            action = ArgAction::Append,
+            allow_hyphen_values = true,
+            help = "Extra Codex startup arg inserted before `exec`; repeat to pass multiple args"
+        )]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -722,6 +757,15 @@ pub(crate) enum AcpCommand {
         args: Vec<String>,
     },
     Doctor,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcpAdapterCommand {
+    Codex {
+        bin: Option<String>,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -992,6 +1036,10 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
                 args,
             },
             AcpCliCommand::Doctor => AcpCommand::Doctor,
+            AcpCliCommand::Agent => AcpCommand::Agent,
+        })),
+        Some(CliCommand::AcpAdapter { command }) => Ok(AppCommand::AcpAdapter(match command {
+            AcpAdapterCliCommand::Codex { bin, args } => AcpAdapterCommand::Codex { bin, args },
         })),
         Some(CliCommand::Codex { command }) => Ok(AppCommand::Codex(match command {
             CodexCliCommand::Setup { bin, agent, args } => CodexCommand::Setup { bin, agent, args },

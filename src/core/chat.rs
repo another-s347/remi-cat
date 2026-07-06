@@ -21,6 +21,7 @@ pub(crate) enum ChatChannel {
     Tui,
     Feishu,
     Web,
+    Acp,
 }
 
 impl ChatChannel {
@@ -30,6 +31,7 @@ impl ChatChannel {
             Self::Tui => Some("tui".to_string()),
             Self::Feishu => Some("feishu".to_string()),
             Self::Web => Some("web".to_string()),
+            Self::Acp => Some("acp".to_string()),
         }
     }
 }
@@ -350,6 +352,13 @@ mod tests {
         request.platform = Some("custom".to_string());
 
         assert_eq!(request.platform(), Some("custom".to_string()));
+    }
+
+    #[test]
+    fn acp_channel_sets_acp_platform() {
+        let request = ChatRequest::text("thread-1", ChatChannel::Acp, "hello");
+
+        assert_eq!(request.platform(), Some("acp".to_string()));
     }
 
     #[test]

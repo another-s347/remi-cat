@@ -62,7 +62,10 @@ cargo run -- --profile prod
 
 `REMI_PROFILE=dev` is equivalent to `--profile dev`. An explicitly exported
 `REMI_DATA_DIR` takes precedence for compatibility with custom data paths.
-The existing `.remi-cat/runtime.yaml` remains the un-named default profile.
+The existing `.remi-cat/runtime.yaml` remains the un-named default profile for
+normal CLI runs. `remi-cat acp agent` is meant to be launched by external ACP
+clients, so without `REMI_DATA_DIR` it uses the HOME config root
+(`$HOME/.remi_cat`, or `$HOME/.remi-cat` for compatibility).
 
 Manage named profiles with:
 
@@ -305,6 +308,18 @@ All provider-specific keys fall back to `OPENAI_API_KEY` and then
 When it is `false`, turns are still saved, but only explicit compaction paths
 will summarize older history.
 
+## Hooks
+
+Remi hooks are Remi-owned by default and use Codex-compatible hook definitions.
+The runtime discovers hooks from `REMI_DATA_DIR/hooks.json`,
+`REMI_DATA_DIR/hooks/config.toml`, `.remi-cat/hooks.json`, and
+`.remi-cat/hooks.toml` under the workspace root. Codex hook files are not read
+unless explicitly imported with `REMI_IMPORT_CODEX_HOOKS=1` or
+`import_codex_hooks = true` in a Remi hooks TOML config.
+
+Hook trust and disabled state live under `REMI_DATA_DIR/hooks/`; manage them
+with `remi-cat hooks` or the in-session `/hooks` command.
+
 ## ACP And Sub-Sessions
 
 Top-level IM sessions enter the active root agent. ACP sessions and sub-agent
@@ -315,15 +330,23 @@ Feishu, a `SubSession(Start)` event automatically creates a private group chat
 for that sub-session and stores the returned Feishu `chat_id` as the
 sub-session channel binding. Parent agent context receives the final tool
 result; intermediate child output stays observable as sub-session progress.
-By default, local ACP uses the installed Codex CLI (`codex exec`) when
-`acp.client` is `codex`; set `REMI_ACP_CODEX_BIN` to override the binary path,
-or run `remi-cat codex setup --bin /path/to/codex`. Extra Codex global startup
-arguments can be configured with `remi-cat codex setup --arg=--config
---arg=model=\"gpt-5-codex\"`, `acp.codex_args: ["--config", "key=value"]`, or
-`REMI_ACP_CODEX_ARGS='["--config","key=value"]'`; they are inserted before
-`exec` as `codex <args> exec ...`. A single `codex` tool call can also pass
-`startup_args: ["--profile", "work"]` for that invocation. The model only sees
-the `codex` tool when the Codex binary is configured and executable.
+Codex is supported through the bundled standard ACP stdio adapter. Run
+`remi-cat codex setup` or `remi-cat acp setup --client codex`; setup writes a
+local profile that starts `remi-cat acp-adapter codex` via `acp.local_bin` and
+`acp.local_args`. Use `--bin /path/to/codex` to choose the Codex CLI binary and
+repeat `--arg` for Codex global startup arguments; those values are stored as
+adapter argv, and the backend still talks only ACP. The model sees the `codex`
+tool when the configured adapter command is executable.
+
+Remi can also run as a standard ACP stdio agent with `remi-cat acp agent`; by
+default this reads the HOME config root, while `REMI_DATA_DIR` can still point it
+at a custom runtime directory.
+Configure another Remi profile to launch it as an external local ACP process
+with `remi-cat acp setup --client remi --bin /path/to/remi-cat --tool-name
+acp__remi`; when `--bin` is provided for `--client remi` and no `--arg` is
+specified, setup stores `acp.local_args: ["acp", "agent"]` automatically. A
+Remi ACP configuration without `acp.local_bin` continues to use the in-process
+local runner; setting `acp.local_bin` switches it to external stdio.
 
 ## Admin API
 

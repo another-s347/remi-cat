@@ -1,7 +1,9 @@
 pub mod backend;
+pub mod client_tools;
 pub mod tools;
 
 pub use backend::{AcpBackend, AcpLocalRunner};
+pub use client_tools::{AcpClientToolProvider, AcpClientToolSupport};
 pub use tools::AcpChatTool;
 
 use std::sync::Arc;

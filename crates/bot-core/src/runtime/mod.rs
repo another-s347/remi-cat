@@ -58,7 +58,7 @@ pub(crate) use prompting::{
     append_thread_todo_system_prompt, apply_skill_injections, insert_pinned_skill_prompt,
     insert_single_chat_sender_system_prompt, insert_skill_injection_prompts, is_direct_chat,
     model_input_snapshot_from_loop_input, prepend_group_sender_username, route_thread_todo_prompt,
-    single_chat_sender_system_prompt, truncate_user_name,
+    single_chat_sender_system_prompt, truncate_user_name, SkillPromptToolAvailability,
 };
 use supervisor_agent::{
     hook_context_message, workflow_round_allows_continue, WorkflowRoundOutcome,
@@ -1711,16 +1711,19 @@ impl CatBot {
                 let mut history = build_injected_history(&ctx);
                 let agent_header_count =
                     usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
+                let skill_prompt_tools = skill_prompt_tool_availability(active_agent);
                 insert_skill_injection_prompts(
                     &mut history,
                     agent_header_count,
                     &round_opts.skill_injections,
+                    skill_prompt_tools,
                 );
                 insert_pinned_skill_prompt(
                     &mut history,
                     agent_header_count,
                     &self.pinned_skill_summaries,
                     effective_model.profile.context_tokens,
+                    skill_prompt_tools,
                 );
                 insert_single_chat_sender_system_prompt(
                     &mut history,
@@ -2373,6 +2376,23 @@ fn cat_agent_contains_tool(agent: &CatAgent<InnerAgent>, name: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn cat_agent_tool_available(agent: &CatAgent<InnerAgent>, name: &str) -> bool {
+    cat_agent_contains_tool(agent, name)
+        && agent
+            .tool_allowlist
+            .as_ref()
+            .map(|allowlist| allowlist.iter().any(|tool| tool == name))
+            .unwrap_or(true)
+}
+
+fn skill_prompt_tool_availability(agent: &CatAgent<InnerAgent>) -> SkillPromptToolAvailability {
+    SkillPromptToolAvailability::new(
+        cat_agent_tool_available(agent, "skill__search"),
+        cat_agent_tool_available(agent, "skill__get"),
+        cat_agent_tool_available(agent, "fs_read"),
+    )
+}
+
 struct LocalToolDeps {
     skill_store: Arc<BuiltinSkillStore<FileSkillStore>>,
     memory: Arc<MemoryStore>,
@@ -2393,6 +2413,7 @@ struct LocalToolDeps {
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
     overflow_bytes: usize,
+    acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
 }
 
 impl LocalToolDeps {
@@ -2423,6 +2444,7 @@ impl LocalToolDeps {
             user_question_manager: Arc::clone(&self.user_question_manager),
             hook_manager: Arc::clone(&self.hook_manager),
             overflow_bytes: self.overflow_bytes,
+            acp_client_tools: self.acp_client_tools.clone(),
         }
     }
 
@@ -2489,6 +2511,7 @@ pub struct CatBotBuilder {
     agents_dir: PathBuf,
     max_turns: Option<usize>,
     model_registry: Arc<ModelProfileRegistry>,
+    acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
 }
 
 impl CatBotBuilder {
@@ -2547,6 +2570,7 @@ impl CatBotBuilder {
             agents_dir: data_dir.join("agents"),
             max_turns: None,
             model_registry,
+            acp_client_tools: None,
         };
         let agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| DEFAULT_AGENT_ID.into());
         let agents_dir = std::env::var("REMI_AGENTS_DIR")
@@ -2600,6 +2624,15 @@ impl CatBotBuilder {
     pub fn approval_model_profile(mut self, profile_id: impl Into<String>) -> Self {
         let profile_id = profile_id.into();
         self.approval_model_profile_id = Some(profile_id);
+        self
+    }
+
+    pub fn acp_client_tools(
+        mut self,
+        provider: acp::AcpClientToolProvider,
+        support: acp::AcpClientToolSupport,
+    ) -> Self {
+        self.acp_client_tools = Some((provider, support));
         self
     }
 
@@ -2796,6 +2829,7 @@ impl CatBotBuilder {
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             overflow_bytes,
+            acp_client_tools: self.acp_client_tools.clone(),
         };
         let mut acp_local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
@@ -2853,6 +2887,7 @@ impl CatBotBuilder {
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             overflow_bytes,
+            acp_client_tools: self.acp_client_tools.clone(),
         };
         let local_tools = Arc::new(tool_deps.build_static_tools(true));
         let model_tools = tool_deps.build_model_tools(&profile, self.extra_options.clone());
@@ -2975,6 +3010,7 @@ impl CatBotBuilder {
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
                 overflow_bytes,
+                acp_client_tools: self.acp_client_tools.clone(),
             };
             let agent_static_tools = Arc::new(agent_tool_deps.build_static_tools(true));
             let mut by_model = HashMap::new();
@@ -3990,6 +4026,7 @@ mod tests {
             agents_dir: agents_dir.clone(),
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .build()
         .unwrap();
@@ -4042,6 +4079,7 @@ mod tests {
                 agents_dir: agents_dir.clone(),
                 max_turns: Some(2),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir.clone()).unwrap()),
+                acp_client_tools: None,
             }
             .build()
             .unwrap()
@@ -4132,6 +4170,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .agent_profile(root_profile)
         .unwrap()
@@ -4252,6 +4291,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .build()
         .unwrap();
@@ -4380,6 +4420,7 @@ You are Remi.
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
+            acp_client_tools: None,
         }
         .agent_profile(profile)
         .unwrap();
@@ -4443,6 +4484,7 @@ You are Remi.
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
+            acp_client_tools: None,
         }
         .agent_profile(profile)
         .unwrap();
@@ -4484,6 +4526,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         };
 
         let bot = builder.build().unwrap();
@@ -4718,6 +4761,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(8),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .build()
         .unwrap();
@@ -4795,6 +4839,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(8),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .build()
         .unwrap();
@@ -4923,6 +4968,7 @@ You are Remi.
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
         }
         .build()
         .unwrap();
@@ -4960,6 +5006,121 @@ You are Remi.
         assert!(
             !pinned_prompt.contains("Unpinned discovery description"),
             "{pinned_prompt}"
+        );
+        assert!(pinned_prompt.contains("`skill__search`"), "{pinned_prompt}");
+        assert!(pinned_prompt.contains("`skill__get`"), "{pinned_prompt}");
+        assert!(!pinned_prompt.contains("scope=skills"), "{pinned_prompt}");
+    }
+
+    #[tokio::test]
+    async fn search_tool_tokenized_query_matches_memory_and_skills_end_to_end() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let responses = vec![
+            sse_tool_call(
+                "call_search",
+                "search",
+                json!({
+                    "query": "我想找靠窗座位相关内容",
+                    "scope": "local",
+                    "limit": 10
+                }),
+            ),
+            sse_text("search observed"),
+        ];
+        let (base_url, requests) = start_openai_mock_server(responses).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let skill_dir = skills_dir.join("window-seat");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: window-seat\ndescription: 靠窗座位偏好处理流程\n---\n\nUse this skill when seating preferences mention windows.",
+        )
+        .unwrap();
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(4),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
+        }
+        .build()
+        .unwrap();
+        bot.memory
+            .upsert_named_memory(
+                DEFAULT_AGENT_ID,
+                "seat-preference",
+                "用户旅行偏好：坐飞机时优先选择靠窗位置。",
+            )
+            .await
+            .unwrap();
+
+        let events = collect_stream(bot.stream("search-tokenized-e2e", "帮我找靠窗座位资料")).await;
+        assert!(events.iter().any(
+            |event| matches!(event, CatEvent::Text(text) if text.contains("search observed"))
+        ));
+        let search_result = events
+            .iter()
+            .find_map(|event| match event {
+                CatEvent::ToolCallResult {
+                    name,
+                    result,
+                    success,
+                    ..
+                } if name == "search" && *success => Some(result),
+                _ => None,
+            })
+            .expect("search tool should return a successful result");
+        let value: serde_json::Value =
+            serde_json::from_str(search_result).expect("search result should be JSON");
+        let results = value["results"]
+            .as_array()
+            .expect("search result should contain results");
+        assert!(
+            results.iter().any(|item| item["scope"] == "memory"
+                && item["snippet"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("靠窗位置"))),
+            "search result did not include tokenized memory match: {search_result}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|item| item["scope"] == "skills" && item["name"] == "window-seat"),
+            "search result did not include tokenized skill match: {search_result}"
+        );
+
+        let requests = requests.lock().expect("request lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].contains("靠窗位置") && requests[1].contains("window-seat"),
+            "second model request did not include local search tool results: {}",
+            requests[1]
         );
     }
 

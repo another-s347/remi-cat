@@ -32,6 +32,7 @@ pub mod remi_skill;
 pub mod runtime;
 pub mod sandbox;
 pub mod search;
+pub(crate) mod search_query;
 pub mod skill;
 pub mod supervisor;
 pub mod supervisor_workflow;
@@ -42,6 +43,7 @@ pub mod tool_pretty;
 pub mod tools;
 pub mod user_question;
 
+pub use acp::{AcpClientToolProvider, AcpClientToolSupport};
 pub use agent::CatAgent;
 pub use approval::{
     ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,

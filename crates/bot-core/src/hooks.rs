@@ -631,14 +631,43 @@ fn hooks_enabled_for_config(path: &Path) -> bool {
 
 fn config_paths(workspace_root: &Path, data_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        paths.push(home.join(".codex").join("hooks.json"));
-        paths.push(home.join(".codex").join("config.toml"));
-    }
-    paths.push(workspace_root.join(".codex").join("hooks.json"));
-    paths.push(workspace_root.join(".codex").join("config.toml"));
     paths.push(data_dir.join("hooks.json"));
+    paths.push(data_dir.join("hooks").join("config.toml"));
+    paths.push(workspace_root.join(".remi-cat").join("hooks.json"));
+    paths.push(workspace_root.join(".remi-cat").join("hooks.toml"));
+    if codex_hook_import_enabled(workspace_root, data_dir) {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            paths.push(home.join(".codex").join("hooks.json"));
+            paths.push(home.join(".codex").join("config.toml"));
+        }
+        paths.push(workspace_root.join(".codex").join("hooks.json"));
+        paths.push(workspace_root.join(".codex").join("config.toml"));
+    }
     paths
+}
+
+fn codex_hook_import_enabled(workspace_root: &Path, data_dir: &Path) -> bool {
+    if std::env::var("REMI_IMPORT_CODEX_HOOKS")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    {
+        return true;
+    }
+    remi_hooks_config_value(data_dir.join("hooks").join("config.toml"))
+        .or_else(|| remi_hooks_config_value(workspace_root.join(".remi-cat").join("hooks.toml")))
+        .and_then(|value| {
+            value
+                .get("import_codex_hooks")
+                .or_else(|| value.get("importCodexHooks"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn remi_hooks_config_value(path: PathBuf) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    serde_json::to_value(value.get("hooks").unwrap_or(&value)).ok()
 }
 
 fn read_config_value(path: &Path) -> Option<Value> {
@@ -646,7 +675,7 @@ fn read_config_value(path: &Path) -> Option<Value> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("toml") => {
             let value: toml::Value = toml::from_str(&text).ok()?;
-            serde_json::to_value(value.get("hooks")?).ok()
+            serde_json::to_value(value.get("hooks").unwrap_or(&value)).ok()
         }
         _ => serde_json::from_str(&text).ok(),
     }
@@ -838,6 +867,27 @@ fn mark_invalid_updated_input(outcome: &mut HookOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static HOOK_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn without_codex_hook_import<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = HOOK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("REMI_IMPORT_CODEX_HOOKS").ok();
+        unsafe {
+            std::env::remove_var("REMI_IMPORT_CODEX_HOOKS");
+        }
+        let result = f();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("REMI_IMPORT_CODEX_HOOKS", value),
+                None => std::env::remove_var("REMI_IMPORT_CODEX_HOOKS"),
+            }
+        }
+        result
+    }
 
     #[test]
     fn parses_codex_hooks_json_shape() {
@@ -944,13 +994,14 @@ mod tests {
 
     #[test]
     fn toml_feature_hooks_false_disables_config_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let codex_dir = dir.path().join(".codex");
-        std::fs::create_dir_all(&codex_dir).unwrap();
-        let path = codex_dir.join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
+        without_codex_hook_import(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let remi_dir = dir.path().join(".remi-cat");
+            std::fs::create_dir_all(&remi_dir).unwrap();
+            let path = remi_dir.join("hooks.toml");
+            std::fs::write(
+                &path,
+                r#"
 [features]
 hooks = false
 
@@ -960,9 +1011,136 @@ matcher = "Bash"
 type = "command"
 command = "echo blocked"
 "#,
-        )
-        .unwrap();
-        assert!(!hooks_enabled_for_config(&path));
-        assert!(discover_hooks(dir.path(), dir.path()).is_empty());
+            )
+            .unwrap();
+            assert!(!hooks_enabled_for_config(&path));
+            assert!(discover_hooks(dir.path(), dir.path()).is_empty());
+        });
+    }
+
+    #[test]
+    fn discovers_remi_owned_hooks_by_default() {
+        without_codex_hook_import(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            let data_dir = dir.path().join("data");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(
+                data_dir.join("hooks.json"),
+                r#"{
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "echo data"}
+                        ]
+                    }
+                ]
+            }"#,
+            )
+            .unwrap();
+
+            let hooks = discover_hooks(&workspace, &data_dir);
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].source, data_dir.join("hooks.json"));
+            assert_eq!(hooks[0].handler.command.as_deref(), Some("echo data"));
+        });
+    }
+
+    #[test]
+    fn does_not_import_codex_hooks_by_default() {
+        without_codex_hook_import(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            let data_dir = dir.path().join("data");
+            let codex_dir = workspace.join(".codex");
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(
+                codex_dir.join("hooks.json"),
+                r#"{
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "echo codex"}
+                        ]
+                    }
+                ]
+            }"#,
+            )
+            .unwrap();
+
+            assert!(discover_hooks(&workspace, &data_dir).is_empty());
+        });
+    }
+
+    #[test]
+    fn imports_codex_hooks_when_remi_config_opts_in() {
+        without_codex_hook_import(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            let data_dir = dir.path().join("data");
+            let remi_hooks_dir = data_dir.join("hooks");
+            let codex_dir = workspace.join(".codex");
+            std::fs::create_dir_all(&remi_hooks_dir).unwrap();
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            std::fs::write(
+                remi_hooks_dir.join("config.toml"),
+                r#"
+[hooks]
+import_codex_hooks = true
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                codex_dir.join("hooks.json"),
+                r#"{
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "echo codex"}
+                        ]
+                    }
+                ]
+            }"#,
+            )
+            .unwrap();
+
+            let hooks = discover_hooks(&workspace, &data_dir);
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].source, codex_dir.join("hooks.json"));
+            assert_eq!(hooks[0].handler.command.as_deref(), Some("echo codex"));
+        });
+    }
+
+    #[test]
+    fn parses_remi_workspace_hooks_toml() {
+        without_codex_hook_import(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            let data_dir = dir.path().join("data");
+            let remi_dir = workspace.join(".remi-cat");
+            std::fs::create_dir_all(&remi_dir).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(
+                remi_dir.join("hooks.toml"),
+                r#"
+[[hooks.PreToolUse]]
+matcher = "Bash"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo remi"
+"#,
+            )
+            .unwrap();
+
+            let hooks = discover_hooks(&workspace, &data_dir);
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].source, remi_dir.join("hooks.toml"));
+            assert_eq!(hooks[0].handler.command.as_deref(), Some("echo remi"));
+        });
     }
 }

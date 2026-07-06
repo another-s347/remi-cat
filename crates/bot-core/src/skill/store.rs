@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
 
+use crate::search_query::tokenize_search_query;
+
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const PRIMARY_SOURCE: &str = ".remi-cat/skills";
 const COMPAT_SOURCE: &str = ".agents/skills";
@@ -601,17 +603,7 @@ fn trim_leading_skill_preamble(mut content: &str) -> &str {
 }
 
 fn parse_keywords(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut keywords = Vec::new();
-    for raw in query.split_whitespace() {
-        let keyword = raw
-            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
-            .to_ascii_lowercase();
-        if !keyword.is_empty() && seen.insert(keyword.clone()) {
-            keywords.push(keyword);
-        }
-    }
-    keywords
+    tokenize_search_query(query)
 }
 
 fn rank_summaries(mut summaries: Vec<SkillSummary>, keywords: &[String]) -> Vec<SkillSummary> {

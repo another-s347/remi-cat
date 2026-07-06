@@ -38,20 +38,32 @@ pub(super) fn register_runtime_tools(
         memory_store: Arc::clone(&deps.memory),
         agent_id: agent_id.to_string(),
     });
-    if deps.bash_enabled {
+    let acp_support = deps
+        .acp_client_tools
+        .as_ref()
+        .map(|(provider, support)| {
+            provider.register_tools(local_tools, *support);
+            *support
+        })
+        .unwrap_or_default();
+    if deps.bash_enabled && !acp_support.terminal {
         local_tools.register(WorkspaceBashTool::new(
             Arc::clone(&deps.sandbox),
             Arc::clone(&deps.redactor),
         ));
     }
     local_tools.register(WorkspaceSshTool::new(Arc::clone(&deps.redactor)));
-    local_tools.register(RootedFsReadTool {
-        sandbox: Arc::clone(&deps.sandbox),
-        redactor: Arc::clone(&deps.redactor),
-    });
-    local_tools.register(RootedFsWriteTool {
-        sandbox: Arc::clone(&deps.sandbox),
-    });
+    if !acp_support.fs_read {
+        local_tools.register(RootedFsReadTool {
+            sandbox: Arc::clone(&deps.sandbox),
+            redactor: Arc::clone(&deps.redactor),
+        });
+    }
+    if !acp_support.fs_write {
+        local_tools.register(RootedFsWriteTool {
+            sandbox: Arc::clone(&deps.sandbox),
+        });
+    }
     local_tools.register(RootedFsApplyPatchTool {
         sandbox: Arc::clone(&deps.sandbox),
     });

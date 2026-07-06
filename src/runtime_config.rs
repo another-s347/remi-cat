@@ -139,35 +139,16 @@ impl RuntimeConfig {
         {
             set_env_if_absent("REMI_ACP_AGENT_NAME", agent_name);
         }
-        if let Some(local_bin) = self
-            .acp
-            .local_bin
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
+        let effective_local_bin = self.acp_effective_local_bin();
+        let effective_local_args = self.acp_effective_local_args();
+        if let Some(local_bin) = effective_local_bin.as_deref() {
             set_env_if_absent("REMI_ACP_LOCAL_BIN", local_bin);
         }
-        if !self.acp.local_args.is_empty() {
-            match serde_json::to_string(&self.acp.local_args) {
+        if !effective_local_args.is_empty() {
+            match serde_json::to_string(&effective_local_args) {
                 Ok(value) => set_env_if_absent("REMI_ACP_LOCAL_ARGS", &value),
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to serialize ACP local startup args")
-                }
-            }
-        }
-        if let Some(codex_bin) = self
-            .acp
-            .codex_bin
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            set_env_if_absent("REMI_ACP_CODEX_BIN", codex_bin);
-        }
-        if !self.acp.codex_args.is_empty() {
-            match serde_json::to_string(&self.acp.codex_args) {
-                Ok(value) => set_env_if_absent("REMI_ACP_CODEX_ARGS", &value),
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to serialize Codex startup args")
                 }
             }
         }
@@ -220,11 +201,66 @@ impl RuntimeConfig {
         set_env_optional("REMI_ACP_MODEL", self.acp.model.as_deref());
         set_env_optional("REMI_ACP_API_KEY", self.acp.api_key.as_deref());
         set_env_optional("REMI_ACP_AGENT_NAME", self.acp.agent_name.as_deref());
-        set_env_optional("REMI_ACP_LOCAL_BIN", self.acp.local_bin.as_deref());
-        set_env_json_array("REMI_ACP_LOCAL_ARGS", &self.acp.local_args);
-        set_env_optional("REMI_ACP_CODEX_BIN", self.acp.codex_bin.as_deref());
-        set_env_json_array("REMI_ACP_CODEX_ARGS", &self.acp.codex_args);
+        let effective_local_bin = self.acp_effective_local_bin();
+        let effective_local_args = self.acp_effective_local_args();
+        set_env_optional("REMI_ACP_LOCAL_BIN", effective_local_bin.as_deref());
+        set_env_json_array("REMI_ACP_LOCAL_ARGS", &effective_local_args);
+        remove_env("REMI_ACP_CODEX_BIN");
+        remove_env("REMI_ACP_CODEX_ARGS");
     }
+
+    fn acp_effective_local_bin(&self) -> Option<String> {
+        self.acp
+            .local_bin
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                if matches!(self.acp.client, AcpClient::Codex)
+                    && (self
+                        .acp
+                        .codex_bin
+                        .as_deref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                        || !self.acp.codex_args.is_empty())
+                {
+                    std::env::current_exe()
+                        .ok()
+                        .map(|path| path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn acp_effective_local_args(&self) -> Vec<String> {
+        if !self.acp.local_args.is_empty() {
+            return self.acp.local_args.clone();
+        }
+        if !matches!(self.acp.client, AcpClient::Codex)
+            || (self.acp.codex_bin.is_none() && self.acp.codex_args.is_empty())
+        {
+            return Vec::new();
+        }
+        codex_adapter_args(self.acp.codex_bin.clone(), &self.acp.codex_args)
+    }
+}
+
+fn codex_adapter_args(codex_bin: Option<String>, codex_args: &[String]) -> Vec<String> {
+    let mut args = vec!["acp-adapter".to_string(), "codex".to_string()];
+    if let Some(bin) = codex_bin
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--bin".to_string());
+        args.push(bin);
+    }
+    for arg in codex_args {
+        args.push("--arg".to_string());
+        args.push(arg.clone());
+    }
+    args
 }
 
 pub fn resolve_runtime_config_for_run(
@@ -834,20 +870,20 @@ model_profile: default
     }
 
     #[test]
-    fn apply_env_defaults_sets_codex_args_as_json() {
+    fn apply_env_defaults_sets_local_args_as_json() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
-            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
         }
         let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
-        cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
+        cfg.acp.local_args = vec!["acp-adapter".into(), "codex".into()];
         cfg.apply_env_defaults();
         assert_eq!(
-            std::env::var("REMI_ACP_CODEX_ARGS").unwrap(),
-            r#"["--config","model=\"gpt-5-codex\""]"#
+            std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
+            r#"["acp-adapter","codex"]"#
         );
         unsafe {
-            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
         }
     }
 
@@ -870,6 +906,43 @@ model_profile: default
         unsafe {
             std::env::remove_var("REMI_MODEL_PROFILE");
             std::env::remove_var("REMI_AGENT_ID");
+        }
+    }
+
+    #[test]
+    fn apply_env_overrides_maps_legacy_codex_config_to_local_adapter() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("REMI_ACP_LOCAL_BIN");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
+            std::env::remove_var("REMI_ACP_CODEX_BIN");
+            std::env::remove_var("REMI_ACP_CODEX_ARGS");
+        }
+
+        let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        cfg.acp.client = AcpClient::Codex;
+        cfg.acp.codex_bin = Some("/usr/local/bin/codex".to_string());
+        cfg.acp.codex_args = vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()];
+        cfg.apply_env_overrides();
+
+        assert!(std::env::var("REMI_ACP_LOCAL_BIN").unwrap().contains(
+            std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ));
+        assert_eq!(
+            std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
+            r#"["acp-adapter","codex","--bin","/usr/local/bin/codex","--arg","--config","--arg","model=\"gpt-5-codex\""]"#
+        );
+        assert!(std::env::var("REMI_ACP_CODEX_BIN").is_err());
+        assert!(std::env::var("REMI_ACP_CODEX_ARGS").is_err());
+
+        unsafe {
+            std::env::remove_var("REMI_ACP_LOCAL_BIN");
+            std::env::remove_var("REMI_ACP_LOCAL_ARGS");
         }
     }
 

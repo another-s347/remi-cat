@@ -7,6 +7,41 @@ use crate::{
 
 const PINNED_SKILL_PROMPT_CONTEXT_PERCENT: usize = 2;
 const PINNED_SKILLS_HEADER: &str = "## Pinned Skills";
+const PINNED_SKILLS_SEARCH_AND_GET_HINT: &str =
+    "More skills may be available; use `skill__search`, then `skill__get`.";
+const PINNED_SKILLS_SEARCH_HINT: &str = "More skills may be available; use `skill__search`.";
+const PINNED_SKILLS_GET_HINT: &str =
+    "Use `skill__get` with an exact skill name to read full skill instructions.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkillPromptToolAvailability {
+    pub(crate) skill_search: bool,
+    pub(crate) skill_get: bool,
+    pub(crate) fs_read: bool,
+}
+
+impl SkillPromptToolAvailability {
+    pub(crate) const fn new(skill_search: bool, skill_get: bool, fs_read: bool) -> Self {
+        Self {
+            skill_search,
+            skill_get,
+            fs_read,
+        }
+    }
+
+    const fn without_skill_discovery(self) -> Self {
+        Self {
+            skill_search: false,
+            skill_get: false,
+            fs_read: self.fs_read,
+        }
+    }
+
+    #[cfg(test)]
+    const fn all() -> Self {
+        Self::new(true, true, true)
+    }
+}
 
 pub(crate) fn truncate_user_name(name: Option<&str>, max_chars: usize) -> Option<String> {
     let trimmed = name?.trim();
@@ -31,18 +66,14 @@ pub(crate) fn insert_skill_injection_prompts(
     history: &mut Vec<Message>,
     insertion_index: usize,
     skills: &[SkillDocument],
+    tool_availability: SkillPromptToolAvailability,
 ) {
     if skills.is_empty() {
         return;
     }
     let mut offset = 0;
     for skill in skills {
-        let resource_hint = match (&skill.skill_file_path, &skill.resource_root_path) {
-            (Some(skill_file), Some(resource_root)) => format!(
-                "Use fs_read with skill_file_path={skill_file}; resource_root_path={resource_root} for supporting files."
-            ),
-            _ => "Supporting files for this skill are not readable through fs_read because the skill is outside the workspace root.".to_string(),
-        };
+        let resource_hint = skill_resource_hint(skill, tool_availability);
         let prompt = format!(
             "Skill `{}` loaded for this turn from {}. {}\n\n{}",
             skill.name,
@@ -63,14 +94,19 @@ pub(crate) fn insert_pinned_skill_prompt(
     insertion_index: usize,
     skills: &[SkillSummary],
     context_tokens: u32,
+    tool_availability: SkillPromptToolAvailability,
 ) {
-    let Some(prompt) = pinned_skill_prompt(skills, context_tokens) else {
+    let Some(prompt) = pinned_skill_prompt(skills, context_tokens, tool_availability) else {
         return;
     };
     history.insert(insertion_index.min(history.len()), Message::system(prompt));
 }
 
-pub(crate) fn pinned_skill_prompt(skills: &[SkillSummary], context_tokens: u32) -> Option<String> {
+pub(crate) fn pinned_skill_prompt(
+    skills: &[SkillSummary],
+    context_tokens: u32,
+    tool_availability: SkillPromptToolAvailability,
+) -> Option<String> {
     let mut pinned = skills
         .iter()
         .filter(|skill| skill.pin)
@@ -81,19 +117,33 @@ pub(crate) fn pinned_skill_prompt(skills: &[SkillSummary], context_tokens: u32) 
     }
     pinned.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
     let budget = context_budget_tokens(context_tokens, PINNED_SKILL_PROMPT_CONTEXT_PERCENT) as u32;
-    let prompt = render_pinned_skill_prompt(&pinned, None);
+    let prompt = render_pinned_skill_prompt(&pinned, None, tool_availability);
     if estimate_model_input_tokens(&prompt) <= budget {
         return Some(prompt);
     }
-    let fixed_tokens = estimate_model_input_tokens(&render_pinned_skill_prompt(&[], None));
-    let per_skill_budget = budget.saturating_sub(fixed_tokens) / pinned.len().max(1) as u32;
-    Some(render_pinned_skill_prompt(
+    let prompt = truncated_pinned_skill_prompt(&pinned, budget, tool_availability);
+    if estimate_model_input_tokens(&prompt) <= budget
+        || pinned_skills_discovery_hint(tool_availability).is_none()
+    {
+        return Some(prompt);
+    }
+    let compact_availability = tool_availability.without_skill_discovery();
+    let prompt = render_pinned_skill_prompt(&pinned, None, compact_availability);
+    if estimate_model_input_tokens(&prompt) <= budget {
+        return Some(prompt);
+    }
+    Some(truncated_pinned_skill_prompt(
         &pinned,
-        Some(per_skill_budget.max(1)),
+        budget,
+        compact_availability,
     ))
 }
 
-fn render_pinned_skill_prompt(skills: &[SkillSummary], per_skill_budget: Option<u32>) -> String {
+fn render_pinned_skill_prompt(
+    skills: &[SkillSummary],
+    per_skill_budget: Option<u32>,
+    tool_availability: SkillPromptToolAvailability,
+) -> String {
     let mut lines = vec![PINNED_SKILLS_HEADER.to_string(), String::new()];
     for skill in skills {
         let description = per_skill_budget
@@ -105,7 +155,51 @@ fn render_pinned_skill_prompt(skills: &[SkillSummary], per_skill_budget: Option<
             lines.push(format!("- `{}` - {}", skill.name, description));
         }
     }
+    if let Some(hint) = pinned_skills_discovery_hint(tool_availability) {
+        lines.push(String::new());
+        lines.push(hint.to_string());
+    }
     lines.join("\n")
+}
+
+fn truncated_pinned_skill_prompt(
+    skills: &[SkillSummary],
+    budget: u32,
+    tool_availability: SkillPromptToolAvailability,
+) -> String {
+    let fixed_tokens =
+        estimate_model_input_tokens(&render_pinned_skill_prompt(&[], None, tool_availability));
+    let per_skill_budget = budget.saturating_sub(fixed_tokens) / skills.len().max(1) as u32;
+    render_pinned_skill_prompt(skills, Some(per_skill_budget.max(1)), tool_availability)
+}
+
+fn skill_resource_hint(
+    skill: &SkillDocument,
+    tool_availability: SkillPromptToolAvailability,
+) -> String {
+    match (&skill.skill_file_path, &skill.resource_root_path) {
+        (Some(skill_file), Some(resource_root)) if tool_availability.fs_read => format!(
+            "Use fs_read with skill_file_path={skill_file}; resource_root_path={resource_root} for supporting files."
+        ),
+        (Some(skill_file), Some(resource_root)) => format!(
+            "Supporting file paths: skill_file_path={skill_file}; resource_root_path={resource_root}."
+        ),
+        _ if tool_availability.fs_read => {
+            "Supporting files for this skill are not readable through fs_read because the skill is outside the workspace root.".to_string()
+        }
+        _ => "Supporting file paths are unavailable for this skill.".to_string(),
+    }
+}
+
+fn pinned_skills_discovery_hint(
+    tool_availability: SkillPromptToolAvailability,
+) -> Option<&'static str> {
+    match (tool_availability.skill_search, tool_availability.skill_get) {
+        (true, true) => Some(PINNED_SKILLS_SEARCH_AND_GET_HINT),
+        (true, false) => Some(PINNED_SKILLS_SEARCH_HINT),
+        (false, true) => Some(PINNED_SKILLS_GET_HINT),
+        (false, false) => None,
+    }
 }
 
 fn truncate_pinned_description(name: &str, description: &str, token_budget: u32) -> String {
@@ -475,8 +569,12 @@ pub(crate) fn is_direct_chat(chat_type: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{pinned_skill_prompt, PINNED_SKILLS_HEADER};
-    use crate::{estimate_model_input_tokens, SkillSummary};
+    use super::{
+        insert_skill_injection_prompts, pinned_skill_prompt, SkillPromptToolAvailability,
+        PINNED_SKILLS_HEADER, PINNED_SKILLS_SEARCH_AND_GET_HINT,
+    };
+    use crate::{estimate_model_input_tokens, SkillDocument, SkillSummary};
+    use remi_agentloop::prelude::Message;
 
     fn skill(name: &str, description: &str, pin: bool) -> SkillSummary {
         SkillSummary {
@@ -484,6 +582,19 @@ mod tests {
             description: description.to_string(),
             source: ".remi-cat/skills".to_string(),
             pin,
+        }
+    }
+
+    fn skill_document() -> SkillDocument {
+        SkillDocument {
+            name: "docs".to_string(),
+            description: "Docs workflow".to_string(),
+            pin: false,
+            content: "Use references.".to_string(),
+            source: ".remi-cat/skills/docs".to_string(),
+            root: None,
+            skill_file_path: Some(".remi-cat/skills/docs/SKILL.md".to_string()),
+            resource_root_path: Some(".remi-cat/skills/docs".to_string()),
         }
     }
 
@@ -495,6 +606,7 @@ mod tests {
                 skill("beta", "Unpinned workflow", false),
             ],
             128_000,
+            SkillPromptToolAvailability::all(),
         )
         .expect("pinned skill should create prompt");
 
@@ -503,13 +615,18 @@ mod tests {
         assert!(prompt.contains("Pinned workflow"));
         assert!(!prompt.contains("beta"));
         assert!(!prompt.contains("Unpinned workflow"));
+        assert!(prompt.ends_with(PINNED_SKILLS_SEARCH_AND_GET_HINT));
+        assert!(!prompt.contains("scope=skills"));
     }
 
     #[test]
     fn pinned_skill_prompt_returns_none_without_pinned_summaries() {
-        assert!(
-            pinned_skill_prompt(&[skill("beta", "Unpinned workflow", false)], 128_000).is_none()
-        );
+        assert!(pinned_skill_prompt(
+            &[skill("beta", "Unpinned workflow", false)],
+            128_000,
+            SkillPromptToolAvailability::all()
+        )
+        .is_none());
     }
 
     #[test]
@@ -520,6 +637,7 @@ mod tests {
                 skill("beta", &"b".repeat(1000), true),
             ],
             2_000,
+            SkillPromptToolAvailability::all(),
         )
         .expect("pinned skills should create prompt");
 
@@ -527,5 +645,68 @@ mod tests {
         assert!(prompt.contains("beta"));
         assert!(prompt.contains("..."));
         assert!(estimate_model_input_tokens(&prompt) <= 40);
+    }
+
+    #[test]
+    fn pinned_skill_prompt_only_mentions_available_discovery_tools() {
+        let prompt = pinned_skill_prompt(
+            &[skill("alpha", "Pinned workflow", true)],
+            128_000,
+            SkillPromptToolAvailability::new(true, false, true),
+        )
+        .expect("pinned skill should create prompt");
+        assert!(prompt.contains("`skill__search`"));
+        assert!(!prompt.contains("`skill__get`"));
+        assert!(!prompt.contains("scope=skills"));
+
+        let prompt = pinned_skill_prompt(
+            &[skill("alpha", "Pinned workflow", true)],
+            128_000,
+            SkillPromptToolAvailability::new(false, true, true),
+        )
+        .expect("pinned skill should create prompt");
+        assert!(!prompt.contains("`skill__search`"));
+        assert!(prompt.contains("`skill__get`"));
+        assert!(!prompt.contains("scope=skills"));
+    }
+
+    #[test]
+    fn pinned_skill_prompt_omits_discovery_hint_when_tools_unavailable() {
+        let prompt = pinned_skill_prompt(
+            &[skill("alpha", "Pinned workflow", true)],
+            128_000,
+            SkillPromptToolAvailability::new(false, false, true),
+        )
+        .expect("pinned skill should create prompt");
+        assert!(prompt.contains("alpha"));
+        assert!(!prompt.contains("More skills may be available"));
+        assert!(!prompt.contains("`skill__search`"));
+        assert!(!prompt.contains("`skill__get`"));
+    }
+
+    #[test]
+    fn skill_injection_prompt_only_mentions_fs_read_when_available() {
+        let skills = vec![skill_document()];
+        let mut history = vec![Message::user("hello")];
+        insert_skill_injection_prompts(
+            &mut history,
+            0,
+            &skills,
+            SkillPromptToolAvailability::new(true, true, false),
+        );
+        let prompt = history[0].content.text_content();
+        assert!(prompt.contains("skill_file_path=.remi-cat/skills/docs/SKILL.md"));
+        assert!(prompt.contains("resource_root_path=.remi-cat/skills/docs"));
+        assert!(!prompt.contains("fs_read"));
+
+        let mut history = vec![Message::user("hello")];
+        insert_skill_injection_prompts(
+            &mut history,
+            0,
+            &skills,
+            SkillPromptToolAvailability::all(),
+        );
+        let prompt = history[0].content.text_content();
+        assert!(prompt.contains("Use fs_read"));
     }
 }

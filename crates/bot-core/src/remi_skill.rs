@@ -15,7 +15,7 @@ description: Builtin guide for using Remi to inspect and manage its own profiles
 This is a builtin guide for operating Remi itself through the local `remi-cat` CLI via the `manage_yourself` tool.
 
 Use this skill when the user asks Remi to inspect, configure, start, stop, or manage Remi runtime profiles, agent profiles, supervisor workflows, sandbox settings, ports, or setup state.
-Also use it when the user asks about updating remi-cat, configuring Codex ACP, checking Feishu/Lark readiness, choosing a local CLI channel/session, or discovering runtime slash commands and skills.
+Also use it when the user asks about updating remi-cat, configuring Codex ACP, configuring Remi hooks, checking Feishu/Lark readiness, choosing a local CLI channel/session, or discovering runtime slash commands and skills.
 
 ## Safety
 
@@ -58,7 +58,7 @@ Create or update runtime configuration:
 profile create <profile> admin.enabled=false sandbox.kind=no_sandbox shell.mode=local
 --profile <profile> config set admin.port=8790
 --profile <profile> sandbox set kind=no_sandbox
---profile <profile> acp setup --client codex --tool-name codex
+--profile <profile> acp setup --client codex
 ```
 
 Manage background instances:
@@ -155,14 +155,28 @@ profile workflow list <profile>
 ## ACP Client Commands
 
 ```bash
-acp setup --client codex --bin /path/to/codex --agent default --tool-name codex
+acp setup --client codex --bin /path/to/codex --agent default
 acp setup --client codex --arg=--config --arg=model=\"gpt-5-codex\"
 acp setup --client remi --tool-name acp__remi
+acp setup --client remi --bin /path/to/remi-cat --tool-name acp__remi
+acp agent
 acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp
 acp doctor
 ```
 
-`acp setup` writes the ACP runtime settings for the selected profile. Repeated `--arg` values are stored as local ACP startup args and inserted before the client execution command. `codex setup` and `codex doctor` remain compatibility aliases for Codex ACP. Named ACP tools are exposed as `codex` for Codex by default, or `acp__<client>` for other clients unless `--tool-name` is set.
+`acp setup` writes the ACP runtime settings for the selected profile. `--client codex` writes an out-of-box local profile that launches `remi-cat acp-adapter codex`; repeated `--arg` values become adapter argv passed to Codex before `exec`, and the backend still speaks standard ACP stdio. `codex setup` and `codex doctor` remain convenience aliases for that profile. Other local clients use `acp.local_bin` plus repeated `--arg` values as their process argv. Named ACP tools default to `codex` for the Codex adapter setup command, or `acp__<client>` for other clients unless `--tool-name` is set. `acp agent` runs remi-cat as a standard ACP stdio agent and defaults to the HOME config root unless `REMI_DATA_DIR` is set. For `--client remi`, omitting `--bin` uses Remi's internal local runner; providing `--bin /path/to/remi-cat` configures an external stdio process and defaults local args to `["acp","agent"]` unless explicit `--arg` values are supplied.
+
+## Hook Commands
+
+```bash
+hooks
+hooks list --json
+hooks trust <hash>
+hooks enable <hash>
+hooks disable <hash>
+```
+
+Remi hooks are Remi-owned and use Codex-compatible definitions. Default hook sources are `REMI_DATA_DIR/hooks.json`, `REMI_DATA_DIR/hooks/config.toml`, `.remi-cat/hooks.json`, and `.remi-cat/hooks.toml` under the workspace root. Codex hook files are imported only when `REMI_IMPORT_CODEX_HOOKS=1` or a Remi hooks TOML config sets `import_codex_hooks = true`. Trust and disabled state live under `REMI_DATA_DIR/hooks/`.
 
 ## Feishu/Lark Commands
 

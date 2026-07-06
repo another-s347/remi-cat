@@ -14,13 +14,14 @@ use crate::channel::Channel;
 #[cfg(test)]
 pub(crate) use crate::cli::UpdateCommand;
 pub(crate) use crate::cli::{
-    parse_cli_args, try_parse_cli_args, AppCommand, CliConfig, FeishuCommand, CLI_USER_ID,
+    parse_cli_args, try_parse_cli_args, AcpAdapterCommand, AcpCommand, AppCommand, CliConfig,
+    FeishuCommand, CLI_USER_ID,
 };
 #[cfg(test)]
 pub(crate) use crate::cli::{parse_command, parse_global_args};
 #[cfg(test)]
 pub(crate) use crate::cli::{
-    AcpCommand, CodexCommand, FeedbackCommand, GitHubIssueCreateRequest, HooksCommand,
+    CodexCommand, FeedbackCommand, GitHubIssueCreateRequest, HooksCommand,
 };
 #[cfg(test)]
 pub(crate) use crate::command::{
@@ -88,7 +89,7 @@ pub(crate) fn parse_session_reasoning_effort(
 fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
     match resolve_runtime_config_for_run(data_dir, tui_mode) {
         Ok(resolution) => {
-            tracing::debug!(
+            tracing::info!(
                 source = ?resolution.source,
                 model_profile = resolution
                     .config
@@ -117,22 +118,31 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let tool_output_overflow_bytes = parsed.tool_output_overflow_bytes;
     let command = parsed.command;
     let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
+    let acp_agent_mode = matches!(&command, AppCommand::Acp(AcpCommand::Agent));
     let explicit_data_dir = if tui_mode {
         None
+    } else if acp_agent_mode {
+        absolute_env_path("REMI_DATA_DIR")
     } else {
         std::env::var_os("REMI_DATA_DIR").map(PathBuf::from)
     };
-    let selected_profile = resolve_instance_profile(parsed.profile, explicit_data_dir, tui_mode)?;
+    let selected_profile = resolve_instance_profile(
+        parsed.profile,
+        explicit_data_dir.clone(),
+        tui_mode,
+        acp_agent_mode,
+    )?;
     if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
         ensure_builtin_diagnostic_profile()?;
     }
     let mut data_dir = selected_profile.data_dir.clone();
     std::fs::create_dir_all(&data_dir)?;
-    let secret_store = Arc::new(Mutex::new(if tui_mode {
+    let secret_store = Arc::new(Mutex::new(if tui_mode || acp_agent_mode {
         SecretStore::from_env_with_default_dotenv_path(data_dir.join(".env"))
     } else {
         SecretStore::from_env()
     }));
+    let secret_backend_label = secret_store.lock().await.backend_label();
     let startup_secrets = secret_store.lock().await.entries()?;
     apply_entries_to_env(&startup_secrets);
     let _observability_guard = init_observability(
@@ -140,8 +150,22 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             &command,
             AppCommand::Run(cli) if cli.tui
         ),
+        acp_agent_mode,
         &data_dir,
     )?;
+    tracing::info!(backend = secret_backend_label, "secret store initialized");
+    tracing::info!(
+        tui_mode,
+        acp_agent_mode,
+        selected_profile = selected_profile.label(),
+        data_dir = %data_dir.display(),
+        explicit_data_dir = explicit_data_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        env_model_profile = std::env::var("REMI_MODEL_PROFILE").unwrap_or_default(),
+        "remi startup profile resolved"
+    );
 
     if let AppCommand::Profile(profile_command) = &command {
         run_profile_command(profile_command, &data_dir).await?;
@@ -192,6 +216,40 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         AppCommand::Feishu(FeishuCommand::Doctor) => {
             run_feishu_doctor().await?;
             return Ok(());
+        }
+        AppCommand::AcpAdapter(AcpAdapterCommand::Codex { bin, args }) => {
+            return crate::codex_acp_adapter::run_codex_adapter(bin, args).await;
+        }
+        AppCommand::Acp(AcpCommand::Agent) => {
+            unsafe {
+                std::env::set_var("REMI_DATA_DIR", &data_dir);
+            }
+            apply_runtime_env_defaults(&mut data_dir, false);
+            tracing::info!(
+                data_dir = %data_dir.display(),
+                env_data_dir = std::env::var("REMI_DATA_DIR").unwrap_or_default(),
+                env_agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_default(),
+                env_model_profile = std::env::var("REMI_MODEL_PROFILE").unwrap_or_default(),
+                env_sandbox_kind = std::env::var("REMI_SANDBOX_KIND").unwrap_or_default(),
+                "ACP agent runtime env applied"
+            );
+            if let Some(overflow_bytes) = tool_output_overflow_bytes {
+                unsafe {
+                    std::env::set_var(
+                        "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
+                        overflow_bytes.to_string(),
+                    );
+                }
+            }
+            if !matches!(
+                detect_setup_state(&data_dir),
+                SetupState::Initialized { .. }
+            ) && !has_legacy_env_credentials()
+            {
+                anyhow::bail!(
+                    "remi-cat is not initialized yet. Run `remi-cat setup` first, or provide legacy env config."
+                );
+            }
         }
         AppCommand::Acp(command) => {
             run_acp_command(&selected_profile, &data_dir, command).await?;
@@ -287,6 +345,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     install_embedded_model_profiles(data_dir.join("models"))?;
     install_embedded_agent_profiles(data_dir.join("agents"))?;
     std::fs::create_dir_all(data_dir.join("workflows"))?;
+
+    if matches!(&command, AppCommand::Acp(AcpCommand::Agent)) {
+        let root_agent_id =
+            std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
+        let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
+        let factory = Rc::new(crate::acp_agent::AcpRuntimeFactory::new(
+            data_dir.clone(),
+            secret_store,
+            sessions,
+            root_agent_id,
+        ));
+        return crate::acp_agent::run_stdio_agent(factory).await;
+    }
 
     let cli = match &command {
         AppCommand::Run(cli) => cli.clone(),
@@ -428,6 +499,7 @@ fn resolve_instance_profile(
     cli_profile: Option<String>,
     explicit_data_dir: Option<PathBuf>,
     tui_mode: bool,
+    home_default: bool,
 ) -> anyhow::Result<InstanceProfile> {
     if tui_mode {
         if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
@@ -445,18 +517,32 @@ fn resolve_instance_profile(
         });
     }
     if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
-        if tui_mode {
+        if home_default {
             return InstanceProfile::named_in_data_root(&name, &tui_home_data_dir());
         }
         return InstanceProfile::named(&name);
     }
-    if let Some(data_dir) = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from) {
+    if !home_default {
+        if let Some(data_dir) = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from) {
+            return Ok(InstanceProfile {
+                name: None,
+                data_dir,
+            });
+        }
+    }
+    if home_default {
         return Ok(InstanceProfile {
             name: None,
-            data_dir,
+            data_dir: tui_home_data_dir(),
         });
     }
     Ok(InstanceProfile::default_instance())
+}
+
+fn absolute_env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> {
@@ -505,6 +591,7 @@ fn current_workspace_root_label(workspace_dir: &Path) -> String {
 
 fn init_observability(
     tui_enabled: bool,
+    stdio_json: bool,
     data_dir: &Path,
 ) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     let _sentry_guard = sentry::init((
@@ -518,10 +605,11 @@ fn init_observability(
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "remi_cat=info,bot_core=info,im_feishu=info".into());
 
-    if tui_enabled {
+    if tui_enabled || stdio_json {
         let log_dir = data_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
-        let file_appender = tracing_appender::rolling::never(log_dir, "tui.log");
+        let file_name = if stdio_json { "acp.log" } else { "tui.log" };
+        let file_appender = tracing_appender::rolling::never(log_dir, file_name);
         let (writer, guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::registry()
             .with(
@@ -552,9 +640,10 @@ mod cli_tests {
         parse_global_args, parse_goal_max_rounds, parse_release_version,
         parse_workflow_start_options, percent_encode_query, prefix_short_config_entry,
         redact_known_secrets, run_streaming_command, run_streaming_command_with_stdin,
-        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available, AcpCommand,
-        AppCommand, CliConfig, CodexCommand, FeedbackCommand, FeishuCommand, FeishuDoctorStatus,
-        FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand, ProfileCommand, UpdateCommand,
+        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
+        AcpAdapterCommand, AcpCommand, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
+        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand,
+        ProfileCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
     use crate::profile_command::{
@@ -669,6 +758,7 @@ mod cli_tests {
             None,
             Some(std::path::PathBuf::from("/tmp/remi-data")),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(profile.name, None);
@@ -681,6 +771,7 @@ mod cli_tests {
             Some("dev".to_string()),
             Some(std::path::PathBuf::from("/tmp/remi-data")),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(named.name.as_deref(), Some("dev"));
@@ -690,6 +781,74 @@ mod cli_tests {
                 .join("profiles")
                 .join("dev")
         );
+    }
+
+    #[test]
+    fn acp_agent_defaults_to_home_config_root() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("REMI_PROFILE");
+            std::env::remove_var("REMI_DATA_DIR");
+        }
+
+        let profile = super::resolve_instance_profile(None, None, false, true).unwrap();
+        assert_eq!(profile.name, None);
+        assert_eq!(
+            profile.data_dir,
+            crate::instance_profile::tui_home_data_dir()
+        );
+
+        let named =
+            super::resolve_instance_profile(Some("dev".to_string()), None, false, true).unwrap();
+        assert_eq!(named.name.as_deref(), Some("dev"));
+        assert_eq!(
+            named.data_dir,
+            crate::instance_profile::tui_home_data_dir()
+                .join("profiles")
+                .join("dev")
+        );
+
+        let explicit = super::resolve_instance_profile(
+            None,
+            Some(std::path::PathBuf::from("/tmp/remi-data")),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(explicit.name, None);
+        assert_eq!(
+            explicit.data_dir,
+            std::path::PathBuf::from("/tmp/remi-data")
+        );
+    }
+
+    #[test]
+    fn acp_agent_accepts_only_absolute_env_data_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_data_dir = std::env::var_os("REMI_DATA_DIR");
+        let absolute = std::env::temp_dir().join(format!("remi-acp-{}", uuid::Uuid::new_v4()));
+
+        unsafe {
+            std::env::set_var("REMI_DATA_DIR", &absolute);
+        }
+        assert_eq!(super::absolute_env_path("REMI_DATA_DIR"), Some(absolute));
+
+        unsafe {
+            std::env::set_var("REMI_DATA_DIR", "relative-remi-data");
+        }
+        assert_eq!(super::absolute_env_path("REMI_DATA_DIR"), None);
+        let profile = super::resolve_instance_profile(None, None, false, true).unwrap();
+        assert_eq!(
+            profile.data_dir,
+            crate::instance_profile::tui_home_data_dir()
+        );
+
+        unsafe {
+            match old_data_dir {
+                Some(value) => std::env::set_var("REMI_DATA_DIR", value),
+                None => std::env::remove_var("REMI_DATA_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -1123,6 +1282,60 @@ mod cli_tests {
                     && api_key.as_deref() == Some("secret")
                     && bin.is_none()
                     && args == vec!["--verbose".to_string()]
+        ));
+    }
+
+    #[test]
+    fn acp_setup_remi_external_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "acp",
+                "setup",
+                "--client",
+                "remi",
+                "--bin",
+                "/usr/local/bin/remi-cat",
+                "--tool-name",
+                "acp__remi"
+            ]))
+            .unwrap(),
+            AppCommand::Acp(AcpCommand::Setup {
+                client,
+                bin,
+                tool_name,
+                args,
+                ..
+            })
+                if client == "remi"
+                    && bin.as_deref() == Some("/usr/local/bin/remi-cat")
+                    && tool_name.as_deref() == Some("acp__remi")
+                    && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn acp_adapter_codex_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&[
+                "acp-adapter",
+                "codex",
+                "--bin",
+                "/usr/local/bin/codex",
+                "--arg=--config",
+                "--arg=model=\"gpt-5-codex\""
+            ]))
+            .unwrap(),
+            AppCommand::AcpAdapter(AcpAdapterCommand::Codex { bin, args })
+                if bin.as_deref() == Some("/usr/local/bin/codex")
+                    && args == vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()]
+        ));
+    }
+
+    #[test]
+    fn acp_agent_command_is_recognized() {
+        assert!(matches!(
+            parse_command(&args(&["acp", "agent"])).unwrap(),
+            AppCommand::Acp(AcpCommand::Agent)
         ));
     }
 

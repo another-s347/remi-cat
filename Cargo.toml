@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.12"
+version = "0.2.13"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -34,6 +34,7 @@ secure-storage = ["dep:keyring"]
 bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
 user-store = { path = "crates/user-store" }
+agent-client-protocol = { version = "1.0.1", features = ["unstable_elicitation"] }
 remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
     "http-client",
     "tracing-langsmith",

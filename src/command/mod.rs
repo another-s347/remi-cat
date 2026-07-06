@@ -272,7 +272,7 @@ fn runtime_command_help() -> String {
         "- `/model` or `/model list` - inspect or select model profiles for this session",
         "- `/agent` or `/agent list` - inspect or select the main agent for this session",
         "- `/permissions` - inspect or change tool approval mode for this session",
-        "- `/hooks` - list/trust/enable/disable Codex-compatible hooks",
+        "- `/hooks` - list/trust/enable/disable Remi hooks",
         "- `/goal ...` - inspect or manage the current goal workflow",
         "- `/workflow ...` - inspect or manage supervisor workflow state",
         "- `/<workflow-id> ...` - start a supervisor workflow directly",

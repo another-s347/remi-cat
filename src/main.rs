@@ -1,6 +1,8 @@
+mod acp_agent;
 mod app;
 mod channel;
 mod cli;
+mod codex_acp_adapter;
 mod command;
 mod config;
 mod core;

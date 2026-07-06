@@ -12,7 +12,10 @@ pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] 
             "bash",
             "Execute a bash command in the configured workspace sandbox.",
         ),
-        ("codex", "Open, resume, or poll a Codex ACP session."),
+        (
+            "codex",
+            "Open, resume, or poll the Codex ACP adapter session.",
+        ),
         (
             "fetch",
             "Fetch content or IM bridge files into the workspace.",
@@ -68,7 +71,7 @@ pub(crate) fn tool_errors(name: &str, registered: bool) -> Vec<String> {
                 .to_string(),
         ],
         "codex" => vec![
-            "codex is not registered because ACP Codex is not configured or the Codex binary is unavailable; run remi-cat acp setup --client codex and remi-cat acp doctor"
+            "codex is not registered because the Codex ACP adapter profile is unavailable; run remi-cat acp setup --client codex and remi-cat acp doctor"
                 .to_string(),
         ],
         name if name.starts_with("acp__") => vec![

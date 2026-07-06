@@ -79,7 +79,7 @@ fn diagnostic_path_skill_name(path: &str) -> Option<String> {
 
 fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
-        return "Local skills follow the Agent Skills SKILL.md directory format. Use skill__search with keywords to discover skills by name and description. Use skill__get to read one skill's instructions for the current turn; use fs_read with the returned resource_root_path for supporting files.".to_string();
+        return "Local skills follow the Agent Skills SKILL.md directory format. Use skill__get with an exact skill name to read one skill's instructions for the current turn.".to_string();
     }
 
     let mut prompt = String::from(
@@ -90,7 +90,7 @@ fn render_skill_get_extra_prompt(skills: &[SkillSummary]) -> String {
         prompt.push('\n');
     }
     prompt.push_str(
-        "Use skill__search to discover additional skills. Use skill__get with the exact skill name to read one skill's instructions for the current turn.",
+        "Use skill__get with the exact skill name to read one skill's instructions for the current turn.",
     );
     prompt
 }
@@ -144,7 +144,7 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
     }
 
     fn description(&self) -> &str {
-        "Read the full SKILL.md instructions for a local skill by name. The instructions are returned in this tool result. For supporting files, use fs_read with the returned resource_root_path."
+        "Read the full SKILL.md instructions for a local skill by name. The instructions are returned in this tool result."
     }
 
     fn extra_prompt(&self, ctx: &ToolDefinitionContext) -> Option<String> {
@@ -179,10 +179,10 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
                 let diagnostics =
                     diagnostics_for_skill_name(&self.store.load_diagnostics(), &doc.name);
                 let resource_hint = match (&doc.skill_file_path, &doc.resource_root_path) {
-                    (Some(skill_file), Some(resource_root)) => format!(
-                        "fs_read skill_file_path={skill_file}; resource_root_path={resource_root}"
-                    ),
-                    _ => "resources are not readable through fs_read because this skill is outside the workspace root".to_string(),
+                    (Some(skill_file), Some(resource_root)) => {
+                        format!("skill_file_path={skill_file}; resource_root_path={resource_root}")
+                    }
+                    _ => "supporting file paths are unavailable for this skill".to_string(),
                 };
                 let mut text = format!(
                     "{}\n\n[skill read: {} from {}; {}]",
@@ -293,12 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_featured_prompt_points_to_search_and_get() {
+    fn empty_featured_prompt_points_to_get() {
         let prompt = render_skill_get_extra_prompt(&Vec::<SkillSummary>::new());
-        assert!(prompt.contains("skill__search"));
         assert!(prompt.contains("skill__get"));
         assert!(prompt.contains("current turn"));
-        assert!(prompt.contains("fs_read"));
+        assert!(!prompt.contains("skill__search"));
+        assert!(!prompt.contains("fs_read"));
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
 
         assert!(output.contains("Use primary sources."));
         assert!(output.contains("[skill read: researcher"));
-        assert!(output.contains("resources are not readable through fs_read"));
+        assert!(output.contains("supporting file paths are unavailable"));
         assert!(!output.contains("[skill activated:"));
         assert_eq!(
             read_skill_names(&ctx.user_state.read().unwrap()),
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_get_returns_fs_read_resource_paths_for_file_skills() {
+    async fn skill_get_returns_resource_paths_for_file_skills() {
         let workspace = temp_dir();
         let primary = workspace.join(".remi-cat").join("skills");
         let skill_dir = primary.join("docs");

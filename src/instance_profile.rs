@@ -101,7 +101,7 @@ pub fn profiles_root_in_data_root(data_root: &Path) -> PathBuf {
 }
 
 pub fn tui_home_data_dir() -> PathBuf {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = home_dir_from_env() else {
         return PathBuf::from(TUI_HOME_DATA_DIR);
     };
     let preferred = home.join(TUI_HOME_DATA_DIR);
@@ -114,6 +114,48 @@ pub fn tui_home_data_dir() -> PathBuf {
     } else {
         preferred
     }
+}
+
+fn home_dir_from_env() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(home) = windows_home_dir_from_env() {
+            return Some(home);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let drive = std::env::var_os("HOMEDRIVE")?;
+    let path = std::env::var_os("HOMEPATH")?;
+    if drive.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(format!(
+        "{}{}",
+        drive.to_string_lossy(),
+        path.to_string_lossy()
+    )))
+}
+
+#[cfg(windows)]
+fn windows_home_dir_from_env() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let drive = std::env::var_os("HOMEDRIVE")?;
+    let path = std::env::var_os("HOMEPATH")?;
+    if drive.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(format!(
+        "{}{}",
+        drive.to_string_lossy(),
+        path.to_string_lossy()
+    )))
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {
@@ -223,9 +265,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_run_metadata, remove_run_metadata, validate_profile_name, write_run_metadata,
-        InstanceProfile, ProfileRunMetadata,
+        read_run_metadata, remove_run_metadata, tui_home_data_dir, validate_profile_name,
+        write_run_metadata, InstanceProfile, ProfileRunMetadata, TUI_HOME_DATA_DIR,
     };
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn validates_profile_names() {
@@ -253,6 +298,32 @@ mod tests {
     }
 
     #[test]
+    fn tui_home_data_dir_uses_userprofile_when_home_is_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let old_homedrive = std::env::var_os("HOMEDRIVE");
+        let old_homepath = std::env::var_os("HOMEPATH");
+        let temp_home =
+            std::env::temp_dir().join(format!("remi-userprofile-{}", uuid::Uuid::new_v4()));
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("USERPROFILE", &temp_home);
+            std::env::remove_var("HOMEDRIVE");
+            std::env::remove_var("HOMEPATH");
+        }
+
+        assert_eq!(tui_home_data_dir(), temp_home.join(TUI_HOME_DATA_DIR));
+
+        unsafe {
+            restore_env("HOME", old_home);
+            restore_env("USERPROFILE", old_userprofile);
+            restore_env("HOMEDRIVE", old_homedrive);
+            restore_env("HOMEPATH", old_homepath);
+        }
+    }
+
+    #[test]
     fn run_metadata_round_trip() {
         let dir = std::env::temp_dir().join(format!("remi-profile-meta-{}", uuid::Uuid::new_v4()));
         let profile = InstanceProfile {
@@ -276,5 +347,12 @@ mod tests {
         remove_run_metadata(&profile).unwrap();
         assert!(read_run_metadata(&profile).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    unsafe fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }

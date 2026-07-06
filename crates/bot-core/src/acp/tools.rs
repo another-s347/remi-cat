@@ -19,7 +19,7 @@ use super::backend::{
     AcpToolTaskStatus,
 };
 
-const DEFAULT_CODEX_WAIT_MS: u64 = 30_000;
+const DEFAULT_ACP_WAIT_MS: u64 = 30_000;
 
 pub struct AcpChatTool {
     backend: Arc<AcpBackend>,
@@ -48,7 +48,7 @@ impl AcpChatTool {
             backend,
             approval_manager,
             "codex",
-            "Open or resume a Codex ACP session. Provide `message` to start work; the tool streams the Codex sub-session until it completes. Optionally pass `session_id` to resume an ACP session, `title` for a new session, or `startup_args` for local Codex CLI global arguments inserted before `exec`.",
+            "Open or resume the configured Codex ACP adapter session. Provide `message` to start work; the tool streams the ACP sub-session until it completes. Optionally pass `session_id` to resume an ACP session or `title` for a new session.",
         )
     }
 }
@@ -84,7 +84,7 @@ impl Tool for AcpChatTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "message": { "type": "string", "description": "The user message to send to Codex/ACP." },
+                "message": { "type": "string", "description": "The user message to send to the configured ACP client." },
                 "session_id": { "type": "string", "description": "Optional ACP session id to resume. The tool result also returns the session_id to reuse later." },
                 "title": { "type": "string", "description": "Optional title for a newly created ACP session." },
                 "task_id": { "type": "string", "description": "Compatibility-only: poll a background task created by an older running result." },
@@ -93,7 +93,7 @@ impl Tool for AcpChatTool {
                 "startup_args": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Extra local Codex CLI global argv inserted before `exec` for this call. Only supported for local Codex ACP."
+                    "description": "Deprecated. Configure local adapter argv in the ACP profile instead."
                 }
             }
         })
@@ -125,10 +125,7 @@ impl Tool for AcpChatTool {
             {
                 let action = args.action.as_deref().unwrap_or("poll");
                 if action != "poll" {
-                    return Err(AgentError::tool(
-                        &tool_name,
-                        "unsupported codex task action",
-                    ));
+                    return Err(AgentError::tool(&tool_name, "unsupported ACP task action"));
                 }
                 let status = backend.poll_tool_task(task_id).await;
                 let preview = serde_json::to_string_pretty(&status)
@@ -148,7 +145,7 @@ impl Tool for AcpChatTool {
                     session_id: args.session_id,
                     title: args.title,
                     current_channel: Some(current_channel),
-                    codex_startup_args: args.startup_args,
+                    startup_args: args.startup_args,
                 })
                 .await
                 .map_err(|err| AgentError::tool(&tool_name, err.to_string()))?;
@@ -156,7 +153,7 @@ impl Tool for AcpChatTool {
             let sub_thread_id = ThreadId(prepared.sub_session_id.clone());
             let sub_run_id = RunId(Uuid::new_v4().to_string());
             let title = prepared.title.clone();
-            let _wait_ms = args.wait_ms.unwrap_or(DEFAULT_CODEX_WAIT_MS);
+            let _wait_ms = args.wait_ms.unwrap_or(DEFAULT_ACP_WAIT_MS);
 
             Ok(ToolResult::Output(
                 stream! {
@@ -278,7 +275,7 @@ fn status_stream(status: AcpToolTaskStatus, preview: String) -> BoxStream<'stati
     stream! {
         let sub_thread_id = ThreadId(status.sub_session_id.clone());
         let sub_run_id = RunId(Uuid::new_v4().to_string());
-        let title = Some("Codex ACP".to_string());
+        let title = Some("ACP".to_string());
         for output in status_sub_session_outputs(status.clone(), &sub_thread_id, &sub_run_id, title, true, None) {
             yield output;
         }
@@ -353,7 +350,7 @@ fn status_sub_session_outputs(
                 content: status
                     .poll_hint
                     .clone()
-                    .unwrap_or_else(|| "Codex ACP is still running.".to_string()),
+                    .unwrap_or_else(|| "ACP task is still running.".to_string()),
             },
         )));
     }

@@ -18,6 +18,7 @@ pub(crate) enum ChannelKind {
     Cli,
     Tui,
     Web,
+    Acp,
 }
 
 impl ChannelKind {
@@ -27,6 +28,7 @@ impl ChannelKind {
             Self::Cli => "cli",
             Self::Tui => "tui",
             Self::Web => "web",
+            Self::Acp => "acp",
         }
     }
 }

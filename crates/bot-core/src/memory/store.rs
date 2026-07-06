@@ -34,6 +34,7 @@ use crate::{ContextCompactionEvent, ContextCompactionSource, ContextCompactionSt
 
 use super::compress::LlmCompressor;
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
+use crate::search_query::{tokenized_search_query, TokenizedSearchQuery};
 
 // ── MemoryContext ─────────────────────────────────────────────────────────────
 
@@ -914,19 +915,23 @@ impl MemoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MemoryRecallResult>, AgentError> {
-        let terms = query_terms(query);
-        if terms.is_empty() {
+        let Some(query) = tokenized_search_query(query) else {
             return Ok(Vec::new());
-        }
+        };
+        tracing::debug!(
+            token_count = query.terms().len(),
+            ripgrep_query = query.ripgrep_query(),
+            "memory.recall.query_tokenized"
+        );
         let limit = limit.clamp(1, 20);
         let mut results = Vec::new();
 
-        self.recall_named(agent_id, &terms, &mut results).await?;
-        self.recall_short_term(thread_id, &terms, &mut results)
+        self.recall_named(agent_id, &query, &mut results).await?;
+        self.recall_short_term(thread_id, &query, &mut results)
             .await?;
-        self.recall_tier(thread_id, "mid_term", &terms, &mut results)
+        self.recall_tier(thread_id, "mid_term", &query, &mut results)
             .await?;
-        self.recall_tier(thread_id, "long_term", &terms, &mut results)
+        self.recall_tier(thread_id, "long_term", &query, &mut results)
             .await?;
 
         results.sort_by(|a, b| {
@@ -942,7 +947,7 @@ impl MemoryStore {
     async fn recall_named(
         &self,
         agent_id: &str,
-        terms: &[String],
+        query: &TokenizedSearchQuery,
         results: &mut Vec<MemoryRecallResult>,
     ) -> Result<(), AgentError> {
         let dir = self.named_memory_dir(agent_id);
@@ -965,7 +970,7 @@ impl MemoryStore {
                 Err(_) => continue,
             };
             let body = strip_named_memory_header(&text);
-            let score = match_score(&body, terms);
+            let score = match_score(&body, query);
             if score == 0 {
                 continue;
             }
@@ -978,7 +983,7 @@ impl MemoryStore {
                 uuid: None,
                 timestamp: updated_at,
                 preview: make_preview(&body, 100),
-                snippet: make_snippet(&body, terms, MEMORY_RECALL_SNIPPET_CHARS),
+                snippet: make_snippet(&body, query, MEMORY_RECALL_SNIPPET_CHARS),
                 score,
             });
         }
@@ -988,12 +993,12 @@ impl MemoryStore {
     async fn recall_short_term(
         &self,
         thread_id: &str,
-        terms: &[String],
+        query: &TokenizedSearchQuery,
         results: &mut Vec<MemoryRecallResult>,
     ) -> Result<(), AgentError> {
         for msg in Self::read_short_term(&self.short_term_path(thread_id)).await {
             let text = msg.content.text_content();
-            let score = match_score(&text, terms);
+            let score = match_score(&text, query);
             if score == 0 {
                 continue;
             }
@@ -1003,7 +1008,7 @@ impl MemoryStore {
                 uuid: Some(msg.id.to_string()),
                 timestamp: message_timestamp(&msg),
                 preview: make_preview(&text, 100),
-                snippet: make_snippet(&text, terms, MEMORY_RECALL_SNIPPET_CHARS),
+                snippet: make_snippet(&text, query, MEMORY_RECALL_SNIPPET_CHARS),
                 score,
             });
         }
@@ -1014,7 +1019,7 @@ impl MemoryStore {
         &self,
         thread_id: &str,
         tier: &str,
-        terms: &[String],
+        query: &TokenizedSearchQuery,
         results: &mut Vec<MemoryRecallResult>,
     ) -> Result<(), AgentError> {
         let (source, dir) = match tier {
@@ -1029,7 +1034,7 @@ impl MemoryStore {
                 Ok(text) => text,
                 Err(_) => continue,
             };
-            let score = match_score(&text, terms);
+            let score = match_score(&text, query);
             if score == 0 {
                 continue;
             }
@@ -1039,7 +1044,7 @@ impl MemoryStore {
                 uuid: Some(entry.uuid),
                 timestamp: entry.created_at,
                 preview: make_preview(&text, 100),
-                snippet: make_snippet(&text, terms, MEMORY_RECALL_SNIPPET_CHARS),
+                snippet: make_snippet(&text, query, MEMORY_RECALL_SNIPPET_CHARS),
                 score,
             });
         }
@@ -1114,83 +1119,26 @@ fn strip_named_memory_header(text: &str) -> String {
         .join("\n")
 }
 
-fn query_terms(query: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    for term in query.split_whitespace() {
-        let term = term
-            .trim_matches(|ch: char| !ch.is_alphanumeric())
-            .to_lowercase();
-        if term.len() >= 2 && !is_query_stopword(&term) && !terms.iter().any(|seen| seen == &term) {
-            terms.push(term);
-        }
-    }
-    terms
-}
-
-fn is_query_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "by"
-            | "can"
-            | "could"
-            | "did"
-            | "do"
-            | "does"
-            | "for"
-            | "from"
-            | "had"
-            | "has"
-            | "have"
-            | "how"
-            | "i"
-            | "in"
-            | "is"
-            | "it"
-            | "me"
-            | "my"
-            | "of"
-            | "on"
-            | "or"
-            | "that"
-            | "the"
-            | "this"
-            | "to"
-            | "was"
-            | "were"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "who"
-            | "why"
-            | "with"
-            | "you"
-            | "your"
-    )
-}
-
-fn match_score(text: &str, terms: &[String]) -> usize {
+fn match_score(text: &str, query: &TokenizedSearchQuery) -> usize {
     let lower = text.to_lowercase();
-    terms.iter().map(|term| lower.matches(term).count()).sum()
+    let unique_hits = query
+        .terms()
+        .iter()
+        .filter(|term| lower.contains(term.as_str()))
+        .count();
+    let regex_hits = query.regex().find_iter(text).count();
+    unique_hits.saturating_mul(10).saturating_add(regex_hits)
 }
 
-fn make_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
+fn make_snippet(text: &str, query: &TokenizedSearchQuery, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    let lower = text.to_lowercase();
-    let mut occurrences = Vec::new();
-    for term in terms {
-        for (byte_idx, _) in lower.match_indices(term) {
-            occurrences.push(byte_idx);
-        }
-    }
+    let occurrences = query
+        .regex()
+        .find_iter(text)
+        .map(|mat| mat.start())
+        .collect::<Vec<_>>();
     if occurrences.is_empty() {
         return text.chars().take(max_chars).collect();
     }
@@ -1200,19 +1148,17 @@ fn make_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
     let text_chars = text.chars().count();
     let mut candidates = Vec::new();
     for byte_idx in occurrences {
-        let hit_char = lower[..byte_idx].chars().count().min(text_chars);
+        let hit_char = text[..byte_idx].chars().count().min(text_chars);
         let start = hit_char.saturating_sub(prefix_chars);
         let end = (start + window_chars).min(text_chars);
         let window: String = text.chars().skip(start).take(end - start).collect();
         let window_lower = window.to_lowercase();
-        let unique_terms = terms
+        let unique_terms = query
+            .terms()
             .iter()
             .filter(|term| window_lower.contains(term.as_str()))
             .count();
-        let total_matches = terms
-            .iter()
-            .map(|term| window_lower.matches(term).count())
-            .sum();
+        let total_matches = query.regex().find_iter(&window).count();
         candidates.push(SnippetWindow {
             start,
             end,
@@ -1526,25 +1472,43 @@ mod tests {
 **user:** Those worked well. I've been listening to audiobooks during my daily commute, which takes 45 minutes each way.
 ";
 
-        let terms = query_terms("How long is my daily commute to work?");
-        let snippet = make_snippet(text, &terms, MEMORY_RECALL_SNIPPET_CHARS);
+        let query = tokenized_search_query("How long is my daily commute to work?").unwrap();
+        let snippet = make_snippet(text, &query, MEMORY_RECALL_SNIPPET_CHARS);
         assert!(snippet.contains("daily commute"));
         assert!(snippet.contains("45 minutes each way"));
 
-        let terms = query_terms("commute work minutes");
-        let snippet = make_snippet(text, &terms, MEMORY_RECALL_SNIPPET_CHARS);
+        let query = tokenized_search_query("commute work minutes").unwrap();
+        let snippet = make_snippet(text, &query, MEMORY_RECALL_SNIPPET_CHARS);
         assert!(snippet.contains("45 minutes each way"));
     }
 
     #[test]
     fn snippet_handles_lowercase_expansion_without_slicing_original_at_lower_byte_offset() {
         let text = "记忆：İstanbul 的偏好是坐在靠窗位置。";
-        let terms = query_terms("istanbul 靠窗");
+        let query = tokenized_search_query("istanbul 靠窗").unwrap();
 
-        let snippet = make_snippet(text, &terms, MEMORY_RECALL_SNIPPET_CHARS);
+        let snippet = make_snippet(text, &query, MEMORY_RECALL_SNIPPET_CHARS);
 
         assert!(snippet.contains("İstanbul"));
         assert!(snippet.contains("靠窗"));
+    }
+
+    #[tokio::test]
+    async fn recall_tokenizes_cjk_natural_language_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        store
+            .upsert_named_memory("default", "travel", "Istanbul 的偏好是坐在靠窗位置。")
+            .await
+            .unwrap();
+
+        let results = store
+            .recall("default", "thread-1", "我想找靠窗座位", 8)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].snippet.contains("靠窗"));
     }
 
     #[tokio::test]
@@ -1706,9 +1670,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 20);
-        assert_eq!(results[0].score, 3);
+        assert_eq!(results[0].score, 13);
         assert_eq!(results[0].timestamp, dt("2026-05-02T00:00:00Z"));
-        assert_eq!(results[1].score, 3);
+        assert_eq!(results[1].score, 13);
         assert_eq!(results[1].timestamp, dt("2026-05-01T00:00:00Z"));
     }
 }
