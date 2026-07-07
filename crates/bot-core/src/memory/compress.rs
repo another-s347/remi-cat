@@ -85,7 +85,10 @@ impl LlmCompressor {
         }
 
         let input = LoopInput::start(text);
-        let stream = self.inner.chat(input).await?;
+        let stream = self
+            .inner
+            .chat(bot_runtime_core::chat_ctx_from_input(&input, None), input)
+            .await?;
         let mut stream = std::pin::pin!(stream);
 
         let mut result = String::new();

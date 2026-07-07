@@ -5,8 +5,9 @@
 //! The metadata propagates through `AgentLoop` into every `ToolContext`.
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Content, Tool, ToolContext, ToolOutput, ToolResult};
+use remi_agentloop::prelude::{AgentError, Content, Tool, ToolOutput, ToolResult};
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -70,7 +71,7 @@ impl Tool for MemoryGetDetailTool {
         &self,
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let uuid = args["uuid"].as_str().unwrap_or("").to_string();
         let name = args["name"].as_str().unwrap_or("").to_string();
@@ -145,7 +146,7 @@ impl Tool for MemoryUpsertNamedTool {
         &self,
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let name = args
             .get("name")
@@ -242,7 +243,7 @@ impl Tool for MemoryRecallTool {
         &self,
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let query = args
             .get("query")
@@ -311,7 +312,7 @@ pub(crate) fn memory_agent_from_args(
 
 pub(crate) fn memory_thread_id_from_args_or_context(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    ctx: ToolContext,
     default_agent_id: &str,
     tool_name: &str,
 ) -> Result<String, AgentError> {
@@ -326,12 +327,13 @@ pub(crate) fn memory_thread_id_from_args_or_context(
         return Ok(named_memory_thread_id(&agent, named));
     }
 
-    ctx.metadata
+    let metadata = ctx.metadata();
+    metadata
         .as_ref()
         .and_then(|m| m.get("thread_id"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .or_else(|| ctx.thread_id.as_ref().map(ToString::to_string))
+        .or_else(|| Some(ctx.thread_id().to_string()))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AgentError::tool(tool_name, "thread_id not found in context metadata"))
 }
@@ -384,9 +386,9 @@ fn absolute_lexical_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{AgentConfig, Message, Tool};
+    use remi_agentloop::prelude::{Message, Tool};
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     fn test_store(data_dir: PathBuf) -> Arc<MemoryStore> {
         Arc::new(MemoryStore {
@@ -406,30 +408,16 @@ mod tests {
     }
 
     fn tool_context(thread_id: Option<&str>) -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("test-thread"))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
-            metadata: thread_id.map(|id| json!({ "thread_id": id })),
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
-    }
-
-    fn tool_context_without_thread() -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: None,
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+            bot_runtime_core::ChatCtxState {
+                metadata: thread_id.map(|id| json!({ "thread_id": id })),
+                ..bot_runtime_core::ChatCtxState::default()
+            },
+        )
     }
 
     async fn collect_text(result: ToolResult<impl Stream<Item = ToolOutput>>) -> String {
@@ -462,7 +450,7 @@ mod tests {
                 &tool,
                 json!({ "content": "x" }),
                 None,
-                &tool_context(None),
+                tool_context(None),
             )
             .await
             .unwrap(),
@@ -475,7 +463,7 @@ mod tests {
                 &tool,
                 json!({ "name": "x" }),
                 None,
-                &tool_context(None),
+                tool_context(None),
             )
             .await
             .unwrap(),
@@ -497,26 +485,13 @@ mod tests {
                 &tool,
                 json!({}),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
         )
         .await;
         assert!(text.contains("query parameter is required"));
-
-        let err = match <MemoryRecallTool as Tool>::execute(
-            &tool,
-            json!({ "query": "alpha" }),
-            None,
-            &tool_context_without_thread(),
-        )
-        .await
-        {
-            Ok(_) => panic!("missing thread id should fail before streaming"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("thread_id not found"));
     }
 
     #[tokio::test]
@@ -542,7 +517,7 @@ mod tests {
                 &upsert,
                 json!({ "name": "project", "content": "alpha belongs to planner" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -555,7 +530,7 @@ mod tests {
                 &planner_recall,
                 json!({ "query": "alpha" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -568,7 +543,7 @@ mod tests {
                 &coder_recall,
                 json!({ "query": "alpha" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -606,7 +581,7 @@ mod tests {
                 &tool,
                 json!({ "query": "alpha", "agent": "coder", "named": "feature_a" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -634,7 +609,7 @@ mod tests {
                 &tool,
                 json!({ "name": "project", "agent": "coder" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -658,7 +633,7 @@ mod tests {
                 &tool,
                 json!({ "name": "project", "content": "alpha" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -686,7 +661,7 @@ mod tests {
                 &tool,
                 json!({ "name": "project", "content": "alpha" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),

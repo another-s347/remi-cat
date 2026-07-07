@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use remi_agentloop::prelude::CancellationToken;
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 mod bash;
 mod path;
@@ -155,7 +156,7 @@ pub trait Sandbox: Send + Sync {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
@@ -208,7 +209,7 @@ impl NoSandbox {
         &self,
         command: &str,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> Result<SandboxBashOutput> {
         tokio::fs::create_dir_all(&self.root)
             .await
@@ -225,7 +226,7 @@ impl NoSandbox {
         named: &str,
         command: &str,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> Result<SandboxBashOutput> {
         tokio::fs::create_dir_all(&self.root)
             .await
@@ -360,7 +361,7 @@ impl Sandbox for NoSandbox {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move {
             match named.map(str::trim).filter(|value| !value.is_empty()) {
@@ -459,7 +460,7 @@ impl DockerSandbox {
         &self,
         command: &str,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> Result<SandboxBashOutput> {
         self.ensure_running().await?;
         let mut cmd = Command::new("docker");
@@ -477,7 +478,7 @@ impl DockerSandbox {
         named: &str,
         command: &str,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> Result<SandboxBashOutput> {
         self.ensure_running().await?;
         let container_name = self.config.container_name.clone();
@@ -649,7 +650,7 @@ impl Sandbox for DockerSandbox {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
-        cancel: Option<Arc<Notify>>,
+        cancel: Option<CancellationToken>,
     ) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move {
             match named.map(str::trim).filter(|value| !value.is_empty()) {
@@ -674,11 +675,10 @@ mod tests {
         current_host_user_spec, DockerSandbox, DockerSandboxConfig, NoSandbox, ReplaceResult,
         Sandbox, SandboxBashStatus,
     };
+    use remi_agentloop::prelude::CancellationToken;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Notify;
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("remi-sandbox-test-{}", uuid::Uuid::new_v4()))
@@ -825,12 +825,12 @@ mod tests {
     async fn cancel_signal_cancels_running_unnamed_bash() {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
-        let cancel = Arc::new(Notify::new());
-        let cancel_for_task = Arc::clone(&cancel);
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            cancel_for_task.notify_waiters();
+            cancel_for_task.cancel();
         });
 
         let started = std::time::Instant::now();

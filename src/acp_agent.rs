@@ -26,9 +26,9 @@ use bot_core::{
     UserQuestionStatus,
 };
 use futures::StreamExt;
-use remi_agentloop::prelude::{SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::{CancellationToken, SubSessionEvent, SubSessionEventPayload};
 use tokio::sync::Mutex;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
@@ -38,7 +38,7 @@ use bot_core::im_tools::ImFileBridge;
 use bot_core::{AcpClientToolProvider, AcpClientToolSupport, CatBotBuilder};
 use user_store::UserStore;
 
-type CancelRegistry = Arc<StdMutex<HashMap<String, Arc<Notify>>>>;
+type CancelRegistry = Arc<StdMutex<HashMap<String, CancellationToken>>>;
 type AcpSessions = Arc<Mutex<SessionRuntime>>;
 type ElicitationSupport = Arc<StdMutex<bool>>;
 type AcpClientToolSupportState = Arc<StdMutex<AcpClientToolSupport>>;
@@ -398,7 +398,7 @@ pub(crate) async fn run_stdio_agent(factory: Rc<AcpRuntimeFactory>) -> anyhow::R
                 let elicitation_support = Arc::clone(&elicitation_support);
                 async move |request: PromptRequest, responder, cx: ConnectionTo<Client>| {
                     let (response_tx, response_rx) = oneshot::channel();
-                    let cancel = Arc::new(Notify::new());
+                    let cancel = CancellationToken::new();
                     let session_id = request.session_id.to_string();
                     tracing::info!(
                         session_id = %session_id,
@@ -412,7 +412,7 @@ pub(crate) async fn run_stdio_agent(factory: Rc<AcpRuntimeFactory>) -> anyhow::R
                                 "ACP cancellation registry is poisoned",
                             )
                         })?
-                        .insert(session_id, Arc::clone(&cancel));
+                        .insert(session_id, cancel.clone());
                     let elicitation_supported = elicitation_support
                         .lock()
                         .map(|supported| *supported)
@@ -457,7 +457,7 @@ pub(crate) async fn run_stdio_agent(factory: Rc<AcpRuntimeFactory>) -> anyhow::R
                 async move |cancel: CancelNotification, _cx| {
                     if let Ok(map) = cancellations.lock() {
                         if let Some(notify) = map.get(&cancel.session_id.to_string()) {
-                            notify.notify_waiters();
+                            notify.cancel();
                         }
                     }
                     Ok(())
@@ -485,7 +485,7 @@ pub(crate) async fn run_stdio_agent(factory: Rc<AcpRuntimeFactory>) -> anyhow::R
 struct PromptJob {
     request: PromptRequest,
     connection: ConnectionTo<Client>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     cancellations: CancelRegistry,
     elicitation_supported: bool,
     response: oneshot::Sender<agent_client_protocol::Result<PromptResponse>>,
@@ -495,7 +495,7 @@ async fn run_prompt_turn(
     runtime: Rc<Runtime>,
     request: PromptRequest,
     cx: ConnectionTo<Client>,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     elicitation_supported: bool,
     acp_client_tool_provider: AcpClientToolProvider,
 ) -> agent_client_protocol::Result<PromptResponse> {
@@ -562,12 +562,12 @@ async fn run_prompt_turn(
         .with_sender("zed", Some("Zed".to_string()))
         .with_message(message_id.to_string(), ACP_CHANNEL)
         .with_platform(Some(ACP_CHANNEL.to_string()))
-        .with_cancel(Arc::clone(&cancel));
+        .with_cancel(cancel.clone());
     let mut stream = std::pin::pin!(runtime.chat(chat_request));
     loop {
         let event = tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 return Ok(PromptResponse::new(StopReason::Cancelled));
             }
             event = stream.next() => event,
@@ -1110,7 +1110,7 @@ async fn delete_acp_session(sessions: &AcpSessions, session_id: &str) -> anyhow:
 fn cancel_acp_session(cancellations: &CancelRegistry, session_id: &str) {
     if let Ok(mut map) = cancellations.lock() {
         if let Some(notify) = map.remove(session_id) {
-            notify.notify_waiters();
+            notify.cancel();
         }
     }
 }

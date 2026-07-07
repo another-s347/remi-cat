@@ -7,10 +7,9 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::{Stream, StreamExt};
-use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, ResumePayload, Tool, ToolOutput, ToolResult};
 use serde::Deserialize;
 
 use crate::tools::DEFAULT_FS_READ_LENGTH;
@@ -111,7 +110,7 @@ impl Tool for AcpFsReadTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let provider = self.provider.clone();
@@ -221,7 +220,7 @@ impl Tool for AcpFsWriteTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let provider = self.provider.clone();
@@ -285,7 +284,7 @@ impl Tool for AcpBashTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let provider = self.provider.clone();

@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult};
+use remi_agentloop::prelude::{AgentError, Tool, ToolOutput, ToolResult};
 use remi_agentloop::types::ResumePayload;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -407,7 +408,7 @@ impl Tool for TodoAddTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let request = parse_add_request(arguments)?;
         let result = self.backend.add_batch(ctx, request).await?;
@@ -451,7 +452,7 @@ impl Tool for TodoListTool {
         &self,
         _arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let todos = self.backend.list(ctx).await;
         let text = fmt_todos(&todos);
@@ -493,7 +494,7 @@ impl Tool for TodoCompleteTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let id = arguments["id"]
             .as_u64()
@@ -536,7 +537,7 @@ impl Tool for TodoUpdateTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let id = arguments["id"]
             .as_u64()
@@ -585,7 +586,7 @@ impl Tool for TodoRemoveTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let id = arguments["id"]
             .as_u64()

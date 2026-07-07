@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::{Stream, StreamExt};
-use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, ResumePayload, Tool, ToolOutput, ToolResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex};
 
@@ -226,18 +225,18 @@ impl Tool for AskUserQuestionTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let manager = Arc::clone(&self.manager);
-        let thread_id = ctx
-            .metadata
+        let metadata = ctx.metadata();
+        let thread_id = metadata
             .as_ref()
             .and_then(|value| value.get("thread_id"))
             .and_then(|value| value.as_str())
             .map(ToString::to_string)
-            .or_else(|| ctx.thread_id.as_ref().map(|id| id.0.clone()));
-        let run_id = ctx.run_id.clone();
+            .or_else(|| Some(ctx.thread_id().0));
+        let run_id = ctx.run_id();
         async move {
             let args: AskUserQuestionArgs = serde_json::from_value(arguments)
                 .map_err(|err| AgentError::tool("ask_user_question", err.to_string()))?;
@@ -342,18 +341,12 @@ fn validate_question_args(args: &AskUserQuestionArgs) -> Result<(), AgentError> 
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use remi_agentloop::prelude::AgentConfig;
-    use std::sync::RwLock;
-
     fn tool_context() -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(remi_agentloop::prelude::ThreadId("thread-1".to_string())),
-            run_id: remi_agentloop::prelude::RunId("run-1".to_string()),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+        ToolContext::with_ids(
+            remi_agentloop::prelude::ThreadId("thread-1".to_string()),
+            remi_agentloop::prelude::RunId("run-1".to_string()),
+            bot_runtime_core::ChatCtxState::default(),
+        )
     }
 
     #[tokio::test]
@@ -432,7 +425,7 @@ mod tests {
                     "options": [{"id": "yes", "label": "Yes"}]
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("tool should start");

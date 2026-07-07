@@ -1,18 +1,17 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 
 use remi_agentloop::prelude::{
-    AgentConfig, AgentState, Content, ContentPart, LoopInput, Message, Role, ToolContext,
-    ToolDefinition, ToolDefinitionContext,
+    AgentConfig, AgentState, CancellationToken, ChatCtx, ChatCtxState, Content, ContentPart,
+    LoopInput, Message, Role, ToolDefinition, ToolDefinitionContext,
 };
 
 use crate::profile::AgentProfile;
 
 #[derive(Debug, Clone, Default)]
 pub struct CoreStreamOptions {
-    pub cancel: Option<Arc<tokio::sync::Notify>>,
+    pub cancel: Option<CancellationToken>,
     pub steer: Option<Arc<CoreSteerQueue>>,
 }
 
@@ -21,7 +20,7 @@ impl CoreStreamOptions {
         Self::default()
     }
 
-    pub fn with_cancel(mut self, cancel: Arc<tokio::sync::Notify>) -> Self {
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
     }
@@ -173,28 +172,24 @@ pub fn tool_allowed(allowed_tools: &[String], name: &str) -> bool {
 pub fn inject_extra_tools(input: LoopInput, extra: Vec<ToolDefinition>) -> LoopInput {
     match input {
         LoopInput::Start {
-            content,
+            message,
             history,
             mut extra_tools,
             model,
             temperature,
             max_tokens,
-            user_name,
             metadata,
-            message_metadata,
             user_state,
         } => {
             extra_tools.extend(extra);
             LoopInput::Start {
-                content,
+                message,
                 history,
                 extra_tools,
                 model,
                 temperature,
                 max_tokens,
-                user_name,
                 metadata,
-                message_metadata,
                 user_state,
             }
         }
@@ -209,15 +204,13 @@ pub fn apply_profile_to_input(
 ) -> LoopInput {
     match input {
         LoopInput::Start {
-            content,
+            message,
             mut history,
             extra_tools,
             model,
             temperature,
             max_tokens,
-            user_name,
             metadata,
-            message_metadata,
             user_state,
         } => {
             if !profile.system_prompt.trim().is_empty()
@@ -227,15 +220,13 @@ pub fn apply_profile_to_input(
             }
             let model = model.or_else(|| effective_config.model.clone());
             LoopInput::Start {
-                content,
+                message,
                 history,
                 extra_tools,
                 model,
                 temperature,
                 max_tokens,
-                user_name,
                 metadata,
-                message_metadata,
                 user_state,
             }
         }
@@ -250,21 +241,79 @@ fn history_contains_system_prompt(history: &[Message], system_prompt: &str) -> b
     })
 }
 
-pub fn tool_ctx_from_state(state: &AgentState) -> ToolContext {
+pub fn tool_ctx_from_state(state: &AgentState) -> ChatCtx {
     tool_ctx_from_state_with_cancel(state, None)
 }
 
 pub fn tool_ctx_from_state_with_cancel(
     state: &AgentState,
-    cancel: Option<Arc<tokio::sync::Notify>>,
-) -> ToolContext {
-    ToolContext {
-        config: AgentConfig::default(),
+    cancel: Option<CancellationToken>,
+) -> ChatCtx {
+    let ctx = ChatCtx::with_ids(
+        state.thread_id.clone(),
+        state.run_id.clone(),
+        ChatCtxState {
+            user_state: state.user_state.clone(),
+            metadata: state.config.metadata.clone(),
+            ..ChatCtxState::default()
+        },
+    );
+    if let Some(cancel) = cancel {
+        let token = ctx.runtime().cancellation();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            token.cancel();
+        });
+    }
+    ctx
+}
+
+pub fn chat_ctx_from_input(input: &LoopInput, cancel: Option<CancellationToken>) -> ChatCtx {
+    let ctx = match input {
+        LoopInput::Start {
+            metadata,
+            user_state,
+            ..
+        } => ChatCtx::new(ChatCtxState {
+            user_state: user_state.clone().unwrap_or(serde_json::Value::Null),
+            metadata: metadata.clone(),
+            ..ChatCtxState::default()
+        }),
+        LoopInput::Resume { state, .. } => ChatCtx::with_ids(
+            state.thread_id.clone(),
+            state.run_id.clone(),
+            ChatCtxState {
+                user_state: state.user_state.clone(),
+                metadata: state.config.metadata.clone(),
+                ..ChatCtxState::default()
+            },
+        ),
+    };
+    if let Some(cancel) = cancel {
+        let token = ctx.runtime().cancellation();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            token.cancel();
+        });
+    }
+    ctx
+}
+
+pub fn tool_definition_ctx_from_chat_ctx(ctx: &ChatCtx) -> ToolDefinitionContext {
+    ToolDefinitionContext {
+        thread_id: Some(ctx.thread_id()),
+        run_id: Some(ctx.run_id()),
+        metadata: ctx.metadata(),
+        user_state: ctx.user_state(),
+    }
+}
+
+pub fn tool_definition_ctx_from_state(state: &AgentState) -> ToolDefinitionContext {
+    ToolDefinitionContext {
         thread_id: Some(state.thread_id.clone()),
-        run_id: state.run_id.clone(),
+        run_id: Some(state.run_id.clone()),
         metadata: state.config.metadata.clone(),
-        cancel,
-        user_state: Arc::new(RwLock::new(state.user_state.clone())),
+        user_state: state.user_state.clone(),
     }
 }
 
@@ -279,12 +328,7 @@ pub fn build_tool_definition_ctx(input: &LoopInput) -> ToolDefinitionContext {
             user_state: user_state.clone().unwrap_or(serde_json::Value::Null),
             ..ToolDefinitionContext::default()
         },
-        LoopInput::Resume { state, .. } | LoopInput::Cancel { state } => ToolDefinitionContext {
-            thread_id: Some(state.thread_id.clone()),
-            run_id: Some(state.run_id.clone()),
-            metadata: state.config.metadata.clone(),
-            user_state: state.user_state.clone(),
-        },
+        LoopInput::Resume { state, .. } => tool_definition_ctx_from_state(state),
     }
 }
 

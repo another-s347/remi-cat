@@ -1,8 +1,7 @@
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
-use remi_agentloop::prelude::{
-    AgentError, Tool, ToolContext, ToolDefinitionContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, Tool, ToolDefinitionContext, ToolOutput, ToolResult};
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
 use std::path::Path;
@@ -109,29 +108,30 @@ pub fn read_skill_names(user_state: &serde_json::Value) -> Vec<String> {
     names
 }
 
-fn mark_skill_read(ctx: &ToolContext, name: &str) {
-    let mut state = ctx.user_state.write().unwrap();
-    if !state.is_object() {
-        *state = json!({});
-    }
-    let Some(map) = state.as_object_mut() else {
-        return;
-    };
-    let entry = map
-        .entry(READ_SKILLS_STATE_KEY.to_string())
-        .or_insert_with(|| json!([]));
-    if !entry.is_array() {
-        *entry = json!([]);
-    }
-    let Some(items) = entry.as_array_mut() else {
-        return;
-    };
-    if !items
-        .iter()
-        .any(|item| item.as_str().is_some_and(|value| value == name))
-    {
-        items.push(serde_json::Value::String(name.to_string()));
-    }
+fn mark_skill_read(ctx: ToolContext, name: &str) {
+    ctx.update_user_state(|state| {
+        if !state.is_object() {
+            *state = json!({});
+        }
+        let Some(map) = state.as_object_mut() else {
+            return;
+        };
+        let entry = map
+            .entry(READ_SKILLS_STATE_KEY.to_string())
+            .or_insert_with(|| json!([]));
+        if !entry.is_array() {
+            *entry = json!([]);
+        }
+        let Some(items) = entry.as_array_mut() else {
+            return;
+        };
+        if !items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|value| value == name))
+        {
+            items.push(serde_json::Value::String(name.to_string()));
+        }
+    });
 }
 
 pub struct SkillGetTool<S> {
@@ -167,7 +167,7 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let name = arguments["name"]
             .as_str()
@@ -244,7 +244,7 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let query = arguments["query"]
             .as_str()
@@ -279,11 +279,10 @@ impl<S: SkillStore + 'static> Tool for SkillSearchTool<S> {
 mod tests {
     use super::{read_skill_names, render_skill_get_extra_prompt, SkillGetTool, SkillSearchTool};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore, SkillSummary};
+    use bot_runtime_core::ToolContext;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{
-        AgentConfig, Tool, ToolContext, ToolDefinitionContext, ToolOutput, ToolResult,
-    };
-    use std::sync::{Arc, RwLock};
+    use remi_agentloop::prelude::{Tool, ToolDefinitionContext, ToolOutput, ToolResult};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn temp_dir() -> std::path::PathBuf {
@@ -323,6 +322,16 @@ mod tests {
         assert!(!prompt.contains("Secret body"));
     }
 
+    fn test_tool_context() -> ToolContext {
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("test-thread"))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            bot_runtime_core::ChatCtxState::default(),
+        )
+    }
+
     #[test]
     fn read_skill_names_reads_current_and_legacy_session_state() {
         let state = serde_json::json!({
@@ -346,21 +355,14 @@ mod tests {
             }],
         ));
         let tool = SkillGetTool { store };
-        let ctx = ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        };
+        let ctx = test_tool_context();
 
         let result = tool
-            .execute(serde_json::json!({ "name": "researcher" }), None, &ctx)
+            .execute(
+                serde_json::json!({ "name": "researcher" }),
+                None,
+                ctx.clone(),
+            )
             .await
             .expect("skill__get should succeed");
         let ToolResult::Output(stream) = result else {
@@ -376,10 +378,7 @@ mod tests {
         assert!(output.contains("[skill read: researcher"));
         assert!(output.contains("supporting file paths are unavailable"));
         assert!(!output.contains("[skill activated:"));
-        assert_eq!(
-            read_skill_names(&ctx.user_state.read().unwrap()),
-            vec!["researcher"]
-        );
+        assert_eq!(read_skill_names(&ctx.user_state()), vec!["researcher"]);
     }
 
     #[tokio::test]
@@ -399,21 +398,10 @@ mod tests {
             [],
         ));
         let tool = SkillGetTool { store };
-        let ctx = ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        };
+        let ctx = test_tool_context();
 
         let result = tool
-            .execute(serde_json::json!({ "name": "docs" }), None, &ctx)
+            .execute(serde_json::json!({ "name": "docs" }), None, ctx.clone())
             .await
             .expect("skill__get should succeed");
         let ToolResult::Output(stream) = result else {
@@ -443,21 +431,14 @@ mod tests {
             [],
         ));
         let tool = SkillGetTool { store };
-        let ctx = ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        };
+        let ctx = test_tool_context();
 
         let result = tool
-            .execute(serde_json::json!({ "name": "loose-skill" }), None, &ctx)
+            .execute(
+                serde_json::json!({ "name": "loose-skill" }),
+                None,
+                ctx.clone(),
+            )
             .await
             .expect("skill__get should succeed");
         let ToolResult::Output(stream) = result else {
@@ -493,21 +474,10 @@ mod tests {
             [],
         ));
         let tool = SkillGetTool { store };
-        let ctx = ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        };
+        let ctx = test_tool_context();
 
         let result = tool
-            .execute(serde_json::json!({ "name": "broken" }), None, &ctx)
+            .execute(serde_json::json!({ "name": "broken" }), None, ctx.clone())
             .await
             .expect("skill__get should return diagnostics");
         let ToolResult::Output(stream) = result else {
@@ -542,21 +512,10 @@ mod tests {
             [],
         ));
         let tool = SkillSearchTool { store };
-        let ctx = ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
-                .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        };
+        let ctx = test_tool_context();
 
         let result = tool
-            .execute(serde_json::json!({ "query": "loose" }), None, &ctx)
+            .execute(serde_json::json!({ "query": "loose" }), None, ctx.clone())
             .await
             .expect("skill__search should succeed");
         let ToolResult::Output(stream) = result else {

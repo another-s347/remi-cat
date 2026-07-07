@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use remi_agentloop::prelude::CancellationToken;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 use super::{SandboxBashOutput, SandboxBashStatus, BASH_TASK_RETAIN};
 
@@ -376,7 +377,7 @@ pub(super) async fn run_command_with_timeout(
     timeout_ms: u64,
     named: Option<String>,
     tasks: BashTaskRegistry,
-    cancel: Option<Arc<Notify>>,
+    cancel: Option<CancellationToken>,
 ) -> Result<SandboxBashOutput> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -450,7 +451,7 @@ pub(super) async fn run_named_bash<F, Fut>(
     start: F,
     command: &str,
     timeout_ms: u64,
-    cancel: Option<Arc<Notify>>,
+    cancel: Option<CancellationToken>,
 ) -> Result<SandboxBashOutput>
 where
     F: FnOnce() -> Fut,
@@ -537,7 +538,7 @@ where
 async fn wait_for_task(
     task: Arc<Mutex<BashTaskState>>,
     timeout_ms: u64,
-    cancel: Option<Arc<Notify>>,
+    cancel: Option<CancellationToken>,
 ) -> Result<SandboxBashOutput> {
     let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(timeout);
@@ -569,7 +570,7 @@ async fn wait_for_task(
             }
             _ = async {
                 if let Some(cancel) = cancel.as_ref() {
-                    cancel.notified().await;
+                    cancel.cancelled().await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -619,12 +620,12 @@ where
     });
 }
 
-fn spawn_cancel_watcher(task: Arc<Mutex<BashTaskState>>, cancel: Option<Arc<Notify>>) {
+fn spawn_cancel_watcher(task: Arc<Mutex<BashTaskState>>, cancel: Option<CancellationToken>) {
     let Some(cancel) = cancel else {
         return;
     };
     tokio::spawn(async move {
-        cancel.notified().await;
+        cancel.cancelled().await;
         cancel_task(&task).await;
     });
 }

@@ -18,14 +18,15 @@ use futures::{
 };
 use tracing::debug;
 
+use bot_runtime_core::ToolContext;
 use bot_runtime_core::{
-    build_tool_definition_ctx, inject_extra_tools, tool_ctx_from_state_with_cancel, CoreAgentLoop,
-    CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreSteerBatch, CoreStreamOptions,
-    CoreUsageStats,
+    build_tool_definition_ctx, chat_ctx_from_input, inject_extra_tools,
+    tool_ctx_from_state_with_cancel, CoreAgentLoop, CoreCancelKind, CoreDriveConfig,
+    CoreDriveEvent, CoreSteerBatch, CoreStreamOptions, CoreUsageStats,
 };
 use remi_agentloop::prelude::{
     AgentError, AgentState, Content, ContentPart, LoopInput, Message, ParsedToolCall,
-    ToolCallOutcome, ToolContext, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    ToolCallOutcome, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
@@ -290,7 +291,8 @@ where
 
             loop {
                 let run_input = inject_extra_tools(current, extra_defs.clone());
-                let inner_stream = match self.inner.chat(run_input).await {
+                let run_ctx = chat_ctx_from_input(&run_input, cancel_signal.clone());
+                let inner_stream = match self.inner.chat(run_ctx, run_input).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(
@@ -603,7 +605,7 @@ where
                                 tokio::pin!(execute_fut);
                                 let results = if let Some(cancel) = cancel_signal.as_ref() {
                                     tokio::select! {
-                                        _ = cancel.notified() => {
+                                        _ = cancel.cancelled() => {
                                             tracing::info!(
                                                 thread_id = %state.thread_id.0,
                                                 run_id = %state.run_id.0,
@@ -713,7 +715,7 @@ where
                                         }
                                         _ = async {
                                             if let Some(cancel) = cancel_signal.as_ref() {
-                                                cancel.notified().await;
+                                                cancel.cancelled().await;
                                             } else {
                                                 std::future::pending::<()>().await;
                                             }
@@ -738,7 +740,7 @@ where
                                         });
                                     }
                                 }
-                                state.user_state = tool_ctx.user_state.read().unwrap().clone();
+                                state.user_state = tool_ctx.user_state();
                                 yield CatEvent::StateUpdate(state.user_state.clone());
                             }
 
@@ -959,7 +961,7 @@ where
                                 tokio::pin!(execute_fut);
                                 let results = if let Some(cancel) = cancel_signal.as_ref() {
                                     tokio::select! {
-                                        _ = cancel.notified() => {
+                                        _ = cancel.cancelled() => {
                                             tracing::info!(
                                                 thread_id = %state.thread_id.0,
                                                 run_id = %state.run_id.0,
@@ -1065,7 +1067,7 @@ where
                                         }
                                         _ = async {
                                             if let Some(cancel) = cancel_signal.as_ref() {
-                                                cancel.notified().await;
+                                                cancel.cancelled().await;
                                             } else {
                                                 std::future::pending::<()>().await;
                                             }
@@ -1159,6 +1161,7 @@ where
 
                             next_input = Some(LoopInput::Resume {
                                 state,
+                                pending_interrupts: Vec::new(),
                                 results: all_outcomes,
                             });
                             break;
@@ -1756,6 +1759,7 @@ async fn collect_result(
                             side_events.push(event);
                         }
                     }
+                    ToolOutput::Custom { .. } => {}
                 }
             }
             CollectedToolResult {
@@ -1927,12 +1931,12 @@ mod tests {
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
     use crate::user_question::UserQuestionManager;
+    use bot_runtime_core::ToolContext;
     use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, Checkpoint, CheckpointStatus, Content, ContentPart,
-        LoopInput, Message, ParsedToolCall, StepConfig, ToolCallOutcome, ToolContext, ToolOutput,
-        ToolResult,
+        LoopInput, Message, ParsedToolCall, StepConfig, ToolCallOutcome, ToolOutput, ToolResult,
     };
     use remi_agentloop::tool::{
         registry::DefaultToolRegistry, BoxedToolResult, BoxedToolStream, Tool,
@@ -2243,6 +2247,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
@@ -2278,9 +2283,6 @@ mod tests {
                         remi_agentloop::types::AgentEvent::Done,
                     ]))
                 }
-                LoopInput::Cancel { .. } => {
-                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
-                }
             }
         }
     }
@@ -2294,6 +2296,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
@@ -2323,9 +2326,6 @@ mod tests {
                         remi_agentloop::types::AgentEvent::Done,
                     ]))
                 }
-                LoopInput::Cancel { .. } => {
-                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
-                }
             }
         }
     }
@@ -2339,6 +2339,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
@@ -2366,9 +2367,6 @@ mod tests {
                         remi_agentloop::types::AgentEvent::Done,
                     ]))
                 }
-                LoopInput::Cancel { .. } => {
-                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
-                }
             }
         }
     }
@@ -2382,6 +2380,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
@@ -2402,9 +2401,6 @@ mod tests {
                     ),
                     remi_agentloop::types::AgentEvent::Done,
                 ])),
-                LoopInput::Cancel { .. } => {
-                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
-                }
             }
         }
     }
@@ -2433,7 +2429,7 @@ mod tests {
             &self,
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
-            _ctx: &ToolContext,
+            _ctx: ToolContext,
         ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
                 "should not execute",
@@ -2467,7 +2463,7 @@ mod tests {
             &self,
             arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
-            _ctx: &ToolContext,
+            _ctx: ToolContext,
         ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
             let label = arguments
                 .get("label")
@@ -2494,6 +2490,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
@@ -2515,7 +2512,7 @@ mod tests {
                         completed_results: vec![],
                     },
                 ])),
-                LoopInput::Resume { .. } | LoopInput::Cancel { .. } => {
+                LoopInput::Resume { .. } => {
                     Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
                 }
             }
@@ -2531,6 +2528,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             let state = match req {
@@ -2539,7 +2537,7 @@ mod tests {
                     state.config.metadata = metadata;
                     state
                 }
-                LoopInput::Resume { state, .. } | LoopInput::Cancel { state } => state,
+                LoopInput::Resume { state, .. } => state,
             };
             Ok(stream::iter(vec![
                 remi_agentloop::types::AgentEvent::NeedToolExecution {
@@ -2574,7 +2572,7 @@ mod tests {
             &self,
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
-            _ctx: &ToolContext,
+            _ctx: ToolContext,
         ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
                 "ok",
@@ -2591,15 +2589,16 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
                 LoopInput::Start {
-                    content,
+                    message,
                     history,
                     extra_tools,
                     ..
-                } if content.text_content().contains("while-tool steer") => {
+                } if message.content.text_content().contains("while-tool steer") => {
                     assert!(
                         history.iter().any(|message| {
                             message.tool_call_id.as_deref() == Some("steer-call")
@@ -2647,9 +2646,6 @@ mod tests {
                 LoopInput::Resume { .. } => {
                     panic!("tool-gap steer should start a steer turn instead of resuming")
                 }
-                LoopInput::Cancel { .. } => {
-                    Ok(stream::iter(vec![remi_agentloop::types::AgentEvent::Done]))
-                }
             }
         }
     }
@@ -2675,7 +2671,7 @@ mod tests {
             &self,
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
-            _ctx: &ToolContext,
+            _ctx: ToolContext,
         ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
             self.queue.push(CoreSteerInput {
                 id: "queued-while-tool".to_string(),
@@ -2699,6 +2695,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             _req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             Ok(stream::iter(vec![
@@ -2721,6 +2718,7 @@ mod tests {
 
         async fn chat(
             &self,
+            _ctx: bot_runtime_core::ChatCtx,
             _req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             let mut state = AgentState::new(StepConfig::new("test-model"));

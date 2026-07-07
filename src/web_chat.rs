@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -11,8 +10,9 @@ use bot_core::{
     UserQuestionRequest, UserQuestionResponse,
 };
 use futures::StreamExt;
+use remi_agentloop::prelude::CancellationToken;
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -106,7 +106,7 @@ struct ActiveRun {
     session_id: String,
     text: String,
     started_at: String,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     handle: JoinHandle<()>,
     direct: mpsc::Sender<ChatEventV1>,
     log: Rc<RefCell<Vec<ChatEventV1>>>,
@@ -371,7 +371,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     )));
                     continue;
                 }
-                let cancel = Arc::new(Notify::new());
+                let cancel = CancellationToken::new();
                 let log = Rc::new(RefCell::new(Vec::new()));
                 let (events_tx, events_rx) = mpsc::channel(128);
                 let sink_direct = events_tx.clone();
@@ -386,7 +386,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 let text_for_task = text.clone();
                 let log_for_task = Rc::clone(&log);
                 let broadcast_for_task = broadcast_tx.clone();
-                let cancel_for_task = Arc::clone(&cancel);
+                let cancel_for_task = cancel.clone();
                 let handle = tokio::task::spawn_local(async move {
                     let sink = WebRunEventSink {
                         direct: events_tx,
@@ -410,7 +410,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                         session_id: session_id.clone(),
                         text: text.clone(),
                         started_at,
-                        cancel: Arc::clone(&cancel),
+                        cancel: cancel.clone(),
                         handle,
                         direct: sink_direct,
                         log: Rc::clone(&log),
@@ -466,7 +466,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
             }
             WebChatCommand::Cancel { run_id, response } => {
                 let cancelled = active.borrow_mut().remove(&run_id).map(|run| {
-                    run.cancel.notify_one();
+                    run.cancel.cancel();
                     run.handle.abort();
                     true
                 });
@@ -485,7 +485,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     .collect::<Vec<_>>();
                 for run_id in run_ids {
                     if let Some(run) = active.borrow_mut().remove(&run_id) {
-                        run.cancel.notify_one();
+                        run.cancel.cancel();
                         run.handle.abort();
                         cancelled = true;
                     }
@@ -554,7 +554,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     .collect::<Vec<_>>();
                 for run_id in run_ids {
                     if let Some(run) = active.borrow_mut().remove(&run_id) {
-                        run.cancel.notify_one();
+                        run.cancel.cancel();
                         run.handle.abort();
                     }
                 }
@@ -1113,7 +1113,7 @@ async fn run_turn(
     session_id: &str,
     run_id: &str,
     text: String,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     sink: WebRunEventSink,
 ) {
     let run_started_at = Instant::now();

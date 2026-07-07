@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use remi_agentloop::prelude::{AgentError, ToolContext};
+use bot_runtime_core::ToolContext;
+use remi_agentloop::prelude::AgentError;
 use serde_json::Value;
 
 use super::tools::{
@@ -43,10 +44,10 @@ impl HybridTodoBackend {
 
     pub(crate) async fn add_batch(
         &self,
-        ctx: &ToolContext,
+        ctx: ToolContext,
         request: TodoBatchAddRequest,
     ) -> Result<TodoBatchAddResult, AgentError> {
-        let mut user_state = self.load_user_state(ctx).await;
+        let mut user_state = self.load_user_state(&ctx).await;
         let todos = todos_from_user_state(&user_state);
         let (updated, result) = add_batch_to_todos(todos, request);
         write_todos_to_user_state(&mut user_state, &updated);
@@ -54,15 +55,15 @@ impl HybridTodoBackend {
         Ok(result)
     }
 
-    pub async fn list(&self, ctx: &ToolContext) -> Vec<TodoItem> {
-        let user_state = self.load_user_state(ctx).await;
+    pub async fn list(&self, ctx: ToolContext) -> Vec<TodoItem> {
+        let user_state = self.load_user_state(&ctx).await;
         let todos = todos_from_user_state(&user_state);
         store_user_state(ctx, user_state);
         todos
     }
 
-    pub async fn complete(&self, ctx: &ToolContext, id: u64) -> Result<String, AgentError> {
-        let mut user_state = self.load_user_state(ctx).await;
+    pub async fn complete(&self, ctx: ToolContext, id: u64) -> Result<String, AgentError> {
+        let mut user_state = self.load_user_state(&ctx).await;
         let mut todos = todos_from_user_state(&user_state);
         let Some(index) = todos.iter().position(|todo| todo.id == id) else {
             store_user_state(ctx, user_state);
@@ -77,11 +78,11 @@ impl HybridTodoBackend {
 
     pub async fn update(
         &self,
-        ctx: &ToolContext,
+        ctx: ToolContext,
         id: u64,
         content: String,
     ) -> Result<String, AgentError> {
-        let mut user_state = self.load_user_state(ctx).await;
+        let mut user_state = self.load_user_state(&ctx).await;
         let mut todos = todos_from_user_state(&user_state);
         let Some(index) = todos.iter().position(|todo| todo.id == id) else {
             store_user_state(ctx, user_state);
@@ -94,8 +95,8 @@ impl HybridTodoBackend {
         Ok(format!("Updated todo #{id}: {content}"))
     }
 
-    pub async fn remove(&self, ctx: &ToolContext, id: u64) -> Result<String, AgentError> {
-        let mut user_state = self.load_user_state(ctx).await;
+    pub async fn remove(&self, ctx: ToolContext, id: u64) -> Result<String, AgentError> {
+        let mut user_state = self.load_user_state(&ctx).await;
         let mut todos = todos_from_user_state(&user_state);
         let Some(index) = todos.iter().position(|todo| todo.id == id) else {
             store_user_state(ctx, user_state);
@@ -109,14 +110,14 @@ impl HybridTodoBackend {
     }
 
     async fn load_user_state(&self, ctx: &ToolContext) -> Value {
-        let mut user_state = { ctx.user_state.read().unwrap().clone() };
+        let mut user_state = ctx.user_state();
         prune_legacy_sdk_todos(&mut user_state);
         user_state
     }
 }
 
-fn store_user_state(ctx: &ToolContext, user_state: Value) {
-    *ctx.user_state.write().unwrap() = user_state;
+fn store_user_state(ctx: ToolContext, user_state: Value) {
+    ctx.set_user_state(user_state);
 }
 
 fn prune_legacy_sdk_todos(user_state: &mut Value) {
@@ -129,11 +130,10 @@ fn prune_legacy_sdk_todos(user_state: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
-
-    use remi_agentloop::prelude::{AgentConfig, RunId, ThreadId, ToolContext};
+    use bot_runtime_core::ToolContext;
+    use remi_agentloop::prelude::{RunId, ThreadId};
     use serde_json::json;
+    use std::path::PathBuf;
 
     use super::HybridTodoBackend;
     use crate::todo::tools::{
@@ -142,14 +142,14 @@ mod tests {
     };
 
     fn test_ctx(user_state: serde_json::Value) -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(ThreadId("thread-1".to_string())),
-            run_id: RunId("run-1".to_string()),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(user_state)),
-        }
+        ToolContext::with_ids(
+            ThreadId("thread-1".to_string()),
+            RunId("run-1".to_string()),
+            bot_runtime_core::ChatCtxState {
+                user_state,
+                ..bot_runtime_core::ChatCtxState::default()
+            },
+        )
     }
 
     fn backend() -> HybridTodoBackend {
@@ -174,7 +174,7 @@ mod tests {
         let ctx = test_ctx(serde_json::Value::Null);
         let result = backend
             .add_batch(
-                &ctx,
+                ctx.clone(),
                 TodoBatchAddRequest {
                     title: "Release".to_string(),
                     items: vec![
@@ -194,19 +194,22 @@ mod tests {
 
         assert_eq!(result.todo_ids, vec![1, 2]);
         assert_eq!(
-            backend.complete(&ctx, 1).await.unwrap(),
+            backend.complete(ctx.clone(), 1).await.unwrap(),
             "Todo #1 marked as done."
         );
         assert_eq!(
             backend
-                .update(&ctx, 2, "Publish release notes".to_string())
+                .update(ctx.clone(), 2, "Publish release notes".to_string())
                 .await
                 .unwrap(),
             "Updated todo #2: Publish release notes"
         );
-        assert_eq!(backend.remove(&ctx, 1).await.unwrap(), "Removed todo #1.");
+        assert_eq!(
+            backend.remove(ctx.clone(), 1).await.unwrap(),
+            "Removed todo #1."
+        );
 
-        let user_state = ctx.user_state.read().unwrap().clone();
+        let user_state = ctx.user_state();
         let todos = todos_from_user_state(&user_state);
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].id, 2);

@@ -5,10 +5,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::{Stream, StreamExt};
-use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, ResumePayload, Tool, ToolOutput, ToolResult};
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -503,13 +502,13 @@ impl Tool for FetchTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         let path_rules = self.path_rules.clone();
         let bridge = self.bridge.clone();
-        let metadata = ctx.metadata.clone();
+        let metadata = ctx.metadata();
         let tasks = self.tasks.clone();
         async move {
             Ok(ToolResult::Output(stream! {
@@ -694,13 +693,13 @@ impl Tool for ImUploadTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let root = self.root.clone();
         let path_rules = self.path_rules.clone();
         let bridge = Arc::clone(&self.bridge);
-        let metadata = ctx.metadata.clone();
+        let metadata = ctx.metadata();
         async move {
             Ok(ToolResult::Output(stream! {
                 let Some(meta) = metadata.as_ref() else {
@@ -1605,7 +1604,6 @@ mod tests {
     };
     use futures::StreamExt;
     use std::path::Path;
-    use std::sync::{Arc, RwLock};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_path_rules(root: &Path) -> WorkspacePathRules {
@@ -1864,7 +1862,7 @@ mod tests {
                     "overwrite": true
                 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fetch should return tool output"),
@@ -1899,7 +1897,7 @@ mod tests {
                     "path": "note.txt"
                 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fetch should return tool output"),
@@ -1948,7 +1946,7 @@ mod tests {
                 &tool,
                 serde_json::json!({ "url": url }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("fetch start should succeed"),
@@ -1974,7 +1972,7 @@ mod tests {
                     &tool,
                     serde_json::json!({ "task_id": task_id.clone() }),
                     None,
-                    &ctx,
+                    ctx.clone(),
                 )
                 .await
                 .expect("fetch poll should succeed"),
@@ -2065,19 +2063,14 @@ mod tests {
         format!("http://{addr}{path}")
     }
 
-    fn test_tool_context() -> remi_agentloop::prelude::ToolContext {
-        remi_agentloop::prelude::ToolContext {
-            config: remi_agentloop::prelude::AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
+    fn test_tool_context() -> bot_runtime_core::ToolContext {
+        bot_runtime_core::ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("test-thread"))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+            bot_runtime_core::ChatCtxState::default(),
+        )
     }
 
     async fn collect_tool_output(

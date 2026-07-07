@@ -5,12 +5,13 @@ use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
-    AgentBuilder, AgentConfig, AgentError, LoopInput, MessageId, OpenAIClient, ResumePayload, Role,
-    RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool, ToolContext, ToolOutput,
-    ToolResult,
+    AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, OpenAIClient,
+    ResumePayload, Role, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool,
+    ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use tokio::sync::Mutex as AsyncMutex;
@@ -185,11 +186,11 @@ pub struct StreamOptions {
     pub im_attachments: Vec<ImAttachment>,
     /// Feishu document links referenced by the current message.
     pub im_documents: Vec<ImDocument>,
-    /// Optional cooperative-cancel signal.  When the wrapped [`Notify`] is
-    /// signalled (via `notify_waiters()`), `stream_with_options` will persist any
+    /// Optional cooperative-cancel signal. When cancelled, `stream_with_options`
+    /// will persist any
     /// already-generated content and yield a final [`CatEvent::Done`] before
     /// returning — so memory is not lost on preemption.
-    pub cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub cancel: Option<CancellationToken>,
 }
 
 // -- Type aliases -------------------------------------------------------------
@@ -3494,7 +3495,7 @@ impl Tool for RemiSubAgentTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let task = arguments
             .get("task")
@@ -3953,11 +3954,8 @@ fn format_subagent_tool_result(
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| final_output.to_string())
 }
 
-fn subagent_metadata(ctx: &ToolContext, sub_thread_id: &str) -> serde_json::Value {
-    let mut metadata = ctx
-        .metadata
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({}));
+fn subagent_metadata(ctx: ToolContext, sub_thread_id: &str) -> serde_json::Value {
+    let mut metadata = ctx.metadata().unwrap_or_else(|| serde_json::json!({}));
     if !metadata.is_object() {
         metadata = serde_json::json!({});
     }
@@ -3967,12 +3965,10 @@ fn subagent_metadata(ctx: &ToolContext, sub_thread_id: &str) -> serde_json::Valu
             serde_json::Value::String(sub_thread_id.to_string()),
         );
         if !map.contains_key("parent_thread_id") {
-            if let Some(thread_id) = &ctx.thread_id {
-                map.insert(
-                    "parent_thread_id".to_string(),
-                    serde_json::Value::String(thread_id.0.clone()),
-                );
-            }
+            map.insert(
+                "parent_thread_id".to_string(),
+                serde_json::Value::String(ctx.thread_id().0),
+            );
         }
         map.insert(
             "subagent_run".to_string(),
@@ -4114,6 +4110,7 @@ mod tests {
     use crate::user_question::{UserQuestionResponse, UserQuestionStatus};
     use crate::{estimate_model_input_tokens, ModelInputSegmentCategory};
     use futures::StreamExt as _;
+    use remi_agentloop::prelude::CancellationToken;
     use remi_agentloop::prelude::Role;
     use remi_agentloop::types::{FunctionCall, RunId, ThreadId, ToolCallMessage};
     use serde_json::json;
@@ -4506,12 +4503,12 @@ You are Remi.
         .build()
         .unwrap();
 
-        let cancel = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
         let mut stream = std::pin::pin!(bot.stream_with_options(
             "cancel-partial-thread",
             Content::text("start"),
             StreamOptions {
-                cancel: Some(Arc::clone(&cancel)),
+                cancel: Some(cancel.clone()),
                 ..StreamOptions::default()
             },
         ));
@@ -4521,7 +4518,7 @@ You are Remi.
                 CatEvent::Text(text) => {
                     if text.contains("partial answer") {
                         saw_partial = true;
-                        cancel.notify_one();
+                        cancel.cancel();
                     }
                 }
                 CatEvent::Done => break,
@@ -4587,12 +4584,12 @@ You are Remi.
         bot.set_goal(thread_id, "pause on cancel", GoalMaxRounds::Limited(1))
             .await
             .unwrap();
-        let cancel = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
         let mut stream = std::pin::pin!(bot.stream_with_options(
             thread_id,
             Content::text("start"),
             StreamOptions {
-                cancel: Some(Arc::clone(&cancel)),
+                cancel: Some(cancel.clone()),
                 ..StreamOptions::default()
             },
         ));
@@ -4600,7 +4597,7 @@ You are Remi.
         while let Some(event) = stream.next().await {
             if let CatEvent::Text(text) = &event {
                 if text.contains("partial answer") {
-                    cancel.notify_one();
+                    cancel.cancel();
                 }
             }
             let done = matches!(event, CatEvent::Done);

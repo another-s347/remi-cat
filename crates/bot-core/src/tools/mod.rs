@@ -9,18 +9,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_stream::stream;
 use base64::Engine as _;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
 use remi_agentloop::prelude::{
-    AgentError, Content, ContentPart, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
+    AgentError, Content, ContentPart, ResumePayload, Tool, ToolOutput, ToolResult,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::sandbox::{Sandbox, SandboxBashOutput, SandboxBashStatus};
 
@@ -185,48 +185,46 @@ struct FsReadLastRecord {
     modified_ms: Option<u64>,
 }
 
-fn fs_read_duplicate_warning(
-    user_state: &Arc<RwLock<Value>>,
-    record: FsReadLastRecord,
-) -> Option<String> {
-    let mut state = user_state.write().unwrap();
-    if !state.is_object() {
-        *state = serde_json::json!({});
-    }
-
-    let previous = state
-        .get(FS_READ_LAST_STATE_KEY)
-        .and_then(|value| serde_json::from_value::<FsReadLastRecord>(value.clone()).ok());
-
-    let warning = previous.and_then(|previous| {
-        let same_file_version = previous.path == record.path
-            && previous.total_bytes == record.total_bytes
-            && previous.metadata_len == record.metadata_len
-            && previous.modified_ms == record.modified_ms;
-        let same_range = previous.start == record.start && previous.end == record.end;
-        if !same_file_version || !same_range {
-            return None;
+fn fs_read_duplicate_warning(ctx: &ToolContext, record: FsReadLastRecord) -> Option<String> {
+    ctx.update_user_state(|state| {
+        if !state.is_object() {
+            *state = serde_json::json!({});
         }
 
-        let mut warning = format!(
-            "warning: this fs_read request repeats a range already read in this session, and the file appears unchanged (path={}, offset={}, length={}).",
-            record.path,
-            record.start,
-            record.end.saturating_sub(record.start)
-        );
-        if record.end < record.total_bytes {
-            warning.push_str(&format!(" Continue with offset={} to read the next unread chunk.", record.end));
-        }
-        Some(warning)
-    });
+        let previous = state
+            .get(FS_READ_LAST_STATE_KEY)
+            .and_then(|value| serde_json::from_value::<FsReadLastRecord>(value.clone()).ok());
 
-    if let Some(object) = state.as_object_mut() {
-        if let Ok(value) = serde_json::to_value(record) {
-            object.insert(FS_READ_LAST_STATE_KEY.to_string(), value);
-        }
-    }
+        let warning = previous.and_then(|previous| {
+            let same_file_version = previous.path == record.path
+                && previous.total_bytes == record.total_bytes
+                && previous.metadata_len == record.metadata_len
+                && previous.modified_ms == record.modified_ms;
+            let same_range = previous.start == record.start && previous.end == record.end;
+            if !same_file_version || !same_range {
+                return None;
+            }
 
-    warning
+            let mut warning = format!(
+                "warning: this fs_read request repeats a range already read in this session, and the file appears unchanged (path={}, offset={}, length={}).",
+                record.path,
+                record.start,
+                record.end.saturating_sub(record.start)
+            );
+            if record.end < record.total_bytes {
+                warning.push_str(&format!(" Continue with offset={} to read the next unread chunk.", record.end));
+            }
+            Some(warning)
+        });
+
+        if let Some(object) = state.as_object_mut() {
+            if let Ok(value) = serde_json::to_value(record) {
+                object.insert(FS_READ_LAST_STATE_KEY.to_string(), value);
+            }
+        }
+
+        warning
+    })
 }
 
 fn fs_read_line_range(
@@ -330,12 +328,12 @@ impl Tool for RootedFsReadTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
-        let user_state = Arc::clone(&ctx.user_state);
+        let tool_ctx = ctx.clone();
         async move {
             let path_str = arguments["path"]
                 .as_str()
@@ -467,7 +465,7 @@ impl Tool for RootedFsReadTool {
                         let end   = (start + length).min(total);
                         let duplicate_warning = metadata.as_ref().and_then(|metadata| {
                             fs_read_duplicate_warning(
-                                &user_state,
+                                &tool_ctx,
                                 FsReadLastRecord {
                                     path: path_str.clone(),
                                     start,
@@ -540,7 +538,7 @@ impl Tool for RootedFsWriteTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -648,7 +646,7 @@ impl Tool for RootedFsApplyPatchTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -1069,7 +1067,7 @@ impl Tool for RootedFsCreateTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -1143,7 +1141,7 @@ impl Tool for RootedFsRemoveTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -1219,7 +1217,7 @@ impl Tool for RootedFsLsTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -1305,12 +1303,12 @@ impl Tool for RipgrepTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
-        let cancel = ctx.cancel.clone();
+        let cancel = Some(ctx.runtime().cancellation());
         async move {
             let rg_args = rg_args_from_arguments(&arguments)?;
             let max_bytes = arguments["max_bytes"]
@@ -1577,7 +1575,7 @@ impl Tool for ExaSearchTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let default_n = self.num_results;
@@ -1693,10 +1691,9 @@ mod tests {
         RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
     };
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
+    use bot_runtime_core::ToolContext;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{
-        AgentConfig, Content, Tool, ToolContext, ToolOutput, ToolResult,
-    };
+    use remi_agentloop::prelude::{Content, Tool, ToolOutput, ToolResult};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
@@ -1714,18 +1711,13 @@ mod tests {
     }
 
     fn test_tool_context() -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("test-thread"))
-                    .expect("thread_id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("test-thread"))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
-            metadata: None,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+            bot_runtime_core::ChatCtxState::default(),
+        )
     }
 
     #[test]
@@ -1754,7 +1746,7 @@ mod tests {
                 &NowTool,
                 json!({ "timezone": "Asia/Shanghai" }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("now should return tool output"),
@@ -1858,7 +1850,7 @@ mod tests {
                     "timeout_ms": 10
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("bash start should succeed"),
@@ -1882,7 +1874,7 @@ mod tests {
                     &tool,
                     json!({ "pid": pid, "action": "poll" }),
                     None,
-                    &ctx,
+                    ctx.clone(),
                 )
                 .await
                 .expect("bash poll should succeed"),
@@ -1921,7 +1913,7 @@ mod tests {
                 &tool,
                 json!({ "command": "sleep 5", "timeout_ms": 10 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("bash start should succeed"),
@@ -1939,7 +1931,7 @@ mod tests {
                 &tool,
                 json!({ "pid": pid, "action": "cancel" }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("bash cancel should succeed"),
@@ -2044,7 +2036,7 @@ mod tests {
                     "query": "alpha src -g '*.rs'"
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("rg should execute"),
@@ -2079,7 +2071,7 @@ mod tests {
                     "query": r#"alpha \"src/lib.rs\""#
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("rg should execute"),
@@ -2124,7 +2116,7 @@ mod tests {
                     ]
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("rg should execute"),
@@ -2159,7 +2151,7 @@ mod tests {
                     "args": ["-F", "info!(\"ready\")", "src"]
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("rg should execute"),
@@ -2193,7 +2185,7 @@ mod tests {
                     "query": r#"info!\( src --max-count 10"#
                 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("rg should execute"),
@@ -2296,7 +2288,7 @@ mod tests {
                 &tool,
                 json!({ "path": "tiny.png", "offset": 5, "length": 3 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2341,7 +2333,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 6, "length": 5 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2373,7 +2365,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "start_line": 2, "end_line": 4, "offset": 99, "length": 1 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2407,7 +2399,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "end_line": 2 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2422,7 +2414,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "start_line": 3 }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2449,7 +2441,7 @@ mod tests {
             &tool,
             json!({ "path": "note.txt", "start_line": 3, "end_line": 2 }),
             None,
-            &test_tool_context(),
+            test_tool_context(),
         )
         .await
         {
@@ -2462,7 +2454,7 @@ mod tests {
             &tool,
             json!({ "path": "note.txt", "start_line": 0 }),
             None,
-            &test_tool_context(),
+            test_tool_context(),
         )
         .await
         {
@@ -2475,7 +2467,7 @@ mod tests {
             &tool,
             json!({ "path": "note.txt", "end_line": -1 }),
             None,
-            &test_tool_context(),
+            test_tool_context(),
         )
         .await
         {
@@ -2506,7 +2498,7 @@ mod tests {
                 &tool,
                 json!({ "path": "notes" }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2540,7 +2532,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 0, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("first fs_read should succeed"),
@@ -2554,7 +2546,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 0, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("second fs_read should succeed"),
@@ -2587,7 +2579,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 0, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("first fs_read should succeed"),
@@ -2599,7 +2591,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 6, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("next fs_read should succeed"),
@@ -2614,7 +2606,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 6, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("repeated fs_read should succeed"),
@@ -2647,7 +2639,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 0, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("first fs_read should succeed"),
@@ -2664,7 +2656,7 @@ mod tests {
                 &tool,
                 json!({ "path": "note.txt", "offset": 0, "length": 5 }),
                 None,
-                &ctx,
+                ctx.clone(),
             )
             .await
             .expect("second fs_read should succeed"),
@@ -2697,7 +2689,7 @@ mod tests {
                 &tool,
                 json!({ "path": "large.rs" }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2728,7 +2720,7 @@ mod tests {
                 &tool,
                 json!({ "path": "blob.bin" }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("fs_read should succeed"),
@@ -2783,7 +2775,7 @@ deleted file mode 100644
                 &tool,
                 json!({ "patch": patch }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("apply_patch should succeed"),
@@ -2869,7 +2861,7 @@ invalid
                 &tool,
                 json!({ "patch": patch }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("apply_patch should return tool output"),
@@ -2912,7 +2904,7 @@ invalid
                 &tool,
                 json!({ "patch": patch, "workdir": "repo" }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("apply_patch should succeed"),
@@ -2963,7 +2955,7 @@ invalid
                 &tool,
                 json!({ "patch": patch }),
                 None,
-                &test_tool_context(),
+                test_tool_context(),
             )
             .await
             .expect("apply_patch should succeed"),

@@ -4,7 +4,6 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -32,9 +31,9 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use remi_agentloop::prelude::{SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::{CancellationToken, SubSessionEvent, SubSessionEventPayload};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -678,7 +677,7 @@ struct TuiApp {
     run_started_at: Option<Instant>,
     interrupt_requested: bool,
     exit_after_run: bool,
-    cancel: Option<Arc<Notify>>,
+    cancel: Option<CancellationToken>,
     run_handle: Option<JoinHandle<()>>,
     queued_inputs: VecDeque<SubmittedInput>,
     input_history: Vec<String>,
@@ -1313,8 +1312,8 @@ impl TuiApp {
             self.cells.remove(0);
         }
 
-        let cancel = Arc::new(Notify::new());
-        self.cancel = Some(Arc::clone(&cancel));
+        let cancel = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
         self.running = true;
         self.run_started_at = Some(Instant::now());
         self.interrupt_requested = false;
@@ -2002,7 +2001,7 @@ impl TuiApp {
             return;
         }
         if let Some(cancel) = &self.cancel {
-            cancel.notify_waiters();
+            cancel.cancel();
         }
         self.status.state = "cancelling".to_string();
         self.cancel_active_tool_cells("cancelled by user");
@@ -3363,7 +3362,7 @@ async fn run_bot_turn(
     content: Content,
     sender_user_id: String,
     sender_username: String,
-    cancel: Arc<Notify>,
+    cancel: CancellationToken,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
     let text = content.text_content();

@@ -2,10 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::{Stream, StreamExt};
-use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, ResumePayload, Tool, ToolOutput, ToolResult};
 
 use crate::sandbox::{Sandbox, SandboxBashOutput, SandboxBashStatus};
 
@@ -69,7 +68,7 @@ impl Tool for WorkspaceBashTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -115,7 +114,7 @@ impl Tool for WorkspaceBashTool {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
-            let cancel = ctx.cancel.clone();
+            let cancel = Some(ctx.runtime().cancellation());
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
                 let started = Instant::now();

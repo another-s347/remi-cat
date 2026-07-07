@@ -1,6 +1,7 @@
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult};
+use remi_agentloop::prelude::{AgentError, Tool, ToolOutput, ToolResult};
 use remi_agentloop::types::ResumePayload;
 use serde_json::json;
 use std::sync::Arc;
@@ -119,7 +120,7 @@ impl<S: SkillStore + 'static> Tool for SearchTool<S> {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
         let query = arguments["query"]
             .as_str()
@@ -305,13 +306,12 @@ mod tests {
     use super::{parse_exa_search_response, preview, SearchTool};
     use crate::memory::{LlmCompressor, MemoryStore};
     use crate::skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};
+    use bot_runtime_core::ToolContext;
     use futures::StreamExt;
-    use remi_agentloop::prelude::{
-        AgentConfig, Message, Tool, ToolContext, ToolOutput, ToolResult,
-    };
+    use remi_agentloop::prelude::{Message, Tool, ToolOutput, ToolResult};
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     fn memory_store(data_dir: PathBuf) -> Arc<MemoryStore> {
         Arc::new(MemoryStore {
@@ -331,18 +331,16 @@ mod tests {
     }
 
     fn tool_context(thread_id: Option<&str>) -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(
-                serde_json::from_value(serde_json::json!("fallback-thread"))
-                    .expect("thread id should deserialize"),
-            ),
-            run_id: serde_json::from_value(serde_json::json!("test-run"))
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("fallback-thread"))
+                .expect("thread id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run id should deserialize"),
-            metadata: thread_id.map(|id| json!({ "thread_id": id })),
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+            bot_runtime_core::ChatCtxState {
+                metadata: thread_id.map(|id| json!({ "thread_id": id })),
+                ..bot_runtime_core::ChatCtxState::default()
+            },
+        )
     }
 
     async fn collect_text(result: ToolResult<impl futures::Stream<Item = ToolOutput>>) -> String {
@@ -406,7 +404,7 @@ mod tests {
                 &tool,
                 json!({ "query": "aurora teal" }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -439,7 +437,7 @@ mod tests {
                 &tool,
                 json!({ "query": "aurora", "scope": "memory", "limit": 99 }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -488,7 +486,7 @@ mod tests {
                     "named": "feature_a"
                 }),
                 None,
-                &tool_context(Some("thread-1")),
+                tool_context(Some("thread-1")),
             )
             .await
             .unwrap(),
@@ -519,7 +517,7 @@ mod tests {
                 &tool,
                 json!({ "query": "aurora", "scope": "web" }),
                 None,
-                &tool_context(None),
+                tool_context(None),
             )
             .await
             .unwrap(),
@@ -578,7 +576,7 @@ mod tests {
             &tool,
             json!({ "query": "aurora", "scope": "bad" }),
             None,
-            &tool_context(Some("thread-1")),
+            tool_context(Some("thread-1")),
         )
         .await
         {

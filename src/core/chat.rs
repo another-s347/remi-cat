@@ -1,10 +1,10 @@
 use std::rc::Rc;
-use std::sync::Arc;
 
 use bot_core::{
     CatEvent, Content, ImAttachment, ImDocument, SteerInput, SteerSubmitResult, StreamOptions,
 };
 use futures::{Stream, StreamExt};
+use remi_agentloop::prelude::CancellationToken;
 
 use super::{
     append_direct_sub_session_turn, sub_session_input_target, Runtime, SubSessionInputTarget,
@@ -48,7 +48,7 @@ pub(crate) struct ChatRequest {
     pub(crate) platform: Option<String>,
     pub(crate) im_attachments: Vec<ImAttachment>,
     pub(crate) im_documents: Vec<ImDocument>,
-    pub(crate) cancel: Option<Arc<tokio::sync::Notify>>,
+    pub(crate) cancel: Option<CancellationToken>,
     pub(crate) command_preprocess: bool,
     pub(crate) sub_session_routing: bool,
 }
@@ -106,7 +106,7 @@ impl ChatRequest {
         self
     }
 
-    pub(crate) fn with_cancel(mut self, cancel: Arc<tokio::sync::Notify>) -> Self {
+    pub(crate) fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
     }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::{stream::BoxStream, Stream, StreamExt};
-use remi_agentloop::prelude::{AgentError, Tool, ToolContext, ToolOutput, ToolResult};
+use remi_agentloop::prelude::{AgentError, Tool, ToolOutput, ToolResult};
 use remi_agentloop::types::{
     ResumePayload, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId,
 };
@@ -103,7 +104,7 @@ impl Tool for AcpChatTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let backend = Arc::clone(&self.backend);
@@ -514,15 +515,13 @@ fn normalize_acp_approval_request(
     mut request: ToolApprovalRequest,
     ctx: &ToolContext,
 ) -> ToolApprovalRequest {
-    if let Some(thread_id) = &ctx.thread_id {
-        request.session_id = thread_id.0.clone();
-    }
+    request.session_id = ctx.thread_id().0;
     if request.run_id.trim().is_empty() {
-        request.run_id = ctx.run_id.0.clone();
+        request.run_id = ctx.run_id().0;
     }
     if request.platform.as_deref().is_none_or(str::is_empty) {
-        request.platform = ctx
-            .metadata
+        let metadata = ctx.metadata();
+        request.platform = metadata
             .as_ref()
             .and_then(|value| value.get("platform"))
             .and_then(|value| value.as_str())
@@ -563,20 +562,22 @@ fn current_bound_channel(
     tool_name: &str,
     ctx: &ToolContext,
 ) -> Result<AcpBoundChannel, AgentError> {
-    let platform = ctx
-        .metadata
+    let metadata = ctx.metadata();
+    let platform = metadata
         .as_ref()
         .and_then(|value| value.get("platform"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("cli");
-    let channel_id = ctx
-        .thread_id
-        .as_ref()
-        .map(|value| value.0.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AgentError::tool(tool_name, "missing thread/channel id in tool context"))?;
+    let thread_id = ctx.thread_id();
+    let channel_id = thread_id.0.trim();
+    if channel_id.is_empty() {
+        return Err(AgentError::tool(
+            tool_name,
+            "missing thread/channel id in tool context",
+        ));
+    }
     Ok(AcpBoundChannel {
         platform: platform.to_string(),
         channel_id: channel_id.to_string(),
@@ -588,21 +589,20 @@ mod tests {
     use super::{current_bound_channel, status_sub_session_outputs, AcpChatTool};
     use crate::acp::backend::{AcpBackend, AcpToolResponse, AcpToolTaskStatus};
     use crate::approval::ToolApprovalManager;
-    use remi_agentloop::prelude::{
-        AgentConfig, SubSessionEventPayload, ThreadId, Tool, ToolContext, ToolOutput,
-    };
+    use bot_runtime_core::{ChatCtxState, ToolContext};
+    use remi_agentloop::prelude::{SubSessionEventPayload, ThreadId, Tool, ToolOutput};
     use remi_agentloop::types::RunId;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     fn tool_context(metadata: Option<serde_json::Value>) -> ToolContext {
-        ToolContext {
-            config: AgentConfig::default(),
-            thread_id: Some(serde_json::from_value(serde_json::json!("thread-1")).unwrap()),
-            run_id: serde_json::from_value(serde_json::json!("run-1")).unwrap(),
-            metadata,
-            cancel: None,
-            user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
-        }
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!("thread-1")).unwrap(),
+            serde_json::from_value(serde_json::json!("run-1")).unwrap(),
+            ChatCtxState {
+                metadata,
+                ..ChatCtxState::default()
+            },
+        )
     }
 
     #[test]

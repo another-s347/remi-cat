@@ -2,13 +2,14 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use futures::{Stream, StreamExt};
-use remi_agentloop::prelude::{AgentError, AgentState, ParsedToolCall, ToolCallOutcome};
+use remi_agentloop::prelude::{
+    AgentError, AgentState, CancellationToken, ParsedToolCall, ToolCallOutcome,
+};
 use remi_agentloop::types::{AgentEvent, SubSessionEvent};
-use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Default)]
 pub struct CoreDriveConfig {
-    pub cancel: Option<std::sync::Arc<Notify>>,
+    pub cancel: Option<CancellationToken>,
     pub max_tool_rounds: Option<usize>,
 }
 
@@ -144,7 +145,7 @@ impl Default for CoreToolRoundLimit {
 }
 
 struct CoreLoopDriver {
-    cancel: Option<std::sync::Arc<Notify>>,
+    cancel: Option<CancellationToken>,
     tool_round_limit: CoreToolRoundLimit,
     tool_rounds: usize,
     metrics: CoreRunMetrics,
@@ -152,7 +153,7 @@ struct CoreLoopDriver {
 }
 
 impl CoreLoopDriver {
-    fn new(cancel: Option<std::sync::Arc<Notify>>) -> Self {
+    fn new(cancel: Option<CancellationToken>) -> Self {
         Self {
             cancel,
             tool_round_limit: CoreToolRoundLimit::Unlimited,
@@ -171,7 +172,7 @@ impl CoreLoopDriver {
     where
         S: Stream<Item = AgentEvent>,
     {
-        let event = match next_cancel_aware(events, self.cancel.as_deref()).await {
+        let event = match next_cancel_aware(events, self.cancel.as_ref()).await {
             CancelAwareNext::Item(event) => event,
             CancelAwareNext::Cancelled => {
                 return Some(CoreDriveEvent::Cancelled {
@@ -259,6 +260,7 @@ impl CoreLoopDriver {
             AgentEvent::TurnStart { .. }
             | AgentEvent::RunStart { .. }
             | AgentEvent::ThinkingStart
+            | AgentEvent::Custom { .. }
             | AgentEvent::Interrupt { .. } => CoreDriveEvent::Ignored,
         }
     }
@@ -310,14 +312,14 @@ enum CancelAwareNext<T> {
 
 async fn next_cancel_aware<S, T>(
     mut events: Pin<&mut S>,
-    cancel: Option<&Notify>,
+    cancel: Option<&CancellationToken>,
 ) -> CancelAwareNext<T>
 where
     S: Stream<Item = T>,
 {
     if let Some(cancel) = cancel {
         tokio::select! {
-            _ = cancel.notified() => CancelAwareNext::Cancelled,
+            _ = cancel.cancelled() => CancelAwareNext::Cancelled,
             event = events.next() => match event {
                 Some(event) => CancelAwareNext::Item(event),
                 None => CancelAwareNext::Ended,

@@ -5,7 +5,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use remi_agentloop::prelude::{
-    AgentError, DefaultToolRegistry, ResumePayload, Tool, ToolContext, ToolDefinition,
+    AgentError, ChatCtx as ToolContext, DefaultToolRegistry, ResumePayload, Tool, ToolDefinition,
     ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::FunctionDefinition;
@@ -89,9 +89,9 @@ impl Tool for DynamicTool {
         &self,
         arguments: serde_json::Value,
         resume: Option<ResumePayload>,
-        ctx: &ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult<impl futures::Stream<Item = ToolOutput>>, AgentError> {
-        (self.handler)(arguments, resume, ctx.clone()).await
+        (self.handler)(arguments, resume, ctx).await
     }
 }
 

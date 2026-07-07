@@ -266,10 +266,9 @@ pub(crate) fn model_input_snapshot_from_loop_input(
     model: &str,
 ) -> Option<ModelInputSnapshot> {
     let LoopInput::Start {
-        content,
+        message,
         history,
         metadata,
-        message_metadata,
         user_state,
         ..
     } = input
@@ -286,7 +285,7 @@ pub(crate) fn model_input_snapshot_from_loop_input(
         ModelInputSegmentCategory::CurrentUser,
         Some("user".to_string()),
         "Current user input".to_string(),
-        content_to_model_input_text(content),
+        content_to_model_input_text(&message.content),
     );
     if let Some(metadata) = metadata {
         append_json_segment(
@@ -296,7 +295,7 @@ pub(crate) fn model_input_snapshot_from_loop_input(
             metadata,
         );
     }
-    if let Some(message_metadata) = message_metadata {
+    if let Some(message_metadata) = &message.metadata {
         append_json_segment(
             &mut segments,
             ModelInputSegmentCategory::Metadata,

@@ -3,10 +3,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_stream::stream;
+use bot_runtime_core::ToolContext;
 use futures::Stream;
-use remi_agentloop::prelude::{
-    AgentError, ResumePayload, Tool, ToolContext, ToolOutput, ToolResult,
-};
+use remi_agentloop::prelude::{AgentError, ResumePayload, Tool, ToolOutput, ToolResult};
 
 use super::log_preview;
 
@@ -38,7 +37,7 @@ impl Tool for ManageYourselfTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         async move {
@@ -199,7 +198,7 @@ impl Tool for NowTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         async move {
@@ -375,7 +374,7 @@ impl Tool for SleepTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         async move {
