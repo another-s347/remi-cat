@@ -251,11 +251,19 @@ fn history_contains_system_prompt(history: &[Message], system_prompt: &str) -> b
 }
 
 pub fn tool_ctx_from_state(state: &AgentState) -> ToolContext {
+    tool_ctx_from_state_with_cancel(state, None)
+}
+
+pub fn tool_ctx_from_state_with_cancel(
+    state: &AgentState,
+    cancel: Option<Arc<tokio::sync::Notify>>,
+) -> ToolContext {
     ToolContext {
         config: AgentConfig::default(),
         thread_id: Some(state.thread_id.clone()),
         run_id: state.run_id.clone(),
         metadata: state.config.metadata.clone(),
+        cancel,
         user_state: Arc::new(RwLock::new(state.user_state.clone())),
     }
 }

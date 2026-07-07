@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use super::{SandboxBashOutput, SandboxBashStatus, BASH_TASK_RETAIN};
 
@@ -189,14 +189,14 @@ impl BashTaskRegistry {
 impl BashSession {
     pub(super) async fn start_local(root: &Path) -> Result<Self> {
         let shell = user_shell();
-        let child = Command::new(&shell)
-            .args(shell_session_args(&shell))
+        let mut cmd = Command::new(&shell);
+        cmd.args(shell_session_args(&shell))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("starting named bash session")?;
+            .stderr(Stdio::null());
+        configure_child_process(&mut cmd);
+        let child = cmd.spawn().context("starting named bash session")?;
         let mut session = Self::from_child(child, "named bash session")?;
         session.discard_startup_output(&shell).await?;
         Ok(session)
@@ -212,19 +212,18 @@ impl BashSession {
         if let Some(user) = user {
             cmd.args(["-u", user]);
         }
-        let child = cmd
-            .args([
-                container_name,
-                "bash",
-                "-l",
-                "-c",
-                "exec 2>&1; exec bash -l",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("starting named bash session")?;
+        cmd.args([
+            container_name,
+            "bash",
+            "-l",
+            "-c",
+            "exec 2>&1; exec bash -l",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        configure_child_process(&mut cmd);
+        let child = cmd.spawn().context("starting named bash session")?;
         let mut session = Self::from_child(child, "named bash session")?;
         session.discard_startup_output("bash").await?;
         Ok(session)
@@ -377,10 +376,12 @@ pub(super) async fn run_command_with_timeout(
     timeout_ms: u64,
     named: Option<String>,
     tasks: BashTaskRegistry,
+    cancel: Option<Arc<Notify>>,
 ) -> Result<SandboxBashOutput> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_child_process(&mut cmd);
     let mut child = cmd.spawn().context("running sandbox command")?;
     let os_pid = child.id();
     let stdout = child
@@ -406,6 +407,7 @@ pub(super) async fn run_command_with_timeout(
             finished_at: None,
         })
         .await;
+    spawn_cancel_watcher(Arc::clone(&task), cancel.clone());
     spawn_reader(stdout, Arc::clone(&task), true);
     spawn_reader(stderr, Arc::clone(&task), false);
     tokio::spawn({
@@ -438,7 +440,7 @@ pub(super) async fn run_command_with_timeout(
             let _ = child.wait().await;
         }
     });
-    wait_for_task(task, timeout_ms).await
+    wait_for_task(task, timeout_ms, cancel).await
 }
 
 pub(super) async fn run_named_bash<F, Fut>(
@@ -448,6 +450,7 @@ pub(super) async fn run_named_bash<F, Fut>(
     start: F,
     command: &str,
     timeout_ms: u64,
+    cancel: Option<Arc<Notify>>,
 ) -> Result<SandboxBashOutput>
 where
     F: FnOnce() -> Fut,
@@ -485,6 +488,7 @@ where
             finished_at: None,
         })
         .await;
+    spawn_cancel_watcher(Arc::clone(&task), cancel.clone());
     let sessions = Arc::clone(sessions);
     let command = command.to_string();
     tokio::spawn({
@@ -527,12 +531,13 @@ where
             }
         }
     });
-    wait_for_task(task, timeout_ms).await
+    wait_for_task(task, timeout_ms, cancel).await
 }
 
 async fn wait_for_task(
     task: Arc<Mutex<BashTaskState>>,
     timeout_ms: u64,
+    cancel: Option<Arc<Notify>>,
 ) -> Result<SandboxBashOutput> {
     let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(timeout);
@@ -561,6 +566,17 @@ async fn wait_for_task(
             _ = &mut timeout => {
                 let mut task = task.lock().await;
                 return Ok(SandboxBashOutput::running(&mut task, true));
+            }
+            _ = async {
+                if let Some(cancel) = cancel.as_ref() {
+                    cancel.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                cancel_task(&task).await;
+                let mut task = task.lock().await;
+                return Ok(SandboxBashOutput::terminal(&mut task, SandboxBashStatus::Cancelled));
             }
         }
     }
@@ -603,6 +619,16 @@ where
     });
 }
 
+fn spawn_cancel_watcher(task: Arc<Mutex<BashTaskState>>, cancel: Option<Arc<Notify>>) {
+    let Some(cancel) = cancel else {
+        return;
+    };
+    tokio::spawn(async move {
+        cancel.notified().await;
+        cancel_task(&task).await;
+    });
+}
+
 async fn append_task_stdout(task: &Arc<Mutex<BashTaskState>>, chunk: &str) {
     task.lock().await.stdout.push_str(chunk);
 }
@@ -624,11 +650,11 @@ async fn trim_task_stdout_newline(task: &Arc<Mutex<BashTaskState>>) {
 async fn terminate_process(pid: u32) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .output()
-            .await;
+        let pid = pid as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGTERM);
+        }
     }
     #[cfg(windows)]
     {
@@ -636,6 +662,37 @@ async fn terminate_process(pid: u32) {
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output()
             .await;
+    }
+}
+
+async fn cancel_task(task: &Arc<Mutex<BashTaskState>>) {
+    let os_pid = {
+        let mut task = task.lock().await;
+        if task.status == BashTaskStatus::Running {
+            task.status = BashTaskStatus::Cancelled;
+            task.exit_code = Some(-1);
+            task.message = Some("bash task cancelled".to_string());
+            task.finished_at = Some(Instant::now());
+        }
+        task.os_pid
+    };
+    if let Some(os_pid) = os_pid {
+        terminate_process(os_pid).await;
+    }
+}
+
+fn configure_child_process(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 }
 

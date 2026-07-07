@@ -231,8 +231,8 @@ fn describe_fetch(args: &Value, verb: &str) -> (String, String) {
     }
     if let Some(file_key) = string_arg(args, "file_key") {
         return (
-            format!("{verb} 飞书文件 {file_key}"),
-            "下载会话文件".to_string(),
+            format!("{verb}会话文件 {file_key}"),
+            "下载或转换会话资源".to_string(),
         );
     }
     if let Some(task_id) = string_arg(args, "task_id") {

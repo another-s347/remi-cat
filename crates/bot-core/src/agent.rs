@@ -19,7 +19,7 @@ use futures::{
 use tracing::debug;
 
 use bot_runtime_core::{
-    build_tool_definition_ctx, inject_extra_tools, tool_ctx_from_state, CoreAgentLoop,
+    build_tool_definition_ctx, inject_extra_tools, tool_ctx_from_state_with_cancel, CoreAgentLoop,
     CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreSteerBatch, CoreStreamOptions,
     CoreUsageStats,
 };
@@ -377,7 +377,8 @@ where
                                 debug!(tools = ?names, "agent: dispatching dynamic tools");
                             }
 
-                            let tool_ctx = tool_ctx_from_state(&state);
+                            let tool_ctx =
+                                tool_ctx_from_state_with_cancel(&state, cancel_signal.clone());
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
 
                             if !local.is_empty() {

@@ -1275,38 +1275,44 @@ impl Tool for RipgrepTool {
     }
     fn description(&self) -> &str {
         "Search workspace files with ripgrep. Prefer this for text/code search. \
-         Pass one ripgrep argument string; paths are workspace-relative. Results include file paths, line numbers, and columns."
+         Prefer structured args like {\"args\":[\"TODO\",\"src\",\"-g\",\"*.rs\"]}; \
+         query is kept for shell-style compatibility. Do not shell-quote args entries. \
+         Use -F for literal text so regex metacharacters like parentheses do not need regex escaping. \
+         Paths are workspace-relative. Results include file paths, line numbers, and columns."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Arguments to pass to rg, for example \"TODO src -g '*.rs'\". Parsed shell-style, then executed as rg argv." },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Preferred. Exact rg argv without the rg binary, for example [\"TODO\", \"src\", \"-g\", \"*.rs\"] or [\"-F\", \"info!(\\\"ready\\\")\", \"src\"]. Do not shell-quote entries; use separate array elements. Use -F for literal text to avoid regex escaping."
+                },
+                "query": { "type": "string", "description": "Compatibility fallback. Arguments to pass to rg, for example \"TODO src -g '*.rs'\". Parsed shell-style, then executed as rg argv." },
                 "max_bytes": {
                     "type": "integer",
                     "description": format!("Maximum output bytes to return (default {DEFAULT_FS_READ_LENGTH}).")
                 }
             },
-            "required": ["query"]
+            "anyOf": [
+                { "required": ["args"] },
+                { "required": ["query"] }
+            ]
         })
     }
     fn execute(
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
+        let cancel = ctx.cancel.clone();
         async move {
-            let query = arguments["query"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| AgentError::tool("rg", "missing 'query'"))?
-                .to_string();
-            let rg_args = parse_rg_query(&query)?;
+            let rg_args = rg_args_from_arguments(&arguments)?;
             let max_bytes = arguments["max_bytes"]
                 .as_u64()
                 .unwrap_or(DEFAULT_FS_READ_LENGTH as u64)
@@ -1317,12 +1323,12 @@ impl Tool for RipgrepTool {
                 let command_preview = log_preview(&command, 160);
                 tracing::info!(
                     command = %command_preview,
-                    query_len = query.len(),
+                    input_len = arguments.to_string().len(),
                     args = rg_args.len(),
                     sandbox_kind = %sandbox.kind(),
                     "rg.start"
                 );
-                match sandbox.bash(&command, None, 30_000).await {
+                match sandbox.bash(&command, None, 30_000, cancel).await {
                     Err(err) => {
                         tracing::warn!(
                             command = %command_preview,
@@ -1354,9 +1360,45 @@ impl Tool for RipgrepTool {
     }
 }
 
+fn rg_args_from_arguments(arguments: &serde_json::Value) -> Result<Vec<String>, AgentError> {
+    let args = if let Some(values) = arguments.get("args").and_then(|value| value.as_array()) {
+        let mut args = Vec::new();
+        for value in values {
+            let arg = value
+                .as_str()
+                .ok_or_else(|| AgentError::tool("rg", "'args' entries must be strings"))?
+                .trim();
+            if !arg.is_empty() {
+                args.push(arg.to_string());
+            }
+        }
+        args
+    } else {
+        let query = arguments["query"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AgentError::tool("rg", "missing 'args' or 'query'"))?;
+        parse_rg_query(query)?
+    };
+    normalize_rg_args(args)
+}
+
 fn parse_rg_query(query: &str) -> Result<Vec<String>, AgentError> {
-    split_rg_query_preserving_regex_escapes(query)
-        .ok_or_else(|| AgentError::tool("rg", "failed to parse query; check shell quoting"))
+    normalize_rg_args(
+        split_rg_query_preserving_regex_escapes(query)
+            .ok_or_else(|| AgentError::tool("rg", "failed to parse query; check shell quoting"))?,
+    )
+}
+
+fn normalize_rg_args(mut args: Vec<String>) -> Result<Vec<String>, AgentError> {
+    if matches!(args.first().map(String::as_str), Some("rg" | "ripgrep")) {
+        args.remove(0);
+    }
+    if args.is_empty() {
+        return Err(AgentError::tool("rg", "missing ripgrep arguments"));
+    }
+    Ok(args)
 }
 
 fn split_rg_query_preserving_regex_escapes(query: &str) -> Option<Vec<String>> {
@@ -1379,7 +1421,14 @@ fn split_rg_query_preserving_regex_escapes(query: &str) -> Option<Vec<String>> {
                 '"' => quote = Quote::Double,
                 '\\' => {
                     if let Some(next) = chars.peek().copied() {
-                        if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') {
+                        if current.is_empty() && matches!(next, '\'' | '"') {
+                            quote = if next == '\'' {
+                                Quote::Single
+                            } else {
+                                Quote::Double
+                            };
+                            chars.next();
+                        } else if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') {
                             current.push(next);
                             chars.next();
                         } else {
@@ -1404,7 +1453,14 @@ fn split_rg_query_preserving_regex_escapes(query: &str) -> Option<Vec<String>> {
                 '"' => quote = Quote::None,
                 '\\' => {
                     if let Some(next) = chars.peek().copied() {
-                        if matches!(next, '"' | '\\') {
+                        if next == '"' {
+                            chars.next();
+                            if chars.peek().is_none_or(|after| after.is_whitespace()) {
+                                quote = Quote::None;
+                            } else {
+                                current.push(next);
+                            }
+                        } else if next == '\\' {
                             current.push(next);
                             chars.next();
                         } else {
@@ -1632,9 +1688,9 @@ impl Tool for ExaSearchTool {
 mod tests {
     use super::{
         format_command_output, format_utc_offset, parse_apply_patch, parse_manage_yourself_command,
-        parse_rg_query, parse_ssh_target, parse_timezone_spec, rg_command, ssh_command_args,
-        validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool, RootedFsApplyPatchTool,
-        RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
+        parse_rg_query, parse_ssh_target, parse_timezone_spec, rg_args_from_arguments, rg_command,
+        ssh_command_args, validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool,
+        RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
     };
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use futures::StreamExt;
@@ -1667,6 +1723,7 @@ mod tests {
             run_id: serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
             metadata: None,
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }
@@ -1922,6 +1979,46 @@ mod tests {
         assert_eq!(args, vec!["alpha beta", "quoted value", "glob*.rs"]);
     }
 
+    #[test]
+    fn rg_query_accepts_json_style_escaped_quotes() {
+        let args =
+            parse_rg_query(r#"alpha \"src/lib.rs\" -g \"*.rs\""#).expect("query should parse");
+        assert_eq!(args, vec!["alpha", "src/lib.rs", "-g", "*.rs"]);
+    }
+
+    #[test]
+    fn rg_query_strips_accidental_binary_prefix() {
+        let args = parse_rg_query(r#"rg alpha src -g '*.rs'"#).expect("query should parse");
+        assert_eq!(args, vec!["alpha", "src", "-g", "*.rs"]);
+    }
+
+    #[test]
+    fn rg_args_accept_structured_complex_values() {
+        let args = rg_args_from_arguments(&json!({
+            "args": [
+                r#"info!\(\"ready\"\)"#,
+                "src/with spaces",
+                "-g",
+                "*.{rs,md}",
+                "--max-count",
+                "10"
+            ]
+        }))
+        .expect("structured args should parse");
+
+        assert_eq!(
+            args,
+            vec![
+                r#"info!\(\"ready\"\)"#,
+                "src/with spaces",
+                "-g",
+                "*.{rs,md}",
+                "--max-count",
+                "10"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn rg_tool_searches_workspace() {
         let root = test_root();
@@ -1957,6 +2054,120 @@ mod tests {
         assert!(output.contains("src/lib.rs:1:4:"));
         assert!(output.contains("fn alpha() {}"));
         assert!(!output.contains("README.md"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rg_tool_accepts_json_style_escaped_path_quotes() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("src"))
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("src/lib.rs"), "fn alpha() {}\n")
+            .await
+            .unwrap();
+        let tool = RipgrepTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let output = collect_tool_text(
+            <RipgrepTool as Tool>::execute(
+                &tool,
+                json!({
+                    "query": r#"alpha \"src/lib.rs\""#
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("rg should execute"),
+        )
+        .await;
+
+        assert!(output.contains("1:4:"));
+        assert!(output.contains("fn alpha() {}"));
+        assert!(!output.contains("No such file"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rg_tool_accepts_structured_complex_args() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("src/with spaces"))
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(
+            root.join("src/with spaces/lib.rs"),
+            "info!(\"ready\");\ninfo!(\"skip\");\n",
+        )
+        .await
+        .unwrap();
+        let tool = RipgrepTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let output = collect_tool_text(
+            <RipgrepTool as Tool>::execute(
+                &tool,
+                json!({
+                    "args": [
+                        r#"info!\("ready"\)"#,
+                        "src/with spaces",
+                        "-g",
+                        "*.rs",
+                        "--max-count",
+                        "5"
+                    ]
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("rg should execute"),
+        )
+        .await;
+
+        assert!(output.contains("src/with spaces/lib.rs:1:1:"));
+        assert!(output.contains("info!(\"ready\");"));
+        assert!(!output.contains("No such file"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rg_tool_accepts_fixed_literal_without_regex_escaping() {
+        let root = test_root();
+        tokio::fs::create_dir_all(root.join("src"))
+            .await
+            .expect("test root should be created");
+        tokio::fs::write(root.join("src/lib.rs"), "info!(\"ready\");\n")
+            .await
+            .unwrap();
+        let tool = RipgrepTool {
+            sandbox: Arc::new(NoSandbox::new(root.clone())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+
+        let output = collect_tool_text(
+            <RipgrepTool as Tool>::execute(
+                &tool,
+                json!({
+                    "args": ["-F", "info!(\"ready\")", "src"]
+                }),
+                None,
+                &ctx,
+            )
+            .await
+            .expect("rg should execute"),
+        )
+        .await;
+
+        assert!(output.contains("src/lib.rs:1:1:"));
+        assert!(output.contains("info!(\"ready\");"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

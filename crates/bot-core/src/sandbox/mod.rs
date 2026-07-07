@@ -6,7 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 mod bash;
 mod path;
@@ -155,6 +155,7 @@ pub trait Sandbox: Send + Sync {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
     ) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
@@ -203,7 +204,12 @@ impl NoSandbox {
         }
     }
 
-    async fn bash_once(&self, command: &str, timeout_ms: u64) -> Result<SandboxBashOutput> {
+    async fn bash_once(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
+    ) -> Result<SandboxBashOutput> {
         tokio::fs::create_dir_all(&self.root)
             .await
             .context("creating sandbox root")?;
@@ -211,7 +217,7 @@ impl NoSandbox {
         let mut cmd = Command::new(&shell);
         cmd.args(shell_command_args(&shell, command));
         cmd.current_dir(&self.root);
-        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
+        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone(), cancel).await
     }
 
     async fn bash_named(
@@ -219,6 +225,7 @@ impl NoSandbox {
         named: &str,
         command: &str,
         timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
     ) -> Result<SandboxBashOutput> {
         tokio::fs::create_dir_all(&self.root)
             .await
@@ -230,6 +237,7 @@ impl NoSandbox {
             || BashSession::start_local(&self.root),
             command,
             timeout_ms,
+            cancel,
         )
         .await
     }
@@ -352,11 +360,12 @@ impl Sandbox for NoSandbox {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
     ) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move {
             match named.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(named) => self.bash_named(named, command, timeout_ms).await,
-                None => self.bash_once(command, timeout_ms).await,
+                Some(named) => self.bash_named(named, command, timeout_ms, cancel).await,
+                None => self.bash_once(command, timeout_ms, cancel).await,
             }
         })
     }
@@ -446,7 +455,12 @@ impl DockerSandbox {
         ))
     }
 
-    async fn bash_once(&self, command: &str, timeout_ms: u64) -> Result<SandboxBashOutput> {
+    async fn bash_once(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
+    ) -> Result<SandboxBashOutput> {
         self.ensure_running().await?;
         let mut cmd = Command::new("docker");
         cmd.args(["exec", "-w", &self.config.container_dir]);
@@ -455,7 +469,7 @@ impl DockerSandbox {
         }
         let command = format!("{}\n{command}", shell_startup_script("bash"));
         cmd.args([&self.config.container_name, "bash", "-l", "-c", &command]);
-        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone()).await
+        run_command_with_timeout(cmd, timeout_ms, None, self.tasks.clone(), cancel).await
     }
 
     async fn bash_session(
@@ -463,6 +477,7 @@ impl DockerSandbox {
         named: &str,
         command: &str,
         timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
     ) -> Result<SandboxBashOutput> {
         self.ensure_running().await?;
         let container_name = self.config.container_name.clone();
@@ -475,6 +490,7 @@ impl DockerSandbox {
             || BashSession::start_docker(&container_name, &container_dir, user.as_deref()),
             command,
             timeout_ms,
+            cancel,
         )
         .await
     }
@@ -633,11 +649,12 @@ impl Sandbox for DockerSandbox {
         command: &'a str,
         named: Option<&'a str>,
         timeout_ms: u64,
+        cancel: Option<Arc<Notify>>,
     ) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move {
             match named.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(named) => self.bash_session(named, command, timeout_ms).await,
-                None => self.bash_once(command, timeout_ms).await,
+                Some(named) => self.bash_session(named, command, timeout_ms, cancel).await,
+                None => self.bash_once(command, timeout_ms, cancel).await,
             }
         })
     }
@@ -659,7 +676,9 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("remi-sandbox-test-{}", uuid::Uuid::new_v4()))
@@ -670,10 +689,10 @@ mod tests {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
         sandbox.write("a.txt", b"hello").await.unwrap();
-        let out = sandbox.bash("cat a.txt", None, 10_000).await.unwrap();
+        let out = sandbox.bash("cat a.txt", None, 10_000, None).await.unwrap();
         assert_eq!(out.stdout, "hello");
         let out = sandbox
-            .bash("printf world > b.txt", None, 10_000)
+            .bash("printf world > b.txt", None, 10_000, None)
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
@@ -704,12 +723,12 @@ mod tests {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
         let out = sandbox
-            .bash("cd /tmp && export REMI_LOCAL_MARK=lost", None, 10_000)
+            .bash("cd /tmp && export REMI_LOCAL_MARK=lost", None, 10_000, None)
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
         let out = sandbox
-            .bash("printf \"$PWD:${REMI_LOCAL_MARK:-}\"", None, 10_000)
+            .bash("printf \"$PWD:${REMI_LOCAL_MARK:-}\"", None, 10_000, None)
             .await
             .unwrap();
         assert_eq!(out.stdout, format!("{}:", root.display()));
@@ -725,12 +744,18 @@ mod tests {
                 "cd /tmp && export REMI_LOCAL_MARK=kept",
                 Some("alpha"),
                 10_000,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
         let out = sandbox
-            .bash("printf \"$PWD:$REMI_LOCAL_MARK\"", Some("alpha"), 10_000)
+            .bash(
+                "printf \"$PWD:$REMI_LOCAL_MARK\"",
+                Some("alpha"),
+                10_000,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(out.stdout, "/tmp:kept");
@@ -739,6 +764,7 @@ mod tests {
                 "printf \"${REMI_LOCAL_MARK:-missing}\"",
                 Some("beta"),
                 10_000,
+                None,
             )
             .await
             .unwrap();
@@ -751,7 +777,7 @@ mod tests {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
         let out = sandbox
-            .bash("echo start; sleep 0.2; echo done", None, 10)
+            .bash("echo start; sleep 0.2; echo done", None, 10, None)
             .await
             .unwrap();
         assert_eq!(out.status, SandboxBashStatus::Running);
@@ -783,7 +809,7 @@ mod tests {
     async fn timed_out_unnamed_bash_can_be_cancelled() {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
-        let out = sandbox.bash("sleep 5", None, 10).await.unwrap();
+        let out = sandbox.bash("sleep 5", None, 10, None).await.unwrap();
         let pid = out.pid.clone().expect("timed out bash should return pid");
 
         let cancelled = sandbox.bash_cancel(&pid).await.unwrap();
@@ -796,6 +822,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_signal_cancels_running_unnamed_bash() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let cancel = Arc::new(Notify::new());
+        let cancel_for_task = Arc::clone(&cancel);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_for_task.notify_waiters();
+        });
+
+        let started = std::time::Instant::now();
+        let out = sandbox
+            .bash("sleep 5", None, 30_000, Some(cancel))
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, SandboxBashStatus::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn timed_out_named_bash_blocks_same_name_until_complete() {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
@@ -804,6 +853,7 @@ mod tests {
                 "export REMI_LOCAL_MARK=kept; sleep 0.2; printf \"$REMI_LOCAL_MARK\"",
                 Some("alpha"),
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -813,7 +863,7 @@ mod tests {
             .expect("timed out named bash should return pid");
 
         let err = sandbox
-            .bash("printf should-not-run", Some("alpha"), 10_000)
+            .bash("printf should-not-run", Some("alpha"), 10_000, None)
             .await
             .unwrap_err();
         let err = err.to_string();
@@ -821,7 +871,7 @@ mod tests {
         assert!(err.contains(&pid));
 
         let beta = sandbox
-            .bash("printf beta", Some("beta"), 10_000)
+            .bash("printf beta", Some("beta"), 10_000, None)
             .await
             .unwrap();
         assert_eq!(beta.stdout, "beta");
@@ -839,7 +889,7 @@ mod tests {
         assert_eq!(completed.exit_code, 0);
 
         let after = sandbox
-            .bash("printf \"$REMI_LOCAL_MARK\"", Some("alpha"), 10_000)
+            .bash("printf \"$REMI_LOCAL_MARK\"", Some("alpha"), 10_000, None)
             .await
             .unwrap();
         assert_eq!(after.stdout, "kept");
@@ -851,13 +901,13 @@ mod tests {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());
         let err = sandbox
-            .bash("true", Some("bad/name"), 10_000)
+            .bash("true", Some("bad/name"), 10_000, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("named bash session"));
         let too_long = "a".repeat(65);
         let err = sandbox
-            .bash("true", Some(&too_long), 10_000)
+            .bash("true", Some(&too_long), 10_000, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at most 64"));
@@ -978,10 +1028,13 @@ mod tests {
         });
 
         sandbox.write("from_fs.txt", b"from-fs").await.unwrap();
-        let out = sandbox.bash("cat from_fs.txt", None, 30_000).await.unwrap();
+        let out = sandbox
+            .bash("cat from_fs.txt", None, 30_000, None)
+            .await
+            .unwrap();
         assert_eq!(out.stdout, "from-fs");
         let out = sandbox
-            .bash("printf from-bash > from_bash.txt", None, 30_000)
+            .bash("printf from-bash > from_bash.txt", None, 30_000, None)
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
@@ -992,12 +1045,18 @@ mod tests {
                 "cd /tmp && export REMI_SESSION_MARK=kept",
                 Some("named"),
                 30_000,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
         let out = sandbox
-            .bash("printf \"$PWD:$REMI_SESSION_MARK\"", Some("named"), 30_000)
+            .bash(
+                "printf \"$PWD:$REMI_SESSION_MARK\"",
+                Some("named"),
+                30_000,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(out.stdout.trim(), "/tmp:kept");

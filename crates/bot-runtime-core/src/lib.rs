@@ -5,8 +5,9 @@ pub mod profile;
 
 pub use agent::{
     apply_profile_to_input, build_tool_definition_ctx, effective_agent_config,
-    filter_tool_definitions, inject_extra_tools, tool_allowed, tool_ctx_from_state, CoreSteerBatch,
-    CoreSteerInput, CoreSteerQueue, CoreStreamOptions,
+    filter_tool_definitions, inject_extra_tools, tool_allowed, tool_ctx_from_state,
+    tool_ctx_from_state_with_cancel, CoreSteerBatch, CoreSteerInput, CoreSteerQueue,
+    CoreStreamOptions,
 };
 pub use dynamic_tool::{register_dynamic_tool_definitions, DynamicTool};
 pub use loop_driver::{

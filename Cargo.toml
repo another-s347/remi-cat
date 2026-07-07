@@ -23,8 +23,53 @@ members = [
     "crates/bot-runtime-core",
     "crates/bot-core",
 ]
+exclude = [
+    "vendor/remi-agentloop",
+    "vendor/remi-agentloop/*",
+    "vendor/remi-agentloop/examples/*",
+]
 default-members = ["."]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/another-s347/remi-agentloop"
+
+[workspace.dependencies]
+futures = "0.3"
+async-stream = "0.3"
+futures-timer = "3"
+pin-project-lite = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "v5"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+] }
+axum = { version = "0.7", features = ["json"] }
+tokio-util = { version = "0.7" }
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+web-time = "1"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+ratatui = { version = "0.26" }
+crossterm = { version = "0.27", features = ["event-stream"] }
+toml = "0.8"
+base64 = "0.22"
+wit-bindgen = "0.53"
+wasmtime = { version = "42", default-features = false, features = [
+    "component-model",
+    "async",
+    "all-arch",
+] }
+wasmtime-wasi = "42"
 
 [features]
 default = ["secure-storage"]
@@ -35,7 +80,7 @@ bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
 user-store = { path = "crates/user-store" }
 agent-client-protocol = { version = "1.0.1", features = ["unstable_elicitation"] }
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "72842cd95b3300d9da9e23c07579fc07ab4e3822", features = [
+remi-agentloop = { path = "vendor/remi-agentloop/remi-agentloop", features = [
     "http-client",
     "tracing-langsmith",
 ] }

@@ -1,0 +1,31 @@
+[package]
+name = "remi-agentloop-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core framework for the remi agent loop — types, traits, state machine, and orchestrator"
+
+[features]
+default = ["native"]
+native = ["tokio/full"]
+tracing-langsmith = ["dep:reqwest"]
+
+[dependencies]
+remi-agentloop-macros = { path = "../remi-agentloop-macros" }
+
+futures = { workspace = true }
+async-stream = { workspace = true }
+pin-project-lite = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+web-time = { workspace = true }
+base64 = { workspace = true }
+
+# Optional: LangSmith HTTP tracing
+reqwest = { workspace = true, optional = true }

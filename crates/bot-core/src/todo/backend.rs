@@ -147,6 +147,7 @@ mod tests {
             thread_id: Some(ThreadId("thread-1".to_string())),
             run_id: RunId("run-1".to_string()),
             metadata: None,
+            cancel: None,
             user_state: Arc::new(RwLock::new(user_state)),
         }
     }

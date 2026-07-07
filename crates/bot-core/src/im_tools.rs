@@ -455,7 +455,7 @@ impl Tool for FetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a Feishu file_key, a Feishu document URL, or any generic URL into the workspace. Generic HTML pages are saved as Markdown by default; set raw=true to save the original response body."
+        "Fetch a URL or current-message file resource into the workspace. HTML pages are saved as Markdown by default; set raw=true to save the original response body."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -472,15 +472,15 @@ impl Tool for FetchTool {
                 },
                 "file_key": {
                     "type": "string",
-                    "description": "Self-contained Feishu file key returned by the system, encoded as message_id\\file_key. Optional if exactly one current-message attachment is available."
+                    "description": "Self-contained current-message file key returned by the system. Optional if exactly one current-message attachment or document is available."
                 },
                 "url": {
                     "type": "string",
-                    "description": "URL to fetch. Feishu document URLs are detected automatically and downloaded through the Feishu export/download APIs."
+                    "description": "HTTP(S) URL to fetch. HTML pages are converted to Markdown unless raw=true."
                 },
                 "file_type": {
                     "type": "string",
-                    "description": "Optional Feishu file type override when fetching a file_key."
+                    "description": "Optional resource type hint when fetching a file_key."
                 },
                 "path": {
                     "type": "string",
@@ -1739,6 +1739,30 @@ mod tests {
     }
 
     #[test]
+    fn fetch_prompt_describes_generic_url_resources() {
+        let tool = FetchTool {
+            root: std::path::PathBuf::new(),
+            path_rules: test_path_rules(std::path::Path::new(".")),
+            bridge: None,
+            tasks: FetchTaskRegistry::new(),
+        };
+        let prompt_text = format!(
+            "{}\n{}",
+            <FetchTool as remi_agentloop::prelude::Tool>::description(&tool),
+            serde_json::to_string(
+                &<FetchTool as remi_agentloop::prelude::Tool>::parameters_schema(&tool)
+            )
+            .unwrap()
+        );
+
+        assert!(!prompt_text.contains("Feishu"));
+        assert!(!prompt_text.contains("Lark"));
+        assert!(!prompt_text.contains("飞书"));
+        assert!(prompt_text.contains("HTTP(S) URL"));
+        assert!(prompt_text.contains("current-message"));
+    }
+
+    #[test]
     fn selects_unambiguous_current_message_attachment() {
         let attachments = vec![ImAttachment {
             key: "msg_123\\file_abc".into(),
@@ -2051,6 +2075,7 @@ mod tests {
             run_id: serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
             metadata: None,
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }

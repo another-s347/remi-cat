@@ -351,6 +351,7 @@ mod tests {
             thread_id: Some(remi_agentloop::prelude::ThreadId("thread-1".to_string())),
             run_id: remi_agentloop::prelude::RunId("run-1".to_string()),
             metadata: None,
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }

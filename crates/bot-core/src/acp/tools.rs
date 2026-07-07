@@ -600,6 +600,7 @@ mod tests {
             thread_id: Some(serde_json::from_value(serde_json::json!("thread-1")).unwrap()),
             run_id: serde_json::from_value(serde_json::json!("run-1")).unwrap(),
             metadata,
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }

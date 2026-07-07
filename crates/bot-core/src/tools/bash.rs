@@ -69,7 +69,7 @@ impl Tool for WorkspaceBashTool {
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
     {
         let sandbox = Arc::clone(&self.sandbox);
@@ -115,6 +115,7 @@ impl Tool for WorkspaceBashTool {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
+            let cancel = ctx.cancel.clone();
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
                 let started = Instant::now();
@@ -127,7 +128,7 @@ impl Tool for WorkspaceBashTool {
                     sandbox_kind = %sandbox.kind(),
                     "bash.start"
                 );
-                match sandbox.bash(&command, named.as_deref(), timeout_ms).await {
+                match sandbox.bash(&command, named.as_deref(), timeout_ms, cancel).await {
                     Ok(output) if output.timed_out || output.status == SandboxBashStatus::Running => {
                         tracing::warn!(
                             command = %cmd_preview,

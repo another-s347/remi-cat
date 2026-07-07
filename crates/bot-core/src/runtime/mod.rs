@@ -70,6 +70,7 @@ pub(crate) use tool_status::{
 
 const DEFAULT_AGENT_ID: &str = "default";
 const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(180);
+const SUPERVISOR_DECISION_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
@@ -83,6 +84,19 @@ fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
         .saturating_sub(profile.max_output_tokens)
         .saturating_sub(SUPERVISOR_PROMPT_MARGIN_TOKENS);
     percent_budget.min(output_budget).max(1)
+}
+
+fn supervisor_retry_feedback(error: &str, raw_output: &str) -> String {
+    let mut raw = raw_output.trim().chars().take(4_000).collect::<String>();
+    if raw_output.trim().chars().count() > 4_000 {
+        raw.push_str("\n...[truncated]");
+    }
+    format!(
+        "Your previous supervisor decision was invalid and was rejected before applying to the workflow.\n\
+         Error: {error}\n\n\
+         Previous output:\n{raw}\n\n\
+         Regenerate the decision now. Return only one JSON object. Use only allowed edge ids or allowed target_node ids from the workflow payload. Use JSON null for absent optional fields, not the string \"null\"."
+    )
 }
 
 pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &str) -> bool {
@@ -1497,7 +1511,6 @@ impl CatBot {
         model_profile_id: Option<&str>,
         progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
     ) -> Result<WorkflowDecision, AgentError> {
-        let supervisor_thread_id = format!("supervisor:{thread_id}:{}", uuid::Uuid::new_v4());
         let effective_model = self.effective_model_profile(model_profile_id);
         let prompt_budget = supervisor_prompt_budget_tokens(&effective_model.profile);
         let prompt = supervisor_workflow::supervisor_prompt_with_budget(
@@ -1510,7 +1523,6 @@ impl CatBot {
         if prompt.included_history_messages < prompt.original_history_messages {
             tracing::warn!(
                 thread_id,
-                supervisor_thread_id = %supervisor_thread_id,
                 estimated_tokens = prompt.estimated_tokens,
                 budget_tokens = prompt_budget,
                 original_history_messages = prompt.original_history_messages,
@@ -1518,96 +1530,147 @@ impl CatBot {
                 "trimmed old main-agent history messages from supervisor prompt"
             );
         }
-        let input = LoopInput::start(prompt.content).metadata(serde_json::json!({
-            "thread_id": supervisor_thread_id,
-            "supervisor_run": "true",
-            "supervisor_prompt_estimated_tokens": prompt.estimated_tokens,
-            "supervisor_prompt_budget_tokens": prompt_budget,
-            "supervisor_history_original_messages": prompt.original_history_messages,
-            "supervisor_history_included_messages": prompt.included_history_messages,
-        }));
         let active_agent = self.agent_for_model_profile(&effective_model.profile.id);
-        let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
-            let mut stream = std::pin::pin!(active_agent
-                .stream_with_input_and_tool_allowlist(input, Some(vec!["rg".to_string()])));
-            let mut output = String::new();
-            let mut trace = Vec::new();
-            let mut tool_args_by_id: std::collections::HashMap<String, serde_json::Value> =
-                std::collections::HashMap::new();
-            while let Some(event) = stream.next().await {
-                match event {
-                    CatEvent::Text(delta) => {
-                        output.push_str(&delta);
-                        let _ = progress.send(SupervisorTraceEvent::OutputDelta { content: delta });
-                    }
-                    CatEvent::Thinking(content) => {
-                        let event = SupervisorTraceEvent::Thinking { content };
-                        let _ = progress.send(event.clone());
-                        trace.push(event);
-                    }
-                    CatEvent::ToolCallStart { id, name } => {
-                        let event = SupervisorTraceEvent::ToolCallStart { id, name };
-                        let _ = progress.send(event.clone());
-                        trace.push(event);
-                    }
-                    CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                        let event = SupervisorTraceEvent::ToolCallArgumentsDelta { id, delta };
-                        let _ = progress.send(event.clone());
-                        trace.push(event);
-                    }
-                    CatEvent::ToolCall { id, name, args } => {
-                        tool_args_by_id.insert(id.clone(), args.clone());
-                        let event = SupervisorTraceEvent::ToolCall { id, name, args };
-                        let _ = progress.send(event.clone());
-                        trace.push(event);
-                    }
-                    CatEvent::ToolCallResult {
-                        id, name, result, ..
-                    } => {
-                        let args = tool_args_by_id
-                            .remove(&id)
-                            .unwrap_or(serde_json::Value::Null);
-                        let event = SupervisorTraceEvent::ToolResult {
-                            id,
-                            name,
-                            args,
-                            result,
-                        };
-                        let _ = progress.send(event.clone());
-                        trace.push(event);
-                    }
-                    CatEvent::Error(err) => {
-                        return Err(AgentError::other(format!(
-                            "{err}\n\nsupervisor trace: {}",
-                            serde_json::to_string(&trace).unwrap_or_default()
-                        )));
-                    }
-                    CatEvent::Done => break,
-                    _ => {}
-                }
-            }
-            Ok((output, trace))
-        })
-        .await
-        .map_err(|_| AgentError::other("supervisor evaluation timed out after 180 seconds"))??;
-        let (output, trace) = output;
-        let mut decision =
-            supervisor_workflow::parse_decision(&output).map_err(AgentError::other)?;
-        let pretty = serde_json::to_string_pretty(&decision)
-            .map_err(|err| AgentError::other(format!("format supervisor JSON: {err}")))?;
-        let final_output = SupervisorTraceEvent::Output { content: pretty };
-        let _ = progress.send(final_output.clone());
-        let mut trace = trace;
-        trace.push(final_output);
-        if let Some(agent_message) = decision.agent_message.as_deref() {
-            let event = SupervisorTraceEvent::AgentMessage {
-                content: agent_message.to_string(),
+        let mut retry_feedback: Option<String> = None;
+        let mut combined_trace = Vec::new();
+        let mut last_validation_error: Option<String> = None;
+
+        for attempt in 1..=SUPERVISOR_DECISION_MAX_ATTEMPTS {
+            let supervisor_thread_id = format!("supervisor:{thread_id}:{}", uuid::Uuid::new_v4());
+            let prompt_content = if let Some(feedback) = retry_feedback.as_deref() {
+                format!("{}\n\n{}", prompt.content, feedback)
+            } else {
+                prompt.content.clone()
             };
-            let _ = progress.send(event.clone());
-            trace.push(event);
+            let input = LoopInput::start(prompt_content).metadata(serde_json::json!({
+                "thread_id": supervisor_thread_id,
+                "supervisor_run": "true",
+                "supervisor_decision_attempt": attempt,
+                "supervisor_decision_max_attempts": SUPERVISOR_DECISION_MAX_ATTEMPTS,
+                "supervisor_prompt_estimated_tokens": prompt.estimated_tokens,
+                "supervisor_prompt_budget_tokens": prompt_budget,
+                "supervisor_history_original_messages": prompt.original_history_messages,
+                "supervisor_history_included_messages": prompt.included_history_messages,
+            }));
+            let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
+                let mut stream = std::pin::pin!(active_agent
+                    .stream_with_input_and_tool_allowlist(input, Some(vec!["rg".to_string()])));
+                let mut output = String::new();
+                let mut trace = Vec::new();
+                let mut tool_args_by_id: std::collections::HashMap<String, serde_json::Value> =
+                    std::collections::HashMap::new();
+                while let Some(event) = stream.next().await {
+                    match event {
+                        CatEvent::Text(delta) => {
+                            output.push_str(&delta);
+                            let _ =
+                                progress.send(SupervisorTraceEvent::OutputDelta { content: delta });
+                        }
+                        CatEvent::Thinking(content) => {
+                            let event = SupervisorTraceEvent::Thinking { content };
+                            let _ = progress.send(event.clone());
+                            trace.push(event);
+                        }
+                        CatEvent::ToolCallStart { id, name } => {
+                            let event = SupervisorTraceEvent::ToolCallStart { id, name };
+                            let _ = progress.send(event.clone());
+                            trace.push(event);
+                        }
+                        CatEvent::ToolCallArgumentsDelta { id, delta } => {
+                            let event = SupervisorTraceEvent::ToolCallArgumentsDelta { id, delta };
+                            let _ = progress.send(event.clone());
+                            trace.push(event);
+                        }
+                        CatEvent::ToolCall { id, name, args } => {
+                            tool_args_by_id.insert(id.clone(), args.clone());
+                            let event = SupervisorTraceEvent::ToolCall { id, name, args };
+                            let _ = progress.send(event.clone());
+                            trace.push(event);
+                        }
+                        CatEvent::ToolCallResult {
+                            id, name, result, ..
+                        } => {
+                            let args = tool_args_by_id
+                                .remove(&id)
+                                .unwrap_or(serde_json::Value::Null);
+                            let event = SupervisorTraceEvent::ToolResult {
+                                id,
+                                name,
+                                args,
+                                result,
+                            };
+                            let _ = progress.send(event.clone());
+                            trace.push(event);
+                        }
+                        CatEvent::Error(err) => {
+                            return Err(AgentError::other(format!(
+                                "{err}\n\nsupervisor trace: {}",
+                                serde_json::to_string(&trace).unwrap_or_default()
+                            )));
+                        }
+                        CatEvent::Done => break,
+                        _ => {}
+                    }
+                }
+                Ok((output, trace))
+            })
+            .await
+            .map_err(|_| {
+                AgentError::other("supervisor evaluation timed out after 180 seconds")
+            })??;
+            let (output, trace) = output;
+            combined_trace.extend(trace);
+
+            let mut decision = match supervisor_workflow::parse_decision(&output) {
+                Ok(decision) => decision,
+                Err(err) => {
+                    last_validation_error = Some(err.clone());
+                    let event = SupervisorTraceEvent::Output {
+                        content: format!(
+                            "Invalid supervisor decision attempt {attempt}/{SUPERVISOR_DECISION_MAX_ATTEMPTS}: {err}"
+                        ),
+                    };
+                    let _ = progress.send(event.clone());
+                    combined_trace.push(event);
+                    retry_feedback = Some(supervisor_retry_feedback(&err, &output));
+                    continue;
+                }
+            };
+            let mut dry_run = instance.clone();
+            if let Err(err) = supervisor_workflow::apply_decision(&mut dry_run, decision.clone(), 0)
+            {
+                last_validation_error = Some(err.clone());
+                let event = SupervisorTraceEvent::Output {
+                    content: format!(
+                        "Invalid supervisor decision attempt {attempt}/{SUPERVISOR_DECISION_MAX_ATTEMPTS}: {err}"
+                    ),
+                };
+                let _ = progress.send(event.clone());
+                combined_trace.push(event);
+                retry_feedback = Some(supervisor_retry_feedback(&err, &output));
+                continue;
+            }
+
+            let pretty = serde_json::to_string_pretty(&decision)
+                .map_err(|err| AgentError::other(format!("format supervisor JSON: {err}")))?;
+            let final_output = SupervisorTraceEvent::Output { content: pretty };
+            let _ = progress.send(final_output.clone());
+            combined_trace.push(final_output);
+            if let Some(agent_message) = decision.agent_message.as_deref() {
+                let event = SupervisorTraceEvent::AgentMessage {
+                    content: agent_message.to_string(),
+                };
+                let _ = progress.send(event.clone());
+                combined_trace.push(event);
+            }
+            decision.trace = combined_trace;
+            return Ok(decision);
         }
-        decision.trace = trace;
-        Ok(decision)
+
+        Err(AgentError::other(format!(
+            "supervisor decision remained invalid after {SUPERVISOR_DECISION_MAX_ATTEMPTS} attempts: {}",
+            last_validation_error.unwrap_or_else(|| "unknown validation error".to_string())
+        )))
     }
 
     /// Stream events for one conversation turn (text input).

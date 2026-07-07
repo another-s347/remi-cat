@@ -1,0 +1,51 @@
+[package]
+name = "remi-agentloop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Facade crate — re-exports remi-core, remi-model, remi-tool, remi-transport"
+
+[features]
+default = ["native"]
+native = ["remi-core/native"]
+http-client = [
+    "remi-transport/http-client",
+    "remi-model/http-client",
+    "tokio/full",
+]
+http-server = ["remi-transport/http-server", "tokio/full"]
+tracing-langsmith = ["http-client", "remi-core/tracing-langsmith"]
+tool-bash = ["remi-tool/tool-bash"]
+tool-bash-virtual = ["remi-tool/tool-bash-virtual"]
+tool-fs = ["remi-tool/tool-fs"]
+tool-fs-virtual = ["remi-tool/tool-fs-virtual"]
+tools = ["remi-tool/tools"]
+tui = ["dep:ratatui", "dep:crossterm", "http-client"]
+
+[dependencies]
+remi-core = { path = "../remi-agentloop-core", package = "remi-agentloop-core", default-features = false }
+remi-transport = { path = "../remi-agentloop-transport", package = "remi-agentloop-transport" }
+remi-model = { path = "../remi-agentloop-model", package = "remi-agentloop-model" }
+remi-tool = { path = "../remi-agentloop-tool", package = "remi-agentloop-tool" }
+remi-agentloop-macros = { path = "../remi-agentloop-macros" }
+
+futures = { workspace = true }
+async-stream = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+
+[[bin]]
+name = "remi-tui"
+path = "src/bin/remi-tui.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "remi-cli"
+path = "src/bin/remi-cli.rs"
+required-features = ["http-client"]

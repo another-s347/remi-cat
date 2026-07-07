@@ -870,8 +870,8 @@ fn render_supervisor_prompt(
         "You are a supervisor workflow agent. Use tools when needed to verify the main agent's work.\n\
          Select either a direct edge from allowed_outgoing_edges or any target_node from allowed_jump_targets. Use target_node when the main agent appears to have already completed intermediate workflow nodes.\n\
          allowed_subtree is rooted at the current node; cycle_cut=true means the subtree was truncated at a repeated node and must not be expanded further.\n\
-         Return only JSON with this shape:\n\
-         {{\"target_node\":\"node id or null\",\"edge\":\"direct edge id or null\",\"agent_message\":\"required instruction for non-terminal transitions, otherwise null\",\"next_node_message\":\"optional private message for the next supervisor node\",\"reason\":\"short reason\"}}\n\
+         Return only JSON with this shape, using the JSON null literal for absent optional fields, never the string \"null\":\n\
+         {{\"target_node\":null,\"edge\":\"direct edge id\",\"agent_message\":\"required instruction for non-terminal transitions, otherwise null\",\"next_node_message\":null,\"reason\":\"short reason\"}}\n\
          For a transition to a non-terminal node, agent_message must be non-empty. For a terminal transition it is ignored.\n\n{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     ))
@@ -898,9 +898,13 @@ pub fn format_prefix(report: &WorkflowReport, context: &serde_json::Value) -> St
 }
 
 fn trim_option(value: Option<String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    value.map(|v| v.trim().to_string()).filter(|v| {
+        !v.is_empty()
+            && !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "null" | "none" | "nil" | "n/a"
+            )
+    })
 }
 fn extract_json_object(raw: &str) -> Option<&str> {
     let value = raw
@@ -1040,6 +1044,18 @@ mod tests {
         assert_eq!(decision.edge, None);
         assert_eq!(decision.target_node.as_deref(), Some("verify"));
         assert_eq!(decision.reason, "skipped ahead");
+    }
+
+    #[test]
+    fn parses_string_null_optional_fields_as_absent() {
+        let decision = parse_decision(
+            r#"{"target_node":"null","edge":"continue","agent_message":"work","next_node_message":" null ","reason":"not done"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decision.target_node, None);
+        assert_eq!(decision.edge.as_deref(), Some("continue"));
+        assert_eq!(decision.next_node_message, None);
     }
 
     #[test]
@@ -1279,6 +1295,23 @@ mod tests {
         assert_eq!(report.to_node, "review");
         assert_eq!(report.path_nodes, vec!["review"]);
         assert!(report.path_edges.is_empty());
+    }
+
+    #[test]
+    fn string_null_target_does_not_override_valid_edge() {
+        let mut instance = workflow_instance(embedded_goal_definition());
+        instance.current_node = "review".into();
+        let decision = parse_decision(
+            r#"{"target_node":"null","edge":"continue","agent_message":"keep working","next_node_message":"null","reason":"more work"}"#,
+        )
+        .unwrap();
+
+        let (report, message) = apply_decision(&mut instance, decision, 1).unwrap();
+
+        assert_eq!(message.as_deref(), Some("keep working"));
+        assert_eq!(report.edge.as_deref(), Some("continue"));
+        assert_eq!(report.to_node, "review");
+        assert_eq!(instance.node_message, None);
     }
 
     #[test]

@@ -415,6 +415,7 @@ mod tests {
             run_id: serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
             metadata: thread_id.map(|id| json!({ "thread_id": id })),
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }
@@ -426,6 +427,7 @@ mod tests {
             run_id: serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
             metadata: None,
+            cancel: None,
             user_state: Arc::new(RwLock::new(serde_json::Value::Null)),
         }
     }

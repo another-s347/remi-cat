@@ -1,0 +1,53 @@
+[package]
+name = "remi-agentloop-deepagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deep agent with todo, skill, context-compression, file-backed registry, and sub-agent task delegation"
+
+[features]
+default = ["native"]
+native = ["remi-core/native", "tokio/full", "dep:reqwest"]
+skill-virtual = ["dep:bashkit"]
+tracing-langsmith = ["remi-core/tracing-langsmith"]
+tui = [
+    "native",
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:remi-transport",
+    "remi-model/http-client",
+    "remi-transport/http-client",
+    "tracing-langsmith",
+]
+
+[dependencies]
+remi-core = { path = "../remi-agentloop-core", package = "remi-agentloop-core" }
+remi-tool = { path = "../remi-agentloop-tool", package = "remi-agentloop-tool", features = [
+    "tool-bash",
+    "tool-fs",
+] }
+remi-model = { path = "../remi-agentloop-model", package = "remi-agentloop-model" }
+remi-transport = { path = "../remi-agentloop-transport", package = "remi-agentloop-transport", optional = true }
+
+futures = { workspace = true }
+async-stream = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+
+bashkit = { version = "0.1", optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
+
+[dev-dependencies]
+remi-model = { path = "../remi-agentloop-model", package = "remi-agentloop-model", features = [
+    "http-client",
+] }
+remi-transport = { path = "../remi-agentloop-transport", package = "remi-agentloop-transport", features = [
+    "http-client",
+] }
+tokio = { workspace = true, features = ["full"] }
