@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
