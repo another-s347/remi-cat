@@ -5,7 +5,7 @@
 //! `NeedToolExecution` by executing local tools and resuming, and finally
 //! emits `CatEvent::History` + `CatEvent::Done` when the run finishes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +49,7 @@ use crate::todo;
 use crate::user_question::UserQuestionManager;
 
 const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
+const INTERRUPTED_TOOL_RESULT_ERROR: &str = "tool execution was interrupted before completion";
 
 #[derive(Debug, Clone, Copy)]
 enum UnavailableToolReason {
@@ -614,6 +615,16 @@ where
                                                 elapsed_ms = batch_started.elapsed().as_millis() as u64,
                                                 "tool_batch.cancelled"
                                             );
+                                            state.user_state = tool_ctx.user_state();
+                                            complete_interrupted_tool_results(
+                                                &mut state,
+                                                &approved_local,
+                                                &mut all_outcomes,
+                                            );
+                                            yield CatEvent::History(
+                                                state.messages.clone(),
+                                                state.user_state.clone(),
+                                            );
                                             yield CatEvent::Cancelled;
                                             return;
                                         }
@@ -726,20 +737,31 @@ where
                                                 tool_kind = "local",
                                                 "tool_result_collection.cancelled"
                                             );
+                                            push_completed_tool_contents(
+                                                &approved_local,
+                                                &mut completed_contents,
+                                                &mut all_outcomes,
+                                            );
+                                            state.user_state = tool_ctx.user_state();
+                                            complete_interrupted_tool_results(
+                                                &mut state,
+                                                &approved_local,
+                                                &mut all_outcomes,
+                                            );
+                                            yield CatEvent::History(
+                                                state.messages.clone(),
+                                                state.user_state.clone(),
+                                            );
                                             yield CatEvent::Cancelled;
                                             return;
                                         }
                                     }
                                 }
-                                for tc in &approved_local {
-                                    if let Some(content) = completed_contents.remove(&tc.id) {
-                                        all_outcomes.push(ToolCallOutcome::Result {
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            content,
-                                        });
-                                    }
-                                }
+                                push_completed_tool_contents(
+                                    &approved_local,
+                                    &mut completed_contents,
+                                    &mut all_outcomes,
+                                );
                                 state.user_state = tool_ctx.user_state();
                                 yield CatEvent::StateUpdate(state.user_state.clone());
                             }
@@ -970,6 +992,16 @@ where
                                                 elapsed_ms = batch_started.elapsed().as_millis() as u64,
                                                 "tool_batch.cancelled"
                                             );
+                                            state.user_state = tool_ctx.user_state();
+                                            complete_interrupted_tool_results(
+                                                &mut state,
+                                                &approved_dynamic,
+                                                &mut all_outcomes,
+                                            );
+                                            yield CatEvent::History(
+                                                state.messages.clone(),
+                                                state.user_state.clone(),
+                                            );
                                             yield CatEvent::Cancelled;
                                             return;
                                         }
@@ -1078,20 +1110,31 @@ where
                                                 tool_kind = "dynamic",
                                                 "tool_result_collection.cancelled"
                                             );
+                                            push_completed_tool_contents(
+                                                &approved_dynamic,
+                                                &mut completed_contents,
+                                                &mut all_outcomes,
+                                            );
+                                            state.user_state = tool_ctx.user_state();
+                                            complete_interrupted_tool_results(
+                                                &mut state,
+                                                &approved_dynamic,
+                                                &mut all_outcomes,
+                                            );
+                                            yield CatEvent::History(
+                                                state.messages.clone(),
+                                                state.user_state.clone(),
+                                            );
                                             yield CatEvent::Cancelled;
                                             return;
                                         }
                                     }
                                 }
-                                for tc in &approved_dynamic {
-                                    if let Some(content) = completed_contents.remove(&tc.id) {
-                                        all_outcomes.push(ToolCallOutcome::Result {
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            content,
-                                        });
-                                    }
-                                }
+                                push_completed_tool_contents(
+                                    &approved_dynamic,
+                                    &mut completed_contents,
+                                    &mut all_outcomes,
+                                );
                             }
 
                             if !unavailable.is_empty() {
@@ -1227,6 +1270,7 @@ where
                         }
                         CoreDriveEvent::Cancelled {
                             kind,
+                            state,
                             stats,
                             tool_rounds,
                             ..
@@ -1239,6 +1283,19 @@ where
                                 elapsed_ms = stats.elapsed_ms,
                                 "agent_run.cancelled"
                             );
+                            if let Some(mut state) = state {
+                                complete_pending_tool_calls_in_state(&mut state);
+                                yield CatEvent::History(
+                                    state.messages.clone(),
+                                    state.user_state.clone(),
+                                );
+                                if kind == CoreCancelKind::Signal {
+                                    yield CatEvent::Cancelled;
+                                } else {
+                                    yield CatEvent::Done;
+                                }
+                                return;
+                            }
                             if kind == CoreCancelKind::Signal {
                                 yield CatEvent::Cancelled;
                                 return;
@@ -1291,21 +1348,135 @@ fn steer_start_input_after_tool_results(
 }
 
 fn append_tool_results_to_history(messages: &mut Vec<Message>, results: Vec<ToolCallOutcome>) {
+    let mut materialized = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect::<HashSet<_>>();
     for result in results {
         match result {
             ToolCallOutcome::Result {
                 tool_call_id,
                 content,
                 ..
-            } => messages.push(Message::tool_result_content(tool_call_id, content)),
+            } => {
+                if materialized.insert(tool_call_id.clone()) {
+                    messages.push(Message::tool_result_content(tool_call_id, content));
+                }
+            }
             ToolCallOutcome::Error {
                 tool_call_id,
                 error,
                 ..
-            } => messages.push(Message::tool_result(
+            } => {
+                if materialized.insert(tool_call_id.clone()) {
+                    messages.push(Message::tool_result(
+                        tool_call_id,
+                        format!("error: {error}"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn tool_outcome_call_ids(results: &[ToolCallOutcome]) -> HashSet<String> {
+    results
+        .iter()
+        .map(|result| match result {
+            ToolCallOutcome::Result { tool_call_id, .. }
+            | ToolCallOutcome::Error { tool_call_id, .. } => tool_call_id.clone(),
+        })
+        .collect()
+}
+
+fn message_tool_result_call_ids(messages: &[Message]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect()
+}
+
+fn push_completed_tool_contents(
+    tool_calls: &[ParsedToolCall],
+    completed_contents: &mut HashMap<String, Content>,
+    outcomes: &mut Vec<ToolCallOutcome>,
+) {
+    let mut materialized = tool_outcome_call_ids(outcomes);
+    for tc in tool_calls {
+        if !materialized.insert(tc.id.clone()) {
+            completed_contents.remove(&tc.id);
+            continue;
+        }
+        if let Some(content) = completed_contents.remove(&tc.id) {
+            outcomes.push(ToolCallOutcome::Result {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                content,
+            });
+        }
+    }
+}
+
+fn complete_interrupted_tool_results(
+    state: &mut AgentState,
+    tool_calls: &[ParsedToolCall],
+    outcomes: &mut Vec<ToolCallOutcome>,
+) {
+    let mut materialized = message_tool_result_call_ids(&state.messages);
+    materialized.extend(tool_outcome_call_ids(outcomes));
+
+    for tc in tool_calls {
+        if materialized.insert(tc.id.clone()) {
+            outcomes.push(ToolCallOutcome::Error {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                error: INTERRUPTED_TOOL_RESULT_ERROR.to_string(),
+            });
+        }
+    }
+    let outcomes = std::mem::take(outcomes);
+    append_tool_results_to_history(&mut state.messages, outcomes);
+}
+
+fn complete_pending_tool_calls_in_state(state: &mut AgentState) {
+    let mut repaired = Vec::with_capacity(state.messages.len());
+    let mut pending = Vec::<(String, String)>::new();
+
+    for message in std::mem::take(&mut state.messages) {
+        if !pending.is_empty() && message.tool_call_id.is_none() {
+            append_interrupted_tool_results(&mut repaired, std::mem::take(&mut pending));
+        }
+
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            pending.retain(|(id, _)| id != tool_call_id);
+        }
+
+        let tool_calls = message.tool_calls.clone();
+        repaired.push(message);
+
+        if let Some(calls) = tool_calls {
+            let materialized = message_tool_result_call_ids(&repaired);
+            for call in calls {
+                if !materialized.contains(&call.id) && !pending.iter().any(|(id, _)| id == &call.id)
+                {
+                    pending.push((call.id, call.function.name));
+                }
+            }
+        }
+    }
+
+    append_interrupted_tool_results(&mut repaired, pending);
+    state.messages = repaired;
+}
+
+fn append_interrupted_tool_results(messages: &mut Vec<Message>, pending: Vec<(String, String)>) {
+    let mut materialized = message_tool_result_call_ids(messages);
+    for (tool_call_id, _tool_name) in pending {
+        if materialized.insert(tool_call_id.clone()) {
+            messages.push(Message::tool_result(
                 tool_call_id,
-                format!("error: {error}"),
-            )),
+                format!("error: {INTERRUPTED_TOOL_RESULT_ERROR}"),
+            ));
         }
     }
 }
@@ -1925,8 +2096,10 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_request_for_tool, collect_result_with_overflow, collect_tool_results_parallel,
-        fs_read_overflow_summary, split_utf8_chunks, tool_output_chunk_bytes, CatAgent,
+        append_tool_results_to_history, approval_request_for_tool, collect_result_with_overflow,
+        collect_tool_results_parallel, complete_interrupted_tool_results,
+        complete_pending_tool_calls_in_state, fs_read_overflow_summary, split_utf8_chunks,
+        tool_output_chunk_bytes, CatAgent, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -1935,8 +2108,9 @@ mod tests {
     use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
-        Agent, AgentError, AgentState, Checkpoint, CheckpointStatus, Content, ContentPart,
-        LoopInput, Message, ParsedToolCall, StepConfig, ToolCallOutcome, ToolOutput, ToolResult,
+        Agent, AgentError, AgentState, CancellationToken, Checkpoint, CheckpointStatus, Content,
+        ContentPart, LoopInput, Message, ParsedToolCall, Role, StepConfig, ToolCallOutcome,
+        ToolOutput, ToolResult,
     };
     use remi_agentloop::tool::{
         registry::DefaultToolRegistry, BoxedToolResult, BoxedToolStream, Tool,
@@ -1956,6 +2130,25 @@ mod tests {
 
     fn test_hook_manager() -> Arc<HookManager> {
         HookManager::new(test_root(), test_root())
+    }
+
+    fn test_tool_call_message(id: &str, name: &str) -> ToolCallMessage {
+        ToolCallMessage {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn test_parsed_tool_call(id: &str, name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+        }
     }
 
     #[test]
@@ -1978,6 +2171,100 @@ mod tests {
 
         assert_eq!(request.session_id, "tui-session-1");
         assert_eq!(request.platform.as_deref(), Some("tui"));
+    }
+
+    #[test]
+    fn interrupted_tool_completion_fills_only_missing_results() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.messages = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![
+                    test_tool_call_message("call-1", "read"),
+                    test_tool_call_message("call-2", "write"),
+                    test_tool_call_message("call-3", "search"),
+                ],
+                None,
+            ),
+            Message::tool_result("call-1", "done"),
+        ];
+        let mut outcomes = vec![ToolCallOutcome::Error {
+            tool_call_id: "call-2".to_string(),
+            tool_name: "write".to_string(),
+            error: "already failed".to_string(),
+        }];
+        let tool_calls = vec![
+            test_parsed_tool_call("call-1", "read"),
+            test_parsed_tool_call("call-2", "write"),
+            test_parsed_tool_call("call-3", "search"),
+        ];
+
+        complete_interrupted_tool_results(&mut state, &tool_calls, &mut outcomes);
+        complete_interrupted_tool_results(&mut state, &tool_calls, &mut Vec::new());
+
+        let result_ids = state
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, vec!["call-1", "call-2", "call-3"]);
+        assert!(state
+            .messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("call-3")
+                && message
+                    .content
+                    .text_content()
+                    .contains(INTERRUPTED_TOOL_RESULT_ERROR)));
+    }
+
+    #[test]
+    fn pending_tool_call_completion_inserts_result_before_next_message() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.messages = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![test_tool_call_message("call-1", "read")],
+                None,
+            ),
+            Message::user("next"),
+        ];
+
+        complete_pending_tool_calls_in_state(&mut state);
+
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(state.messages[1].role, Role::Tool);
+        assert_eq!(state.messages[1].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(state.messages[2].role, Role::User);
+    }
+
+    #[test]
+    fn append_tool_results_to_history_does_not_duplicate_existing_result() {
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![test_tool_call_message("call-1", "read")],
+                None,
+            ),
+            Message::tool_result("call-1", "done"),
+        ];
+
+        append_tool_results_to_history(
+            &mut messages,
+            vec![ToolCallOutcome::Result {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                content: Content::text("duplicate"),
+            }],
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.tool_call_id.as_deref() == Some("call-1"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2901,6 +3188,88 @@ mod tests {
         }
 
         panic!("fast tool result was not emitted");
+    }
+
+    #[tokio::test]
+    async fn cat_agent_cancel_during_tool_collection_emits_repaired_history() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(LazyWaitTool);
+        let agent = CatAgent {
+            inner: StaggeredParallelToolInnerAgent,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+        };
+        let cancel = CancellationToken::new();
+        let stream = agent.stream_with_input_and_options(
+            LoopInput::start("run staggered tools"),
+            CoreStreamOptions {
+                cancel: Some(cancel.clone()),
+                steer: None,
+            },
+        );
+        tokio::pin!(stream);
+
+        let mut repaired_history = None;
+        let mut saw_cancelled = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                CatEvent::ToolCallResult { id, .. } if id == "fast-call" => {
+                    cancel.cancel();
+                }
+                CatEvent::History(messages, _) => {
+                    repaired_history = Some(messages);
+                }
+                CatEvent::Cancelled => {
+                    saw_cancelled = true;
+                    break;
+                }
+                CatEvent::Error(err) => panic!("unexpected error: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(saw_cancelled);
+        let history = repaired_history.expect("cancel should emit repaired history");
+        let result_messages = history
+            .iter()
+            .filter_map(|message| {
+                message
+                    .tool_call_id
+                    .as_deref()
+                    .map(|id| (id.to_string(), message.content.text_content()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result_messages
+                .iter()
+                .filter(|(id, _)| id == "fast-call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            result_messages
+                .iter()
+                .filter(|(id, _)| id == "slow-call")
+                .count(),
+            1
+        );
+        assert!(result_messages
+            .iter()
+            .any(|(id, text)| id == "fast-call" && text == "fast"));
+        assert!(result_messages.iter().any(|(id, text)| {
+            id == "slow-call" && text.contains(INTERRUPTED_TOOL_RESULT_ERROR)
+        }));
     }
 
     #[tokio::test]
