@@ -661,11 +661,12 @@ where
                                     overflow_bytes,
                                     Some(side_tx),
                                     Arc::clone(&self.tool_tasks),
-                                    task_thread_id,
+                                    task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
+                                let mut forward_background_side_events = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
@@ -688,6 +689,7 @@ where
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
                                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
+                                                    forward_background_side_events = true;
                                                     spawn_background_tool_result(
                                                         task_id.clone(),
                                                         tc.name.clone(),
@@ -788,6 +790,13 @@ where
                                             return;
                                         }
                                     }
+                                }
+                                if forward_background_side_events {
+                                    spawn_background_side_event_forwarder(
+                                        task_thread_id,
+                                        Arc::clone(&self.tool_tasks),
+                                        side_rx,
+                                    );
                                 }
                                 push_completed_tool_contents(
                                     &approved_local,
@@ -1064,11 +1073,12 @@ where
                                     overflow_bytes,
                                     Some(side_tx),
                                     Arc::clone(&self.tool_tasks),
-                                    task_thread_id,
+                                    task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
+                                let mut forward_background_side_events = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
@@ -1091,6 +1101,7 @@ where
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
                                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
+                                                    forward_background_side_events = true;
                                                     spawn_background_tool_result(
                                                         task_id.clone(),
                                                         tc.name.clone(),
@@ -1187,6 +1198,13 @@ where
                                             return;
                                         }
                                     }
+                                }
+                                if forward_background_side_events {
+                                    spawn_background_side_event_forwarder(
+                                        task_thread_id,
+                                        Arc::clone(&self.tool_tasks),
+                                        side_rx,
+                                    );
                                 }
                                 push_completed_tool_contents(
                                     &approved_dynamic,
@@ -2057,6 +2075,18 @@ fn spawn_background_tool_result(
     });
 }
 
+fn spawn_background_side_event_forwarder(
+    thread_id: String,
+    tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
+    mut side_rx: mpsc::UnboundedReceiver<CatEvent>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(event) = side_rx.recv().await {
+            tool_tasks.publish_side_event(thread_id.clone(), event);
+        }
+    });
+}
+
 async fn collect_result(
     result: Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
@@ -2288,9 +2318,9 @@ mod tests {
         append_tool_results_to_history, approval_request_for_tool, collect_result_with_overflow,
         collect_tool_result_futures_with_timeout, collect_tool_results_parallel,
         complete_interrupted_tool_results, complete_pending_tool_calls_in_state,
-        fs_read_overflow_summary, outer_thread_id_from_metadata, spawn_background_tool_result,
-        split_utf8_chunks, tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome,
-        INTERRUPTED_TOOL_RESULT_ERROR,
+        fs_read_overflow_summary, outer_thread_id_from_metadata,
+        spawn_background_side_event_forwarder, spawn_background_tool_result, split_utf8_chunks,
+        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -3473,6 +3503,93 @@ mod tests {
                 assert_eq!(completed.status.as_str(), "completed");
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_tool_result_forwards_background_side_events() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut side_events = tool_tasks.subscribe_side_events();
+                let (side_tx, side_rx) = mpsc::unbounded_channel();
+                let tool_names = HashMap::from([("sub-call".to_string(), "sub_agent".to_string())]);
+                let calls = vec![ParsedToolCall {
+                    id: "sub-call".to_string(),
+                    name: "sub_agent".to_string(),
+                    arguments: serde_json::json!({"task": "run bash"}),
+                }];
+                let output: BoxedToolStream = Box::pin(async_stream::stream! {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    yield ToolOutput::SubSession(remi_agentloop::prelude::SubSessionEvent::new(
+                        "",
+                        remi_agentloop::prelude::ThreadId("sub-thread".to_string()),
+                        remi_agentloop::prelude::RunId("sub-run".to_string()),
+                        "coder",
+                        None,
+                        1,
+                        remi_agentloop::prelude::ProtocolEvent::ToolCallStart {
+                            id: "bash-call".to_string(),
+                            name: "bash".to_string(),
+                        },
+                    ));
+                    yield ToolOutput::text("done");
+                });
+
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![("sub-call".to_string(), Ok(ToolResult::Output(output)))],
+                    &calls,
+                    &tool_names,
+                    &root,
+                    8_192,
+                    Some(side_tx),
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    Duration::from_millis(5),
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome");
+                let ForegroundToolOutcome::TimedOut {
+                    task_id, future, ..
+                } = outcome
+                else {
+                    panic!("expected sub-agent tool to move into the background");
+                };
+
+                spawn_background_side_event_forwarder(
+                    "thread-1".to_string(),
+                    Arc::clone(&tool_tasks),
+                    side_rx,
+                );
+                spawn_background_tool_result(
+                    task_id,
+                    "sub_agent".to_string(),
+                    Arc::clone(&tool_tasks),
+                    future,
+                );
+
+                let (thread_id, event) =
+                    tokio::time::timeout(Duration::from_secs(1), side_events.recv())
+                        .await
+                        .expect("background side event should notify")
+                        .expect("side event channel should stay open");
+                assert_eq!(thread_id, "thread-1");
+                assert!(matches!(
+                    event,
+                    CatEvent::SubSession(ref sub)
+                        if matches!(
+                            sub.event.as_ref(),
+                            remi_agentloop::prelude::ProtocolEvent::ToolCallStart { name, .. }
+                                if name == "bash"
+                        )
+                ));
             })
             .await;
     }

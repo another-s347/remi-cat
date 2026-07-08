@@ -13,6 +13,8 @@ use remi_agentloop::prelude::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::CatEvent;
+
 const STORE_FILE: &str = "tool_tasks.json";
 pub const TOOL_TASK_RUNNING: &str = "running";
 pub const TOOL_TASK_COMPLETED: &str = "completed";
@@ -60,6 +62,7 @@ pub struct ToolTaskManager {
     store: Mutex<ToolTaskStore>,
     running: Mutex<HashMap<String, RunningTask>>,
     completed_tx: broadcast::Sender<ToolTaskRecord>,
+    side_event_tx: broadcast::Sender<(String, CatEvent)>,
 }
 
 impl ToolTaskManager {
@@ -86,6 +89,7 @@ impl ToolTaskManager {
             store: Mutex::new(store),
             running: Mutex::new(HashMap::new()),
             completed_tx: broadcast::channel(64).0,
+            side_event_tx: broadcast::channel(256).0,
         });
         Ok(manager)
     }
@@ -185,6 +189,14 @@ impl ToolTaskManager {
 
     pub fn subscribe_completed(&self) -> broadcast::Receiver<ToolTaskRecord> {
         self.completed_tx.subscribe()
+    }
+
+    pub fn subscribe_side_events(&self) -> broadcast::Receiver<(String, CatEvent)> {
+        self.side_event_tx.subscribe()
+    }
+
+    pub fn publish_side_event(&self, thread_id: String, event: CatEvent) {
+        let _ = self.side_event_tx.send((thread_id, event));
     }
 
     pub async fn cancel(&self, task_id: &str) -> Option<ToolTaskRecord> {
