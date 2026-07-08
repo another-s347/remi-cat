@@ -17,6 +17,7 @@ mod tui_app;
 mod tui_form;
 mod tui_markdown;
 mod tui_text;
+mod tui_theme;
 mod web_chat;
 mod workspace_files;
 

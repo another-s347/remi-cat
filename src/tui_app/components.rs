@@ -1600,12 +1600,3 @@ pub(super) fn truncate_for_width(text: &str, width: u16) -> String {
     output.push('…');
     output
 }
-
-pub(super) fn short_session_label(session_id: &str) -> String {
-    let width = UnicodeWidthStr::width(session_id);
-    if width <= 12 {
-        return session_id.to_string();
-    }
-    let prefix = session_id.chars().take(8).collect::<String>();
-    format!("{prefix}…")
-}

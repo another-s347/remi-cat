@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.16"
+version = "0.2.17"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"

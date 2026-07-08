@@ -61,10 +61,10 @@ use crate::{
 
 const TUI_CHANNEL: &str = "tui";
 const MAX_HISTORY_CELLS: usize = 400;
-const CODEX_CYAN: Color = Color::Rgb(109, 209, 255);
-const CODEX_DIM: Color = Color::Rgb(118, 124, 134);
-const CODEX_BORDER: Color = Color::Rgb(63, 68, 78);
-const CODEX_GREEN: Color = Color::Rgb(122, 222, 151);
+const CODEX_CYAN: Color = crate::tui_theme::ACCENT;
+const CODEX_DIM: Color = crate::tui_theme::DIM;
+const CODEX_BORDER: Color = crate::tui_theme::BORDER;
+const CODEX_GREEN: Color = crate::tui_theme::SUCCESS;
 const FOOTER_INDENT: &str = "  ";
 const HISTORY_GUTTER_WIDTH: u16 = 4;
 const MAX_TOOL_BODY_CHARS: usize = 240;
@@ -417,14 +417,14 @@ fn render_resume_selector(
         .map(|(index, session)| {
             let title = sanitize_tui_text(session.title.as_deref().unwrap_or("untitled"));
             let workspace = resume_session_workspace_label(session, current_workspace_dir);
-            let marker = if index == selected { "›" } else { " " };
+            let marker = crate::tui_theme::selection_marker(index == selected);
             let prefix = if index < 9 {
                 format!("{marker} {}. ", index + 1)
             } else {
                 format!("{marker}    ")
             };
             ListItem::new(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(CODEX_CYAN)),
+                Span::styled(prefix, crate::tui_theme::accent_style(Modifier::empty())),
                 Span::styled(
                     short_session_id(&session.id),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -2962,9 +2962,20 @@ impl TuiApp {
     }
 
     fn activity_height(&self) -> u16 {
-        u16::from(self.pending_approval.is_some())
-            + u16::from(self.running)
+        u16::from(self.running && self.active_tool_count() > 0)
             + u16::from(!self.queued_inputs.is_empty())
+    }
+
+    fn action_panel_height(&self, root_height: u16) -> u16 {
+        if self.pending_approval.is_none() && self.pending_user_question.is_none() {
+            return 0;
+        }
+        let cap = (root_height / 3).clamp(4, 12);
+        if self.pending_approval.is_some() {
+            cap
+        } else {
+            cap.min(10)
+        }
     }
 
     fn footer_height(&self) -> u16 {

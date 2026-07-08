@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui_theme;
+
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 struct FormTerminal {
@@ -159,7 +161,7 @@ fn render_text_input(frame: &mut Frame<'_>, label: &str, default: &str, value: &
     let block = Block::default()
         .title(" setup ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(63, 68, 78)));
+        .border_style(tui_theme::border_style());
     frame.render_widget(block, area);
     let inner = inset(area, 2, 1);
     let chunks = Layout::default()
@@ -231,7 +233,7 @@ fn render_select(frame: &mut Frame<'_>, label: &str, options: &[String], selecte
     let block = Block::default()
         .title(" setup ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(63, 68, 78)));
+        .border_style(tui_theme::border_style());
     frame.render_widget(block, area);
     let inner = inset(area, 2, 1);
     let chunks = Layout::default()
@@ -250,14 +252,14 @@ fn render_select(frame: &mut Frame<'_>, label: &str, options: &[String], selecte
         .iter()
         .enumerate()
         .map(|(index, option)| {
-            let marker = if index == selected { "›" } else { " " };
+            let marker = tui_theme::selection_marker(index == selected);
             let number = if index < 9 {
                 format!("{} ", index + 1)
             } else {
                 "  ".to_string()
             };
             ListItem::new(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::Rgb(109, 209, 255))),
+                Span::styled(marker, tui_theme::accent_style(Modifier::empty())),
                 Span::styled(number, Style::default().fg(Color::DarkGray)),
                 Span::raw(option.clone()),
             ]))
