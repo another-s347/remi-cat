@@ -41,7 +41,7 @@ use crate::core::Runtime;
 use bot_core::{
     api_key_from_env, model_profile_key_status, AccountBalance, AccountUsage, AccountUsageStatus,
     CatBot, GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument, SkillLoadDiagnostic,
-    SkillLoadDiagnosticSeverity,
+    SkillLoadDiagnosticSeverity, ToolTaskRecord,
 };
 
 pub(crate) enum RuntimeCommandResult {
@@ -162,6 +162,10 @@ pub(crate) async fn handle_runtime_command(
             .join("\n");
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
+    if command == "/tasks" || command.starts_with("/tasks ") {
+        let reply = handle_tasks_command(&runtime.bot, session_id, command).await?;
+        return Ok(Some(RuntimeCommandResult::Reply(reply)));
+    }
     if command == "/skill" || command.starts_with("/skill ") || command.starts_with("/skill:") {
         let result = handle_skill_command(runtime, session_id, command).await?;
         return Ok(Some(result));
@@ -265,6 +269,8 @@ fn runtime_command_help() -> String {
         "",
         "- `/help` - show this command list",
         "- `/tools` - list tools available to the current agent",
+        "- `/tasks` - list background tool tasks for this session",
+        "- `/tasks all|get <task_id>|cancel <task_id>` - inspect or cancel background tasks",
         "- `/skill list` - list available local and builtin skills",
         "- `/skill status` - show skills already read or activated in this session",
         "- `/skill:<name> <task>` - load a skill for the same message and run the task",
@@ -280,6 +286,75 @@ fn runtime_command_help() -> String {
         "- `/clear` - clear chat memory for this session",
     ]
     .join("\n")
+}
+
+async fn handle_tasks_command(
+    bot: &CatBot,
+    session_id: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["/tasks"] | ["/tasks", "list"] => {
+            let tasks = bot.list_background_tasks(Some(session_id)).await;
+            Ok(format_tool_tasks(&tasks))
+        }
+        ["/tasks", "all"] => {
+            let tasks = bot.list_background_tasks(None).await;
+            Ok(format_tool_tasks(&tasks))
+        }
+        ["/tasks", "get", task_id] => Ok(bot
+            .get_background_task(task_id)
+            .await
+            .map(|task| format_tool_task_detail(&task))
+            .unwrap_or_else(|| format!("background task not found: {task_id}"))),
+        ["/tasks", "cancel", task_id] => Ok(bot
+            .cancel_background_task(task_id)
+            .await
+            .map(|task| format!("{} {}", task.task_id, task.status))
+            .unwrap_or_else(|| format!("background task not found: {task_id}"))),
+        _ => Ok("用法：/tasks [list|all|get <task_id>|cancel <task_id>]".to_string()),
+    }
+}
+
+fn format_tool_tasks(tasks: &[ToolTaskRecord]) -> String {
+    if tasks.is_empty() {
+        return "no background tool tasks".to_string();
+    }
+    tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "- `{}` `{}` `{}` `{}` {}ms",
+                task.task_id,
+                task.status,
+                task.thread_id,
+                task.tool_name,
+                task.elapsed_ms.unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_tool_task_detail(task: &ToolTaskRecord) -> String {
+    let mut lines = vec![
+        format!("task_id: {}", task.task_id),
+        format!("status: {}", task.status),
+        format!("thread_id: {}", task.thread_id),
+        format!("tool: {}", task.tool_name),
+        format!("elapsed_ms: {}", task.elapsed_ms.unwrap_or(0)),
+    ];
+    if let Some(message) = task.message.as_deref() {
+        lines.push(format!("message: {message}"));
+    }
+    if !task.recent_output.is_empty() {
+        lines.push(format!("recent_output:\n{}", task.recent_output.join("\n")));
+    }
+    if let Some(result) = task.result_preview.as_deref() {
+        lines.push(format!("result:\n{result}"));
+    }
+    lines.join("\n")
 }
 
 pub(crate) async fn handle_agent_command(
@@ -1512,4 +1587,44 @@ fn format_goal_status(goal: &bot_core::GoalState) -> String {
         "goal: {}\nstatus: {status}\nmax_rounds: {max_rounds}{last}",
         goal.goal
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_task() -> ToolTaskRecord {
+        ToolTaskRecord {
+            task_id: "task-1".to_string(),
+            thread_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"command": "sleep 60"}),
+            status: bot_core::tool_tasks::TOOL_TASK_RUNNING.to_string(),
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: None,
+            elapsed_ms: None,
+            success: None,
+            result_preview: Some("result body".to_string()),
+            recent_output: vec!["tail line".to_string()],
+            message: None,
+        }
+    }
+
+    #[test]
+    fn formats_background_task_list_and_detail() {
+        let task = test_task();
+
+        let list = format_tool_tasks(std::slice::from_ref(&task));
+        assert!(list.contains("task-1"));
+        assert!(list.contains("running"));
+        assert!(list.contains("session-1"));
+        assert!(list.contains("bash"));
+
+        let detail = format_tool_task_detail(&task);
+        assert!(detail.contains("task_id: task-1"));
+        assert!(detail.contains("recent_output:\ntail line"));
+        assert!(detail.contains("result:\nresult body"));
+    }
 }

@@ -223,6 +223,18 @@ fn static_command_catalog() -> Vec<CommandCatalogEntry> {
         ),
         ("/tools", "列出工具", "显示当前 Agent 可用的工具", false),
         (
+            "/tasks",
+            "查看后台任务",
+            "显示当前 session 的后台工具任务",
+            false,
+        ),
+        (
+            "/tasks all",
+            "查看全部后台任务",
+            "显示所有 session 的后台工具任务",
+            false,
+        ),
+        (
             "/goal status",
             "查看 Goal",
             "查看当前会话的目标与监督状态",

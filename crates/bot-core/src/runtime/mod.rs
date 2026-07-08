@@ -177,6 +177,54 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(map))
 }
 
+fn background_task_completion_content(task: &crate::ToolTaskRecord) -> Content {
+    let mut text = format!(
+        "Background tool task completed.\n\
+         tool: {}\n\
+         task_id: {}\n\
+         status: {}\n\
+         elapsed_ms: {}\n",
+        task.tool_name,
+        task.task_id,
+        task.status,
+        task.elapsed_ms.unwrap_or(0)
+    );
+    if let Some(success) = task.success {
+        text.push_str(&format!("success: {success}\n"));
+    }
+    if let Some(message) = task.message.as_deref() {
+        text.push_str(&format!("message: {message}\n"));
+    }
+    if !task.recent_output.is_empty() {
+        text.push_str("recent_output:\n");
+        text.push_str(&task.recent_output.join("\n"));
+        text.push('\n');
+    }
+    if let Some(result) = task.result_preview.as_deref() {
+        text.push_str("result:\n");
+        text.push_str(result);
+    }
+    Content::text(text)
+}
+
+fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreSteerInput {
+    CoreSteerInput {
+        id: format!("tool-task-{}", task.task_id),
+        content: background_task_completion_content(task),
+        preview: format!(
+            "Background task {} ({}) completed",
+            task.task_id, task.tool_name
+        ),
+        message_metadata: Some(serde_json::json!({
+            "background_tool_task": true,
+            "task_id": task.task_id,
+            "tool_name": task.tool_name,
+            "status": task.status,
+        })),
+        user_name: None,
+    }
+}
+
 // -- StreamOptions ----------------------------------------------------------
 
 /// Per-turn options for [`CatBot::stream_with_options`].
@@ -1266,6 +1314,21 @@ impl CatBot {
         self.tool_tasks.cancel_thread(thread_id).await
     }
 
+    pub async fn list_background_tasks(
+        &self,
+        thread_id: Option<&str>,
+    ) -> Vec<crate::ToolTaskRecord> {
+        self.tool_tasks.list(thread_id).await
+    }
+
+    pub async fn get_background_task(&self, task_id: &str) -> Option<crate::ToolTaskRecord> {
+        self.tool_tasks.get(task_id).await
+    }
+
+    pub async fn cancel_background_task(&self, task_id: &str) -> Option<crate::ToolTaskRecord> {
+        self.tool_tasks.cancel(task_id).await
+    }
+
     pub async fn acp_bound_message(
         &self,
         session_id: &str,
@@ -1793,6 +1856,7 @@ impl CatBot {
                 let mut next_content = content;
                 let mut supervisor_round: u32 = 0;
                 let mut continuation_from_supervisor = false;
+                let mut continuation_from_background_task = false;
                 let mut stop_hook_active = false;
                 let mut interruption_resume_checked = false;
                 let turn_started = Instant::now();
@@ -1908,13 +1972,20 @@ impl CatBot {
                 }
 
                 let mut round_opts = opts.clone();
-                if continuation_from_supervisor {
-                    round_opts.sender_username = Some("supervisor".to_string());
-                    round_opts.sender_user_id = Some("supervisor".to_string());
+                let background_task_continuation = continuation_from_background_task;
+                if continuation_from_supervisor || background_task_continuation {
+                    if continuation_from_supervisor {
+                        round_opts.sender_username = Some("supervisor".to_string());
+                        round_opts.sender_user_id = Some("supervisor".to_string());
+                    } else {
+                        round_opts.sender_username = None;
+                        round_opts.sender_user_id = None;
+                    }
                     round_opts.message_id = None;
                     round_opts.im_attachments.clear();
                     round_opts.im_documents.clear();
                 }
+                continuation_from_background_task = false;
 
                 apply_skill_injections(&mut ctx.user_state, &round_opts.skill_injections);
                 let requested_user_name = round_opts
@@ -2053,7 +2124,7 @@ impl CatBot {
                         history.push(hook_context_message("SessionStart", context));
                     }
                 }
-                if !continuation_from_supervisor {
+                if !continuation_from_supervisor && !background_task_continuation {
                     let user_prompt_hook = self
                         .hook_manager
                         .run(
@@ -2198,6 +2269,9 @@ impl CatBot {
                         completed = completed_tool_tasks.recv() => {
                             if let Ok(task) = completed {
                                 if task.thread_id == thread_id_owned {
+                                    if let Some(steer) = steer_queue.as_ref() {
+                                        steer.push(background_task_completion_steer_input(&task));
+                                    }
                                     yield CatEvent::ToolTaskCompleted(task);
                                 }
                             }
@@ -2476,6 +2550,20 @@ impl CatBot {
                                 ).await {
                                     yield event;
                                 }
+                                if let Some(steer) = steer_queue.as_ref() {
+                                    if let Some(batch) = steer.drain_batch() {
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                            steer_ids: batch.ids.clone(),
+                                            session_id: thread_id_owned.clone(),
+                                            preview: batch.preview.clone(),
+                                            count: batch.count,
+                                        });
+                                        next_content = batch.content;
+                                        continuation_from_supervisor = false;
+                                        continuation_from_background_task = true;
+                                        continue 'workflow_loop;
+                                    }
+                                }
                                 if !round_opts.supervisor_run
                                     && !user_question_requested_this_round
                                     && !workflow_interrupted_this_round
@@ -2563,10 +2651,50 @@ impl CatBot {
                                         continue 'workflow_loop;
                                     }
                                 }
+                                if let Some(steer) = steer_queue.as_ref() {
+                                    if let Some(batch) = steer.drain_batch() {
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                            steer_ids: batch.ids.clone(),
+                                            session_id: thread_id_owned.clone(),
+                                            preview: batch.preview.clone(),
+                                            count: batch.count,
+                                        });
+                                        next_content = batch.content;
+                                        continuation_from_supervisor = false;
+                                        continuation_from_background_task = true;
+                                        continue 'workflow_loop;
+                                    }
+                                }
                                 while self.tool_tasks.is_thread_running(&thread_id_owned).await {
                                     match completed_tool_tasks.recv().await {
                                         Ok(task) if task.thread_id == thread_id_owned => {
+                                            let fallback_content =
+                                                background_task_completion_content(&task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                steer.push(background_task_completion_steer_input(&task));
+                                            }
                                             yield CatEvent::ToolTaskCompleted(task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                if let Some(batch) = steer.drain_batch() {
+                                                    yield CatEvent::SteerInjected(
+                                                        crate::SteerInjectedEvent {
+                                                            steer_ids: batch.ids.clone(),
+                                                            session_id: thread_id_owned.clone(),
+                                                            preview: batch.preview.clone(),
+                                                            count: batch.count,
+                                                        },
+                                                    );
+                                                    next_content = batch.content;
+                                                    continuation_from_supervisor = false;
+                                                    continuation_from_background_task = true;
+                                                    continue 'workflow_loop;
+                                                }
+                                            } else {
+                                                next_content = fallback_content;
+                                                continuation_from_supervisor = false;
+                                                continuation_from_background_task = true;
+                                                continue 'workflow_loop;
+                                            }
                                         }
                                         Ok(_) => {}
                                         Err(_) => break,
@@ -4246,10 +4374,11 @@ fn register_delegate_agent_tools(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_thread_todo_system_prompt, context_percent_tokens, default_system_prompt,
-        format_subagent_tool_result, insert_single_chat_sender_system_prompt,
-        install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
-        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
+        append_thread_todo_system_prompt, background_task_completion_steer_input,
+        context_percent_tokens, default_system_prompt, format_subagent_tool_result,
+        insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
+        local_acp_thread_id, model_input_snapshot_from_loop_input, prepend_group_sender_username,
+        route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, AgentModelBindings, CatBotBuilder,
         CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
         ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
@@ -4352,6 +4481,38 @@ mod tests {
         assert!(categories.contains(&ModelInputSegmentCategory::UserState));
         assert_eq!(snapshot.run_id, "run_1");
         assert!(snapshot.totals.estimated_tokens > 0);
+    }
+
+    #[test]
+    fn background_task_completion_steer_input_includes_result_context() {
+        let task = crate::ToolTaskRecord {
+            task_id: "task-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({"command": "sleep 60"}),
+            status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-09T00:01:00Z".to_string()),
+            elapsed_ms: Some(60_000),
+            success: Some(true),
+            result_preview: Some("done".to_string()),
+            recent_output: vec!["last line".to_string()],
+            message: None,
+        };
+
+        let steer = background_task_completion_steer_input(&task);
+        let text = steer.content.text_content();
+
+        assert_eq!(steer.id, "tool-task-task-1");
+        assert!(text.contains("Background tool task completed."));
+        assert!(text.contains("tool: bash"));
+        assert!(text.contains("task_id: task-1"));
+        assert!(text.contains("elapsed_ms: 60000"));
+        assert!(text.contains("last line"));
+        assert!(text.contains("done"));
+        assert_eq!(steer.user_name, None);
     }
 
     #[test]
