@@ -68,6 +68,9 @@ impl RuntimeConfig {
                 &overflow_bytes.to_string(),
             );
         }
+        if let Some(timeout_ms) = self.tool_output.foreground_timeout_ms {
+            set_env_if_absent("REMI_TOOL_FOREGROUND_TIMEOUT_MS", &timeout_ms.to_string());
+        }
         set_env_if_absent("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
         set_env_if_absent(
             "REMI_SANDBOX_HOST_DIR",
@@ -166,6 +169,11 @@ impl RuntimeConfig {
             );
         } else {
             remove_env("REMI_TOOL_OUTPUT_OVERFLOW_BYTES");
+        }
+        if let Some(timeout_ms) = self.tool_output.foreground_timeout_ms {
+            set_env("REMI_TOOL_FOREGROUND_TIMEOUT_MS", &timeout_ms.to_string());
+        } else {
+            remove_env("REMI_TOOL_FOREGROUND_TIMEOUT_MS");
         }
         set_env("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
         set_env(
@@ -306,6 +314,8 @@ pub fn resolve_runtime_config_for_run(
 pub struct ToolOutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overflow_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -807,6 +817,7 @@ mod tests {
             model_profile: "deepseek-v4-flash".into(),
             tool_output: super::ToolOutputConfig {
                 overflow_bytes: Some(32_768),
+                foreground_timeout_ms: Some(15_000),
             },
             sandbox: super::RuntimeSandboxConfig::default_for(&dir),
             admin: AdminConfig::default(),
@@ -831,6 +842,7 @@ model_profile: default
         let cfg: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
 
         assert_eq!(cfg.tool_output.overflow_bytes, None);
+        assert_eq!(cfg.tool_output.foreground_timeout_ms, None);
     }
 
     #[test]
@@ -958,10 +970,12 @@ model_profile: default
             std::env::set_var("REMI_SANDBOX_KIND", "docker");
             std::env::set_var("REMI_IM_MODE", "feishu");
             std::env::set_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES", "1");
+            std::env::set_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS", "1");
         }
 
         let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
         cfg.tool_output.overflow_bytes = Some(7777);
+        cfg.tool_output.foreground_timeout_ms = Some(12_345);
         cfg.sandbox.kind = super::RuntimeSandboxKind::NoSandbox;
         cfg.shell.mode = super::ShellMode::Local;
         cfg.im.mode = ImMode::Disabled;
@@ -986,6 +1000,10 @@ model_profile: default
             std::env::var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES").unwrap(),
             "7777"
         );
+        assert_eq!(
+            std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS").unwrap(),
+            "12345"
+        );
 
         unsafe {
             std::env::remove_var("REMI_ACP_CLIENT");
@@ -996,6 +1014,7 @@ model_profile: default
             std::env::remove_var("REMI_SANDBOX_KIND");
             std::env::remove_var("REMI_IM_MODE");
             std::env::remove_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES");
+            std::env::remove_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS");
         }
     }
 

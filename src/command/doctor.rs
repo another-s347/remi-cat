@@ -30,6 +30,14 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
                     .unwrap_or_else(|| "model_profile_default".to_string())
             );
             println!(
+                "tool_foreground_timeout_ms: {}",
+                config
+                    .tool_output
+                    .foreground_timeout_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "10000".to_string())
+            );
+            println!(
                 "admin: {}",
                 if config.admin.enabled {
                     format!("http://{}:{}", config.admin.host, config.admin.port)

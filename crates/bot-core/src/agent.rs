@@ -1809,12 +1809,13 @@ fn build_dynamic_tools(
 /// [`CatAgent::overflow_bytes`] which is derived from the model profile.
 const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
 const TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 512;
-const DEFAULT_TOOL_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_TOOL_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn tool_foreground_timeout() -> std::time::Duration {
     std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS")
         .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_TOOL_FOREGROUND_TIMEOUT)
 }
@@ -1850,10 +1851,12 @@ enum ForegroundToolOutcome {
 
 fn background_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolResult {
     CollectedToolResult::text(format!(
-        "Tool `{tool_name}` is still running in the background.\n\
-         task_id: {task_id}\n\
-         You do not need to poll continuously; the system will notify you automatically when it finishes. \
-         Use tool_tasks only if you need to inspect or cancel the task."
+        "Tool `{tool_name}` is already running in the background.\n\
+         task_id: {task_id}\n\n\
+         Do not call `{tool_name}` again to continue or duplicate this same work. \
+         Do not start a replacement task for the same objective. \
+         The system will automatically send you the result when this task finishes; continue only after that notification unless the user explicitly asks you to cancel or start a different task. \
+         Use tool_tasks only to inspect recent output/status or cancel the existing task."
     ))
 }
 
@@ -2323,12 +2326,13 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_tool_results_to_history, approval_request_for_tool, collect_result_with_overflow,
-        collect_tool_result_futures_with_timeout, collect_tool_results_parallel,
-        complete_interrupted_tool_results, complete_pending_tool_calls_in_state,
-        fs_read_overflow_summary, outer_thread_id_from_metadata,
-        spawn_background_side_event_forwarder, split_utf8_chunks, tool_output_chunk_bytes,
-        CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
+        append_tool_results_to_history, approval_request_for_tool, background_task_tool_result,
+        collect_result_with_overflow, collect_tool_result_futures_with_timeout,
+        collect_tool_results_parallel, complete_interrupted_tool_results,
+        complete_pending_tool_calls_in_state, fs_read_overflow_summary,
+        outer_thread_id_from_metadata, spawn_background_side_event_forwarder, split_utf8_chunks,
+        tool_foreground_timeout, tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome,
+        INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -2425,6 +2429,35 @@ mod tests {
             ),
             "agentloop-inner-thread"
         );
+    }
+
+    #[test]
+    fn tool_foreground_timeout_defaults_to_ten_seconds_and_env_overrides() {
+        let previous = std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS").ok();
+        unsafe {
+            std::env::remove_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS");
+        }
+        assert_eq!(tool_foreground_timeout(), Duration::from_secs(10));
+
+        unsafe {
+            std::env::set_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS", "2500");
+        }
+        assert_eq!(tool_foreground_timeout(), Duration::from_millis(2500));
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS", value),
+                None => std::env::remove_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS"),
+            }
+        }
+    }
+
+    #[test]
+    fn background_task_prompt_tells_agent_not_to_duplicate_work() {
+        let prompt = background_task_tool_result("task-1", "bash").preview;
+        assert!(prompt.contains("Do not call `bash` again"));
+        assert!(prompt.contains("Do not start a replacement task"));
+        assert!(prompt.contains("automatically send you the result"));
     }
 
     #[test]
@@ -3636,6 +3669,87 @@ mod tests {
                             remi_agentloop::prelude::ProtocolEvent::ToolCallStart { name, .. }
                                 if name == "bash"
                         )
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_subagent_approval_request_forwards_as_background_side_event() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut side_events = tool_tasks.subscribe_side_events();
+                let (side_tx, side_rx) = mpsc::unbounded_channel();
+                let tool_names = HashMap::from([("sub-call".to_string(), "sub_agent".to_string())]);
+                let calls = vec![ParsedToolCall {
+                    id: "sub-call".to_string(),
+                    name: "sub_agent".to_string(),
+                    arguments: serde_json::json!({"task": "run bash"}),
+                }];
+                let output: BoxedToolStream = Box::pin(async_stream::stream! {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    yield crate::tool_approval_requested_marker(
+                        &remi_agentloop::prelude::ThreadId("sub-thread".to_string()),
+                        &remi_agentloop::prelude::RunId("sub-run".to_string()),
+                        &crate::ToolApprovalRequest {
+                            id: "approval-1".to_string(),
+                            session_id: "thread-1".to_string(),
+                            run_id: "run-1".to_string(),
+                            tool_call_id: "bash-call".to_string(),
+                            tool_name: "bash".to_string(),
+                            risk: crate::ToolRiskLevel::High,
+                            args_summary: "sleep 60".to_string(),
+                            command_key: Some("bash:sleep 60".to_string()),
+                            model_review_reason: None,
+                            platform: Some("tui".to_string()),
+                            review: None,
+                        },
+                    );
+                    yield ToolOutput::text("done");
+                });
+
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![("sub-call".to_string(), Ok(ToolResult::Output(output)))],
+                    &calls,
+                    &tool_names,
+                    &root,
+                    8_192,
+                    Some(side_tx),
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    Duration::from_millis(5),
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome");
+                let ForegroundToolOutcome::TimedOut { .. } = outcome else {
+                    panic!("expected sub-agent tool to exceed the foreground window");
+                };
+
+                spawn_background_side_event_forwarder(
+                    "thread-1".to_string(),
+                    Arc::clone(&tool_tasks),
+                    side_rx,
+                );
+
+                let (thread_id, event) =
+                    tokio::time::timeout(Duration::from_secs(1), side_events.recv())
+                        .await
+                        .expect("background approval event should notify")
+                        .expect("side event channel should stay open");
+                assert_eq!(thread_id, "thread-1");
+                assert!(matches!(
+                    event,
+                    CatEvent::ToolApprovalRequested(ref request)
+                        if request.tool_call_id == "bash-call"
+                            && request.tool_name == "bash"
+                            && request.platform.as_deref() == Some("tui")
                 ));
             })
             .await;

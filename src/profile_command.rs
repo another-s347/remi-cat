@@ -169,6 +169,14 @@ pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> 
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "model_profile_default".to_string())
                     );
+                    println!(
+                        "tool_foreground_timeout_ms: {}",
+                        config
+                            .tool_output
+                            .foreground_timeout_ms
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "10000".to_string())
+                    );
                     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
                     println!("sandbox_container: {}", config.sandbox.container_name);
                     println!("im_mode: {}", config.im.mode.as_env_value());
@@ -887,6 +895,10 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         | "tool_output.overflow_bytes"
         | "overflow_bytes"
         | "tool_overflow_bytes" => config.tool_output.overflow_bytes = Some(parse_usize(value)?),
+        "tool_foreground_timeout_ms"
+        | "tool_output.foreground_timeout_ms"
+        | "foreground_timeout_ms"
+        | "tool_timeout_ms" => config.tool_output.foreground_timeout_ms = Some(parse_u64(value)?),
         "admin_enabled" | "admin.enabled" => config.admin.enabled = parse_bool(value)?,
         "admin_host" | "admin.host" => config.admin.host = value.to_string(),
         "admin_port" | "admin.port" => config.admin.port = parse_port(value)?,
@@ -1020,6 +1032,14 @@ fn parse_port(value: &str) -> anyhow::Result<u16> {
 }
 
 fn parse_usize(value: &str) -> anyhow::Result<usize> {
+    let parsed = value.parse().context("invalid positive integer")?;
+    if parsed == 0 {
+        anyhow::bail!("value must be greater than 0");
+    }
+    Ok(parsed)
+}
+
+fn parse_u64(value: &str) -> anyhow::Result<u64> {
     let parsed = value.parse().context("invalid positive integer")?;
     if parsed == 0 {
         anyhow::bail!("value must be greater than 0");
