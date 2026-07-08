@@ -4,11 +4,17 @@ use crate::{GoalMaxRounds, WorkflowMaxRounds, WorkflowReport};
 
 pub(super) enum WorkflowRoundOutcome {
     NoWorkflow,
+    Cancelled,
     Report(WorkflowReport),
     Continue {
         report: WorkflowReport,
         message: String,
     },
+}
+
+pub(super) enum SupervisorNodeOutcome {
+    Cancelled,
+    Decision(crate::WorkflowDecision),
 }
 
 pub(super) fn workflow_round_allows_continue(

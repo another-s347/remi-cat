@@ -1,6 +1,7 @@
 use bot_core::im_tools::SubSessionBindingUpsertRequest;
 use im_feishu::FeishuMessage;
-use remi_agentloop::types::{SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::ProtocolEvent;
+use remi_agentloop::types::SubSessionEvent;
 use tracing::warn;
 
 use crate::app::FEISHU_CHANNEL;
@@ -19,13 +20,11 @@ pub(super) async fn record_sub_session_event(
     } else {
         SubSessionKind::Agent
     };
-    let payload = format!("{:?}", event.payload);
-    let status = if payload.starts_with("Done") {
-        "done"
-    } else if payload.starts_with("Error") {
-        "error"
-    } else {
-        "running"
+    let status = match event.event.as_ref() {
+        ProtocolEvent::Done => "done",
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => "done",
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => "error",
+        _ => "running",
     };
     if let Err(err) = runtime.sessions.lock().await.upsert_sub_session(
         parent_session_id,
@@ -51,7 +50,7 @@ pub(super) async fn record_sub_session_event(
         }
     }
 
-    if !matches!(event.payload, SubSessionEventPayload::Start) {
+    if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
         if platform == FEISHU_CHANNEL {
             forward_sub_session_event_to_bound_channel(runtime, parent_session_id, event).await;
         }
@@ -193,8 +192,11 @@ async fn forward_sub_session_event_to_bound_channel(
         return;
     };
     let done = matches!(
-        event.payload,
-        SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
+        event.event.as_ref(),
+        ProtocolEvent::Done | ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled
+    ) || matches!(
+        event.event.as_ref(),
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done"
     );
     if let Err(err) = runtime
         .im_bridge
@@ -206,8 +208,8 @@ async fn forward_sub_session_event_to_bound_channel(
 }
 
 fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<remi_agentloop::prelude::Message> {
-    match &event.payload {
-        SubSessionEventPayload::Start => {
+    match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => {
             let input = event
                 .title
                 .as_deref()
@@ -222,45 +224,77 @@ fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<remi_agentloop::
                 });
             vec![remi_agentloop::prelude::Message::user(input)]
         }
-        _ => sub_session_event_text(event)
-            .map(remi_agentloop::prelude::Message::assistant)
-            .into_iter()
-            .collect(),
+        ProtocolEvent::Delta { content, .. } => {
+            if content.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![remi_agentloop::prelude::Message::assistant(content.clone())]
+            }
+        }
+        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
+            .get("final_output")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                vec![remi_agentloop::prelude::Message::assistant(
+                    value.to_string(),
+                )]
+            })
+            .unwrap_or_default(),
+        ProtocolEvent::Error { message, .. } => {
+            vec![remi_agentloop::prelude::Message::assistant(format!(
+                "Error: {message}"
+            ))]
+        }
+        ProtocolEvent::Cancelled => {
+            vec![remi_agentloop::prelude::Message::assistant(
+                "Error: cancelled",
+            )]
+        }
+        _ => Vec::new(),
     }
 }
 
 fn sub_session_event_text(event: &SubSessionEvent) -> Option<String> {
-    let text = match &event.payload {
-        SubSessionEventPayload::Start => return None,
-        SubSessionEventPayload::Delta { content } => content.clone(),
-        SubSessionEventPayload::ThinkingStart => "Thinking...".to_string(),
-        SubSessionEventPayload::ThinkingEnd { content } => {
+    let text = match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => return None,
+        ProtocolEvent::Delta { content, .. } => content.clone(),
+        ProtocolEvent::ThinkingStart => "Thinking...".to_string(),
+        ProtocolEvent::ThinkingEnd { content } => {
             if content.trim().is_empty() {
                 "Thinking complete.".to_string()
             } else {
                 format!("Thinking:\n{content}")
             }
         }
-        SubSessionEventPayload::TurnStart { turn } => format!("Turn {turn}"),
-        SubSessionEventPayload::ToolCallStart { id, name } => {
+        ProtocolEvent::TurnStart { turn } => format!("Turn {turn}"),
+        ProtocolEvent::ToolCallStart { id, name } => {
             format!("Tool `{name}` started ({id}).")
         }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
-            format!("Tool arguments `{id}`:\n{delta}")
+        ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta,
+        } => {
+            format!("Tool arguments `{id}`:\n{arguments_delta}")
         }
-        SubSessionEventPayload::ToolDelta { id, name, delta } => {
+        ProtocolEvent::ToolDelta { id, name, delta } => {
             format!("Tool `{name}` output ({id}):\n{delta}")
         }
-        SubSessionEventPayload::ToolResult { id, name, result } => {
+        ProtocolEvent::ToolResult { id, name, result } => {
             format!("Tool `{name}` result ({id}):\n{result}")
         }
-        SubSessionEventPayload::Done { final_output } => final_output
-            .as_deref()
+        ProtocolEvent::Done => "Done.".to_string(),
+        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
+            .get("final_output")
+            .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "Done.".to_string()),
-        SubSessionEventPayload::Error { message } => format!("Error: {message}"),
+        ProtocolEvent::Error { message, .. } => format!("Error: {message}"),
+        ProtocolEvent::Cancelled => "Error: cancelled".to_string(),
+        other => format!("{other:?}"),
     };
     if text.trim().is_empty() {
         None

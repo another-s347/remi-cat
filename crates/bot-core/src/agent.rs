@@ -2176,7 +2176,7 @@ mod tests {
                 "coder",
                 None,
                 1,
-                remi_agentloop::prelude::SubSessionEventPayload::ToolCallStart {
+                remi_agentloop::prelude::ProtocolEvent::ToolCallStart {
                     id: "sub-call".to_string(),
                     name: "fs_ls".to_string(),
                 },

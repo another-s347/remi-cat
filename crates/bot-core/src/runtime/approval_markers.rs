@@ -1,6 +1,4 @@
-use remi_agentloop::prelude::{
-    RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, ToolOutput,
-};
+use remi_agentloop::prelude::{ProtocolEvent, RunId, SubSessionEvent, ThreadId, ToolOutput};
 
 use crate::{
     CatEvent, ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
@@ -113,8 +111,9 @@ pub(crate) fn subagent_approval_marker(
         SUBAGENT_APPROVAL_MARKER_AGENT,
         None,
         0,
-        SubSessionEventPayload::Error {
+        ProtocolEvent::Error {
             message: format!("{prefix}{payload}"),
+            code: None,
         },
     ))
 }
@@ -123,7 +122,7 @@ pub(crate) fn cat_event_from_subagent_approval_marker(event: &SubSessionEvent) -
     if event.agent_name != SUBAGENT_APPROVAL_MARKER_AGENT {
         return None;
     }
-    let SubSessionEventPayload::Error { message } = &event.payload else {
+    let ProtocolEvent::Error { message, .. } = event.event.as_ref() else {
         return None;
     };
     if let Some(payload) = message.strip_prefix(SUBAGENT_APPROVAL_REQUESTED_PREFIX) {

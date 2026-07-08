@@ -31,7 +31,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use remi_agentloop::prelude::{CancellationToken, SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::{CancellationToken, ProtocolEvent, SubSessionEvent};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -2502,16 +2502,16 @@ impl TuiApp {
 
     fn render_sub_session_event(&mut self, event: &SubSessionEvent) {
         let id = sub_session_id(event);
-        let status = sub_session_status(&event.payload);
+        let status = sub_session_status(event.event.as_ref());
         let state = self
             .sub_sessions
             .entry(id.clone())
             .or_insert_with(|| SubSessionUiState::from_event(&event));
         state.update_context(&event);
-        match &event.payload {
-            SubSessionEventPayload::Start => {}
-            SubSessionEventPayload::Delta { .. } => {}
-            SubSessionEventPayload::ThinkingStart => {
+        match event.event.as_ref() {
+            ProtocolEvent::RunStart { .. } => {}
+            ProtocolEvent::Delta { .. } => {}
+            ProtocolEvent::ThinkingStart => {
                 state.upsert_activity(SubSessionActivity::keyed(
                     "thinking",
                     "thinking",
@@ -2519,7 +2519,7 @@ impl TuiApp {
                     ToolVisualStatus::Running,
                 ));
             }
-            SubSessionEventPayload::ThinkingEnd { .. } => {
+            ProtocolEvent::ThinkingEnd { .. } => {
                 state.upsert_activity(SubSessionActivity::keyed(
                     "thinking",
                     "thinking",
@@ -2527,14 +2527,14 @@ impl TuiApp {
                     ToolVisualStatus::Running,
                 ));
             }
-            SubSessionEventPayload::TurnStart { turn } => {
+            ProtocolEvent::TurnStart { turn } => {
                 state.push_activity(SubSessionActivity::message(
                     "turn",
                     &format!("turn {turn}"),
                     ToolVisualStatus::Running,
                 ));
             }
-            SubSessionEventPayload::ToolCallStart { id: call_id, name } => {
+            ProtocolEvent::ToolCallStart { id: call_id, name } => {
                 self.sub_tool_names.insert(call_id.clone(), name.clone());
                 self.sub_tool_args.entry(call_id.clone()).or_default();
                 let pretty = PrettyToolCall::started(call_id, name, &empty_tool_args());
@@ -2542,9 +2542,12 @@ impl TuiApp {
                 state.upsert_tool(tool.clone());
                 state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
-            SubSessionEventPayload::ToolCallArgumentsDelta { id: call_id, delta } => {
+            ProtocolEvent::ToolCallDelta {
+                id: call_id,
+                arguments_delta,
+            } => {
                 let args = self.sub_tool_args.entry(call_id.clone()).or_default();
-                args.push_str(delta);
+                args.push_str(arguments_delta);
                 let name = self
                     .sub_tool_names
                     .get(call_id)
@@ -2556,7 +2559,7 @@ impl TuiApp {
                 state.upsert_tool(tool.clone());
                 state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
-            SubSessionEventPayload::ToolDelta {
+            ProtocolEvent::ToolDelta {
                 id: call_id,
                 name,
                 delta,
@@ -2571,7 +2574,7 @@ impl TuiApp {
                 state.upsert_tool(tool.clone());
                 state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
-            SubSessionEventPayload::ToolResult {
+            ProtocolEvent::ToolResult {
                 id: call_id,
                 name,
                 result,
@@ -2590,11 +2593,15 @@ impl TuiApp {
                 state.upsert_tool(tool.clone());
                 state.upsert_activity(SubSessionActivity::from_tool(call_id, &tool));
             }
-            SubSessionEventPayload::Done { .. } => {
+            ProtocolEvent::Done => {
                 state.done = true;
                 state.final_output = None;
             }
-            SubSessionEventPayload::Error { message } => {
+            ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+                state.done = true;
+                state.final_output = None;
+            }
+            ProtocolEvent::Error { message, .. } => {
                 state.failed = true;
                 state.final_output =
                     Some(truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS));
@@ -2604,6 +2611,16 @@ impl TuiApp {
                     ToolVisualStatus::Error,
                 ));
             }
+            ProtocolEvent::Cancelled => {
+                state.failed = true;
+                state.final_output = Some("cancelled".to_string());
+                state.push_activity(SubSessionActivity::message(
+                    "error",
+                    "cancelled",
+                    ToolVisualStatus::Error,
+                ));
+            }
+            _ => {}
         }
         let title = state.title();
         let meta = state.meta();
@@ -2624,7 +2641,7 @@ impl TuiApp {
 
     async fn persist_and_maybe_open_sub_session(&mut self, event: SubSessionEvent) {
         let kind = sub_session_kind(&event);
-        let status = sub_session_status_label(&event.payload);
+        let status = sub_session_status_label(event.event.as_ref());
         if let Err(error) = self.runtime.sessions.lock().await.upsert_sub_session(
             &self.session_id,
             &event.sub_thread_id.0,
@@ -2668,7 +2685,7 @@ impl TuiApp {
             )));
         }
 
-        if !matches!(event.payload, SubSessionEventPayload::Start) {
+        if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
             return;
         }
         let pane_key = format!("{}:{}", self.session_id, event.sub_thread_id.0);
@@ -2752,40 +2769,46 @@ impl TuiApp {
     }
 
     fn apply_sub_session_event_as_session_view(&mut self, event: SubSessionEvent) {
-        match event.payload {
-            SubSessionEventPayload::Start => {
+        match *event.event {
+            ProtocolEvent::RunStart { .. } => {
                 self.status.state = "running".to_string();
                 self.status.elapsed_ms = 0;
                 self.status.last_error = None;
             }
-            SubSessionEventPayload::Delta { content } => {
+            ProtocolEvent::Delta { content, .. } => {
                 self.status.state = "running".to_string();
                 self.push_assistant_delta(&content);
             }
-            SubSessionEventPayload::ThinkingStart => {
+            ProtocolEvent::ThinkingStart => {
                 self.status.state = "thinking".to_string();
             }
-            SubSessionEventPayload::ThinkingEnd { content } => {
+            ProtocolEvent::ThinkingEnd { content } => {
                 self.status.state = "running".to_string();
                 if !content.trim().is_empty() {
                     self.push_thinking_delta(&content);
                 }
             }
-            SubSessionEventPayload::TurnStart { turn } => {
+            ProtocolEvent::TurnStart { turn } => {
                 self.status.state = format!("turn {turn}");
             }
-            SubSessionEventPayload::ToolCallStart { id, name } => {
+            ProtocolEvent::ToolCallStart { id, name } => {
                 self.status.state = "running".to_string();
                 self.handle_bot_event_sync(BotEvent::ToolStart { id, name });
             }
-            SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
-                self.handle_bot_event_sync(BotEvent::ToolArgs { id, delta });
+            ProtocolEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            } => {
+                self.handle_bot_event_sync(BotEvent::ToolArgs {
+                    id,
+                    delta: arguments_delta,
+                });
             }
-            SubSessionEventPayload::ToolDelta { id, name, delta } => {
+            ProtocolEvent::ToolDelta { id, name, delta } => {
                 self.status.state = "running".to_string();
                 self.handle_bot_event_sync(BotEvent::ToolDelta { id, name, delta });
             }
-            SubSessionEventPayload::ToolResult { id, name, result } => {
+            ProtocolEvent::ToolResult { id, name, result } => {
                 self.handle_bot_event_sync(BotEvent::ToolDone {
                     id,
                     name,
@@ -2795,9 +2818,13 @@ impl TuiApp {
                     elapsed_ms: 0,
                 });
             }
-            SubSessionEventPayload::Done { final_output } => {
-                if let Some(output) = final_output
-                    .as_deref()
+            ProtocolEvent::Done => {
+                self.status.state = "idle".to_string();
+            }
+            ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => {
+                if let Some(output) = extra
+                    .get("final_output")
+                    .and_then(|value| value.as_str())
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                 {
@@ -2812,11 +2839,17 @@ impl TuiApp {
                 }
                 self.status.state = "idle".to_string();
             }
-            SubSessionEventPayload::Error { message } => {
+            ProtocolEvent::Error { message, .. } => {
                 self.status.state = "error".to_string();
                 self.status.last_error = Some(message.clone());
                 self.cells.push(HistoryCell::error(message));
             }
+            ProtocolEvent::Cancelled => {
+                self.status.state = "error".to_string();
+                self.status.last_error = Some("cancelled".to_string());
+                self.cells.push(HistoryCell::error("cancelled"));
+            }
+            _ => {}
         }
     }
 
@@ -4229,7 +4262,7 @@ fn should_cleanup_old_session_on_switch(has_activity: bool) -> bool {
 }
 
 fn wrap_text(text: &str, width: u16) -> Vec<String> {
-    let width = width.max(16) as usize;
+    let width = width.max(1) as usize;
     let text = sanitize_tui_text(text);
     text.lines()
         .flat_map(|line| {
@@ -4822,6 +4855,23 @@ mod tests {
     }
 
     #[test]
+    fn patch_diff_cell_lines_fit_render_width() {
+        let cell = HistoryCell::patch_diff(
+            "tool-1".to_string(),
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-\tlet old_value = \"你好🙂abcdefghijklmnopqrstuvwxyz\";\n+\tlet new_value = \"你好🙂abcdefghijklmnopqrstuvwxyz\";\n*** End Patch\n".to_string(),
+            "12345ms · tokens +100p/+20c".to_string(),
+            ToolVisualStatus::Success,
+        );
+        let width = 18_u16;
+        for line in rendered_lines(&cell.lines(width)) {
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= width as usize,
+                "line exceeds width {width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn assistant_cell_renders_markdown_styles() {
         let cell = HistoryCell::assistant("hello **bold** and `code`");
         let lines = cell.lines(80);
@@ -5300,7 +5350,11 @@ mod tests {
             "coder",
             Some("Coder Agent".to_string()),
             2,
-            SubSessionEventPayload::Start,
+            ProtocolEvent::RunStart {
+                thread_id: "thread-1234567890".to_string(),
+                run_id: "run-1234567890".to_string(),
+                metadata: None,
+            },
         );
 
         assert_eq!(format_sub_session_title(&event), "    sub-agent · coder");
@@ -5322,7 +5376,11 @@ mod tests {
                 "acp",
                 Some("Codex ACP".to_string()),
                 1,
-                SubSessionEventPayload::Start,
+                ProtocolEvent::RunStart {
+                    thread_id: "thread-1".to_string(),
+                    run_id: run_id.to_string(),
+                    metadata: None,
+                },
             )
         };
 
@@ -5341,7 +5399,11 @@ mod tests {
             "acp",
             Some("Codex ACP".to_string()),
             1,
-            SubSessionEventPayload::Start,
+            ProtocolEvent::RunStart {
+                thread_id: "thread-1".to_string(),
+                run_id: "run-1".to_string(),
+                metadata: None,
+            },
         );
         let agent = SubSessionEvent::new(
             "parent-tool-call",
@@ -5350,20 +5412,21 @@ mod tests {
             "coder",
             None,
             1,
-            SubSessionEventPayload::Error {
+            ProtocolEvent::Error {
                 message: "failed".to_string(),
+                code: None,
             },
         );
 
         assert_eq!(sub_session_kind(&acp), SubSessionKind::Acp);
         assert_eq!(sub_session_kind(&agent), SubSessionKind::Agent);
-        assert_eq!(sub_session_status_label(&acp.payload), "running");
-        assert_eq!(sub_session_status_label(&agent.payload), "error");
+        assert_eq!(sub_session_status_label(acp.event.as_ref()), "running");
+        assert_eq!(sub_session_status_label(agent.event.as_ref()), "error");
     }
 
     #[test]
     fn sub_session_events_convert_to_child_history_messages() {
-        let base = |payload| {
+        let base = |event| {
             SubSessionEvent::new(
                 "parent-tool-call",
                 remi_agentloop::prelude::ThreadId("thread-1".to_string()),
@@ -5371,27 +5434,40 @@ mod tests {
                 "coder",
                 Some("Investigate issue".to_string()),
                 1,
-                payload,
+                event,
             )
         };
 
-        let start_messages = sub_session_history_messages(&base(SubSessionEventPayload::Start));
+        let start_messages = sub_session_history_messages(&base(ProtocolEvent::RunStart {
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            metadata: None,
+        }));
         assert_eq!(start_messages.len(), 1);
         assert_eq!(
             start_messages[0].content.text_content(),
             "Investigate issue"
         );
 
-        let output_messages = sub_session_history_messages(&base(SubSessionEventPayload::Delta {
+        let output_messages = sub_session_history_messages(&base(ProtocolEvent::Delta {
             content: "progress".to_string(),
+            role: None,
         }));
         assert_eq!(output_messages.len(), 1);
         assert_eq!(output_messages[0].content.text_content(), "progress");
 
-        let done_messages = sub_session_history_messages(&base(SubSessionEventPayload::Done {
-            final_output: None,
+        let tool_messages = sub_session_history_messages(&base(ProtocolEvent::ToolResult {
+            id: "tool-1".to_string(),
+            name: "bash".to_string(),
+            result: "ok".to_string(),
         }));
-        assert_eq!(done_messages[0].content.text_content(), "Done.");
+        assert!(tool_messages.is_empty());
+
+        let done_messages = sub_session_history_messages(&base(ProtocolEvent::Custom {
+            event_type: "sub_session_done".to_string(),
+            extra: serde_json::json!({ "final_output": "final answer" }),
+        }));
+        assert_eq!(done_messages[0].content.text_content(), "final answer");
     }
 
     #[tokio::test]
@@ -5405,7 +5481,7 @@ mod tests {
             "acp",
             Some("Codex ACP".to_string()),
             1,
-            SubSessionEventPayload::ToolCallStart {
+            ProtocolEvent::ToolCallStart {
                 id: "tool-1".to_string(),
                 name: "bash".to_string(),
             },
@@ -5423,8 +5499,8 @@ mod tests {
         assert_eq!(restored.sub_thread_id.0, "acp-sub-1");
         assert_eq!(restored.sub_run_id.0, "run-acp-1");
         assert!(matches!(
-            restored.payload,
-            SubSessionEventPayload::ToolCallStart { ref name, .. } if name == "bash"
+            restored.event.as_ref(),
+            ProtocolEvent::ToolCallStart { name, .. } if name == "bash"
         ));
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -5446,7 +5522,7 @@ mod tests {
 
     #[test]
     fn sub_session_parent_summary_hides_model_output() {
-        let base = |payload| {
+        let base = |event| {
             SubSessionEvent::new(
                 "parent-tool-call",
                 remi_agentloop::prelude::ThreadId("thread-1".to_string()),
@@ -5454,27 +5530,27 @@ mod tests {
                 "coder",
                 None,
                 1,
-                payload,
+                event,
             )
         };
 
+        assert!(format_sub_session_event(&base(ProtocolEvent::Delta {
+            content: "streaming text".to_string(),
+            role: None,
+        }))
+        .is_none());
+        assert!(format_sub_session_event(&base(ProtocolEvent::ThinkingStart)).is_none());
         assert!(
-            format_sub_session_event(&base(SubSessionEventPayload::Delta {
-                content: "streaming text".to_string(),
-            }))
-            .is_none()
-        );
-        assert!(format_sub_session_event(&base(SubSessionEventPayload::ThinkingStart)).is_none());
-        assert!(
-            format_sub_session_event(&base(SubSessionEventPayload::ToolCallStart {
+            format_sub_session_event(&base(ProtocolEvent::ToolCallStart {
                 id: "call-1".to_string(),
                 name: "fs_ls".to_string(),
             }))
             .is_some_and(|body| body.contains("tool call: fs_ls"))
         );
         assert_eq!(
-            format_sub_session_event(&base(SubSessionEventPayload::Done {
-                final_output: Some("final answer".to_string()),
+            format_sub_session_event(&base(ProtocolEvent::Custom {
+                event_type: "sub_session_done".to_string(),
+                extra: serde_json::json!({ "final_output": "final answer" }),
             }))
             .as_deref(),
             Some("done")
@@ -5490,7 +5566,11 @@ mod tests {
             "explorer",
             Some("Explore this workspace in detail".to_string()),
             1,
-            SubSessionEventPayload::Start,
+            ProtocolEvent::RunStart {
+                thread_id: "thread-1".to_string(),
+                run_id: "run-1".to_string(),
+                metadata: None,
+            },
         ));
         for index in 0..5 {
             state.upsert_tool(SubToolDisplay {
@@ -5523,7 +5603,11 @@ mod tests {
             "explorer",
             Some("Explore".to_string()),
             0,
-            SubSessionEventPayload::Start,
+            ProtocolEvent::RunStart {
+                thread_id: "thread-1".to_string(),
+                run_id: "run-1".to_string(),
+                metadata: None,
+            },
         ));
         state.done = true;
         state.final_output = Some("final answer".to_string());

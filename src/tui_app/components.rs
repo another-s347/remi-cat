@@ -677,7 +677,8 @@ impl HistoryCell {
         } else {
             format!("{} · {} · {}", self.title, self.status.label(), self.meta)
         };
-        let title = sanitize_tui_text(&title);
+        let title_width = width.saturating_sub(HISTORY_GUTTER_WIDTH);
+        let title = truncate_for_width(&sanitize_tui_text(&title), title_width);
         lines.push(Line::from(vec![
             Span::styled(history_gutter(prefix), title_style),
             Span::styled(title, title_style),
@@ -700,7 +701,7 @@ impl HistoryCell {
         };
         let safe_body = sanitize_tui_text(raw_body);
         let body = safe_body.trim_end();
-        let body_width = width.saturating_sub(HISTORY_GUTTER_WIDTH).max(16);
+        let body_width = width.saturating_sub(HISTORY_GUTTER_WIDTH).max(1);
         if matches!(self.kind, CellKind::PatchDiff { .. }) {
             for line in diff_lines(body, body_width) {
                 lines.push(Line::from(vec![
@@ -1055,17 +1056,20 @@ pub(super) fn keyed_stream_event(event: &str) -> Option<String> {
 #[cfg(test)]
 pub(super) fn format_sub_session_title(event: &SubSessionEvent) -> String {
     let prefix = format_sub_session_prefix(event);
-    match &event.payload {
-        SubSessionEventPayload::ToolCallStart { name, .. }
-        | SubSessionEventPayload::ToolDelta { name, .. }
-        | SubSessionEventPayload::ToolResult { name, .. } => {
+    match event.event.as_ref() {
+        ProtocolEvent::ToolCallStart { name, .. }
+        | ProtocolEvent::ToolDelta { name, .. }
+        | ProtocolEvent::ToolResult { name, .. } => {
             format!("{prefix} · {name}")
         }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, .. } => {
+        ProtocolEvent::ToolCallDelta { id, .. } => {
             format!("{prefix} · {id}")
         }
-        SubSessionEventPayload::Done { .. } => format!("{prefix} · final"),
-        SubSessionEventPayload::Error { .. } => format!("{prefix} · error"),
+        ProtocolEvent::Done => format!("{prefix} · final"),
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            format!("{prefix} · final")
+        }
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => format!("{prefix} · error"),
         _ => prefix,
     }
 }
@@ -1089,10 +1093,21 @@ pub(super) fn sub_session_kind(event: &SubSessionEvent) -> SubSessionKind {
     }
 }
 
-pub(super) fn sub_session_status_label(payload: &SubSessionEventPayload) -> &'static str {
-    match payload {
-        SubSessionEventPayload::Done { .. } => "done",
-        SubSessionEventPayload::Error { .. } => "error",
+pub(super) fn sub_session_final_output(event: &ProtocolEvent) -> Option<String> {
+    match event {
+        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
+            .get("final_output")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+pub(super) fn sub_session_status_label(event: &ProtocolEvent) -> &'static str {
+    match event {
+        ProtocolEvent::Done => "done",
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => "done",
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => "error",
         _ => "running",
     }
 }
@@ -1118,8 +1133,8 @@ pub(super) fn sub_session_input(event: &SubSessionEvent) -> Option<String> {
 }
 
 pub(super) fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<Message> {
-    match &event.payload {
-        SubSessionEventPayload::Start => {
+    match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => {
             let input = event
                 .title
                 .as_deref()
@@ -1134,69 +1149,49 @@ pub(super) fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<Messa
                 });
             vec![Message::user(input)]
         }
-        _ => sub_session_event_text(event)
-            .map(Message::assistant)
-            .into_iter()
-            .collect(),
-    }
-}
-
-pub(super) fn sub_session_event_text(event: &SubSessionEvent) -> Option<String> {
-    let text = match &event.payload {
-        SubSessionEventPayload::Start => return None,
-        SubSessionEventPayload::Delta { content } => content.clone(),
-        SubSessionEventPayload::ThinkingStart => "Thinking...".to_string(),
-        SubSessionEventPayload::ThinkingEnd { content } => {
+        ProtocolEvent::Delta { content, .. } => {
             if content.trim().is_empty() {
-                "Thinking complete.".to_string()
+                Vec::new()
             } else {
-                format!("Thinking:\n{content}")
+                vec![Message::assistant(content.clone())]
             }
         }
-        SubSessionEventPayload::TurnStart { turn } => format!("Turn {turn}"),
-        SubSessionEventPayload::ToolCallStart { id, name } => {
-            format!("Tool `{name}` started ({id}).")
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            sub_session_final_output(event.event.as_ref())
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| vec![Message::assistant(value.to_string())])
+                .unwrap_or_default()
         }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
-            format!("Tool arguments `{id}`:\n{delta}")
+        ProtocolEvent::Error { message, .. } => {
+            vec![Message::assistant(format!("Error: {message}"))]
         }
-        SubSessionEventPayload::ToolDelta { id, name, delta } => {
-            format!("Tool `{name}` output ({id}):\n{delta}")
-        }
-        SubSessionEventPayload::ToolResult { id, name, result } => {
-            format!("Tool `{name}` result ({id}):\n{result}")
-        }
-        SubSessionEventPayload::Done { final_output } => final_output
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "Done.".to_string()),
-        SubSessionEventPayload::Error { message } => format!("Error: {message}"),
-    };
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
+        ProtocolEvent::Cancelled => vec![Message::assistant("Error: cancelled")],
+        _ => Vec::new(),
     }
 }
 
 #[cfg(test)]
 pub(super) fn format_sub_session_meta(event: &SubSessionEvent) -> String {
-    let state = match &event.payload {
-        SubSessionEventPayload::Start => "started".to_string(),
-        SubSessionEventPayload::Delta { .. } => "streaming".to_string(),
-        SubSessionEventPayload::ThinkingStart => "thinking".to_string(),
-        SubSessionEventPayload::ThinkingEnd { .. } => "thinking done".to_string(),
-        SubSessionEventPayload::ToolCallStart { name, .. } => format!("{name} · running"),
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, .. } => {
+    let state = match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => "started".to_string(),
+        ProtocolEvent::Delta { .. } => "streaming".to_string(),
+        ProtocolEvent::ThinkingStart => "thinking".to_string(),
+        ProtocolEvent::ThinkingEnd { .. } => "thinking done".to_string(),
+        ProtocolEvent::ToolCallStart { name, .. } => format!("{name} · running"),
+        ProtocolEvent::ToolCallDelta { id, .. } => {
             format!("{id} · args")
         }
-        SubSessionEventPayload::ToolDelta { name, .. } => format!("{name} · streaming"),
-        SubSessionEventPayload::ToolResult { name, .. } => format!("{name} · done"),
-        SubSessionEventPayload::TurnStart { turn } => format!("turn {turn}"),
-        SubSessionEventPayload::Done { .. } => "done".to_string(),
-        SubSessionEventPayload::Error { .. } => "failed".to_string(),
+        ProtocolEvent::ToolDelta { name, .. } => format!("{name} · streaming"),
+        ProtocolEvent::ToolResult { name, .. } => format!("{name} · done"),
+        ProtocolEvent::TurnStart { turn } => format!("turn {turn}"),
+        ProtocolEvent::Done => "done".to_string(),
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            "done".to_string()
+        }
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => "failed".to_string(),
+        other => format!("{other:?}"),
     };
     format!(
         "depth {} · parent {} · thread {} · {}",
@@ -1207,45 +1202,56 @@ pub(super) fn format_sub_session_meta(event: &SubSessionEvent) -> String {
     )
 }
 
-pub(super) fn sub_session_status(payload: &SubSessionEventPayload) -> ToolVisualStatus {
-    match payload {
-        SubSessionEventPayload::ToolResult { result, .. } => {
+pub(super) fn sub_session_status(event: &ProtocolEvent) -> ToolVisualStatus {
+    match event {
+        ProtocolEvent::ToolResult { result, .. } => {
             ToolVisualStatus::from_success(bot_core::tool_success(result))
         }
-        SubSessionEventPayload::Done { .. } => ToolVisualStatus::Success,
-        SubSessionEventPayload::Error { .. } => ToolVisualStatus::Error,
+        ProtocolEvent::Done => ToolVisualStatus::Success,
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            ToolVisualStatus::Success
+        }
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => ToolVisualStatus::Error,
         _ => ToolVisualStatus::Running,
     }
 }
 
 #[cfg(test)]
 pub(super) fn format_sub_session_event(event: &SubSessionEvent) -> Option<String> {
-    match &event.payload {
-        SubSessionEventPayload::Start
-        | SubSessionEventPayload::Delta { .. }
-        | SubSessionEventPayload::ThinkingStart
-        | SubSessionEventPayload::ThinkingEnd { .. }
-        | SubSessionEventPayload::TurnStart { .. } => None,
-        SubSessionEventPayload::ToolCallStart { id, name } => {
+    match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. }
+        | ProtocolEvent::Delta { .. }
+        | ProtocolEvent::ThinkingStart
+        | ProtocolEvent::ThinkingEnd { .. }
+        | ProtocolEvent::TurnStart { .. } => None,
+        ProtocolEvent::ToolCallStart { id, name } => {
             Some(format!("tool call: {name}\ncall_id: {id}"))
         }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => Some(format!(
+        ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta,
+        } => Some(format!(
             "tool args: {id}\n{}",
-            truncate_chars(delta, MAX_TOOL_BODY_CHARS)
+            truncate_chars(arguments_delta, MAX_TOOL_BODY_CHARS)
         )),
-        SubSessionEventPayload::ToolDelta { id, name, delta } => Some(format!(
+        ProtocolEvent::ToolDelta { id, name, delta } => Some(format!(
             "tool delta: {name}\ncall_id: {id}\n{}",
             truncate_chars(delta, MAX_TOOL_BODY_CHARS)
         )),
-        SubSessionEventPayload::ToolResult { id, name, result } => Some(format!(
+        ProtocolEvent::ToolResult { id, name, result } => Some(format!(
             "tool result: {name}\ncall_id: {id}\n{}",
             truncate_chars(&single_line(result), MAX_TOOL_BODY_CHARS)
         )),
-        SubSessionEventPayload::Done { .. } => Some("done".to_string()),
-        SubSessionEventPayload::Error { message } => Some(format!(
+        ProtocolEvent::Done => Some("done".to_string()),
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            Some("done".to_string())
+        }
+        ProtocolEvent::Error { message, .. } => Some(format!(
             "error\n{}",
             truncate_chars(&single_line(message), MAX_TOOL_BODY_CHARS)
         )),
+        ProtocolEvent::Cancelled => Some("error\ncancelled".to_string()),
+        _ => None,
     }
 }
 
@@ -1526,21 +1532,42 @@ pub(super) fn build_tui_user_question_answer_text(
 }
 
 pub(super) fn diff_lines(text: &str, width: u16) -> Vec<Span<'static>> {
-    let width = width.max(16);
+    let width = width.max(1);
     let text = sanitize_tui_text(text);
     text.lines()
         .flat_map(|line| {
             let style = diff_line_style(line);
-            let chunks = if line.is_empty() {
-                vec![String::new()]
-            } else {
-                wrap_text(line, width)
-            };
+            let chunks = wrap_display_width(line, width);
             chunks
                 .into_iter()
                 .map(move |chunk| Span::styled(chunk, style))
         })
         .collect()
+}
+
+fn wrap_display_width(line: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let line = expand_tabs(line);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_width = 0_usize;
+    for ch in line.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width > 0 && chunk_width > 0 && chunk_width + ch_width > width {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_width = 0;
+        }
+        chunk.push(ch);
+        chunk_width += ch_width;
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 pub(super) fn diff_line_style(line: &str) -> Style {

@@ -10,7 +10,7 @@ use bot_core::{
 };
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
-use remi_agentloop::types::SubSessionEventPayload;
+use remi_agentloop::prelude::ProtocolEvent;
 use tracing::{info, warn};
 use user_store::UserStore;
 
@@ -476,8 +476,13 @@ impl FeishuEventForwarder<'_, '_> {
                 .await;
                 if let Some(line) = format_feishu_sub_session_line(&event) {
                     let done = matches!(
-                        event.payload,
-                        SubSessionEventPayload::Done { .. } | SubSessionEventPayload::Error { .. }
+                        event.event.as_ref(),
+                        ProtocolEvent::Done
+                            | ProtocolEvent::Error { .. }
+                            | ProtocolEvent::Cancelled
+                    ) || matches!(
+                        event.event.as_ref(),
+                        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done"
                     );
                     self.update_sub_session(&event.sub_thread_id.0, &line, done)
                         .await;

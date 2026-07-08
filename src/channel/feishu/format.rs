@@ -1,4 +1,5 @@
-use remi_agentloop::types::{SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::ProtocolEvent;
+use remi_agentloop::types::SubSessionEvent;
 
 use super::FeishuReplyKind;
 
@@ -20,29 +21,35 @@ pub(crate) fn format_context_compaction_line(event: &bot_core::ContextCompaction
 }
 
 pub(super) fn format_feishu_sub_session_line(event: &SubSessionEvent) -> Option<String> {
-    let (status, detail) = match &event.payload {
-        SubSessionEventPayload::Start => ("running", "started".to_string()),
-        SubSessionEventPayload::Delta { .. } => return None,
-        SubSessionEventPayload::ThinkingStart => ("running", "thinking".to_string()),
-        SubSessionEventPayload::ThinkingEnd { .. } => ("running", "thinking complete".to_string()),
-        SubSessionEventPayload::TurnStart { turn } => ("running", format!("turn {turn}")),
-        SubSessionEventPayload::ToolCallStart { name, .. } => {
-            ("running", format!("calling tool `{name}`"))
-        }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => (
+    let (status, detail) = match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => ("running", "started".to_string()),
+        ProtocolEvent::Delta { .. } => return None,
+        ProtocolEvent::ThinkingStart => ("running", "thinking".to_string()),
+        ProtocolEvent::ThinkingEnd { .. } => ("running", "thinking complete".to_string()),
+        ProtocolEvent::TurnStart { turn } => ("running", format!("turn {turn}")),
+        ProtocolEvent::ToolCallStart { name, .. } => ("running", format!("calling tool `{name}`")),
+        ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta,
+        } => (
             "running",
-            format!("tool arguments `{id}`: {}", single_line(delta)),
+            format!("tool arguments `{id}`: {}", single_line(arguments_delta)),
         ),
-        SubSessionEventPayload::ToolDelta { name, delta, .. } => (
+        ProtocolEvent::ToolDelta { name, delta, .. } => (
             "running",
             format!("tool `{name}` output: {}", single_line(delta)),
         ),
-        SubSessionEventPayload::ToolResult { name, result, .. } => (
+        ProtocolEvent::ToolResult { name, result, .. } => (
             "running",
             format!("tool `{name}` result: {}", single_line(result)),
         ),
-        SubSessionEventPayload::Done { .. } => ("done", "done".to_string()),
-        SubSessionEventPayload::Error { message } => ("error", single_line(message)),
+        ProtocolEvent::Done => ("done", "done".to_string()),
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            ("done", "done".to_string())
+        }
+        ProtocolEvent::Error { message, .. } => ("error", single_line(message)),
+        ProtocolEvent::Cancelled => ("error", "cancelled".to_string()),
+        other => ("running", format!("{other:?}")),
     };
     Some(truncate_tool_line(&format!(
         "**Sub-session** `{}` / `{}` · {status} · {detail}",

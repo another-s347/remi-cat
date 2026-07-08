@@ -10,8 +10,8 @@ use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, OpenAIClient,
-    ResumePayload, Role, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId, Tool,
-    ToolOutput, ToolResult,
+    ProtocolEvent, ResumePayload, Role, RunId, SubSessionEvent, ThreadId, Tool, ToolOutput,
+    ToolResult,
 };
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 use tokio::sync::Mutex as AsyncMutex;
@@ -31,8 +31,7 @@ use crate::{
     MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
     SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SteerQueuedEvent,
     SupervisorTraceEvent, ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager,
-    WorkflowDecision, WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport,
-    WorkflowStatus,
+    WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
 };
 
 mod approval_markers;
@@ -62,7 +61,8 @@ pub(crate) use prompting::{
     single_chat_sender_system_prompt, truncate_user_name, SkillPromptToolAvailability,
 };
 use supervisor_agent::{
-    hook_context_message, workflow_round_allows_continue, WorkflowRoundOutcome,
+    hook_context_message, workflow_round_allows_continue, SupervisorNodeOutcome,
+    WorkflowRoundOutcome,
 };
 use tool_registry::{build_subagent_tools, register_runtime_tools};
 pub(crate) use tool_status::{
@@ -75,6 +75,8 @@ const SUPERVISOR_DECISION_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
+const AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE: &str =
+    "Agent.md exists in the current working directory; read it before substantive work and follow any applicable project instructions.";
 
 fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
     let percent_budget = (profile.context_tokens as usize)
@@ -85,6 +87,27 @@ fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
         .saturating_sub(profile.max_output_tokens)
         .saturating_sub(SUPERVISOR_PROMPT_MARGIN_TOKENS);
     percent_budget.min(output_budget).max(1)
+}
+
+fn system_prompt_with_agent_md_notice_for_current_dir(system_prompt: String) -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return system_prompt;
+    };
+    system_prompt_with_agent_md_notice(system_prompt, &cwd)
+}
+
+fn system_prompt_with_agent_md_notice(mut system_prompt: String, cwd: &std::path::Path) -> String {
+    if !cwd.join("Agent.md").is_file() {
+        return system_prompt;
+    }
+    if system_prompt.contains(AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE) {
+        return system_prompt;
+    }
+    if !system_prompt.ends_with('\n') {
+        system_prompt.push('\n');
+    }
+    system_prompt.push_str(AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE);
+    system_prompt
 }
 
 fn supervisor_retry_feedback(error: &str, raw_output: &str) -> String {
@@ -992,6 +1015,7 @@ impl CatBot {
                 todo_prompt,
                 0,
                 supervisor_model_profile_id.as_deref(),
+                opts.cancel.clone(),
                 progress_tx,
             );
             tokio::pin!(evaluation);
@@ -1010,6 +1034,11 @@ impl CatBot {
             }
 
             match outcome {
+                WorkflowRoundOutcome::Cancelled => {
+                    yield CatEvent::Cancelled;
+                    yield CatEvent::Done;
+                    return;
+                }
                 WorkflowRoundOutcome::NoWorkflow => {
                     yield CatEvent::Supervisor(WorkflowReport {
                         workflow_id: instance.definition.id.clone(),
@@ -1414,6 +1443,7 @@ impl CatBot {
         todo_prompt: Option<String>,
         completed_continuations: u32,
         model_profile_id: Option<&str>,
+        cancel: Option<CancellationToken>,
         progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
     ) -> WorkflowRoundOutcome {
         let Some(mut instance) = self.workflow_status(thread_id).await else {
@@ -1430,11 +1460,25 @@ impl CatBot {
                 history,
                 todo_prompt.as_deref(),
                 model_profile_id,
+                cancel,
                 progress,
             )
             .await
         {
-            Ok(decision) => decision,
+            Ok(SupervisorNodeOutcome::Decision(decision)) => decision,
+            Ok(SupervisorNodeOutcome::Cancelled) => {
+                if let Some((report, _instance)) = self
+                    .pause_workflow_for_user_interruption(
+                        thread_id,
+                        completed_continuations,
+                        "interrupted by user",
+                    )
+                    .await
+                {
+                    return WorkflowRoundOutcome::Report(report);
+                }
+                return WorkflowRoundOutcome::Cancelled;
+            }
             Err(err) => {
                 return self
                     .workflow_error(
@@ -1510,8 +1554,9 @@ impl CatBot {
         history: &[Message],
         todo_prompt: Option<&str>,
         model_profile_id: Option<&str>,
+        cancel: Option<CancellationToken>,
         progress: tokio::sync::mpsc::UnboundedSender<SupervisorTraceEvent>,
-    ) -> Result<WorkflowDecision, AgentError> {
+    ) -> Result<SupervisorNodeOutcome, AgentError> {
         let effective_model = self.effective_model_profile(model_profile_id);
         let prompt_budget = supervisor_prompt_budget_tokens(&effective_model.profile);
         let prompt = supervisor_workflow::supervisor_prompt_with_budget(
@@ -1537,6 +1582,9 @@ impl CatBot {
         let mut last_validation_error: Option<String> = None;
 
         for attempt in 1..=SUPERVISOR_DECISION_MAX_ATTEMPTS {
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Ok(SupervisorNodeOutcome::Cancelled);
+            }
             let supervisor_thread_id = format!("supervisor:{thread_id}:{}", uuid::Uuid::new_v4());
             let prompt_content = if let Some(feedback) = retry_feedback.as_deref() {
                 format!("{}\n\n{}", prompt.content, feedback)
@@ -1555,13 +1603,33 @@ impl CatBot {
             }));
             let output = tokio::time::timeout(SUPERVISOR_TIMEOUT, async {
                 let mut stream = std::pin::pin!(active_agent
-                    .stream_with_input_and_tool_allowlist(input, Some(vec!["rg".to_string()])));
+                    .stream_with_input_and_tool_allowlist_and_options(
+                        input,
+                        Some(vec!["rg".to_string()]),
+                        CoreStreamOptions {
+                            cancel: cancel.clone(),
+                            steer: None,
+                        },
+                    ));
                 let mut output = String::new();
                 let mut trace = Vec::new();
                 let mut tool_args_by_id: std::collections::HashMap<String, serde_json::Value> =
                     std::collections::HashMap::new();
-                while let Some(event) = stream.next().await {
+                loop {
+                    let event = match cancel.as_ref() {
+                        Some(cancel) => {
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Ok(None),
+                                event = stream.next() => event,
+                            }
+                        }
+                        None => stream.next().await,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
                     match event {
+                        CatEvent::Cancelled => return Ok(None),
                         CatEvent::Text(delta) => {
                             output.push_str(&delta);
                             let _ =
@@ -1613,13 +1681,15 @@ impl CatBot {
                         _ => {}
                     }
                 }
-                Ok((output, trace))
+                Ok(Some((output, trace)))
             })
             .await
             .map_err(|_| {
                 AgentError::other("supervisor evaluation timed out after 180 seconds")
             })??;
-            let (output, trace) = output;
+            let Some((output, trace)) = output else {
+                return Ok(SupervisorNodeOutcome::Cancelled);
+            };
             combined_trace.extend(trace);
 
             let mut decision = match supervisor_workflow::parse_decision(&output) {
@@ -1665,7 +1735,7 @@ impl CatBot {
                 combined_trace.push(event);
             }
             decision.trace = combined_trace;
-            return Ok(decision);
+            return Ok(SupervisorNodeOutcome::Decision(decision));
         }
 
         Err(AgentError::other(format!(
@@ -2387,6 +2457,7 @@ impl CatBot {
                                         supervisor_todo_prompt,
                                         supervisor_round,
                                         round_opts.model_profile_id.as_deref(),
+                                        round_opts.cancel.clone(),
                                         progress_tx,
                                     );
                                     tokio::pin!(evaluation);
@@ -2404,6 +2475,11 @@ impl CatBot {
                                         yield CatEvent::SupervisorProgress(progress);
                                     }
                                     match outcome {
+                                        WorkflowRoundOutcome::Cancelled => {
+                                            yield CatEvent::Cancelled;
+                                            yield CatEvent::Done;
+                                            return;
+                                        }
                                         WorkflowRoundOutcome::NoWorkflow => {}
                                         WorkflowRoundOutcome::Report(report) => {
                                             yield CatEvent::Supervisor(report);
@@ -2936,7 +3012,7 @@ impl CatBotBuilder {
         if let Some(url) = resolved_base_url.clone() {
             oai = oai.with_base_url(url);
         }
-        let system_prompt = self.system.clone();
+        let system_prompt = system_prompt_with_agent_md_notice_for_current_dir(self.system.clone());
 
         let extra_options = self.extra_options.clone();
         let agent_config = AgentConfig::default().with_max_tokens(profile.max_output_tokens);
@@ -3191,6 +3267,10 @@ impl CatBotBuilder {
                     persistent_sessions: false,
                     system_prompt: system_prompt.clone(),
                 });
+        }
+        for profile in agent_profiles.values_mut() {
+            profile.system_prompt =
+                system_prompt_with_agent_md_notice_for_current_dir(profile.system_prompt.clone());
         }
         let default_agent_profile = agent_profiles
             .get(&active_agent_id)
@@ -3603,7 +3683,11 @@ impl Tool for RemiSubAgentTool {
                 agent_name.clone(),
                 title.clone(),
                 0,
-                SubSessionEventPayload::Start,
+                ProtocolEvent::RunStart {
+                    thread_id: sub_thread_id.to_string(),
+                    run_id: sub_run_id.to_string(),
+                    metadata: None,
+                },
             ));
 
             let mut final_output = String::new();
@@ -3626,8 +3710,9 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::Error {
+                            ProtocolEvent::Error {
                                 message: format!("failed to load sub-agent session: {err}"),
+                                code: None,
                             },
                         ));
                         yield ToolOutput::text(format_subagent_tool_result(
@@ -3690,7 +3775,10 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::Delta { content },
+                            ProtocolEvent::Delta {
+                                content,
+                                role: None,
+                            },
                         ));
                     }
                     CatEvent::Thinking(content) => {
@@ -3701,7 +3789,7 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::ThinkingEnd { content },
+                            ProtocolEvent::ThinkingEnd { content },
                         ));
                     }
                     CatEvent::ToolCallStart { id, name } | CatEvent::ToolCall { id, name, .. } => {
@@ -3712,7 +3800,7 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::ToolCallStart { id, name },
+                            ProtocolEvent::ToolCallStart { id, name },
                         ));
                     }
                     CatEvent::ToolCallArgumentsDelta { id, delta } => {
@@ -3723,7 +3811,10 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::ToolCallArgumentsDelta { id, delta },
+                            ProtocolEvent::ToolCallDelta {
+                                id,
+                                arguments_delta: delta,
+                            },
                         ));
                     }
                     CatEvent::ToolCallResult { id, name, result, .. } => {
@@ -3734,7 +3825,7 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::ToolResult { id, name, result },
+                            ProtocolEvent::ToolResult { id, name, result },
                         ));
                     }
                     CatEvent::ToolApprovalRequested(request) => {
@@ -3853,13 +3944,11 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::Done {
-                                final_output: if final_output.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(final_output.clone())
-                                },
-                            },
+                            sub_session_done_event(if final_output.trim().is_empty() {
+                                None
+                            } else {
+                                Some(final_output.clone())
+                            }),
                         ));
                         yield ToolOutput::text(format_subagent_tool_result(
                             &sub_thread_id,
@@ -3891,8 +3980,9 @@ impl Tool for RemiSubAgentTool {
                             agent_name.clone(),
                             title.clone(),
                             0,
-                            SubSessionEventPayload::Error {
+                            ProtocolEvent::Error {
                                 message: message.clone(),
+                                code: None,
                             },
                         ));
                         yield ToolOutput::text(format_subagent_tool_result(
@@ -3915,13 +4005,11 @@ impl Tool for RemiSubAgentTool {
                 agent_name.clone(),
                 title.clone(),
                 0,
-                SubSessionEventPayload::Done {
-                    final_output: if final_output.trim().is_empty() {
-                        None
-                    } else {
-                        Some(final_output.clone())
-                    },
-                },
+                sub_session_done_event(if final_output.trim().is_empty() {
+                    None
+                } else {
+                    Some(final_output.clone())
+                }),
             ));
             yield ToolOutput::text(format_subagent_tool_result(
                 &sub_thread_id,
@@ -3952,6 +4040,16 @@ fn format_subagent_tool_result(
         "error": error,
     });
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| final_output.to_string())
+}
+
+fn sub_session_done_event(final_output: Option<String>) -> ProtocolEvent {
+    match final_output {
+        Some(final_output) => ProtocolEvent::Custom {
+            event_type: "sub_session_done".to_string(),
+            extra: serde_json::json!({ "final_output": final_output }),
+        },
+        None => ProtocolEvent::Done,
+    }
 }
 
 fn subagent_metadata(ctx: ToolContext, sub_thread_id: &str) -> serde_json::Value {
@@ -4028,7 +4126,8 @@ fn register_delegate_agent_tools(
             profile.name, profile.description
         );
         let agent_name = profile.id.clone();
-        let system_prompt = profile.system_prompt.clone();
+        let system_prompt =
+            system_prompt_with_agent_md_notice_for_current_dir(profile.system_prompt.clone());
         let model_name = profile
             .model
             .clone()
@@ -4098,10 +4197,11 @@ mod tests {
         format_subagent_tool_result, insert_single_chat_sender_system_prompt,
         install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
-        thread_run_lock, AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart,
-        GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
-        PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, ThreadRunLocks,
-        WorkflowStatus, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        system_prompt_with_agent_md_notice, thread_run_lock, AgentModelBindings, CatBotBuilder,
+        CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
+        ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
+        SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
+        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
@@ -4117,7 +4217,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
@@ -4199,6 +4299,37 @@ mod tests {
         assert!(categories.contains(&ModelInputSegmentCategory::UserState));
         assert_eq!(snapshot.run_id, "run_1");
         assert!(snapshot.totals.estimated_tokens > 0);
+    }
+
+    #[test]
+    fn system_prompt_agent_md_notice_is_added_when_cwd_contains_agent_md() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(data_dir.path().join("Agent.md"), "Read me.").unwrap();
+
+        let prompt = system_prompt_with_agent_md_notice("base prompt".to_string(), data_dir.path());
+
+        assert!(prompt.contains("base prompt"));
+        assert!(prompt.contains(AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE));
+    }
+
+    #[test]
+    fn system_prompt_agent_md_notice_is_omitted_without_agent_md() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let prompt = system_prompt_with_agent_md_notice("base prompt".to_string(), data_dir.path());
+
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn system_prompt_agent_md_notice_is_idempotent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(data_dir.path().join("Agent.md"), "Read me.").unwrap();
+        let once = system_prompt_with_agent_md_notice("base prompt".to_string(), data_dir.path());
+
+        let twice = system_prompt_with_agent_md_notice(once, data_dir.path());
+
+        assert_eq!(twice.matches(AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE).count(), 1);
     }
 
     #[test]
@@ -4620,6 +4751,110 @@ You are Remi.
             Some(supervisor_workflow::WorkflowPauseReason::Interrupted)
         );
         assert_eq!(requests.lock().expect("request lock poisoned").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_supervisor_evaluation_pauses_without_waiting_for_timeout() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let (base_url, requests) = start_openai_mock_server_with_slow_tail(
+            vec![sse_text("main done")],
+            "supervisor partial",
+        )
+        .await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        let bot = CatBotBuilder {
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            short_term_tokens: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(2),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
+        }
+        .build()
+        .unwrap();
+
+        let thread_id = "cancel-supervisor-evaluation";
+        bot.set_goal(
+            thread_id,
+            "cancel supervisor evaluation",
+            GoalMaxRounds::Limited(1),
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let mut stream = std::pin::pin!(bot.stream_with_options(
+            thread_id,
+            Content::text("start"),
+            StreamOptions {
+                cancel: Some(cancel.clone()),
+                ..StreamOptions::default()
+            },
+        ));
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for event: {events:?}"));
+            let Some(event) = event else {
+                break;
+            };
+            if matches!(
+                &event,
+                CatEvent::SupervisorProgress(SupervisorTraceEvent::OutputDelta { content })
+                    if content.contains("supervisor partial")
+            ) {
+                cancel.cancel();
+            }
+            let done = matches!(event, CatEvent::Done);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "supervisor cancel should not wait for slow response or timeout: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CatEvent::Supervisor(report)
+                if report.status == WorkflowStatus::Paused
+                    && report.reason == "interrupted by user"
+        )));
+        let instance = bot.workflow_status(thread_id).await.unwrap();
+        assert_eq!(instance.status, WorkflowStatus::Paused);
+        assert_eq!(
+            instance.pause_reason,
+            Some(supervisor_workflow::WorkflowPauseReason::Interrupted)
+        );
+        assert_eq!(requests.lock().expect("request lock poisoned").len(), 2);
     }
 
     #[tokio::test]
@@ -5733,6 +5968,94 @@ You are Remi.
                         "choices": [{
                             "index": 0,
                             "delta": {"content": first_content},
+                            "finish_reason": null
+                        }]
+                    });
+                    socket
+                        .write_all(format!("data: {chunk}\n\n").as_bytes())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = socket.write_all(b"data: [DONE]\n\n").await;
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    async fn start_openai_mock_server_with_slow_tail(
+        responses: Vec<String>,
+        slow_content: &str,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let responses = Arc::new(StdMutex::new(VecDeque::from(responses)));
+        let slow_content = slow_content.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = Arc::clone(&captured_requests);
+                let responses = Arc::clone(&responses);
+                let slow_content = slow_content.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0_u8; 1024];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = find_header_end(&buffer) {
+                            break pos;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while buffer.len() < body_start + content_length {
+                        let mut chunk = vec![0_u8; body_start + content_length - buffer.len()];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                    }
+                    let body =
+                        String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
+                            .to_string();
+                    requests.lock().expect("request lock poisoned").push(body);
+                    let response_body = responses
+                        .lock()
+                        .expect("response lock poisoned")
+                        .pop_front();
+                    if let Some(response_body) = response_body {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        return;
+                    }
+
+                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    let chunk = json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": slow_content},
                             "finish_reason": null
                         }]
                     });

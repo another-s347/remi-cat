@@ -26,7 +26,7 @@ use bot_core::{
     UserQuestionStatus,
 };
 use futures::StreamExt;
-use remi_agentloop::prelude::{CancellationToken, SubSessionEvent, SubSessionEventPayload};
+use remi_agentloop::prelude::{CancellationToken, ProtocolEvent, SubSessionEvent};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -833,7 +833,7 @@ impl AcpEventForwarder {
                     "depth": event.depth,
                     "parent_tool_call_id": &event.parent_tool_call_id,
                 }));
-            if matches!(&event.payload, SubSessionEventPayload::Start) {
+            if matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
                 call = call.content(vec![ToolCallContent::from(ContentBlock::Text(
                     TextContent::new(sub_session_header(&event)),
                 ))]);
@@ -858,7 +858,7 @@ impl AcpEventForwarder {
             }
         }
 
-        let status = sub_session_tool_status(&event.payload);
+        let status = sub_session_tool_status(event.event.as_ref());
         let content = self
             .sub_session_summaries
             .get(&id)
@@ -906,46 +906,56 @@ fn sub_session_header(event: &SubSessionEvent) -> String {
     )
 }
 
-fn sub_session_tool_status(payload: &SubSessionEventPayload) -> ToolCallStatus {
-    match payload {
-        SubSessionEventPayload::Done { .. } => ToolCallStatus::Completed,
-        SubSessionEventPayload::Error { .. } => ToolCallStatus::Failed,
+fn sub_session_tool_status(event: &ProtocolEvent) -> ToolCallStatus {
+    match event {
+        ProtocolEvent::Done => ToolCallStatus::Completed,
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            ToolCallStatus::Completed
+        }
+        ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => ToolCallStatus::Failed,
         _ => ToolCallStatus::InProgress,
     }
 }
 
 fn sub_session_event_line(event: &SubSessionEvent) -> Option<String> {
-    let line = match &event.payload {
-        SubSessionEventPayload::Start => sub_session_header(event),
-        SubSessionEventPayload::Delta { content } => content.clone(),
-        SubSessionEventPayload::ThinkingStart => "Thinking...".to_string(),
-        SubSessionEventPayload::ThinkingEnd { content } => {
+    let line = match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. } => sub_session_header(event),
+        ProtocolEvent::Delta { content, .. } => content.clone(),
+        ProtocolEvent::ThinkingStart => "Thinking...".to_string(),
+        ProtocolEvent::ThinkingEnd { content } => {
             if content.trim().is_empty() {
                 "Thinking complete.".to_string()
             } else {
                 format!("Thinking:\n{content}")
             }
         }
-        SubSessionEventPayload::TurnStart { turn } => format!("Turn {turn}"),
-        SubSessionEventPayload::ToolCallStart { id, name } => {
+        ProtocolEvent::TurnStart { turn } => format!("Turn {turn}"),
+        ProtocolEvent::ToolCallStart { id, name } => {
             format!("Tool `{name}` started ({id}).")
         }
-        SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
-            format!("Tool arguments `{id}`:\n{delta}")
+        ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta,
+        } => {
+            format!("Tool arguments `{id}`:\n{arguments_delta}")
         }
-        SubSessionEventPayload::ToolDelta { id, name, delta } => {
+        ProtocolEvent::ToolDelta { id, name, delta } => {
             format!("Tool `{name}` output ({id}):\n{delta}")
         }
-        SubSessionEventPayload::ToolResult { id, name, result } => {
+        ProtocolEvent::ToolResult { id, name, result } => {
             format!("Tool `{name}` result ({id}):\n{result}")
         }
-        SubSessionEventPayload::Done { final_output } => final_output
-            .as_deref()
+        ProtocolEvent::Done => "Done.".to_string(),
+        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
+            .get("final_output")
+            .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| format!("Done:\n{value}"))
             .unwrap_or_else(|| "Done.".to_string()),
-        SubSessionEventPayload::Error { message } => format!("Error: {message}"),
+        ProtocolEvent::Error { message, .. } => format!("Error: {message}"),
+        ProtocolEvent::Cancelled => "Error: cancelled".to_string(),
+        other => format!("{other:?}"),
     };
     (!line.trim().is_empty()).then_some(line)
 }
@@ -1423,7 +1433,7 @@ mod tests {
     use agent_client_protocol::schema::v1::NewSessionRequest;
     use agent_client_protocol::schema::v1::ToolCallStatus;
     use bot_core::ToolApprovalDecision;
-    use remi_agentloop::prelude::{RunId, SubSessionEvent, SubSessionEventPayload, ThreadId};
+    use remi_agentloop::prelude::{ProtocolEvent, RunId, SubSessionEvent, ThreadId};
     use std::rc::Rc;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -1494,14 +1504,14 @@ mod tests {
             "coder",
             Some("Coder Agent".to_string()),
             1,
-            SubSessionEventPayload::ToolCallStart {
+            ProtocolEvent::ToolCallStart {
                 id: "tool-1".to_string(),
                 name: "bash".to_string(),
             },
         );
 
         assert_eq!(
-            sub_session_tool_status(&event.payload),
+            sub_session_tool_status(event.event.as_ref()),
             ToolCallStatus::InProgress
         );
         assert_eq!(
@@ -1509,14 +1519,20 @@ mod tests {
             Some("Tool `bash` started (tool-1).")
         );
 
-        let done = SubSessionEvent {
-            payload: SubSessionEventPayload::Done {
-                final_output: Some("finished".to_string()),
+        let done = SubSessionEvent::new(
+            event.parent_tool_call_id,
+            event.sub_thread_id,
+            event.sub_run_id,
+            event.agent_name,
+            event.title,
+            event.depth,
+            ProtocolEvent::Custom {
+                event_type: "sub_session_done".to_string(),
+                extra: serde_json::json!({ "final_output": "finished" }),
             },
-            ..event
-        };
+        );
         assert_eq!(
-            sub_session_tool_status(&done.payload),
+            sub_session_tool_status(done.event.as_ref()),
             ToolCallStatus::Completed
         );
         assert_eq!(

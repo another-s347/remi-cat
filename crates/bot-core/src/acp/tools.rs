@@ -3,10 +3,8 @@ use std::sync::Arc;
 use async_stream::stream;
 use bot_runtime_core::ToolContext;
 use futures::{stream::BoxStream, Stream, StreamExt};
-use remi_agentloop::prelude::{AgentError, Tool, ToolOutput, ToolResult};
-use remi_agentloop::types::{
-    ResumePayload, RunId, SubSessionEvent, SubSessionEventPayload, ThreadId,
-};
+use remi_agentloop::prelude::{AgentError, ProtocolEvent, Tool, ToolOutput, ToolResult};
+use remi_agentloop::types::{ResumePayload, RunId, SubSessionEvent, ThreadId};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -21,6 +19,16 @@ use super::backend::{
 };
 
 const DEFAULT_ACP_WAIT_MS: u64 = 30_000;
+
+fn sub_session_done_event(final_output: Option<String>) -> ProtocolEvent {
+    match final_output {
+        Some(final_output) => ProtocolEvent::Custom {
+            event_type: "sub_session_done".to_string(),
+            extra: serde_json::json!({ "final_output": final_output }),
+        },
+        None => ProtocolEvent::Done,
+    }
+}
 
 pub struct AcpChatTool {
     backend: Arc<AcpBackend>,
@@ -165,7 +173,11 @@ impl Tool for AcpChatTool {
                         "acp",
                         title.clone(),
                         1,
-                        SubSessionEventPayload::Start,
+                        ProtocolEvent::RunStart {
+                            thread_id: sub_thread_id.to_string(),
+                            run_id: sub_run_id.to_string(),
+                            metadata: None,
+                        },
                     ));
                     yield ToolOutput::SubSession(SubSessionEvent::new(
                         "",
@@ -174,7 +186,7 @@ impl Tool for AcpChatTool {
                         "acp",
                         title.clone(),
                         1,
-                        SubSessionEventPayload::ThinkingStart,
+                        ProtocolEvent::ThinkingStart,
                     ));
                     let mut spawned = backend
                         .spawn_prepared_tool_turn_with_events(prepared.clone())
@@ -232,7 +244,7 @@ impl Tool for AcpChatTool {
                                         "acp",
                                         title.clone(),
                                         1,
-                                        SubSessionEventPayload::Done { final_output: None },
+                                        ProtocolEvent::Done,
                                     ));
                                     return;
                                 }
@@ -313,8 +325,9 @@ fn status_sub_session_outputs(
                 "acp",
                 title.clone(),
                 1,
-                SubSessionEventPayload::Delta {
+                ProtocolEvent::Delta {
                     content: response.reply.clone(),
+                    role: None,
                 },
             )));
         }
@@ -325,9 +338,9 @@ fn status_sub_session_outputs(
             "acp",
             title,
             1,
-            SubSessionEventPayload::Done {
-                final_output: Some(final_output_override.unwrap_or(response.final_summary.clone())),
-            },
+            sub_session_done_event(Some(
+                final_output_override.unwrap_or(response.final_summary.clone()),
+            )),
         )));
     } else if let Some(error) = status.error.clone() {
         outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
@@ -337,7 +350,10 @@ fn status_sub_session_outputs(
             "acp",
             title,
             1,
-            SubSessionEventPayload::Error { message: error },
+            ProtocolEvent::Error {
+                message: error,
+                code: None,
+            },
         )));
     } else if status.status == "running" {
         outputs.push(ToolOutput::SubSession(SubSessionEvent::new(
@@ -347,7 +363,7 @@ fn status_sub_session_outputs(
             "acp",
             title,
             1,
-            SubSessionEventPayload::ThinkingEnd {
+            ProtocolEvent::ThinkingEnd {
                 content: status
                     .poll_hint
                     .clone()
@@ -364,25 +380,27 @@ fn acp_task_event_output(
     sub_run_id: &RunId,
     title: Option<String>,
 ) -> ToolOutput {
-    let payload = match event {
-        AcpToolTaskEvent::Delta(content) => SubSessionEventPayload::Delta { content },
-        AcpToolTaskEvent::Thinking(content) => SubSessionEventPayload::ThinkingEnd { content },
-        AcpToolTaskEvent::ToolCallStart { id, name } => {
-            SubSessionEventPayload::ToolCallStart { id, name }
-        }
+    let event = match event {
+        AcpToolTaskEvent::Delta(content) => ProtocolEvent::Delta {
+            content,
+            role: None,
+        },
+        AcpToolTaskEvent::Thinking(content) => ProtocolEvent::ThinkingEnd { content },
+        AcpToolTaskEvent::ToolCallStart { id, name } => ProtocolEvent::ToolCallStart { id, name },
         AcpToolTaskEvent::ToolDelta { id, name, delta } => {
-            SubSessionEventPayload::ToolDelta { id, name, delta }
+            ProtocolEvent::ToolDelta { id, name, delta }
         }
         AcpToolTaskEvent::ToolResult { id, name, result } => {
-            SubSessionEventPayload::ToolResult { id, name, result }
+            ProtocolEvent::ToolResult { id, name, result }
         }
         AcpToolTaskEvent::ApprovalRequested(request)
         | AcpToolTaskEvent::ApprovalUpdated(request)
-        | AcpToolTaskEvent::ApprovalResolved { request, .. } => SubSessionEventPayload::Error {
+        | AcpToolTaskEvent::ApprovalResolved { request, .. } => ProtocolEvent::Error {
             message: format!(
                 "ACP approval event was not handled before rendering: {}",
                 request.id
             ),
+            code: None,
         },
     };
     ToolOutput::SubSession(SubSessionEvent::new(
@@ -392,7 +410,7 @@ fn acp_task_event_output(
         "acp",
         title,
         1,
-        payload,
+        event,
     ))
 }
 
@@ -552,8 +570,9 @@ fn acp_sub_session_error(
         "acp",
         title,
         1,
-        SubSessionEventPayload::Error {
+        ProtocolEvent::Error {
             message: message.into(),
+            code: None,
         },
     ))
 }
@@ -590,7 +609,7 @@ mod tests {
     use crate::acp::backend::{AcpBackend, AcpToolResponse, AcpToolTaskStatus};
     use crate::approval::ToolApprovalManager;
     use bot_runtime_core::{ChatCtxState, ToolContext};
-    use remi_agentloop::prelude::{SubSessionEventPayload, ThreadId, Tool, ToolOutput};
+    use remi_agentloop::prelude::{ProtocolEvent, ThreadId, Tool, ToolOutput};
     use remi_agentloop::types::RunId;
     use std::sync::Arc;
 
@@ -668,8 +687,13 @@ mod tests {
             let ToolOutput::SubSession(event) = output else {
                 return None;
             };
-            match event.payload {
-                SubSessionEventPayload::Done { final_output } => final_output,
+            match event.event.as_ref() {
+                ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => {
+                    extra
+                        .get("final_output")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned)
+                }
                 _ => None,
             }
         });
