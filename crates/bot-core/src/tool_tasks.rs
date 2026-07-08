@@ -54,6 +54,7 @@ struct ToolTaskStore {
 struct RunningTask {
     cancel: CancellationToken,
     abort: Option<tokio::task::AbortHandle>,
+    notify_on_finish: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +126,7 @@ impl ToolTaskManager {
             RunningTask {
                 cancel,
                 abort: None,
+                notify_on_finish: false,
             },
         );
         self.store
@@ -141,6 +143,12 @@ impl ToolTaskManager {
             running.abort = Some(abort);
         } else {
             abort.abort();
+        }
+    }
+
+    pub async fn enable_completion_notification(&self, task_id: &str) {
+        if let Some(running) = self.running.lock().await.get_mut(task_id) {
+            running.notify_on_finish = true;
         }
     }
 
@@ -164,7 +172,13 @@ impl ToolTaskManager {
         elapsed_ms: u64,
         result_preview: String,
     ) -> Option<ToolTaskRecord> {
-        self.running.lock().await.remove(task_id);
+        let notify_on_finish = self
+            .running
+            .lock()
+            .await
+            .remove(task_id)
+            .map(|running| running.notify_on_finish)
+            .unwrap_or(false);
         let mut store = self.store.lock().await;
         let record = store.tasks.get_mut(task_id)?;
         if record.status != TOOL_TASK_RUNNING {
@@ -183,7 +197,9 @@ impl ToolTaskManager {
         let cloned = record.clone();
         drop(store);
         let _ = self.save().await;
-        let _ = self.completed_tx.send(cloned.clone());
+        if notify_on_finish {
+            let _ = self.completed_tx.send(cloned.clone());
+        }
         Some(cloned)
     }
 

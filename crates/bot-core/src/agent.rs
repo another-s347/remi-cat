@@ -31,7 +31,7 @@ use remi_agentloop::prelude::{
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
 use remi_agentloop::types::{AgentEvent, ResumePayload};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::approval::{
     classify_tool_risk_assessment, command_key, review_tool_risk, summarize_tool_args,
@@ -687,15 +687,9 @@ where
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
-                                                ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
+                                                ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
                                                     forward_background_side_events = true;
-                                                    spawn_background_tool_result(
-                                                        task_id.clone(),
-                                                        tc.name.clone(),
-                                                        Arc::clone(&self.tool_tasks),
-                                                        future,
-                                                    );
                                                     (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
                                                 }
                                             };
@@ -1099,15 +1093,9 @@ where
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
-                                                ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
+                                                ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
                                                     forward_background_side_events = true;
-                                                    spawn_background_tool_result(
-                                                        task_id.clone(),
-                                                        tc.name.clone(),
-                                                        Arc::clone(&self.tool_tasks),
-                                                        future,
-                                                    );
                                                     (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
                                                 }
                                             };
@@ -1857,7 +1845,6 @@ enum ForegroundToolOutcome {
     TimedOut {
         call_id: String,
         task_id: String,
-        future: LocalBoxFuture<'static, (String, CollectedToolResult)>,
     },
 }
 
@@ -2001,28 +1988,45 @@ fn collect_tool_result_futures_with_timeout(
                     .await;
                     (collect_call_id, collected)
                 };
-                let mut collect = collect.boxed_local();
+                let cancel = CancellationToken::new();
+                let task_id = tool_tasks
+                    .start(
+                        thread_id,
+                        run_id,
+                        call_id.clone(),
+                        tool_name.clone(),
+                        args,
+                        cancel,
+                    )
+                    .await
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                let (completed_tx, mut completed_rx) =
+                    oneshot::channel::<(String, CollectedToolResult)>();
+                spawn_background_tool_result(
+                    task_id.clone(),
+                    tool_name,
+                    Arc::clone(&tool_tasks),
+                    collect.boxed_local(),
+                    Some(completed_tx),
+                );
                 tokio::select! {
-                    completed = &mut collect => {
+                    completed = &mut completed_rx => {
+                        let (completed_call_id, collected) = completed.unwrap_or_else(|_| {
+                            (
+                                call_id.clone(),
+                                CollectedToolResult::text("error: background tool task was cancelled"),
+                            )
+                        });
                         ForegroundToolOutcome::Completed {
-                            call_id: completed.0,
-                            collected: completed.1,
+                            call_id: completed_call_id,
+                            collected,
                         }
                     }
                     _ = tokio::time::sleep(foreground_timeout) => {
-                        let cancel = CancellationToken::new();
-                        let task_id = tool_tasks.start(
-                            thread_id,
-                            run_id,
-                            call_id.clone(),
-                            tool_name,
-                            args,
-                            cancel,
-                        ).await.unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                        tool_tasks.enable_completion_notification(&task_id).await;
                         ForegroundToolOutcome::TimedOut {
                             call_id,
                             task_id,
-                            future: collect,
                         }
                     }
                 }
@@ -2037,12 +2041,13 @@ fn spawn_background_tool_result(
     tool_name: String,
     tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
     future: LocalBoxFuture<'static, (String, CollectedToolResult)>,
+    completed_tx: Option<oneshot::Sender<(String, CollectedToolResult)>>,
 ) {
     let task_manager = Arc::clone(&tool_tasks);
     let task_id_for_attach = task_id.clone();
     let handle = tokio::task::spawn_local(async move {
         let started = Instant::now();
-        let (_call_id, collected) = future.await;
+        let (call_id, collected) = future.await;
         let success = crate::tool_pretty::tool_success(&collected.preview);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         for line in collected
@@ -2064,8 +2069,11 @@ fn spawn_background_tool_result(
             "tool_task.completed"
         );
         let _ = tool_tasks
-            .finish(&task_id, success, elapsed_ms, collected.preview)
+            .finish(&task_id, success, elapsed_ms, collected.preview.clone())
             .await;
+        if let Some(completed_tx) = completed_tx {
+            let _ = completed_tx.send((call_id, collected));
+        }
     });
     tokio::task::spawn_local(async move {
         task_manager
@@ -2319,8 +2327,8 @@ mod tests {
         collect_tool_result_futures_with_timeout, collect_tool_results_parallel,
         complete_interrupted_tool_results, complete_pending_tool_calls_in_state,
         fs_read_overflow_summary, outer_thread_id_from_metadata,
-        spawn_background_side_event_forwarder, spawn_background_tool_result, split_utf8_chunks,
-        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
+        spawn_background_side_event_forwarder, split_utf8_chunks, tool_output_chunk_bytes,
+        CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -3476,23 +3484,11 @@ mod tests {
                     .next()
                     .await
                     .expect("tool result future should produce an outcome");
-                let ForegroundToolOutcome::TimedOut {
-                    call_id,
-                    task_id,
-                    future,
-                } = outcome
-                else {
-                    panic!("expected slow tool to move into the background");
+                let ForegroundToolOutcome::TimedOut { call_id, task_id } = outcome else {
+                    panic!("expected slow tool to exceed the foreground window");
                 };
                 assert_eq!(call_id, "slow-call");
                 assert!(tool_tasks.is_thread_running("thread-1").await);
-
-                spawn_background_tool_result(
-                    task_id.clone(),
-                    "lazy_wait".to_string(),
-                    Arc::clone(&tool_tasks),
-                    future,
-                );
 
                 let completed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
                     .await
@@ -3503,6 +3499,66 @@ mod tests {
                 assert_eq!(completed.status.as_str(), "completed");
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_completed_tool_updates_task_without_completion_notification() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut completed_rx = tool_tasks.subscribe_completed();
+                let tool_names =
+                    HashMap::from([("fast-call".to_string(), "lazy_wait".to_string())]);
+                let calls = vec![ParsedToolCall {
+                    id: "fast-call".to_string(),
+                    name: "lazy_wait".to_string(),
+                    arguments: serde_json::json!({"label": "fast"}),
+                }];
+
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![(
+                        "fast-call".to_string(),
+                        delayed_boxed_result("fast", Duration::from_millis(5)),
+                    )],
+                    &calls,
+                    &tool_names,
+                    &root,
+                    8_192,
+                    None,
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    Duration::from_millis(200),
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome");
+                let ForegroundToolOutcome::Completed { call_id, collected } = outcome else {
+                    panic!("expected fast tool to complete inside the foreground window");
+                };
+                assert_eq!(call_id, "fast-call");
+                assert_eq!(collected.preview, "fast");
+                assert!(!tool_tasks.is_thread_running("thread-1").await);
+
+                let task = tool_tasks
+                    .list(Some("thread-1"))
+                    .await
+                    .into_iter()
+                    .find(|task| task.tool_call_id == "fast-call")
+                    .expect("foreground-completed task should still be recorded");
+                assert_eq!(task.status.as_str(), "completed");
+                assert_eq!(task.result_preview.as_deref(), Some("fast"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), completed_rx.recv())
+                        .await
+                        .is_err()
+                );
             })
             .await;
     }
@@ -3556,23 +3612,14 @@ mod tests {
                     .next()
                     .await
                     .expect("tool result future should produce an outcome");
-                let ForegroundToolOutcome::TimedOut {
-                    task_id, future, ..
-                } = outcome
-                else {
-                    panic!("expected sub-agent tool to move into the background");
+                let ForegroundToolOutcome::TimedOut { task_id: _, .. } = outcome else {
+                    panic!("expected sub-agent tool to exceed the foreground window");
                 };
 
                 spawn_background_side_event_forwarder(
                     "thread-1".to_string(),
                     Arc::clone(&tool_tasks),
                     side_rx,
-                );
-                spawn_background_tool_result(
-                    task_id,
-                    "sub_agent".to_string(),
-                    Arc::clone(&tool_tasks),
-                    future,
                 );
 
                 let (thread_id, event) =
