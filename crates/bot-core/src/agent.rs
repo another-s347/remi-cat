@@ -649,6 +649,10 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
+                                let task_thread_id = outer_thread_id_from_metadata(
+                                    &state.thread_id.0,
+                                    state.config.metadata.as_ref(),
+                                );
                                 let mut pending_results = collect_tool_result_futures_with_timeout(
                                     results,
                                     &approved_local,
@@ -657,7 +661,7 @@ where
                                     overflow_bytes,
                                     Some(side_tx),
                                     Arc::clone(&self.tool_tasks),
-                                    state.thread_id.0.clone(),
+                                    task_thread_id,
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
                                 );
@@ -1048,6 +1052,10 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
+                                let task_thread_id = outer_thread_id_from_metadata(
+                                    &state.thread_id.0,
+                                    state.config.metadata.as_ref(),
+                                );
                                 let mut pending_results = collect_tool_result_futures_with_timeout(
                                     results,
                                     &approved_dynamic,
@@ -1056,7 +1064,7 @@ where
                                     overflow_bytes,
                                     Some(side_tx),
                                     Arc::clone(&self.tool_tasks),
-                                    state.thread_id.0.clone(),
+                                    task_thread_id,
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
                                 );
@@ -1705,6 +1713,19 @@ fn approval_request_for_tool(
     }
 }
 
+fn outer_thread_id_from_metadata(
+    fallback_thread_id: &str,
+    metadata: Option<&serde_json::Value>,
+) -> String {
+    metadata
+        .and_then(|value| value.get("thread_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_thread_id)
+        .to_string()
+}
+
 async fn prepare_approval_request_for_tool(
     tc: &ParsedToolCall,
     session_id: &str,
@@ -2267,8 +2288,9 @@ mod tests {
         append_tool_results_to_history, approval_request_for_tool, collect_result_with_overflow,
         collect_tool_result_futures_with_timeout, collect_tool_results_parallel,
         complete_interrupted_tool_results, complete_pending_tool_calls_in_state,
-        fs_read_overflow_summary, spawn_background_tool_result, split_utf8_chunks,
-        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
+        fs_read_overflow_summary, outer_thread_id_from_metadata, spawn_background_tool_result,
+        split_utf8_chunks, tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome,
+        INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -2344,6 +2366,27 @@ mod tests {
 
         assert_eq!(request.session_id, "tui-session-1");
         assert_eq!(request.platform.as_deref(), Some("tui"));
+    }
+
+    #[test]
+    fn background_task_uses_outer_thread_id_from_metadata() {
+        assert_eq!(
+            outer_thread_id_from_metadata(
+                "agentloop-inner-thread",
+                Some(&serde_json::json!({
+                    "thread_id": "tui-session-1",
+                    "platform": "tui"
+                })),
+            ),
+            "tui-session-1"
+        );
+        assert_eq!(
+            outer_thread_id_from_metadata(
+                "agentloop-inner-thread",
+                Some(&serde_json::json!({"thread_id": "   "})),
+            ),
+            "agentloop-inner-thread"
+        );
     }
 
     #[test]
