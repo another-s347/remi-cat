@@ -45,7 +45,9 @@ mod render;
 use components::*;
 use composer::*;
 
-use crate::command::model_reasoning_effort_label;
+use crate::command::{
+    model_reasoning_effort_label, process_runtime_commands, RuntimeCommandPipelineResult,
+};
 use crate::session::{ChannelBinding, Session, SubSessionKind};
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
 #[cfg(test)]
@@ -1144,6 +1146,29 @@ impl TuiApp {
         }
         if is_tui_new_command(&text) {
             self.start_new_command();
+            return Ok(false);
+        }
+        if self.running && text.trim_start().starts_with('/') {
+            self.cells.push(HistoryCell::user(display_text.clone()));
+            match process_runtime_commands(&self.runtime, &self.session_id, text.trim()).await {
+                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                    self.cells.push(HistoryCell::system(reply));
+                }
+                Ok(RuntimeCommandPipelineResult::StartWorkflow { .. })
+                | Ok(RuntimeCommandPipelineResult::Continue { .. }) => {
+                    self.queued_inputs.push_back(SubmittedInput {
+                        display_text,
+                        content,
+                    });
+                    self.cells.push(HistoryCell::system(
+                        "当前 session 正在运行，该命令会在当前 run 结束后执行。",
+                    ));
+                }
+                Err(error) => {
+                    self.cells
+                        .push(HistoryCell::system(format!("command failed: {error:#}")));
+                }
+            }
             return Ok(false);
         }
         if self.running {
@@ -3924,6 +3949,10 @@ fn static_commands() -> Vec<CommandEntry> {
         ("/exit", "退出 TUI", false),
         ("/quit", "退出 TUI", false),
         ("/tools", "显示当前 Agent 可用的工具", false),
+        ("/tasks", "显示当前 session 后台任务", false),
+        ("/tasks all", "显示全部后台任务", false),
+        ("/tasks get ", "查看后台任务详情", true),
+        ("/tasks cancel ", "取消后台任务", true),
         ("/goal status", "查看当前会话目标", false),
         ("/goal set ", "设置目标；可嵌套 /skill:<name>", true),
         ("/goal clear", "清除目标", false),
@@ -4380,6 +4409,10 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| command.value == "/skill list"));
+        assert!(commands.iter().any(|command| command.value == "/tasks"));
+        assert!(commands
+            .iter()
+            .any(|command| command.value == "/tasks get "));
         assert!(commands
             .iter()
             .any(|command| command.value == "/model status"));

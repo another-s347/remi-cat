@@ -16,8 +16,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
-    model_input_store::upsert_model_input_snapshot_json, ChatChannel, ChatRequest, CoreChatEvent,
-    Runtime, SESSION_AGENT_ID_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
+    command::{process_runtime_commands, RuntimeCommandPipelineResult},
+    model_input_store::upsert_model_input_snapshot_json,
+    ChatChannel, ChatRequest, CoreChatEvent, Runtime, SESSION_AGENT_ID_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 
 pub const WEB_CHANNEL: &str = "web";
@@ -432,6 +434,36 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     let _ = response.send(Err(anyhow::anyhow!(
                         "no matching active run for this session"
                     )));
+                    continue;
+                }
+                if text.trim_start().starts_with('/') {
+                    match process_runtime_commands(&runtime, &session_id, text.trim()).await {
+                        Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                            if let Some(run) = active.borrow().get(&run_id) {
+                                let sequence = run.log.borrow().len() as u64;
+                                let web_event = ChatEventV1::new(
+                                    "text_delta",
+                                    &run_id,
+                                    &session_id,
+                                    sequence,
+                                    Some(serde_json::json!({"text": reply})),
+                                );
+                                run.log.borrow_mut().push(web_event.clone());
+                                let _ = run.broadcast.send(web_event.clone());
+                                let _ = run.direct.try_send(web_event);
+                            }
+                            let _ = response.send(Ok(()));
+                        }
+                        Ok(RuntimeCommandPipelineResult::StartWorkflow { .. })
+                        | Ok(RuntimeCommandPipelineResult::Continue { .. }) => {
+                            let _ = response.send(Err(anyhow::anyhow!(
+                                "command requires starting a new run; wait for the active run to finish"
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                        }
+                    }
                     continue;
                 }
                 let request = ChatRequest::text(session_id.clone(), ChatChannel::Web, text.clone())
