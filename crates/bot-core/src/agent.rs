@@ -25,8 +25,8 @@ use bot_runtime_core::{
     CoreDriveEvent, CoreSteerBatch, CoreStreamOptions, CoreUsageStats,
 };
 use remi_agentloop::prelude::{
-    AgentError, AgentState, Content, ContentPart, LoopInput, Message, ParsedToolCall,
-    ToolCallOutcome, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    AgentError, AgentState, CancellationToken, Content, ContentPart, LoopInput, Message,
+    ParsedToolCall, ToolCallOutcome, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
@@ -179,6 +179,8 @@ pub struct CatAgent<I> {
     pub user_question_manager: Arc<UserQuestionManager>,
     /// Codex-compatible hook runner.
     pub hook_manager: Arc<HookManager>,
+    /// Background tool task registry.
+    pub tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
 }
 
 impl<I> CatAgent<I>
@@ -312,7 +314,11 @@ where
                 let mut next_input: Option<LoopInput> = None;
                 let mut last_checkpoint_state: Option<remi_agentloop::prelude::AgentState> = None;
 
-                while let Some(ev) = inner_stream.next().await {
+                loop {
+                    let ev = inner_stream.next().await;
+                    let Some(ev) = ev else {
+                        break;
+                    };
                     match ev {
                         CoreDriveEvent::Text(t) => {
                             yield CatEvent::Text(t);
@@ -643,12 +649,17 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
-                                let mut pending_results = collect_tool_result_futures(
+                                let mut pending_results = collect_tool_result_futures_with_timeout(
                                     results,
+                                    &approved_local,
                                     &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
+                                    Arc::clone(&self.tool_tasks),
+                                    state.thread_id.0.clone(),
+                                    state.run_id.0.clone(),
+                                    tool_foreground_timeout(),
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 while !pending_results.is_empty() {
@@ -668,7 +679,20 @@ where
                                                 return;
                                             }
                                         }
-                                        Some((call_id, mut collected)) = pending_results.next() => {
+                                        Some(outcome) = pending_results.next() => {
+                                            let (call_id, mut collected, timed_out_task_id) = match outcome {
+                                                ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
+                                                ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
+                                                    let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
+                                                    spawn_background_tool_result(
+                                                        task_id.clone(),
+                                                        tc.name.clone(),
+                                                        Arc::clone(&self.tool_tasks),
+                                                        future,
+                                                    );
+                                                    (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
+                                                }
+                                            };
                                             let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
                                             let elapsed_ms = started_at
                                                 .get(&call_id)
@@ -678,7 +702,8 @@ where
                                                 &state,
                                                 &workspace_root,
                                             );
-                                            let post_hook = hook_manager
+                                            let post_hook = if timed_out_task_id.is_none() {
+                                                hook_manager
                                                 .run_tool(
                                                     HookEventName::PostToolUse,
                                                     &hook_context,
@@ -687,7 +712,10 @@ where
                                                         Some(serde_json::Value::String(collected.preview.clone())),
                                                     ),
                                                 )
-                                                .await;
+                                                .await
+                                            } else {
+                                                Default::default()
+                                            };
                                             if post_hook.blocked {
                                                 let blocked = post_hook
                                                     .reason
@@ -1020,12 +1048,17 @@ where
                                 );
 
                                 let (side_tx, mut side_rx) = mpsc::unbounded_channel();
-                                let mut pending_results = collect_tool_result_futures(
+                                let mut pending_results = collect_tool_result_futures_with_timeout(
                                     results,
+                                    &approved_dynamic,
                                     &tool_names,
                                     &data_dir,
                                     overflow_bytes,
                                     Some(side_tx),
+                                    Arc::clone(&self.tool_tasks),
+                                    state.thread_id.0.clone(),
+                                    state.run_id.0.clone(),
+                                    tool_foreground_timeout(),
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 while !pending_results.is_empty() {
@@ -1045,7 +1078,20 @@ where
                                                 return;
                                             }
                                         }
-                                        Some((call_id, mut collected)) = pending_results.next() => {
+                                        Some(outcome) = pending_results.next() => {
+                                            let (call_id, mut collected, timed_out_task_id) = match outcome {
+                                                ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
+                                                ForegroundToolOutcome::TimedOut { call_id, task_id, future } => {
+                                                    let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
+                                                    spawn_background_tool_result(
+                                                        task_id.clone(),
+                                                        tc.name.clone(),
+                                                        Arc::clone(&self.tool_tasks),
+                                                        future,
+                                                    );
+                                                    (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
+                                                }
+                                            };
                                             let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
                                             let elapsed_ms = started_at
                                                 .get(&call_id)
@@ -1055,7 +1101,8 @@ where
                                                 &state,
                                                 &workspace_root,
                                             );
-                                            let post_hook = hook_manager
+                                            let post_hook = if timed_out_task_id.is_none() {
+                                                hook_manager
                                                 .run_tool(
                                                     HookEventName::PostToolUse,
                                                     &hook_context,
@@ -1064,7 +1111,10 @@ where
                                                         Some(serde_json::Value::String(collected.preview.clone())),
                                                     ),
                                                 )
-                                                .await;
+                                                .await
+                                            } else {
+                                                Default::default()
+                                            };
                                             if post_hook.blocked {
                                                 let blocked = post_hook
                                                     .reason
@@ -1549,7 +1599,7 @@ async fn execute_runtime_tools<'a>(
     calls: &'a [ParsedToolCall],
     resume_map: &'a HashMap<String, ResumePayload>,
     ctx: &'a ToolContext,
-) -> Vec<(String, Result<BoxedToolResult<'a>, AgentError>)> {
+) -> Vec<(String, Result<BoxedToolResult, AgentError>)> {
     let Some(model_tools) = model_tools else {
         return local_tools.execute_parallel(calls, resume_map, ctx).await;
     };
@@ -1561,10 +1611,10 @@ async fn execute_runtime_tools<'a>(
     let model_results = model_tools.execute_parallel(calls, resume_map, ctx).await;
     let mut local_by_id = local_results
         .into_iter()
-        .collect::<HashMap<String, Result<BoxedToolResult<'a>, AgentError>>>();
+        .collect::<HashMap<String, Result<BoxedToolResult, AgentError>>>();
     let mut model_by_id = model_results
         .into_iter()
-        .collect::<HashMap<String, Result<BoxedToolResult<'a>, AgentError>>>();
+        .collect::<HashMap<String, Result<BoxedToolResult, AgentError>>>();
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
         let result = if model_tools.contains(&call.name) {
@@ -1732,6 +1782,15 @@ fn build_dynamic_tools(
 /// [`CatAgent::overflow_bytes`] which is derived from the model profile.
 const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
 const TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 512;
+const DEFAULT_TOOL_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn tool_foreground_timeout() -> std::time::Duration {
+    std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_TOOL_FOREGROUND_TIMEOUT)
+}
 
 #[derive(Debug, Clone)]
 struct CollectedToolResult {
@@ -1749,6 +1808,27 @@ impl CollectedToolResult {
             side_events: Vec::new(),
         }
     }
+}
+
+enum ForegroundToolOutcome {
+    Completed {
+        call_id: String,
+        collected: CollectedToolResult,
+    },
+    TimedOut {
+        call_id: String,
+        task_id: String,
+        future: LocalBoxFuture<'static, (String, CollectedToolResult)>,
+    },
+}
+
+fn background_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolResult {
+    CollectedToolResult::text(format!(
+        "Tool `{tool_name}` is still running in the background.\n\
+         task_id: {task_id}\n\
+         You do not need to poll continuously; the system will notify you automatically when it finishes. \
+         Use tool_tasks only if you need to inspect or cancel the task."
+    ))
 }
 
 fn preview_text_for_content(content: &Content) -> String {
@@ -1809,8 +1889,8 @@ fn preview_text_for_content(content: &Content) -> String {
 }
 
 #[cfg(test)]
-async fn collect_tool_results_parallel<'a>(
-    results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
+async fn collect_tool_results_parallel(
+    results: Vec<(String, Result<BoxedToolResult, AgentError>)>,
     tool_names: &HashMap<String, String>,
     data_dir: &Path,
     overflow_bytes: usize,
@@ -1837,39 +1917,127 @@ async fn collect_tool_results_parallel<'a>(
     futures::future::join_all(futures).await
 }
 
-fn collect_tool_result_futures<'a>(
-    results: Vec<(String, Result<BoxedToolResult<'a>, AgentError>)>,
+fn collect_tool_result_futures_with_timeout(
+    results: Vec<(String, Result<BoxedToolResult, AgentError>)>,
+    calls: &[ParsedToolCall],
     tool_names: &HashMap<String, String>,
     data_dir: &Path,
     overflow_bytes: usize,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
-) -> FuturesUnordered<LocalBoxFuture<'a, (String, CollectedToolResult)>> {
+    tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
+    thread_id: String,
+    run_id: String,
+    foreground_timeout: std::time::Duration,
+) -> FuturesUnordered<LocalBoxFuture<'static, ForegroundToolOutcome>> {
     let data_dir = data_dir.to_path_buf();
+    let call_args = calls
+        .iter()
+        .map(|call| (call.id.clone(), call.arguments.clone()))
+        .collect::<HashMap<_, _>>();
     results
         .into_iter()
         .map(|(call_id, result)| {
             let data_dir = data_dir.clone();
             let side_event_tx = side_event_tx.clone();
             let tool_name = tool_names.get(&call_id).cloned().unwrap_or_default();
+            let args = call_args
+                .get(&call_id)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let tool_tasks = Arc::clone(&tool_tasks);
+            let thread_id = thread_id.clone();
+            let run_id = run_id.clone();
             async move {
-                let collected = collect_result_with_overflow(
-                    result,
-                    &data_dir,
-                    overflow_bytes,
-                    side_event_tx,
-                    Some(call_id.as_str()),
-                    tool_name.as_str(),
-                )
-                .await;
-                (call_id, collected)
+                let collect_call_id = call_id.clone();
+                let collect_tool_name = tool_name.clone();
+                let collect = async move {
+                    let collected = collect_result_with_overflow(
+                        result,
+                        &data_dir,
+                        overflow_bytes,
+                        side_event_tx,
+                        Some(collect_call_id.as_str()),
+                        collect_tool_name.as_str(),
+                    )
+                    .await;
+                    (collect_call_id, collected)
+                };
+                let mut collect = collect.boxed_local();
+                tokio::select! {
+                    completed = &mut collect => {
+                        ForegroundToolOutcome::Completed {
+                            call_id: completed.0,
+                            collected: completed.1,
+                        }
+                    }
+                    _ = tokio::time::sleep(foreground_timeout) => {
+                        let cancel = CancellationToken::new();
+                        let task_id = tool_tasks.start(
+                            thread_id,
+                            run_id,
+                            call_id.clone(),
+                            tool_name,
+                            args,
+                            cancel,
+                        ).await.unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                        ForegroundToolOutcome::TimedOut {
+                            call_id,
+                            task_id,
+                            future: collect,
+                        }
+                    }
+                }
             }
             .boxed_local()
         })
         .collect()
 }
 
+fn spawn_background_tool_result(
+    task_id: String,
+    tool_name: String,
+    tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
+    future: LocalBoxFuture<'static, (String, CollectedToolResult)>,
+) {
+    let task_manager = Arc::clone(&tool_tasks);
+    let task_id_for_attach = task_id.clone();
+    let handle = tokio::task::spawn_local(async move {
+        let started = Instant::now();
+        let (_call_id, collected) = future.await;
+        let success = crate::tool_pretty::tool_success(&collected.preview);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        for line in collected
+            .preview
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            tool_tasks.append_output(&task_id, line.to_string()).await;
+        }
+        tracing::info!(
+            task_id = %task_id,
+            tool_name = %tool_name,
+            success,
+            elapsed_ms,
+            "tool_task.completed"
+        );
+        let _ = tool_tasks
+            .finish(&task_id, success, elapsed_ms, collected.preview)
+            .await;
+    });
+    tokio::task::spawn_local(async move {
+        task_manager
+            .attach_abort_handle(&task_id_for_attach, handle.abort_handle())
+            .await;
+        let _ = handle.await;
+    });
+}
+
 async fn collect_result(
-    result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
+    result: Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
     parent_tool_call_id: Option<&str>,
 ) -> CollectedToolResult {
@@ -1943,7 +2111,7 @@ async fn collect_result(
 }
 
 async fn collect_result_with_overflow(
-    result: Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>,
+    result: Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
     data_dir: &Path,
     overflow_bytes: usize,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
@@ -2097,9 +2265,10 @@ fn make_side_events(tc: &ParsedToolCall, result_str: &str) -> Vec<CatEvent> {
 mod tests {
     use super::{
         append_tool_results_to_history, approval_request_for_tool, collect_result_with_overflow,
-        collect_tool_results_parallel, complete_interrupted_tool_results,
-        complete_pending_tool_calls_in_state, fs_read_overflow_summary, split_utf8_chunks,
-        tool_output_chunk_bytes, CatAgent, INTERRUPTED_TOOL_RESULT_ERROR,
+        collect_tool_result_futures_with_timeout, collect_tool_results_parallel,
+        complete_interrupted_tool_results, complete_pending_tool_calls_in_state,
+        fs_read_overflow_summary, spawn_background_tool_result, split_utf8_chunks,
+        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -2130,6 +2299,10 @@ mod tests {
 
     fn test_hook_manager() -> Arc<HookManager> {
         HookManager::new(test_root(), test_root())
+    }
+
+    fn test_tool_tasks() -> Arc<crate::tool_tasks::ToolTaskManager> {
+        crate::tool_tasks::ToolTaskManager::load(test_root()).unwrap()
     }
 
     fn test_tool_call_message(id: &str, name: &str) -> ToolCallMessage {
@@ -2411,8 +2584,8 @@ mod tests {
     fn delayed_boxed_result(
         label: &'static str,
         delay: Duration,
-    ) -> Result<BoxedToolResult<'static>, remi_agentloop::prelude::AgentError> {
-        let output: BoxedToolStream<'static> = Box::pin(async_stream::stream! {
+    ) -> Result<BoxedToolResult, remi_agentloop::prelude::AgentError> {
+        let output: BoxedToolStream = Box::pin(async_stream::stream! {
             tokio::time::sleep(delay).await;
             yield ToolOutput::text(label);
         });
@@ -2455,7 +2628,7 @@ mod tests {
     async fn sub_session_events_are_forwarded_before_tool_result_completes() {
         let root = test_root();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let output: BoxedToolStream<'static> = Box::pin(async_stream::stream! {
+        let output: BoxedToolStream = Box::pin(async_stream::stream! {
             yield ToolOutput::SubSession(remi_agentloop::prelude::SubSessionEvent::new(
                 "",
                 remi_agentloop::prelude::ThreadId("sub-thread".to_string()),
@@ -2717,7 +2890,7 @@ mod tests {
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
             _ctx: ToolContext,
-        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
                 "should not execute",
             )])))
@@ -2751,7 +2924,7 @@ mod tests {
             arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
             _ctx: ToolContext,
-        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
             let label = arguments
                 .get("label")
                 .and_then(|value| value.as_str())
@@ -2860,7 +3033,7 @@ mod tests {
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
             _ctx: ToolContext,
-        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
                 "ok",
             )])))
@@ -2959,7 +3132,7 @@ mod tests {
             _arguments: serde_json::Value,
             _resume: Option<remi_agentloop::types::ResumePayload>,
             _ctx: ToolContext,
-        ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+        ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
             self.queue.push(CoreSteerInput {
                 id: "queued-while-tool".to_string(),
                 content: Content::text("while-tool steer"),
@@ -3042,6 +3215,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3086,6 +3260,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3129,6 +3304,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let started = Instant::now();
@@ -3162,6 +3338,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let started = Instant::now();
@@ -3190,6 +3367,73 @@ mod tests {
         panic!("fast tool result was not emitted");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_tool_result_runs_as_background_task_and_notifies() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut completed_rx = tool_tasks.subscribe_completed();
+                let tool_names =
+                    HashMap::from([("slow-call".to_string(), "lazy_wait".to_string())]);
+                let calls = vec![ParsedToolCall {
+                    id: "slow-call".to_string(),
+                    name: "lazy_wait".to_string(),
+                    arguments: serde_json::json!({"label": "slow"}),
+                }];
+
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![(
+                        "slow-call".to_string(),
+                        delayed_boxed_result("slow", Duration::from_millis(50)),
+                    )],
+                    &calls,
+                    &tool_names,
+                    &root,
+                    8_192,
+                    None,
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    Duration::from_millis(5),
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome");
+                let ForegroundToolOutcome::TimedOut {
+                    call_id,
+                    task_id,
+                    future,
+                } = outcome
+                else {
+                    panic!("expected slow tool to move into the background");
+                };
+                assert_eq!(call_id, "slow-call");
+                assert!(tool_tasks.is_thread_running("thread-1").await);
+
+                spawn_background_tool_result(
+                    task_id.clone(),
+                    "lazy_wait".to_string(),
+                    Arc::clone(&tool_tasks),
+                    future,
+                );
+
+                let completed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                    .await
+                    .expect("background completion should notify")
+                    .expect("completion channel should stay open");
+                assert_eq!(completed.task_id, task_id);
+                assert_eq!(completed.tool_name, "lazy_wait");
+                assert_eq!(completed.status.as_str(), "completed");
+                assert_eq!(completed.recent_output, vec!["slow".to_string()]);
+                assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn cat_agent_cancel_during_tool_collection_emits_repaired_history() {
         let mut local_tools = DefaultToolRegistry::new();
@@ -3209,6 +3453,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
         let cancel = CancellationToken::new();
         let stream = agent.stream_with_input_and_options(
@@ -3294,6 +3539,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3332,6 +3578,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3386,6 +3633,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3440,6 +3688,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent
@@ -3492,6 +3741,7 @@ mod tests {
             approval_reviewer: None,
             user_question_manager: UserQuestionManager::new(),
             hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
         };
 
         let events = agent

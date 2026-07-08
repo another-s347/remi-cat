@@ -100,7 +100,7 @@ pub(crate) async fn process_prompt_message(
                     _ => {}
                 }
             }
-            _ = &mut timeout => {
+            _ = &mut timeout, if !cli.wait_background_tasks => {
                 anyhow::bail!("prompt timed out");
             }
         }

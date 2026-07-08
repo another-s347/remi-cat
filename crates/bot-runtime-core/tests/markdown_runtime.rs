@@ -27,7 +27,7 @@ impl Tool for PublicEchoTool {
         _arguments: serde_json::Value,
         _resume: Option<bot_runtime_core::ResumePayload>,
         _ctx: &ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
             "public-tool-output",
         )])))

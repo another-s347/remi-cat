@@ -1710,6 +1710,16 @@ impl TuiApp {
                     count, preview
                 )));
             }
+            BotEvent::ToolTaskCompleted(task) => {
+                self.has_activity = true;
+                self.cells.push(HistoryCell::system(format!(
+                    "后台工具任务完成\n任务: {}\n工具: {}\n状态: {}\n耗时: {}ms",
+                    task.task_id,
+                    task.tool_name,
+                    task.status,
+                    task.elapsed_ms.unwrap_or(0)
+                )));
+            }
             BotEvent::Stats {
                 prompt_tokens,
                 completion_tokens,
@@ -3486,6 +3496,9 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
                 elapsed_ms,
             });
         }
+        CatEvent::ToolTaskCompleted(task) => {
+            let _ = tx.send(BotEvent::ToolTaskCompleted(task));
+        }
         CatEvent::SubSession(event) => {
             let _ = tx.send(BotEvent::SubSession(event));
         }
@@ -3839,6 +3852,7 @@ enum BotEvent {
         success: bool,
         elapsed_ms: u64,
     },
+    ToolTaskCompleted(bot_core::ToolTaskRecord),
     ToolDelta {
         id: String,
         name: String,
@@ -5839,6 +5853,7 @@ mod tests {
             channel_id: "desk".to_string(),
             user_id: "u1".to_string(),
             username: "Alice".to_string(),
+            wait_background_tasks: false,
         }
     }
 

@@ -111,8 +111,9 @@ impl Tool for AcpFsReadTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let provider = self.provider.clone();
         async move {
             let args: FsReadArgs = serde_json::from_value(arguments).map_err(|_| {
@@ -221,8 +222,9 @@ impl Tool for AcpFsWriteTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let provider = self.provider.clone();
         async move {
             let args: FsWriteArgs = serde_json::from_value(arguments)
@@ -285,8 +287,9 @@ impl Tool for AcpBashTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let provider = self.provider.clone();
         async move {
             let args: BashArgs = serde_json::from_value(arguments)

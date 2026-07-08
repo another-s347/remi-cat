@@ -97,6 +97,14 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/chat/sessions/{id}/runs/active",
             get(active_web_session_run),
         )
+        .route(
+            "/api/v1/chat/sessions/{id}/tool-tasks",
+            get(list_web_tool_tasks),
+        )
+        .route(
+            "/api/v1/chat/tool-tasks/{id}",
+            get(get_web_tool_task).delete(cancel_web_tool_task),
+        )
         .route("/api/v1/chat/runs/{id}", delete(cancel_web_run))
         .route("/api/v1/chat/approvals/{id}", post(decide_web_approval))
         .route(
@@ -726,6 +734,42 @@ async fn active_web_session_run(
     Ok(Json(web_handle(&state)?.active_run(id).await?))
 }
 
+async fn list_web_tool_tasks(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<bot_core::ToolTaskRecord>>, AdminError> {
+    require_web_session(&state, &id).await?;
+    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
+        .map_err(|err| AdminError::internal(err.to_string()))?;
+    Ok(Json(manager.list(Some(&id)).await))
+}
+
+async fn get_web_tool_task(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<bot_core::ToolTaskRecord>, AdminError> {
+    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
+        .map_err(|err| AdminError::internal(err.to_string()))?;
+    manager
+        .get(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AdminError::not_found("tool task not found".into()))
+}
+
+async fn cancel_web_tool_task(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<bot_core::ToolTaskRecord>, AdminError> {
+    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
+        .map_err(|err| AdminError::internal(err.to_string()))?;
+    manager
+        .cancel(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AdminError::not_found("tool task not found".into()))
+}
+
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     run_id: String,
@@ -1104,6 +1148,13 @@ impl AdminError {
     fn conflict(message: String) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message,
+        }
+    }
+
+    fn internal(message: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
         }
     }

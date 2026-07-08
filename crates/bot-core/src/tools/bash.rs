@@ -48,20 +48,17 @@ impl Tool for WorkspaceBashTool {
     fn description(&self) -> &str {
         "Execute a bash command in the workspace. Relative paths resolve in the \
          same workspace used by fs_read/fs_write. Pass `named` to reuse a shell \
-         and preserve state such as cd and exported variables. If a command \
-         times out it keeps running and returns a pid; call bash again with \
-         that pid and action=poll or action=cancel."
+         and preserve state such as cd and exported variables. Long-running \
+         commands are managed by the background tool task system."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command":    { "type": "string",  "description": "Shell command to execute" },
-                "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." },
-                "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds" },
-                "pid":        { "type": "string",  "description": "Existing bash task pid returned after a timeout" },
-                "action":     { "type": "string",  "enum": ["poll", "cancel"], "description": "Action for an existing pid. Defaults to poll when pid is provided." }
-            }
+                "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." }
+            },
+            "required": ["command"]
         })
     }
     fn execute(
@@ -69,51 +66,22 @@ impl Tool for WorkspaceBashTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         async move {
-            let pid = arguments["pid"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
-            let action = arguments["action"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("poll")
-                .to_ascii_lowercase();
-            if let Some(pid) = pid {
-                return Ok(ToolResult::Output(
-                    stream! {
-                        let result = match action.as_str() {
-                            "poll" => sandbox.bash_poll(&pid).await,
-                            "cancel" => sandbox.bash_cancel(&pid).await,
-                            other => Err(anyhow::anyhow!("unsupported bash action `{other}`")),
-                        };
-                        match result {
-                            Ok(output) => {
-                                let value = bash_task_json(output, &redactor);
-                                yield ToolOutput::text(json_text(value));
-                            }
-                            Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
-                        }
-                    }
-                    .boxed(),
-                ));
-            }
             let command = arguments["command"]
                 .as_str()
-                .ok_or_else(|| AgentError::tool("bash", "missing 'command' or 'pid'"))?
+                .ok_or_else(|| AgentError::tool("bash", "missing 'command'"))?
                 .to_string();
             let named = arguments["named"]
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
+            let timeout_ms = u64::MAX / 2;
             let cancel = Some(ctx.runtime().cancellation());
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));

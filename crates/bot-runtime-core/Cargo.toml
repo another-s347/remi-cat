@@ -12,7 +12,7 @@ publish = false
 doctest = false
 
 [dependencies]
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "5c25771633d7c9ec2f36316fa6df625ef104c936", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "2d429ffd261b405fa8e1f8434747b22f8a264ccf", features = [
     "tracing-langsmith",
 ] }
 anyhow = "1"

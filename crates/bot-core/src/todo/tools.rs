@@ -409,7 +409,7 @@ impl Tool for TodoAddTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let request = parse_add_request(arguments)?;
         let result = self.backend.add_batch(ctx, request).await?;
         Ok(ToolResult::Output(stream! {
@@ -453,7 +453,7 @@ impl Tool for TodoListTool {
         _arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let todos = self.backend.list(ctx).await;
         let text = fmt_todos(&todos);
         Ok(ToolResult::Output(
@@ -495,7 +495,7 @@ impl Tool for TodoCompleteTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let id = arguments["id"]
             .as_u64()
             .ok_or_else(|| AgentError::tool("todo__complete", "missing 'id'"))?;
@@ -538,7 +538,7 @@ impl Tool for TodoUpdateTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let id = arguments["id"]
             .as_u64()
             .ok_or_else(|| AgentError::tool("todo__update", "missing 'id'"))?;
@@ -587,7 +587,7 @@ impl Tool for TodoRemoveTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let id = arguments["id"]
             .as_u64()
             .ok_or_else(|| AgentError::tool("todo__remove", "missing 'id'"))?;

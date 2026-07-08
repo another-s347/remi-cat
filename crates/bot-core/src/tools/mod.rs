@@ -329,8 +329,9 @@ impl Tool for RootedFsReadTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         let tool_ctx = ctx.clone();
@@ -539,8 +540,9 @@ impl Tool for RootedFsWriteTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
@@ -647,8 +649,9 @@ impl Tool for RootedFsApplyPatchTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         async move {
             let patch = arguments["patch"]
@@ -1068,8 +1071,9 @@ impl Tool for RootedFsCreateTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
@@ -1142,8 +1146,9 @@ impl Tool for RootedFsRemoveTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         async move {
             let path_str = arguments["path"]
@@ -1218,8 +1223,9 @@ impl Tool for RootedFsLsTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         async move {
@@ -1304,8 +1310,9 @@ impl Tool for RipgrepTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let sandbox = Arc::clone(&self.sandbox);
         let redactor = Arc::clone(&self.redactor);
         let cancel = Some(ctx.runtime().cancellation());
@@ -1576,8 +1583,9 @@ impl Tool for ExaSearchTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let default_n = self.num_results;
         async move {
             let api_key = match std::env::var("EXA_API_KEY") {
@@ -1689,6 +1697,7 @@ mod tests {
         parse_rg_query, parse_ssh_target, parse_timezone_spec, rg_args_from_arguments, rg_command,
         ssh_command_args, validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool,
         RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
+        WorkspaceSshTool,
     };
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use bot_runtime_core::ToolContext;
@@ -1830,118 +1839,28 @@ mod tests {
         collect_tool_content(result).await.text_content()
     }
 
-    #[tokio::test]
-    async fn bash_tool_timeout_returns_pid_and_poll_completes() {
-        let root = test_root();
-        tokio::fs::create_dir_all(&root)
-            .await
-            .expect("test root should be created");
-        let tool = WorkspaceBashTool::new(
-            Arc::new(NoSandbox::new(root.clone())),
+    #[test]
+    fn bash_and_ssh_schemas_do_not_expose_legacy_task_fields() {
+        let bash = WorkspaceBashTool::new(
+            Arc::new(NoSandbox::new(test_root())),
             Arc::new(RwLock::new(SecretRedactor::empty())),
         );
-        let ctx = test_tool_context();
+        let ssh = WorkspaceSshTool::new(Arc::new(RwLock::new(SecretRedactor::empty())));
 
-        let started = collect_tool_text(
-            <WorkspaceBashTool as Tool>::execute(
-                &tool,
-                json!({
-                    "command": "echo start; sleep 0.2; echo done",
-                    "timeout_ms": 10
-                }),
-                None,
-                ctx.clone(),
-            )
-            .await
-            .expect("bash start should succeed"),
-        )
-        .await;
-        let started: serde_json::Value =
-            serde_json::from_str(&started).expect("timeout output should be json");
-        assert_eq!(started["status"], "running");
-        assert_eq!(started["timed_out"], true);
-        let pid = started["pid"]
-            .as_str()
-            .expect("timeout output should include pid")
-            .to_string();
-
-        let mut combined_stdout = started["stdout"].as_str().unwrap_or_default().to_string();
-        let mut completed = None;
-        for _ in 0..100 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let polled = collect_tool_text(
-                <WorkspaceBashTool as Tool>::execute(
-                    &tool,
-                    json!({ "pid": pid, "action": "poll" }),
-                    None,
-                    ctx.clone(),
-                )
-                .await
-                .expect("bash poll should succeed"),
-            )
-            .await;
-            let polled: serde_json::Value =
-                serde_json::from_str(&polled).expect("poll output should be json");
-            combined_stdout.push_str(polled["stdout"].as_str().unwrap_or_default());
-            if polled["status"] == "completed" {
-                completed = Some(polled);
-                break;
+        for schema in [
+            <WorkspaceBashTool as Tool>::parameters_schema(&bash),
+            <WorkspaceSshTool as Tool>::parameters_schema(&ssh),
+        ] {
+            let properties = schema["properties"]
+                .as_object()
+                .expect("tool schema should contain properties");
+            for legacy in ["timeout_ms", "pid", "action", "running"] {
+                assert!(
+                    !properties.contains_key(legacy),
+                    "{legacy} should be managed by the background task layer, not tool schema"
+                );
             }
         }
-
-        let completed = completed.expect("bash task should complete");
-        assert_eq!(completed["exit_code"], 0);
-        assert!(combined_stdout.contains("start"));
-        assert!(combined_stdout.contains("done"));
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn bash_tool_timeout_task_can_be_cancelled() {
-        let root = test_root();
-        tokio::fs::create_dir_all(&root)
-            .await
-            .expect("test root should be created");
-        let tool = WorkspaceBashTool::new(
-            Arc::new(NoSandbox::new(root.clone())),
-            Arc::new(RwLock::new(SecretRedactor::empty())),
-        );
-        let ctx = test_tool_context();
-
-        let started = collect_tool_text(
-            <WorkspaceBashTool as Tool>::execute(
-                &tool,
-                json!({ "command": "sleep 5", "timeout_ms": 10 }),
-                None,
-                ctx.clone(),
-            )
-            .await
-            .expect("bash start should succeed"),
-        )
-        .await;
-        let started: serde_json::Value =
-            serde_json::from_str(&started).expect("timeout output should be json");
-        let pid = started["pid"]
-            .as_str()
-            .expect("timeout output should include pid")
-            .to_string();
-
-        let cancelled = collect_tool_text(
-            <WorkspaceBashTool as Tool>::execute(
-                &tool,
-                json!({ "pid": pid, "action": "cancel" }),
-                None,
-                ctx.clone(),
-            )
-            .await
-            .expect("bash cancel should succeed"),
-        )
-        .await;
-        let cancelled: serde_json::Value =
-            serde_json::from_str(&cancelled).expect("cancel output should be json");
-        assert_eq!(cancelled["status"], "cancelled");
-        assert_eq!(cancelled["message"], "bash task cancelled");
-        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]

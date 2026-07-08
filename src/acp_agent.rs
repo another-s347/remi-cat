@@ -666,6 +666,15 @@ impl AcpEventForwarder {
                 } => {
                     send_tool_result(&self.cx, self.session_id.clone(), id, name, result, success)?;
                 }
+                CatEvent::ToolTaskCompleted(task) => {
+                    self.send_thought_chunk(format!(
+                        "Background task {} ({}) completed with status {} in {}ms.",
+                        task.task_id,
+                        task.tool_name,
+                        task.status,
+                        task.elapsed_ms.unwrap_or(0)
+                    ))?;
+                }
                 CatEvent::ToolApprovalRequested(request) => {
                     self.handle_tool_approval(request).await?;
                 }

@@ -38,8 +38,9 @@ impl Tool for ManageYourselfTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         async move {
             let command = arguments
                 .get("command")
@@ -199,8 +200,9 @@ impl Tool for NowTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         async move {
             use chrono::{Datelike, FixedOffset, TimeZone, Timelike, Utc, Weekday};
 
@@ -375,8 +377,9 @@ impl Tool for SleepTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         async move {
             let seconds = arguments["seconds"]
                 .as_f64()

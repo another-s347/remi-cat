@@ -11,6 +11,7 @@ pub(crate) enum AppCommand {
     Setup(Vec<String>),
     Doctor,
     Tools(ToolsArgs),
+    Tasks(TasksCommand),
     Hooks(HooksCommand),
     Secrets(SecretCommand),
     ConfigSet(Vec<String>),
@@ -133,6 +134,12 @@ struct RunArgs {
         help = "CLI display name"
     )]
     username: String,
+
+    #[arg(
+        long = "wait-background-tasks",
+        help = "In one-shot CLI/prompt mode, wait for background tool tasks to finish before exiting"
+    )]
+    wait_background_tasks: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +153,8 @@ enum CliCommand {
     Doctor,
     #[command(about = "List all runtime-registered tools with configuration diagnostics")]
     Tools(ToolsArgs),
+    #[command(about = "List, inspect, or cancel background tool tasks")]
+    Tasks(TasksArgs),
     #[command(about = "List, trust, enable, or disable Remi hooks")]
     Hooks(HooksArgs),
     #[command(alias = "secret", about = "List, read, set, or delete secrets")]
@@ -221,6 +230,40 @@ struct SetupArgs {
 pub(crate) struct ToolsArgs {
     #[arg(long, help = "Print machine-readable JSON")]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TasksCommand {
+    List { json: bool },
+    Get { task_id: String, json: bool },
+    Cancel { task_id: String, json: bool },
+}
+
+#[derive(Debug, Args)]
+struct TasksArgs {
+    #[command(subcommand)]
+    command: Option<TasksCliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TasksCliCommand {
+    #[command(about = "List background tool tasks")]
+    List {
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Show one background tool task")]
+    Get {
+        task_id: String,
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Cancel one background tool task")]
+    Cancel {
+        task_id: String,
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -481,6 +524,11 @@ enum IssueCliCommand {
 struct LocalChatArgs {
     #[command(flatten)]
     common: LocalCommonArgs,
+    #[arg(
+        long = "wait-background-tasks",
+        help = "When MESSAGE is provided, wait for background tool tasks to finish before exiting"
+    )]
+    wait_background_tasks: bool,
     #[arg(trailing_var_arg = true, value_name = "MESSAGE")]
     message: Vec<String>,
 }
@@ -489,6 +537,11 @@ struct LocalChatArgs {
 struct PromptArgs {
     #[command(flatten)]
     common: LocalCommonArgs,
+    #[arg(
+        long = "wait-background-tasks",
+        help = "Wait for background tool tasks to finish before exiting"
+    )]
+    wait_background_tasks: bool,
     #[arg(required = true, trailing_var_arg = true, value_name = "PROMPT")]
     prompt: Vec<String>,
 }
@@ -838,6 +891,7 @@ pub(crate) struct CliConfig {
     pub(crate) channel_id: String,
     pub(crate) user_id: String,
     pub(crate) username: String,
+    pub(crate) wait_background_tasks: bool,
 }
 
 impl CliConfig {
@@ -857,6 +911,7 @@ impl CliConfig {
         let mut channel_id = CLI_CHAT_ID.to_string();
         let mut user_id = CLI_USER_ID.to_string();
         let mut username = CLI_USERNAME.to_string();
+        let mut wait_background_tasks = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -915,6 +970,9 @@ impl CliConfig {
                     username = next_arg(args, i)?;
                     i += 1;
                 }
+                "--wait-background-tasks" => {
+                    wait_background_tasks = true;
+                }
                 value if enabled && !value.starts_with('-') => {
                     once = Some(args[i..].join(" "));
                     break;
@@ -939,6 +997,7 @@ impl CliConfig {
             channel_id,
             user_id,
             username,
+            wait_background_tasks,
         })
     }
 }
@@ -995,6 +1054,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Setup(args)) => Ok(AppCommand::Setup(args.entries)),
         Some(CliCommand::Doctor) => Ok(AppCommand::Doctor),
         Some(CliCommand::Tools(args)) => Ok(AppCommand::Tools(args)),
+        Some(CliCommand::Tasks(args)) => Ok(AppCommand::Tasks(tasks_cli_to_command(args))),
         Some(CliCommand::Hooks(args)) => Ok(AppCommand::Hooks(hooks_cli_to_command(args))),
         Some(CliCommand::Secrets(args)) => Ok(AppCommand::Secrets(secret_cli_to_command(args))),
         Some(CliCommand::Config(args)) => match args.command {
@@ -1079,6 +1139,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             channel_id: CLI_CHAT_ID.to_string(),
             user_id: CLI_USER_ID.to_string(),
             username: CLI_USERNAME.to_string(),
+            wait_background_tasks: false,
         })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
     }
@@ -1136,6 +1197,17 @@ fn hooks_cli_to_command(args: HooksArgs) -> HooksCommand {
         HooksCliCommand::Trust { hash } => HooksCommand::Trust { hash },
         HooksCliCommand::Enable { hash } => HooksCommand::Enable { hash },
         HooksCliCommand::Disable { hash } => HooksCommand::Disable { hash },
+    }
+}
+
+fn tasks_cli_to_command(args: TasksArgs) -> TasksCommand {
+    match args
+        .command
+        .unwrap_or(TasksCliCommand::List { json: false })
+    {
+        TasksCliCommand::List { json } => TasksCommand::List { json },
+        TasksCliCommand::Get { task_id, json } => TasksCommand::Get { task_id, json },
+        TasksCliCommand::Cancel { task_id, json } => TasksCommand::Cancel { task_id, json },
     }
 }
 
@@ -1305,6 +1377,7 @@ fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
         channel_id: args.common.channel_id,
         user_id: args.common.user_id,
         username: args.common.username,
+        wait_background_tasks: args.wait_background_tasks,
     }
 }
 
@@ -1343,6 +1416,7 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         channel_id,
         user_id,
         username,
+        wait_background_tasks: false,
     }
 }
 
@@ -1358,6 +1432,7 @@ fn prompt_args_to_config(args: PromptArgs) -> CliConfig {
         channel_id: args.common.channel_id,
         user_id: args.common.user_id,
         username: args.common.username,
+        wait_background_tasks: args.wait_background_tasks,
     }
 }
 
@@ -1382,6 +1457,7 @@ fn run_args_to_config(args: RunArgs) -> anyhow::Result<CliConfig> {
         channel_id: args.channel_id,
         user_id: args.user_id,
         username: args.username,
+        wait_background_tasks: args.wait_background_tasks,
     })
 }
 

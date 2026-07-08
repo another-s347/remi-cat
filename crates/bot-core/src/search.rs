@@ -121,7 +121,7 @@ impl<S: SkillStore + 'static> Tool for SearchTool<S> {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let query = arguments["query"]
             .as_str()
             .ok_or_else(|| AgentError::tool("search", "missing 'query'"))?

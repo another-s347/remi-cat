@@ -226,8 +226,9 @@ impl Tool for AskUserQuestionTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let manager = Arc::clone(&self.manager);
         let metadata = ctx.metadata();
         let thread_id = metadata

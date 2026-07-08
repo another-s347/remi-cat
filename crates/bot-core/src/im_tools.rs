@@ -503,8 +503,9 @@ impl Tool for FetchTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let root = self.root.clone();
         let path_rules = self.path_rules.clone();
         let bridge = self.bridge.clone();
@@ -694,8 +695,9 @@ impl Tool for ImUploadTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let root = self.root.clone();
         let path_rules = self.path_rules.clone();
         let bridge = Arc::clone(&self.bridge);

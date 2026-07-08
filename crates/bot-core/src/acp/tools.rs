@@ -113,8 +113,9 @@ impl Tool for AcpChatTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let backend = Arc::clone(&self.backend);
         let approval_manager = Arc::clone(&self.approval_manager);
         let tool_name = self.name.clone();

@@ -467,6 +467,11 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
             WebChatCommand::Cancel { run_id, response } => {
                 let cancelled = active.borrow_mut().remove(&run_id).map(|run| {
                     run.cancel.cancel();
+                    let runtime = Rc::clone(&runtime);
+                    let session_id = run.session_id.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = runtime.bot.cancel_background_tasks(&session_id).await;
+                    });
                     run.handle.abort();
                     true
                 });
@@ -486,9 +491,17 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 for run_id in run_ids {
                     if let Some(run) = active.borrow_mut().remove(&run_id) {
                         run.cancel.cancel();
+                        let runtime = Rc::clone(&runtime);
+                        let session_id = run.session_id.clone();
+                        tokio::task::spawn_local(async move {
+                            let _ = runtime.bot.cancel_background_tasks(&session_id).await;
+                        });
                         run.handle.abort();
                         cancelled = true;
                     }
+                }
+                if !cancelled {
+                    let _ = runtime.bot.cancel_background_tasks(&session_id).await;
                 }
                 let _ = response.send(cancelled);
             }

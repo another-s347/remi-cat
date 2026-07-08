@@ -2,6 +2,7 @@ use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::channel::cli::{process_cli_message, process_prompt_message};
 use crate::channel::feishu::im_mode_from_env;
@@ -15,7 +16,7 @@ use crate::channel::Channel;
 pub(crate) use crate::cli::UpdateCommand;
 pub(crate) use crate::cli::{
     parse_cli_args, try_parse_cli_args, AcpAdapterCommand, AcpCommand, AppCommand, CliConfig,
-    FeishuCommand, CLI_USER_ID,
+    FeishuCommand, TasksCommand, CLI_USER_ID,
 };
 #[cfg(test)]
 pub(crate) use crate::cli::{parse_command, parse_global_args};
@@ -187,6 +188,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
         AppCommand::Hooks(command) => {
             run_hooks_command(&selected_profile, &data_dir, command).await?;
+            return Ok(());
+        }
+        AppCommand::Tasks(command) => {
+            run_tasks_command(&data_dir, &command).await?;
             return Ok(());
         }
         AppCommand::Secrets(command) => {
@@ -361,7 +366,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let cli = match &command {
         AppCommand::Run(cli) => cli.clone(),
-        AppCommand::Tools(_) => CliConfig {
+        AppCommand::Tools(_) | AppCommand::Tasks(_) => CliConfig {
             enabled: false,
             tui: false,
             resume: false,
@@ -372,6 +377,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             channel_id: CLI_CHAT_ID.to_string(),
             user_id: CLI_USER_ID.to_string(),
             username: CLI_USERNAME.to_string(),
+            wait_background_tasks: false,
         },
         _ => unreachable!(),
     };
@@ -471,9 +477,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
                     process_prompt_message(Rc::clone(&runtime), &cli, message).await?;
+                    wait_for_cli_background_tasks(Rc::clone(&runtime), &cli).await;
                     return Ok(());
                 }
                 process_cli_message(Rc::clone(&runtime), &cli, message).await?;
+                wait_for_cli_background_tasks(Rc::clone(&runtime), &cli).await;
                 return Ok(());
             }
             if cli.enabled {
@@ -568,6 +576,74 @@ async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> 
     Ok(())
 }
 
+async fn wait_for_cli_background_tasks(runtime: Rc<Runtime>, cli: &CliConfig) {
+    if !cli.wait_background_tasks {
+        return;
+    }
+    while runtime.bot.is_thread_running(&cli.channel_id).await {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn run_tasks_command(data_dir: &Path, command: &TasksCommand) -> anyhow::Result<()> {
+    let manager = bot_core::ToolTaskManager::load(data_dir)?;
+    match command {
+        TasksCommand::List { json } => {
+            let tasks = manager.list(None).await;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
+                println!("no background tool tasks");
+            } else {
+                for task in tasks {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}ms",
+                        task.task_id,
+                        task.status,
+                        task.thread_id,
+                        task.tool_name,
+                        task.elapsed_ms.unwrap_or(0)
+                    );
+                }
+            }
+        }
+        TasksCommand::Get { task_id, json } => {
+            let task = manager.get(task_id).await;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else if let Some(task) = task {
+                println!("task_id: {}", task.task_id);
+                println!("status: {}", task.status);
+                println!("thread_id: {}", task.thread_id);
+                println!("tool: {}", task.tool_name);
+                println!("elapsed_ms: {}", task.elapsed_ms.unwrap_or(0));
+                if let Some(message) = task.message {
+                    println!("message: {message}");
+                }
+                if !task.recent_output.is_empty() {
+                    println!("recent_output:\n{}", task.recent_output.join("\n"));
+                }
+                if let Some(result) = task.result_preview {
+                    println!("result:\n{result}");
+                }
+            } else {
+                anyhow::bail!("task not found: {task_id}");
+            }
+        }
+        TasksCommand::Cancel { task_id, json } => {
+            let task = manager.cancel(task_id).await;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else if let Some(task) = task {
+                println!("{} {}", task.task_id, task.status);
+            } else {
+                anyhow::bail!("task not found: {task_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn current_workspace_dir(data_dir: &Path) -> PathBuf {
     std::env::var_os("REMI_SANDBOX_HOST_DIR")
         .map(PathBuf::from)
@@ -636,8 +712,8 @@ mod cli_tests {
         build_cargo_install_args, extract_first_url, extract_lark_cli_config_from_json,
         feedback_repo, feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
         first_available_port, format_context_compaction_line, format_feishu_tool_line,
-        github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_command,
-        parse_global_args, parse_goal_max_rounds, parse_release_version,
+        github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_cli_args,
+        parse_command, parse_global_args, parse_goal_max_rounds, parse_release_version,
         parse_workflow_start_options, percent_encode_query, prefix_short_config_entry,
         redact_known_secrets, run_streaming_command, run_streaming_command_with_stdin,
         should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
@@ -1616,6 +1692,14 @@ mod cli_tests {
     }
 
     #[test]
+    fn cli_message_can_wait_for_background_tasks() {
+        let config =
+            CliConfig::from_args(&args(&["--wait-background-tasks", "-m", "hello"])).unwrap();
+        assert!(config.wait_background_tasks);
+        assert_eq!(config.once.as_deref(), Some("hello"));
+    }
+
+    #[test]
     fn prompt_flag_accepts_prompt_tail_and_session() {
         let config =
             CliConfig::from_args(&args(&["-p", "--session", "lme-demo", "hello", "world"]))
@@ -1631,6 +1715,24 @@ mod cli_tests {
         let config = CliConfig::from_args(&args(&["prompt", "--session", "s1", "hello"])).unwrap();
         assert!(config.enabled);
         assert!(config.pure_prompt);
+        assert_eq!(config.channel_id, "s1");
+        assert_eq!(config.once.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn prompt_subcommand_can_wait_for_background_tasks() {
+        let parsed = parse_cli_args(&args(&[
+            "prompt",
+            "--wait-background-tasks",
+            "--session",
+            "s1",
+            "hello",
+        ]))
+        .unwrap();
+        let AppCommand::Run(config) = parsed.command else {
+            panic!("expected run command");
+        };
+        assert!(config.wait_background_tasks);
         assert_eq!(config.channel_id, "s1");
         assert_eq!(config.once.as_deref(), Some("hello"));
     }

@@ -90,7 +90,7 @@ impl Tool for DynamicTool {
         arguments: serde_json::Value,
         resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl futures::Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl futures::Stream<Item = ToolOutput> + 'static>, AgentError> {
         (self.handler)(arguments, resume, ctx).await
     }
 }

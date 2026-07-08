@@ -204,6 +204,8 @@ pub enum CatEvent {
         success: bool,
         elapsed_ms: u64,
     },
+    /// A background tool task completed after the foreground tool call timed out.
+    ToolTaskCompleted(crate::tool_tasks::ToolTaskRecord),
     /// Token usage + elapsed time stats for the completed run.
     Stats {
         prompt_tokens: u32,

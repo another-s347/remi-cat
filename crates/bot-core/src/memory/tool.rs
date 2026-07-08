@@ -72,7 +72,7 @@ impl Tool for MemoryGetDetailTool {
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let uuid = args["uuid"].as_str().unwrap_or("").to_string();
         let name = args["name"].as_str().unwrap_or("").to_string();
         let thread_id = memory_thread_id_from_args_or_context(
@@ -147,7 +147,7 @@ impl Tool for MemoryUpsertNamedTool {
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let name = args
             .get("name")
             .and_then(|value| value.as_str())
@@ -244,7 +244,7 @@ impl Tool for MemoryRecallTool {
         args: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         let query = args
             .get("query")
             .and_then(|value| value.as_str())
@@ -420,7 +420,7 @@ mod tests {
         )
     }
 
-    async fn collect_text(result: ToolResult<impl Stream<Item = ToolOutput>>) -> String {
+    async fn collect_text(result: ToolResult<impl Stream<Item = ToolOutput> + 'static>) -> String {
         match result {
             ToolResult::Interrupt(_) => "interrupted".to_string(),
             ToolResult::Output(output) => {

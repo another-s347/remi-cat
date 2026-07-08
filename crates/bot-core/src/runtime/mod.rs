@@ -354,6 +354,7 @@ pub struct CatBot {
     approval_manager: Arc<ToolApprovalManager>,
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
+    tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
     run_locks: ThreadRunLocks,
     active_steers: ActiveSteerQueues,
     model_profile: ModelProfileConfig,
@@ -1258,8 +1259,11 @@ impl CatBot {
 
     pub async fn is_thread_running(&self, thread_id: &str) -> bool {
         let lock = self.thread_run_lock(thread_id).await;
-        let running = lock.try_lock().is_err();
-        running
+        lock.try_lock().is_err() || self.tool_tasks.is_thread_running(thread_id).await
+    }
+
+    pub async fn cancel_background_tasks(&self, thread_id: &str) -> Vec<crate::ToolTaskRecord> {
+        self.tool_tasks.cancel_thread(thread_id).await
     }
 
     pub async fn acp_bound_message(
@@ -2181,10 +2185,36 @@ impl CatBot {
                     },
                 );
                 let mut inner_stream = std::pin::pin!(inner_stream);
+                let mut completed_tool_tasks = self.tool_tasks.subscribe_completed();
 
-                while let Some(ev) = inner_stream.next().await {
+                loop {
+                    let ev = tokio::select! {
+                        ev = inner_stream.next() => {
+                            let Some(ev) = ev else {
+                                break;
+                            };
+                            ev
+                        }
+                        completed = completed_tool_tasks.recv() => {
+                            if let Ok(task) = completed {
+                                if task.thread_id == thread_id_owned {
+                                    yield CatEvent::ToolTaskCompleted(task);
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     match ev {
                         CatEvent::Cancelled => {
+                            let cancelled_tasks =
+                                self.cancel_background_tasks(&thread_id_owned).await;
+                            if !cancelled_tasks.is_empty() {
+                                tracing::info!(
+                                    thread_id = %thread_id_owned,
+                                    cancelled_task_count = cancelled_tasks.len(),
+                                    "agent_turn.cancelled_background_tasks"
+                                );
+                            }
                             tracing::info!(
                                 thread_id = %thread_id_owned,
                                 model_profile = %effective_model.profile.id,
@@ -2533,6 +2563,15 @@ impl CatBot {
                                         continue 'workflow_loop;
                                     }
                                 }
+                                while self.tool_tasks.is_thread_running(&thread_id_owned).await {
+                                    match completed_tool_tasks.recv().await {
+                                        Ok(task) if task.thread_id == thread_id_owned => {
+                                            yield CatEvent::ToolTaskCompleted(task);
+                                        }
+                                        Ok(_) => {}
+                                        Err(_) => break,
+                                    }
+                                }
                                 yield CatEvent::Done;
                                 return;
                             }
@@ -2698,6 +2737,7 @@ struct LocalToolDeps {
     approval_reviewer: Option<Arc<ModelApprovalReviewer>>,
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
+    tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
     overflow_bytes: usize,
     acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
 }
@@ -2729,6 +2769,7 @@ impl LocalToolDeps {
             approval_reviewer: self.approval_reviewer.clone(),
             user_question_manager: Arc::clone(&self.user_question_manager),
             hook_manager: Arc::clone(&self.hook_manager),
+            tool_tasks: Arc::clone(&self.tool_tasks),
             overflow_bytes: self.overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         }
@@ -3076,6 +3117,8 @@ impl CatBotBuilder {
         let approval_manager = ToolApprovalManager::new();
         let user_question_manager = UserQuestionManager::new();
         let hook_manager = HookManager::new(workspace_root.clone(), data_dir.clone());
+        let tool_tasks = crate::tool_tasks::ToolTaskManager::load(&data_dir)
+            .map_err(|err| AgentError::other(format!("load tool task store: {err:#}")))?;
         let acp_backend = Arc::new(acp::AcpBackend::new(
             data_dir.clone(),
             self.im_bridge.clone(),
@@ -3114,6 +3157,7 @@ impl CatBotBuilder {
             approval_reviewer: Some(Arc::clone(&approval_reviewer)),
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
+            tool_tasks: Arc::clone(&tool_tasks),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         };
@@ -3149,6 +3193,7 @@ impl CatBotBuilder {
                 approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
+                tool_tasks: Arc::clone(&tool_tasks),
             },
             memory: Arc::clone(&memory),
             run_locks: Arc::clone(&run_locks),
@@ -3173,6 +3218,7 @@ impl CatBotBuilder {
             approval_reviewer: Some(Arc::clone(&approval_reviewer)),
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
+            tool_tasks: Arc::clone(&tool_tasks),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         };
@@ -3215,6 +3261,7 @@ impl CatBotBuilder {
                         approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                         user_question_manager: Arc::clone(&user_question_manager),
                         hook_manager: Arc::clone(&hook_manager),
+                        tool_tasks: Arc::clone(&tool_tasks),
                     },
                 );
             }
@@ -3300,6 +3347,7 @@ impl CatBotBuilder {
                 approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
+                tool_tasks: Arc::clone(&tool_tasks),
                 overflow_bytes,
                 acp_client_tools: self.acp_client_tools.clone(),
             };
@@ -3339,6 +3387,7 @@ impl CatBotBuilder {
                             approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                             user_question_manager: Arc::clone(&user_question_manager),
                             hook_manager: Arc::clone(&hook_manager),
+                            tool_tasks: Arc::clone(&tool_tasks),
                         },
                     );
                 }
@@ -3362,6 +3411,7 @@ impl CatBotBuilder {
                 approval_reviewer: Some(Arc::clone(&approval_reviewer)),
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
+                tool_tasks: Arc::clone(&tool_tasks),
             },
             model_agents,
             agent_runtimes,
@@ -3375,6 +3425,7 @@ impl CatBotBuilder {
             approval_manager,
             user_question_manager,
             hook_manager,
+            tool_tasks,
             run_locks,
             active_steers,
             model_profile: profile,
@@ -3571,12 +3622,13 @@ impl Tool for RemiSubAgentTool {
         self.parameters_schema.clone()
     }
 
+    #[allow(refining_impl_trait)]
     async fn execute(
         &self,
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
-    ) -> Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError> {
+    ) -> Result<ToolResult<remi_agentloop::tool::BoxedToolStream>, AgentError> {
         let task = arguments
             .get("task")
             .and_then(serde_json::Value::as_str)
@@ -3621,6 +3673,7 @@ impl Tool for RemiSubAgentTool {
             approval_reviewer: self.deps.approval_reviewer.clone(),
             user_question_manager: Arc::clone(&self.deps.user_question_manager),
             hook_manager: Arc::clone(&self.deps.hook_manager),
+            tool_tasks: Arc::clone(&self.deps.tool_tasks),
         };
         let sub_thread_id = ThreadId(match named.as_deref() {
             Some(named) => format!("subagent:{}:{named}", self.agent_name),
@@ -3630,6 +3683,9 @@ impl Tool for RemiSubAgentTool {
         let sub_thread_id_for_memory = sub_thread_id.0.clone();
         let metadata = subagent_metadata(ctx, &sub_thread_id_for_memory);
         let memory = Arc::clone(&self.deps.memory);
+        let workspace_root = self.deps.workspace_root.clone();
+        let model_name = self.model_name.clone();
+        let hook_manager = Arc::clone(&self.deps.hook_manager);
         let persistent = named.is_some();
         let session_lock = if persistent {
             Some(self.session_lock(&sub_thread_id_for_memory).await)
@@ -3637,7 +3693,7 @@ impl Tool for RemiSubAgentTool {
             None
         };
 
-        Ok(ToolResult::Output(stream! {
+        let output: remi_agentloop::tool::BoxedToolStream = Box::pin(stream! {
             let _session_guard = match session_lock.as_ref() {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
@@ -3646,14 +3702,12 @@ impl Tool for RemiSubAgentTool {
             let sub_hook_context = HookContext {
                 session_id: sub_thread_id_for_memory.clone(),
                 transcript_path: None,
-                cwd: self.deps.workspace_root.clone(),
-                model: Some(self.model_name.clone()),
+                cwd: workspace_root.clone(),
+                model: Some(model_name.clone()),
                 turn_id: Some(sub_run_id.0.clone()),
                 permission_mode: None,
             };
-            let start_hook = self
-                .deps
-                .hook_manager
+            let start_hook = hook_manager
                 .run(
                     HookEventName::SubagentStart,
                     Some(&agent_name),
@@ -3896,9 +3950,7 @@ impl Tool for RemiSubAgentTool {
                             )
                             .await;
                         }
-                        let stop_hook = self
-                            .deps
-                            .hook_manager
+                        let stop_hook = hook_manager
                             .run(
                                 HookEventName::SubagentStop,
                                 Some(&agent_name),
@@ -4019,7 +4071,8 @@ impl Tool for RemiSubAgentTool {
                 &final_output,
                 None,
             ));
-        }))
+        });
+        Ok(ToolResult::Output(output))
     }
 }
 

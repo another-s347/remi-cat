@@ -5,6 +5,7 @@ use remi_agentloop::tool::registry::DefaultToolRegistry;
 use crate::im_tools::register_fetch_tool;
 use crate::memory::{MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
 use crate::search::SearchTool;
+use crate::tool_tasks::ToolTasksTool;
 use crate::tools::{
     ExaSearchTool, ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool,
     RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
@@ -38,6 +39,7 @@ pub(super) fn register_runtime_tools(
         memory_store: Arc::clone(&deps.memory),
         agent_id: agent_id.to_string(),
     });
+    local_tools.register(ToolTasksTool::new(Arc::clone(&deps.tool_tasks)));
     let acp_support = deps
         .acp_client_tools
         .as_ref()

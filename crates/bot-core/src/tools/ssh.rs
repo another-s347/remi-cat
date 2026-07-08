@@ -36,7 +36,7 @@ impl Tool for WorkspaceSshTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a command on a remote host via the host OpenSSH client. Uses the host ~/.ssh/config, keys, and ssh-agent in batch mode; password and inline private-key parameters are not supported. Pass `named` to reuse a remote shell session for the same host/user/port and preserve state such as cd and exported variables. If a command times out it keeps running and returns a pid; call ssh again with that pid and action=poll or action=cancel."
+        "Execute a command on a remote host via the host OpenSSH client. Uses the host ~/.ssh/config, keys, and ssh-agent in batch mode; password and inline private-key parameters are not supported. Pass `named` to reuse a remote shell session for the same host/user/port and preserve state such as cd and exported variables. Long-running commands are managed by the background tool task system."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -47,11 +47,9 @@ impl Tool for WorkspaceSshTool {
                 "user":       { "type": "string",  "description": "Optional SSH username; otherwise OpenSSH config/defaults apply" },
                 "port":       { "type": "integer", "description": "Optional SSH port, 1 through 65535" },
                 "command":    { "type": "string",  "description": "Remote shell command to execute" },
-                "named":      { "type": "string",  "description": "Optional named remote shell session. Calls with the same name preserve state for the same host/user/port." },
-                "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds" },
-                "pid":        { "type": "string",  "description": "Existing ssh task pid returned after a timeout" },
-                "action":     { "type": "string",  "enum": ["poll", "cancel"], "description": "Action for an existing pid. Defaults to poll when pid is provided." }
-            }
+                "named":      { "type": "string",  "description": "Optional named remote shell session. Calls with the same name preserve state for the same host/user/port." }
+            },
+            "required": ["host", "command"]
         })
     }
 
@@ -60,47 +58,17 @@ impl Tool for WorkspaceSshTool {
         arguments: serde_json::Value,
         _resume: Option<ResumePayload>,
         _ctx: ToolContext,
-    ) -> impl std::future::Future<Output = Result<ToolResult<impl Stream<Item = ToolOutput>>, AgentError>>
-    {
+    ) -> impl std::future::Future<
+        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
+    > {
         let runner = Arc::clone(&self.runner);
         let redactor = Arc::clone(&self.redactor);
         async move {
-            let pid = arguments["pid"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
-            let action = arguments["action"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("poll")
-                .to_ascii_lowercase();
-            if let Some(pid) = pid {
-                return Ok(ToolResult::Output(
-                    stream! {
-                        let result = match action.as_str() {
-                            "poll" => runner.poll(&pid).await,
-                            "cancel" => runner.cancel(&pid).await,
-                            other => Err(anyhow::anyhow!("unsupported ssh action `{other}`")),
-                        };
-                        match result {
-                            Ok(output) => {
-                                let value = command_task_json(output, &redactor, "ssh");
-                                yield ToolOutput::text(json_text(value));
-                            }
-                            Err(e) => yield ToolOutput::text(format!("error: {e:#}")),
-                        }
-                    }
-                    .boxed(),
-                ));
-            }
-
             let target =
                 parse_ssh_target(&arguments).map_err(|err| AgentError::tool("ssh", err))?;
             let command = arguments["command"]
                 .as_str()
-                .ok_or_else(|| AgentError::tool("ssh", "missing 'command' or 'pid'"))?
+                .ok_or_else(|| AgentError::tool("ssh", "missing 'command'"))?
                 .to_string();
             let named = arguments["named"]
                 .as_str()
@@ -110,7 +78,7 @@ impl Tool for WorkspaceSshTool {
             if let Some(named) = named.as_deref() {
                 validate_ssh_named(named).map_err(|err| AgentError::tool("ssh", err))?;
             }
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30_000);
+            let timeout_ms = u64::MAX / 2;
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("ssh {} $ {}", target.display(), command));
                 let started = Instant::now();
@@ -351,9 +319,6 @@ impl SshRunner {
                 {
                     let mut task = task.lock().await;
                     match task.status {
-                        SshTaskStatus::Cancelled => {
-                            remove_session = true;
-                        }
                         SshTaskStatus::Running => match result {
                             Ok(exit_code) => {
                                 task.exit_code = Some(exit_code);
@@ -377,14 +342,6 @@ impl SshRunner {
             }
         });
         wait_for_ssh_task(task, timeout_ms).await
-    }
-
-    async fn poll(&self, pid: &str) -> anyhow::Result<SandboxBashOutput> {
-        Ok(self.tasks.poll(pid).await)
-    }
-
-    async fn cancel(&self, pid: &str) -> anyhow::Result<SandboxBashOutput> {
-        Ok(self.tasks.cancel(pid).await)
     }
 }
 
@@ -499,7 +456,6 @@ impl SshSession {
 enum SshTaskStatus {
     Running,
     Completed,
-    Cancelled,
 }
 
 #[derive(Debug)]
@@ -547,47 +503,6 @@ impl SshTaskRegistry {
             }
         }
         None
-    }
-
-    async fn poll(&self, pid: &str) -> SandboxBashOutput {
-        self.prune().await;
-        let task = self.tasks.lock().await.get(pid).cloned();
-        let Some(task) = task else {
-            return ssh_not_found(pid);
-        };
-        let mut task = task.lock().await;
-        match task.status {
-            SshTaskStatus::Running => ssh_output_running(&mut task, false),
-            SshTaskStatus::Completed => {
-                ssh_output_terminal(&mut task, SandboxBashStatus::Completed)
-            }
-            SshTaskStatus::Cancelled => {
-                ssh_output_terminal(&mut task, SandboxBashStatus::Cancelled)
-            }
-        }
-    }
-
-    async fn cancel(&self, pid: &str) -> SandboxBashOutput {
-        self.prune().await;
-        let task = self.tasks.lock().await.get(pid).cloned();
-        let Some(task) = task else {
-            return ssh_not_found(pid);
-        };
-        let os_pid = {
-            let mut task = task.lock().await;
-            if task.status == SshTaskStatus::Running {
-                task.status = SshTaskStatus::Cancelled;
-                task.exit_code = Some(-1);
-                task.message = Some("ssh task cancelled".to_string());
-                task.finished_at = Some(Instant::now());
-            }
-            task.os_pid
-        };
-        if let Some(os_pid) = os_pid {
-            terminate_ssh_process(os_pid).await;
-        }
-        let mut task = task.lock().await;
-        ssh_output_terminal(&mut task, SandboxBashStatus::Cancelled)
     }
 
     async fn prune(&self) {
@@ -703,9 +618,6 @@ async fn wait_for_ssh_task(
                     output.os_pid = None;
                     return Ok(output);
                 }
-                SshTaskStatus::Cancelled => {
-                    return Ok(ssh_output_terminal(&mut task, SandboxBashStatus::Cancelled));
-                }
             }
         }
         tokio::select! {
@@ -745,19 +657,6 @@ fn ssh_output_terminal(task: &mut SshTaskState, status: SandboxBashStatus) -> Sa
         pid: Some(task.pid.clone()),
         os_pid: task.os_pid,
         message: task.message.clone(),
-    }
-}
-
-fn ssh_not_found(pid: &str) -> SandboxBashOutput {
-    SandboxBashOutput {
-        stdout: String::new(),
-        stderr: String::new(),
-        exit_code: -1,
-        timed_out: false,
-        status: SandboxBashStatus::NotFound,
-        pid: Some(pid.to_string()),
-        os_pid: None,
-        message: Some("ssh task not found; it may have completed and expired".to_string()),
     }
 }
 
@@ -819,24 +718,6 @@ fn parse_ssh_marker_line(line: &str, marker: &str) -> Option<i32> {
 
 fn new_ssh_pid() -> String {
     format!("ssh_{}", uuid::Uuid::new_v4().simple())
-}
-
-async fn terminate_ssh_process(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = TokioCommand::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .output()
-            .await;
-    }
-    #[cfg(windows)]
-    {
-        let _ = TokioCommand::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output()
-            .await;
-    }
 }
 
 async fn ensure_ssh_available() -> anyhow::Result<()> {
