@@ -88,6 +88,7 @@ pub enum CoreCancelKind {
 pub enum CoreDriveEvent {
     Text(String),
     Thinking(String),
+    ThinkingDelta(String),
     ToolCallStart {
         id: String,
         name: String,
@@ -191,6 +192,7 @@ impl CoreLoopDriver {
     fn drive_event(&mut self, event: AgentEvent) -> CoreDriveEvent {
         match event {
             AgentEvent::TextDelta(delta) => CoreDriveEvent::Text(delta),
+            AgentEvent::ThinkingDelta(delta) => CoreDriveEvent::ThinkingDelta(delta),
             AgentEvent::ThinkingEnd { content } => CoreDriveEvent::Thinking(content),
             AgentEvent::ToolCallStart { id, name } => CoreDriveEvent::ToolCallStart { id, name },
             AgentEvent::ToolCallArgumentsDelta { id, delta } => {

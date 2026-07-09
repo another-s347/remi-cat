@@ -9,10 +9,10 @@ doctest = false
 [dependencies]
 bot-runtime-core = { path = "../bot-runtime-core" }
 agent-client-protocol = "1.0.1"
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "2d429ffd261b405fa8e1f8434747b22f8a264ccf", features = [
+remi-agentloop = { path = "/home/skye/remi-agentloop/remi-agentloop", features = [
     "tracing-langsmith",
 ] }
-remi-agentloop-deepagent = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop-deepagent", rev = "2d429ffd261b405fa8e1f8434747b22f8a264ccf" }
+remi-agentloop-deepagent = { path = "/home/skye/remi-agentloop/remi-agentloop-deepagent" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"

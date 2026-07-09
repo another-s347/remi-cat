@@ -359,6 +359,9 @@ where
                         CoreDriveEvent::Thinking(content) => {
                             yield CatEvent::Thinking(content);
                         }
+                        CoreDriveEvent::ThinkingDelta(delta) => {
+                            yield CatEvent::Thinking(delta);
+                        }
                         CoreDriveEvent::ToolCallStart { id, name } => {
                             yield CatEvent::ToolCallStart { id, name };
                         }

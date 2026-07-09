@@ -35,7 +35,7 @@ bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
 user-store = { path = "crates/user-store" }
 agent-client-protocol = { version = "1.0.1", features = ["unstable_elicitation"] }
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "2d429ffd261b405fa8e1f8434747b22f8a264ccf", features = [
+remi-agentloop = { path = "/home/skye/remi-agentloop/remi-agentloop", features = [
     "tracing-langsmith",
 ] }
 
