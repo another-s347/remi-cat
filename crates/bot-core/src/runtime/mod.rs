@@ -225,6 +225,21 @@ fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreS
     }
 }
 
+fn try_recv_completed_tool_task(
+    completed_tool_tasks: &mut tokio::sync::broadcast::Receiver<crate::ToolTaskRecord>,
+    thread_id: &str,
+) -> Option<crate::ToolTaskRecord> {
+    loop {
+        match completed_tool_tasks.try_recv() {
+            Ok(task) if task.thread_id == thread_id => return Some(task),
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return None,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+        }
+    }
+}
+
 pub const ASYNC_TOOL_SYSTEM_PROMPT: &str = "\
 Async tool execution:
 - Tool calls can keep running in the background after the foreground observation window closes.
@@ -2694,7 +2709,43 @@ impl CatBot {
                                         continue 'workflow_loop;
                                     }
                                 }
-                                while self.tool_tasks.is_thread_running(&thread_id_owned).await {
+                                loop {
+                                    if let Some(task) = try_recv_completed_tool_task(
+                                        &mut completed_tool_tasks,
+                                        &thread_id_owned,
+                                    ) {
+                                        let fallback_content =
+                                            background_task_completion_content(&task);
+                                        if let Some(steer) = steer_queue.as_ref() {
+                                            steer.push(background_task_completion_steer_input(&task));
+                                        }
+                                        yield CatEvent::ToolTaskCompleted(task);
+                                        if let Some(steer) = steer_queue.as_ref() {
+                                            if let Some(batch) = steer.drain_batch() {
+                                                yield CatEvent::SteerInjected(
+                                                    crate::SteerInjectedEvent {
+                                                        steer_ids: batch.ids.clone(),
+                                                        session_id: thread_id_owned.clone(),
+                                                        preview: batch.preview.clone(),
+                                                        count: batch.count,
+                                                    },
+                                                );
+                                                next_content = batch.content;
+                                                continuation_from_supervisor = false;
+                                                continuation_from_background_task = true;
+                                                continue 'workflow_loop;
+                                            }
+                                        } else {
+                                            next_content = fallback_content;
+                                            continuation_from_supervisor = false;
+                                            continuation_from_background_task = true;
+                                            continue 'workflow_loop;
+                                        }
+                                        continue;
+                                    }
+                                    if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
+                                        break;
+                                    }
                                     tokio::select! {
                                         completed = completed_tool_tasks.recv() => {
                                             match completed {
@@ -4419,11 +4470,12 @@ mod tests {
         insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
         install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
-        system_prompt_with_agent_md_notice, thread_run_lock, AgentModelBindings, CatBotBuilder,
-        CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
-        ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
-        SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
-        ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        system_prompt_with_agent_md_notice, thread_run_lock, try_recv_completed_tool_task,
+        AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds,
+        LlmCompressor, LoopInput, Message, ModelProfileRegistry, PartialTurnRecorder,
+        RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent, ThreadRunLocks,
+        WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE, ASYNC_TOOL_SYSTEM_PROMPT,
+        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
@@ -4553,6 +4605,35 @@ mod tests {
         assert!(text.contains("last line"));
         assert!(text.contains("done"));
         assert_eq!(steer.user_name, None);
+    }
+
+    #[tokio::test]
+    async fn completed_tool_task_buffer_is_drained_before_running_check() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let manager = crate::ToolTaskManager::load(data_dir.path()).unwrap();
+        let mut completed_rx = manager.subscribe_completed();
+        let task_id = manager
+            .start(
+                "thread-1".to_string(),
+                "run-1".to_string(),
+                "call-1".to_string(),
+                "bash".to_string(),
+                json!({"command": "sleep 30"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.enable_completion_notification(&task_id).await;
+        manager
+            .finish(&task_id, true, 30_000, "done".to_string())
+            .await
+            .unwrap();
+
+        assert!(!manager.is_thread_running("thread-1").await);
+        let completed = try_recv_completed_tool_task(&mut completed_rx, "thread-1")
+            .expect("completion event should remain buffered after task stops running");
+        assert_eq!(completed.task_id, task_id);
+        assert_eq!(completed.status, crate::tool_tasks::TOOL_TASK_COMPLETED);
     }
 
     #[test]
