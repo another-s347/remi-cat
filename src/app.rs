@@ -1634,7 +1634,7 @@ mod cli_tests {
             "call-1",
             "manage_yourself",
             &serde_json::json!({"command": "profile agent list default"}),
-            "default\tRemi\tdefault\tsearch, skill__get, todo__add, todo__list, todo__complete, todo__update, todo__remove, memory__upsert_named, memory__get_detail, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, codex, manage_yourself",
+            "default\tRemi\tdefault\tsearch, skill__get, todo__add, todo__list, todo__complete, todo__update, todo__remove, memory__upsert_named, memory__get_detail, tool_tasks, bash, fs_read, fs_write, apply_patch, fs_mkdir, fs_remove, fs_ls, fetch, codex, manage_yourself",
             true,
             511,
         );

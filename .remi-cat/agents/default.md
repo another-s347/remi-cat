@@ -19,6 +19,7 @@ tools:
   - trigger__delete
   - memory__upsert_named
   - memory__get_detail
+  - tool_tasks
   - bash
   - fs_read
   - fs_write

@@ -217,5 +217,6 @@ You are Remi.
             .system_prompt
             .contains("Before starting substantive work, search for"));
         assert!(profile.system_prompt.contains("relevant skills and memory"));
+        assert!(profile.allows_tool("tool_tasks"));
     }
 }

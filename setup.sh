@@ -31,6 +31,7 @@ tools:
   - todo__update
   - todo__remove
   - memory__get_detail
+  - tool_tasks
   - codex
   - manage_yourself
   - fs_read

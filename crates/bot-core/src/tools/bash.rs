@@ -49,7 +49,9 @@ impl Tool for WorkspaceBashTool {
         "Execute a bash command in the workspace. Relative paths resolve in the \
          same workspace used by fs_read/fs_write. Pass `named` to reuse a shell \
          and preserve state such as cd and exported variables. Long-running \
-         commands are managed by the background tool task system."
+         commands are managed by the background tool task system. Prefer \
+         straightforward commands that complete synchronously; if the invoked \
+         program supports its own timeout flag, choose a generous timeout."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
