@@ -51,6 +51,7 @@ pub(crate) struct ChatRequest {
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) command_preprocess: bool,
     pub(crate) sub_session_routing: bool,
+    pub(crate) async_agent: bool,
 }
 
 impl ChatRequest {
@@ -73,6 +74,7 @@ impl ChatRequest {
             cancel: None,
             command_preprocess: true,
             sub_session_routing: true,
+            async_agent: false,
         }
     }
 
@@ -108,6 +110,11 @@ impl ChatRequest {
 
     pub(crate) fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    pub(crate) fn with_async_agent(mut self, enabled: bool) -> Self {
+        self.async_agent = enabled;
         self
     }
 
@@ -237,6 +244,7 @@ impl Runtime {
                                 im_attachments: request.im_attachments,
                                 im_documents: request.im_documents,
                                 cancel: request.cancel,
+                                async_agent: request.async_agent,
                                 ..StreamOptions::default()
                             };
                             let mut stream = std::pin::pin!(
@@ -300,6 +308,7 @@ impl Runtime {
                 im_attachments: request.im_attachments,
                 im_documents: request.im_documents,
                 cancel: request.cancel,
+                async_agent: request.async_agent,
                 ..StreamOptions::default()
             };
             let user_text_for_history = content.text_content();

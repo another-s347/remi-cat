@@ -37,6 +37,7 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "10000".to_string())
             );
+            println!("async_agent: {}", config.tool_output.async_agent);
             println!(
                 "admin: {}",
                 if config.admin.enabled {

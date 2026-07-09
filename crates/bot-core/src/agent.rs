@@ -680,6 +680,7 @@ where
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
+                                    options.async_agent,
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
@@ -705,8 +706,13 @@ where
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
-                                                    forward_background_side_events = true;
-                                                    (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
+                                                    forward_background_side_events = options.async_agent;
+                                                    let collected = if options.async_agent {
+                                                        background_task_tool_result(&task_id, &tc.name)
+                                                    } else {
+                                                        manual_task_tool_result(&task_id, &tc.name)
+                                                    };
+                                                    (call_id, collected, Some(task_id))
                                                 }
                                             };
                                             let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
@@ -1102,6 +1108,7 @@ where
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     tool_foreground_timeout(),
+                                    options.async_agent,
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
@@ -1127,8 +1134,13 @@ where
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
-                                                    forward_background_side_events = true;
-                                                    (call_id, background_task_tool_result(&task_id, &tc.name), Some(task_id))
+                                                    forward_background_side_events = options.async_agent;
+                                                    let collected = if options.async_agent {
+                                                        background_task_tool_result(&task_id, &tc.name)
+                                                    } else {
+                                                        manual_task_tool_result(&task_id, &tc.name)
+                                                    };
+                                                    (call_id, collected, Some(task_id))
                                                 }
                                             };
                                             let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
@@ -1893,6 +1905,14 @@ fn background_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolR
     ))
 }
 
+fn manual_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolResult {
+    CollectedToolResult::text(format!(
+        "Tool `{tool_name}` is still running in the background.\n\
+         task_id: {task_id}\n\
+         Use `tool_tasks` with action=get to inspect status/recent output, or action=cancel to cancel it."
+    ))
+}
+
 fn preview_text_for_content(content: &Content) -> String {
     let text = content.text_content();
     if !text.is_empty() {
@@ -1990,6 +2010,7 @@ fn collect_tool_result_futures_with_timeout(
     thread_id: String,
     run_id: String,
     foreground_timeout: std::time::Duration,
+    async_agent: bool,
 ) -> FuturesUnordered<LocalBoxFuture<'static, ForegroundToolOutcome>> {
     let data_dir = data_dir.to_path_buf();
     let call_args = calls
@@ -2059,7 +2080,9 @@ fn collect_tool_result_futures_with_timeout(
                         }
                     }
                     _ = tokio::time::sleep(foreground_timeout) => {
-                        tool_tasks.enable_completion_notification(&task_id).await;
+                        if async_agent {
+                            tool_tasks.enable_completion_notification(&task_id).await;
+                        }
                         ForegroundToolOutcome::TimedOut {
                             call_id,
                             task_id,
@@ -3635,6 +3658,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     Duration::from_millis(5),
+                    true,
                 );
 
                 let outcome = pending
@@ -3656,6 +3680,59 @@ mod tests {
                 assert_eq!(completed.status.as_str(), "completed");
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_background_task_does_not_auto_notify() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut completed_rx = tool_tasks.subscribe_completed();
+                let tool_names =
+                    HashMap::from([("slow-call".to_string(), "lazy_wait".to_string())]);
+                let calls = vec![ParsedToolCall {
+                    id: "slow-call".to_string(),
+                    name: "lazy_wait".to_string(),
+                    arguments: serde_json::json!({"label": "slow"}),
+                }];
+
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![(
+                        "slow-call".to_string(),
+                        delayed_boxed_result("slow", Duration::from_millis(30)),
+                    )],
+                    &calls,
+                    &tool_names,
+                    &root,
+                    8_192,
+                    None,
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    Duration::from_millis(5),
+                    false,
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome");
+                let ForegroundToolOutcome::TimedOut { task_id, .. } = outcome else {
+                    panic!("expected slow tool to exceed the foreground window");
+                };
+                assert!(tool_tasks.get(&task_id).await.is_some());
+
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                assert!(!tool_tasks.is_thread_running("thread-1").await);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), completed_rx.recv())
+                        .await
+                        .is_err()
+                );
             })
             .await;
     }
@@ -3690,6 +3767,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     Duration::from_millis(200),
+                    true,
                 );
 
                 let outcome = pending
@@ -3763,6 +3841,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     Duration::from_millis(5),
+                    true,
                 );
 
                 let outcome = pending
@@ -3846,6 +3925,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     Duration::from_millis(5),
+                    true,
                 );
 
                 let outcome = pending
@@ -3906,6 +3986,7 @@ mod tests {
             CoreStreamOptions {
                 cancel: Some(cancel.clone()),
                 steer: None,
+                async_agent: false,
             },
         );
         tokio::pin!(stream);
@@ -4198,6 +4279,7 @@ mod tests {
             CoreStreamOptions {
                 cancel: Some(cancel.clone()),
                 steer: None,
+                async_agent: false,
             },
         );
         tokio::pin!(stream);

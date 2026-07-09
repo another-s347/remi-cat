@@ -71,6 +71,14 @@ impl RuntimeConfig {
         if let Some(timeout_ms) = self.tool_output.foreground_timeout_ms {
             set_env_if_absent("REMI_TOOL_FOREGROUND_TIMEOUT_MS", &timeout_ms.to_string());
         }
+        set_env_if_absent(
+            "REMI_ASYNC_AGENT",
+            if self.tool_output.async_agent {
+                "true"
+            } else {
+                "false"
+            },
+        );
         set_env_if_absent("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
         set_env_if_absent(
             "REMI_SANDBOX_HOST_DIR",
@@ -175,6 +183,14 @@ impl RuntimeConfig {
         } else {
             remove_env("REMI_TOOL_FOREGROUND_TIMEOUT_MS");
         }
+        set_env(
+            "REMI_ASYNC_AGENT",
+            if self.tool_output.async_agent {
+                "true"
+            } else {
+                "false"
+            },
+        );
         set_env("REMI_SANDBOX_KIND", self.sandbox.kind.as_env_value());
         set_env(
             "REMI_SANDBOX_HOST_DIR",
@@ -316,6 +332,8 @@ pub struct ToolOutputConfig {
     pub overflow_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub async_agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -818,6 +836,7 @@ mod tests {
             tool_output: super::ToolOutputConfig {
                 overflow_bytes: Some(32_768),
                 foreground_timeout_ms: Some(15_000),
+                async_agent: true,
             },
             sandbox: super::RuntimeSandboxConfig::default_for(&dir),
             admin: AdminConfig::default(),

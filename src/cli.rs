@@ -550,6 +550,11 @@ struct PromptArgs {
 struct TuiArgs {
     #[command(flatten)]
     common: LocalCommonArgs,
+    #[arg(
+        long = "async",
+        help = "Enable automatic async-agent handling for background tool tasks"
+    )]
+    async_agent: bool,
     #[command(subcommand)]
     command: Option<TuiCliCommand>,
 }
@@ -892,6 +897,7 @@ pub(crate) struct CliConfig {
     pub(crate) user_id: String,
     pub(crate) username: String,
     pub(crate) wait_background_tasks: bool,
+    pub(crate) async_agent: bool,
 }
 
 impl CliConfig {
@@ -912,6 +918,7 @@ impl CliConfig {
         let mut user_id = CLI_USER_ID.to_string();
         let mut username = CLI_USERNAME.to_string();
         let mut wait_background_tasks = false;
+        let mut async_agent = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -973,6 +980,9 @@ impl CliConfig {
                 "--wait-background-tasks" => {
                     wait_background_tasks = true;
                 }
+                "--async" => {
+                    async_agent = true;
+                }
                 value if enabled && !value.starts_with('-') => {
                     once = Some(args[i..].join(" "));
                     break;
@@ -998,6 +1008,7 @@ impl CliConfig {
             user_id,
             username,
             wait_background_tasks,
+            async_agent,
         })
     }
 }
@@ -1140,6 +1151,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             user_id: CLI_USER_ID.to_string(),
             username: CLI_USERNAME.to_string(),
             wait_background_tasks: false,
+            async_agent: false,
         })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
     }
@@ -1378,6 +1390,7 @@ fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
         user_id: args.common.user_id,
         username: args.common.username,
         wait_background_tasks: args.wait_background_tasks,
+        async_agent: false,
     }
 }
 
@@ -1417,6 +1430,7 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         user_id,
         username,
         wait_background_tasks: false,
+        async_agent: args.async_agent,
     }
 }
 
@@ -1433,6 +1447,7 @@ fn prompt_args_to_config(args: PromptArgs) -> CliConfig {
         user_id: args.common.user_id,
         username: args.common.username,
         wait_background_tasks: args.wait_background_tasks,
+        async_agent: false,
     }
 }
 
@@ -1458,6 +1473,7 @@ fn run_args_to_config(args: RunArgs) -> anyhow::Result<CliConfig> {
         user_id: args.user_id,
         username: args.username,
         wait_background_tasks: args.wait_background_tasks,
+        async_agent: false,
     })
 }
 

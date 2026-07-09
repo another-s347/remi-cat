@@ -1354,6 +1354,7 @@ impl TuiApp {
         let session_id = self.session_id.clone();
         let sender_user_id = self.cli.user_id.clone();
         let sender_username = self.cli.username.clone();
+        let async_agent = self.cli.async_agent;
         let tx = self.bot_tx.clone();
         self.run_handle = Some(tokio::task::spawn_local(async move {
             run_bot_turn(
@@ -1362,6 +1363,7 @@ impl TuiApp {
                 input.content,
                 sender_user_id,
                 sender_username,
+                async_agent,
                 cancel,
                 tx,
             )
@@ -3462,6 +3464,7 @@ async fn run_bot_turn(
     content: Content,
     sender_user_id: String,
     sender_username: String,
+    async_agent: bool,
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
@@ -3472,6 +3475,7 @@ async fn run_bot_turn(
         .with_sender(sender_user_id, Some(sender_username))
         .with_message(format!("tui-msg-{}", uuid::Uuid::new_v4()), "p2p")
         .with_platform(Some(TUI_CHANNEL.to_string()))
+        .with_async_agent(async_agent)
         .with_cancel(cancel);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     while let Some(event) = stream.next().await {
@@ -4219,16 +4223,19 @@ fn build_warp_open_command(config_name: &str) -> PaneLaunchCommand {
 }
 
 fn tui_resume_command_args(exe: &Path, session_id: &str, cli: &CliConfig) -> Vec<OsString> {
-    vec![
-        exe.as_os_str().to_os_string(),
-        OsString::from("tui"),
+    let mut args = vec![exe.as_os_str().to_os_string(), OsString::from("tui")];
+    if cli.async_agent {
+        args.push(OsString::from("--async"));
+    }
+    args.extend([
         OsString::from("resume"),
         OsString::from(session_id),
         OsString::from("--user"),
         OsString::from(cli.user_id.clone()),
         OsString::from("--name"),
         OsString::from(cli.username.clone()),
-    ]
+    ]);
+    args
 }
 
 fn warp_tab_config_dir() -> anyhow::Result<PathBuf> {
@@ -4657,6 +4664,22 @@ mod tests {
         assert!(toml.contains("type = \"terminal\""));
         assert!(toml.contains("is_focused = true"));
         assert!(toml.contains("'/tmp/remi cat' tui resume session-1 --user u1 --name Alice"));
+    }
+
+    #[test]
+    fn tui_resume_args_preserve_async_agent_flag() {
+        let args = tui_resume_command_args(
+            Path::new("/tmp/remi-cat"),
+            "session-1",
+            &test_async_cli_config(),
+        );
+        let rendered = os_args_to_strings(&args);
+
+        assert_eq!(rendered[0], "/tmp/remi-cat");
+        assert_eq!(rendered[1], "tui");
+        assert_eq!(rendered[2], "--async");
+        assert_eq!(rendered[3], "resume");
+        assert_eq!(rendered[4], "session-1");
     }
 
     #[test]
@@ -5912,6 +5935,14 @@ mod tests {
             user_id: "u1".to_string(),
             username: "Alice".to_string(),
             wait_background_tasks: false,
+            async_agent: false,
+        }
+    }
+
+    fn test_async_cli_config() -> CliConfig {
+        CliConfig {
+            async_agent: true,
+            ..test_cli_config()
         }
     }
 

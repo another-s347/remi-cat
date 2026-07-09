@@ -378,6 +378,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             user_id: CLI_USER_ID.to_string(),
             username: CLI_USERNAME.to_string(),
             wait_background_tasks: false,
+            async_agent: false,
         },
         _ => unreachable!(),
     };
@@ -777,6 +778,15 @@ mod cli_tests {
         assert_eq!(config.user_id, "u1");
         assert_eq!(config.username, "Alice");
         assert_eq!(config.once, None);
+        assert!(!config.async_agent);
+    }
+
+    #[test]
+    fn tui_subcommand_can_enable_async_agent_mode() {
+        let config = CliConfig::from_args(&args(&["tui", "--async"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.async_agent);
     }
 
     #[test]

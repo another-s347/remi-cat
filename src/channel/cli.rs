@@ -72,11 +72,9 @@ pub(crate) async fn process_prompt_message(
         &cli.channel_id,
         &runtime.root_agent_id,
     )?;
-    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(ChatRequest::text(
-        session_id,
-        ChatChannel::Cli,
-        text,
-    )));
+    let request = ChatRequest::text(session_id, ChatChannel::Cli, text)
+        .with_async_agent(cli.wait_background_tasks);
+    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let mut output = String::new();
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);

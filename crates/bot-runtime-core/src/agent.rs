@@ -13,6 +13,7 @@ use crate::profile::AgentProfile;
 pub struct CoreStreamOptions {
     pub cancel: Option<CancellationToken>,
     pub steer: Option<Arc<CoreSteerQueue>>,
+    pub async_agent: bool,
 }
 
 impl CoreStreamOptions {
@@ -27,6 +28,11 @@ impl CoreStreamOptions {
 
     pub fn with_steer(mut self, steer: Arc<CoreSteerQueue>) -> Self {
         self.steer = Some(steer);
+        self
+    }
+
+    pub fn with_async_agent(mut self, enabled: bool) -> Self {
+        self.async_agent = enabled;
         self
     }
 }
