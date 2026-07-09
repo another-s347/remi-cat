@@ -240,6 +240,21 @@ fn try_recv_completed_tool_task(
     }
 }
 
+fn try_recv_background_side_event(
+    background_side_events: &mut tokio::sync::broadcast::Receiver<(String, CatEvent)>,
+    thread_id: &str,
+) -> Option<CatEvent> {
+    loop {
+        match background_side_events.try_recv() {
+            Ok((event_thread_id, event)) if event_thread_id == thread_id => return Some(event),
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return None,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+        }
+    }
+}
+
 pub const ASYNC_TOOL_SYSTEM_PROMPT: &str = "\
 Async tool execution:
 - Tool calls can keep running in the background after the foreground observation window closes.
@@ -2710,6 +2725,12 @@ impl CatBot {
                                     }
                                 }
                                 loop {
+                                    while let Some(event) = try_recv_background_side_event(
+                                        &mut background_side_events,
+                                        &thread_id_owned,
+                                    ) {
+                                        yield event;
+                                    }
                                     if let Some(task) = try_recv_completed_tool_task(
                                         &mut completed_tool_tasks,
                                         &thread_id_owned,
@@ -2742,6 +2763,12 @@ impl CatBot {
                                             continue 'workflow_loop;
                                         }
                                         continue;
+                                    }
+                                    while let Some(event) = try_recv_background_side_event(
+                                        &mut background_side_events,
+                                        &thread_id_owned,
+                                    ) {
+                                        yield event;
                                     }
                                     if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
                                         break;
@@ -2779,14 +2806,18 @@ impl CatBot {
                                                     }
                                                 }
                                                 Ok(_) => {}
-                                                Err(_) => break,
+                                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                             }
                                         }
                                         side_event = background_side_events.recv() => {
-                                            if let Ok((event_thread_id, event)) = side_event {
-                                                if event_thread_id == thread_id_owned {
+                                            match side_event {
+                                                Ok((event_thread_id, event)) if event_thread_id == thread_id_owned => {
                                                     yield event;
                                                 }
+                                                Ok(_) => {}
+                                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                                             }
                                         }
                                     }
@@ -4470,12 +4501,12 @@ mod tests {
         insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
         install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
-        system_prompt_with_agent_md_notice, thread_run_lock, try_recv_completed_tool_task,
-        AgentModelBindings, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds,
-        LlmCompressor, LoopInput, Message, ModelProfileRegistry, PartialTurnRecorder,
-        RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent, ThreadRunLocks,
-        WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE, ASYNC_TOOL_SYSTEM_PROMPT,
-        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
+        try_recv_completed_tool_task, AgentModelBindings, CatBotBuilder, CatEvent, Content,
+        ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
+        PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent,
+        ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
+        ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
@@ -4634,6 +4665,19 @@ mod tests {
             .expect("completion event should remain buffered after task stops running");
         assert_eq!(completed.task_id, task_id);
         assert_eq!(completed.status, crate::tool_tasks::TOOL_TASK_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn background_side_event_buffer_is_drained_before_running_check() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let manager = crate::ToolTaskManager::load(data_dir.path()).unwrap();
+        let mut side_rx = manager.subscribe_side_events();
+        manager.publish_side_event("thread-1".to_string(), CatEvent::Text("side".to_string()));
+
+        assert!(!manager.is_thread_running("thread-1").await);
+        let event = try_recv_background_side_event(&mut side_rx, "thread-1")
+            .expect("side event should remain buffered after task stops running");
+        assert!(matches!(event, CatEvent::Text(text) if text == "side"));
     }
 
     #[test]

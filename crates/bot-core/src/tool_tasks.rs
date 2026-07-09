@@ -146,10 +146,18 @@ impl ToolTaskManager {
         }
     }
 
-    pub async fn enable_completion_notification(&self, task_id: &str) {
+    pub async fn enable_completion_notification(&self, task_id: &str) -> Option<ToolTaskRecord> {
         if let Some(running) = self.running.lock().await.get_mut(task_id) {
             running.notify_on_finish = true;
+            return None;
         }
+        let record = self.store.lock().await.tasks.get(task_id).cloned();
+        if let Some(record) = record.as_ref() {
+            if record.status != TOOL_TASK_RUNNING {
+                let _ = self.completed_tx.send(record.clone());
+            }
+        }
+        record
     }
 
     pub async fn append_output(&self, task_id: &str, line: impl Into<String>) {
@@ -493,5 +501,36 @@ mod tests {
             manager.get(&task_id).await.unwrap().status,
             TOOL_TASK_CANCELLED
         );
+    }
+
+    #[tokio::test]
+    async fn enable_completion_notification_replays_already_completed_task() {
+        let manager = ToolTaskManager::load(temp_data_dir("late-enable")).unwrap();
+        let mut completed_rx = manager.subscribe_completed();
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({"command": "sleep 10"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        manager
+            .finish(&task_id, true, 10_000, "done".to_string())
+            .await
+            .unwrap();
+        let replayed = manager
+            .enable_completion_notification(&task_id)
+            .await
+            .expect("completed task should be returned");
+
+        assert_eq!(replayed.task_id, task_id);
+        let completed = completed_rx.recv().await.unwrap();
+        assert_eq!(completed.task_id, task_id);
+        assert_eq!(completed.status, TOOL_TASK_COMPLETED);
     }
 }
