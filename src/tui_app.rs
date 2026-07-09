@@ -1787,8 +1787,27 @@ impl TuiApp {
                 self.sub_sessions.clear();
                 self.opened_sub_session_panes.clear();
                 self.supervisors.clear();
+                self.pending_approval = None;
+                self.pending_user_question = None;
                 self.active_supervisor_id = None;
                 self.status.state = "error".to_string();
+            }
+            BotEvent::Cancelled => {
+                self.has_activity = true;
+                self.running = false;
+                self.interrupt_requested = false;
+                self.cancel = None;
+                self.run_handle = None;
+                self.sub_tool_args.clear();
+                self.sub_tool_names.clear();
+                self.sub_sessions.clear();
+                self.opened_sub_session_panes.clear();
+                self.supervisors.clear();
+                self.pending_approval = None;
+                self.pending_user_question = None;
+                self.active_supervisor_id = None;
+                self.status.state = "idle".to_string();
+                self.refresh_command_catalog();
             }
             BotEvent::Done => {
                 self.has_activity = true;
@@ -1801,6 +1820,8 @@ impl TuiApp {
                 self.sub_sessions.clear();
                 self.opened_sub_session_panes.clear();
                 self.supervisors.clear();
+                self.pending_approval = None;
+                self.pending_user_question = None;
                 self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
                 self.refresh_command_catalog();
@@ -3584,6 +3605,9 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
         CatEvent::Error(error) => {
             let _ = tx.send(BotEvent::Error(error.to_string()));
         }
+        CatEvent::Cancelled => {
+            let _ = tx.send(BotEvent::Cancelled);
+        }
         CatEvent::Done => return true,
         _ => {}
     }
@@ -3887,6 +3911,7 @@ enum BotEvent {
     ContextCompaction(ContextCompactionEvent),
     SupervisorProgress(SupervisorTraceEvent),
     SupervisorReport(WorkflowReport),
+    Cancelled,
     TodoState {
         body: String,
         latest_active: Option<String>,

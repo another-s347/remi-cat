@@ -523,8 +523,19 @@ where
                                                 should_wait,
                                                 "tool_approval.wait_start"
                                             );
+                                            let mut cancelled_while_waiting = false;
                                             let decision = if should_wait {
-                                                rx.await.unwrap_or(crate::approval::ToolApprovalDecision::Deny)
+                                                if let Some(cancel) = cancel_signal.as_ref() {
+                                                    tokio::select! {
+                                                        decision = rx => decision.unwrap_or(crate::approval::ToolApprovalDecision::Deny),
+                                                        _ = cancel.cancelled() => {
+                                                            cancelled_while_waiting = true;
+                                                            crate::approval::ToolApprovalDecision::Deny
+                                                        }
+                                                    }
+                                                } else {
+                                                    rx.await.unwrap_or(crate::approval::ToolApprovalDecision::Deny)
+                                                }
                                             } else {
                                                 crate::approval::ToolApprovalDecision::Deny
                                             };
@@ -546,6 +557,11 @@ where
                                                 .await;
                                             if let ApprovalEvent::Resolved { request, decision } = event {
                                                 yield CatEvent::ToolApprovalResolved { request, decision };
+                                            }
+                                            if cancelled_while_waiting {
+                                                yield stats_event(stats);
+                                                yield CatEvent::Cancelled;
+                                                return;
                                             }
                                             resolution
                                             }
@@ -934,8 +950,19 @@ where
                                                 should_wait,
                                                 "tool_approval.wait_start"
                                             );
+                                            let mut cancelled_while_waiting = false;
                                             let decision = if should_wait {
-                                                rx.await.unwrap_or(crate::approval::ToolApprovalDecision::Deny)
+                                                if let Some(cancel) = cancel_signal.as_ref() {
+                                                    tokio::select! {
+                                                        decision = rx => decision.unwrap_or(crate::approval::ToolApprovalDecision::Deny),
+                                                        _ = cancel.cancelled() => {
+                                                            cancelled_while_waiting = true;
+                                                            crate::approval::ToolApprovalDecision::Deny
+                                                        }
+                                                    }
+                                                } else {
+                                                    rx.await.unwrap_or(crate::approval::ToolApprovalDecision::Deny)
+                                                }
                                             } else {
                                                 crate::approval::ToolApprovalDecision::Deny
                                             };
@@ -957,6 +984,11 @@ where
                                                 .await;
                                             if let ApprovalEvent::Resolved { request, decision } = event {
                                                 yield CatEvent::ToolApprovalResolved { request, decision };
+                                            }
+                                            if cancelled_while_waiting {
+                                                yield stats_event(stats);
+                                                yield CatEvent::Cancelled;
+                                                return;
                                             }
                                             resolution
                                             }
@@ -2958,17 +2990,21 @@ mod tests {
             req: Self::Request,
         ) -> Result<impl Stream<Item = Self::Response>, Self::Error> {
             match req {
-                LoopInput::Start { .. } => Ok(stream::iter(vec![
-                    remi_agentloop::types::AgentEvent::NeedToolExecution {
-                        state: AgentState::new(StepConfig::new("test-model")),
-                        tool_calls: vec![ParsedToolCall {
-                            id: "send-call".to_string(),
-                            name: "danger_send".to_string(),
-                            arguments: serde_json::json!({ "message": "hello" }),
-                        }],
-                        completed_results: vec![],
-                    },
-                ])),
+                LoopInput::Start { metadata, .. } => {
+                    let mut state = AgentState::new(StepConfig::new("test-model"));
+                    state.config.metadata = metadata;
+                    Ok(stream::iter(vec![
+                        remi_agentloop::types::AgentEvent::NeedToolExecution {
+                            state,
+                            tool_calls: vec![ParsedToolCall {
+                                id: "send-call".to_string(),
+                                name: "danger_send".to_string(),
+                                arguments: serde_json::json!({ "message": "hello" }),
+                            }],
+                            completed_results: vec![],
+                        },
+                    ]))
+                }
                 LoopInput::Resume { .. } => Ok(stream::iter(vec![
                     remi_agentloop::types::AgentEvent::TextDelta(
                         "resumed after denial".to_string(),
@@ -4041,6 +4077,91 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, CatEvent::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_for_tool_approval_resolves_and_cancels() {
+        let mut local_tools = DefaultToolRegistry::new();
+        local_tools.register(RiskySendTool);
+        let agent = CatAgent {
+            inner: ApprovalDeniedInnerAgent,
+            local_tools: Arc::new(local_tools),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
+        };
+        let cancel = CancellationToken::new();
+        let input = LoopInput::start("call risky send").metadata(serde_json::json!({
+            "thread_id": "approval-cancel-thread",
+            "platform": "tui",
+        }));
+        let stream = agent.stream_with_input_and_options(
+            input,
+            CoreStreamOptions {
+                cancel: Some(cancel.clone()),
+                steer: None,
+            },
+        );
+        tokio::pin!(stream);
+
+        let mut saw_requested = false;
+        for _ in 0..5 {
+            let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("approval request should arrive")
+                .expect("stream should emit approval request");
+            if matches!(
+                event,
+                CatEvent::ToolApprovalRequested(ref request)
+                    if request.tool_call_id == "send-call"
+                        && request.platform.as_deref() == Some("tui")
+            ) {
+                saw_requested = true;
+                break;
+            }
+        }
+        assert!(saw_requested);
+
+        cancel.cancel();
+        let mut saw_resolved = false;
+        let mut saw_cancelled = false;
+        for _ in 0..5 {
+            let Some(event) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("cancelled approval stream should make progress")
+            else {
+                break;
+            };
+            match event {
+                CatEvent::ToolApprovalResolved { request, decision }
+                    if request.tool_call_id == "send-call"
+                        && decision == crate::approval::ToolApprovalDecision::Deny =>
+                {
+                    saw_resolved = true;
+                }
+                CatEvent::Cancelled => {
+                    saw_cancelled = true;
+                    break;
+                }
+                CatEvent::ToolCall { id, .. } if id == "send-call" => {
+                    panic!("tool should not execute after approval wait is cancelled");
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_resolved);
+        assert!(saw_cancelled);
     }
 
     #[tokio::test]
