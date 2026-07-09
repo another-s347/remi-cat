@@ -38,12 +38,19 @@ impl CoreStreamOptions {
 }
 
 #[derive(Debug, Clone)]
+pub enum CoreSteerSource {
+    User,
+    BackgroundToolCompletion,
+}
+
+#[derive(Debug, Clone)]
 pub struct CoreSteerInput {
     pub id: String,
     pub content: Content,
     pub preview: String,
     pub message_metadata: Option<serde_json::Value>,
     pub user_name: Option<String>,
+    pub source: CoreSteerSource,
 }
 
 #[derive(Debug, Clone)]
@@ -97,16 +104,15 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
         .collect::<Vec<_>>()
         .join(" / ");
     let content = if inputs.len() == 1 {
-        prefixed_steer_content(
-            "[User steer received while this run was active]\n",
-            inputs[0].content.clone(),
-        )
+        prefixed_steer_content(steer_prefix(&inputs[0]), inputs[0].content.clone())
     } else {
-        let mut parts = vec![ContentPart::text(
-            "[User steer received while this run was active]\nMultiple queued inputs arrived in order:\n",
-        )];
+        let mut parts = vec![ContentPart::text(steer_batch_prefix(&inputs))];
         for (idx, input) in inputs.iter().enumerate() {
-            parts.push(ContentPart::text(format!("\n{}. ", idx + 1)));
+            parts.push(ContentPart::text(format!(
+                "\n{}. {}",
+                idx + 1,
+                steer_item_label(input)
+            )));
             parts.extend(content_into_parts(input.content.clone()));
         }
         Content::parts(parts)
@@ -122,6 +128,33 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
         count,
         message_metadata,
         user_name,
+    }
+}
+
+fn steer_prefix(input: &CoreSteerInput) -> &'static str {
+    match input.source {
+        CoreSteerSource::User => "[User steer received while this run was active]\n",
+        CoreSteerSource::BackgroundToolCompletion => {
+            "[Background tool task completed while this run was active]\n"
+        }
+    }
+}
+
+fn steer_batch_prefix(inputs: &[CoreSteerInput]) -> String {
+    let all_background = inputs
+        .iter()
+        .all(|input| matches!(input.source, CoreSteerSource::BackgroundToolCompletion));
+    if all_background {
+        "[Background tool tasks completed while this run was active]\nMultiple queued inputs arrived in order:\n".to_string()
+    } else {
+        "[Queued inputs received while this run was active]\nMultiple queued inputs arrived in order:\n".to_string()
+    }
+}
+
+fn steer_item_label(input: &CoreSteerInput) -> &'static str {
+    match input.source {
+        CoreSteerSource::User => "User steer: ",
+        CoreSteerSource::BackgroundToolCompletion => "Background tool task completion: ",
     }
 }
 
@@ -416,6 +449,7 @@ You are a markdown agent.
             preview: "first".to_string(),
             message_metadata: None,
             user_name: None,
+            source: CoreSteerSource::User,
         });
         queue.push(CoreSteerInput {
             id: "two".to_string(),
@@ -423,6 +457,7 @@ You are a markdown agent.
             preview: "second".to_string(),
             message_metadata: None,
             user_name: Some("alice".to_string()),
+            source: CoreSteerSource::User,
         });
 
         let batch = queue.drain_batch().expect("batch should be present");
@@ -431,8 +466,8 @@ You are a markdown agent.
         assert_eq!(batch.count, 2);
         assert_eq!(batch.user_name.as_deref(), Some("alice"));
         let text = batch.content.text_content();
-        assert!(text.contains("1. first"));
-        assert!(text.contains("2. second"));
+        assert!(text.contains("1. User steer: first"));
+        assert!(text.contains("2. User steer: second"));
         assert!(queue.drain_batch().is_none());
     }
 
@@ -449,6 +484,7 @@ You are a markdown agent.
             preview: "describe image".to_string(),
             message_metadata: None,
             user_name: None,
+            source: CoreSteerSource::User,
         });
 
         let batch = queue.drain_batch().expect("batch should be present");

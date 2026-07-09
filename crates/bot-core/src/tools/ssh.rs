@@ -40,15 +40,19 @@ impl Tool for WorkspaceSshTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let mut props = serde_json::json!({
+            "host":       { "type": "string",  "description": "OpenSSH host alias or hostname" },
+            "user":       { "type": "string",  "description": "Optional SSH username; otherwise OpenSSH config/defaults apply" },
+            "port":       { "type": "integer", "description": "Optional SSH port, 1 through 65535" },
+            "command":    { "type": "string",  "description": "Remote shell command to execute" },
+            "named":      { "type": "string",  "description": "Optional named remote shell session. Calls with the same name preserve state for the same host/user/port." }
+        });
+        if !super::async_agent_enabled() {
+            props["timeout"] = serde_json::json!({ "type": "integer", "description": "Optional timeout in seconds. If the program supports its own timeout flag, prefer that and set this to a generous value." });
+        }
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "host":       { "type": "string",  "description": "OpenSSH host alias or hostname" },
-                "user":       { "type": "string",  "description": "Optional SSH username; otherwise OpenSSH config/defaults apply" },
-                "port":       { "type": "integer", "description": "Optional SSH port, 1 through 65535" },
-                "command":    { "type": "string",  "description": "Remote shell command to execute" },
-                "named":      { "type": "string",  "description": "Optional named remote shell session. Calls with the same name preserve state for the same host/user/port." }
-            },
+            "properties": props,
             "required": ["host", "command"]
         })
     }
@@ -78,7 +82,11 @@ impl Tool for WorkspaceSshTool {
             if let Some(named) = named.as_deref() {
                 validate_ssh_named(named).map_err(|err| AgentError::tool("ssh", err))?;
             }
-            let timeout_ms = u64::MAX / 2;
+            let timeout_ms = arguments["timeout"]
+                .as_u64()
+                .filter(|v| *v > 0)
+                .map(|s| s.saturating_mul(1000))
+                .unwrap_or(u64::MAX / 2);
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("ssh {} $ {}", target.display(), command));
                 let started = Instant::now();

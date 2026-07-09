@@ -8,7 +8,7 @@ pub use agent::{
     filter_tool_definitions, inject_extra_tools, tool_allowed, tool_ctx_from_state,
     tool_ctx_from_state_with_cancel, tool_definition_ctx_from_chat_ctx,
     tool_definition_ctx_from_state, CoreSteerBatch, CoreSteerInput, CoreSteerQueue,
-    CoreStreamOptions,
+    CoreSteerSource, CoreStreamOptions,
 };
 pub use dynamic_tool::{register_dynamic_tool_definitions, DynamicTool};
 pub use loop_driver::{

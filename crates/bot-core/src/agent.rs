@@ -146,6 +146,25 @@ fn is_denied_approval_event(event: &CatEvent) -> bool {
     )
 }
 
+/// Returns true when the event indicates an approval or user question is now
+/// pending (waiting for human response). While pending, foreground tool
+/// timeouts must be suppressed so the tool is not moved to the background
+/// before the human can respond.
+fn is_approval_request_event(event: &CatEvent) -> bool {
+    matches!(
+        event,
+        CatEvent::ToolApprovalRequested(..)
+            | CatEvent::UserQuestionRequested(..)
+    )
+}
+
+fn is_approval_resolved_event(event: &CatEvent) -> bool {
+    matches!(
+        event,
+        CatEvent::ToolApprovalResolved { .. } | CatEvent::UserQuestionResolved { .. }
+    )
+}
+
 // ── CatAgent ─────────────────────────────────────────────────────────────────
 
 /// Drives an inner agent loop, handling skill and todo tools locally.
@@ -684,10 +703,16 @@ where
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
+                                let mut approval_pending = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
+                                            if is_approval_request_event(&side_event) {
+                                                approval_pending = true;
+                                            } else if is_approval_resolved_event(&side_event) {
+                                                approval_pending = false;
+                                            }
                                             yield side_event;
                                             if denied {
                                                 tracing::info!(
@@ -703,6 +728,12 @@ where
                                         }
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
+                                                ForegroundToolOutcome::TimedOut { .. } if approval_pending => {
+                                                    // A human-facing interrupt (approval / user
+                                                    // question) is pending – do not move the tool to
+                                                    // the background while waiting for a response.
+                                                    continue;
+                                                }
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
@@ -1112,10 +1143,16 @@ where
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
+                                let mut approval_pending = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
+                                            if is_approval_request_event(&side_event) {
+                                                approval_pending = true;
+                                            } else if is_approval_resolved_event(&side_event) {
+                                                approval_pending = false;
+                                            }
                                             yield side_event;
                                             if denied {
                                                 tracing::info!(
@@ -1131,6 +1168,12 @@ where
                                         }
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
+                                                ForegroundToolOutcome::TimedOut { .. } if approval_pending => {
+                                                    // A human-facing interrupt (approval / user
+                                                    // question) is pending – do not move the tool to
+                                                    // the background while waiting for a response.
+                                                    continue;
+                                                }
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
@@ -2394,7 +2437,7 @@ mod tests {
     use crate::events::CatEvent;
     use crate::user_question::UserQuestionManager;
     use bot_runtime_core::ToolContext;
-    use bot_runtime_core::{CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
+    use bot_runtime_core::{CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions};
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, CancellationToken, Checkpoint, CheckpointStatus, Content,
@@ -3400,6 +3443,7 @@ mod tests {
                 preview: "while-tool steer".to_string(),
                 message_metadata: None,
                 user_name: None,
+                source: CoreSteerSource::User,
             });
             Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
                 "tool done",

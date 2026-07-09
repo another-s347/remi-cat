@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use bot_runtime_core::ToolContext;
-use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
+use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions};
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, OpenAIClient,
@@ -178,15 +178,18 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
 }
 
 fn background_task_completion_content(task: &crate::ToolTaskRecord) -> Content {
+    let args_preview = background_task_args_preview(&task.args);
     let mut text = format!(
         "Background tool task completed.\n\
          tool: {}\n\
          task_id: {}\n\
          status: {}\n\
+         args: {}\n\
          elapsed_ms: {}\n",
         task.tool_name,
         task.task_id,
         task.status,
+        args_preview,
         task.elapsed_ms.unwrap_or(0)
     );
     if let Some(success) = task.success {
@@ -207,7 +210,13 @@ fn background_task_completion_content(task: &crate::ToolTaskRecord) -> Content {
     Content::text(text)
 }
 
+fn background_task_args_preview(args: &serde_json::Value) -> String {
+    let rendered = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
+    rendered.chars().take(50).collect()
+}
+
 fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreSteerInput {
+    let args_preview = background_task_args_preview(&task.args);
     CoreSteerInput {
         id: format!("tool-task-{}", task.task_id),
         content: background_task_completion_content(task),
@@ -220,8 +229,10 @@ fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreS
             "task_id": task.task_id,
             "tool_name": task.tool_name,
             "status": task.status,
+            "args": args_preview,
         })),
         user_name: None,
+        source: CoreSteerSource::BackgroundToolCompletion,
     }
 }
 
@@ -535,6 +546,7 @@ impl CatBot {
             preview: preview.clone(),
             message_metadata,
             user_name: input.sender_username.clone(),
+            source: CoreSteerSource::User,
         });
         SteerSubmitResult::Queued(SteerQueuedEvent {
             steer_id,
@@ -1906,8 +1918,6 @@ impl CatBot {
     ) -> impl Stream<Item = CatEvent> + 'a {
         let thread_id_owned = thread_id.to_string();
         stream! {
-                let mut opts = opts;
-                opts.async_agent = opts.async_agent || async_agent_enabled_from_env();
                 let run_lock = self.thread_run_lock(&thread_id_owned).await;
                 let _run_guard = run_lock.lock().await;
                 let steer_registration = if opts.supervisor_run {
@@ -2646,6 +2656,106 @@ impl CatBot {
                                         continue 'workflow_loop;
                                     }
                                 }
+                                if round_opts.async_agent {
+                                    loop {
+                                        while let Some(event) = try_recv_background_side_event(
+                                            &mut background_side_events,
+                                            &thread_id_owned,
+                                        ) {
+                                            yield event;
+                                        }
+                                        if let Some(task) = try_recv_completed_tool_task(
+                                            &mut completed_tool_tasks,
+                                            &thread_id_owned,
+                                        ) {
+                                            let fallback_content =
+                                                background_task_completion_content(&task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                steer.push(background_task_completion_steer_input(&task));
+                                            }
+                                            yield CatEvent::ToolTaskCompleted(task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                if let Some(batch) = steer.drain_batch() {
+                                                    yield CatEvent::SteerInjected(
+                                                        crate::SteerInjectedEvent {
+                                                            steer_ids: batch.ids.clone(),
+                                                            session_id: thread_id_owned.clone(),
+                                                            preview: batch.preview.clone(),
+                                                            count: batch.count,
+                                                        },
+                                                    );
+                                                    next_content = batch.content;
+                                                    continuation_from_supervisor = false;
+                                                    continuation_from_background_task = true;
+                                                    continue 'workflow_loop;
+                                                }
+                                            } else {
+                                                next_content = fallback_content;
+                                                continuation_from_supervisor = false;
+                                                continuation_from_background_task = true;
+                                                continue 'workflow_loop;
+                                            }
+                                            continue;
+                                        }
+                                        while let Some(event) = try_recv_background_side_event(
+                                            &mut background_side_events,
+                                            &thread_id_owned,
+                                        ) {
+                                            yield event;
+                                        }
+                                        if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
+                                            break;
+                                        }
+                                        tokio::select! {
+                                            completed = completed_tool_tasks.recv() => {
+                                                match completed {
+                                                    Ok(task) if task.thread_id == thread_id_owned => {
+                                                        let fallback_content =
+                                                            background_task_completion_content(&task);
+                                                        if let Some(steer) = steer_queue.as_ref() {
+                                                            steer.push(background_task_completion_steer_input(&task));
+                                                        }
+                                                        yield CatEvent::ToolTaskCompleted(task);
+                                                        if let Some(steer) = steer_queue.as_ref() {
+                                                            if let Some(batch) = steer.drain_batch() {
+                                                                yield CatEvent::SteerInjected(
+                                                                    crate::SteerInjectedEvent {
+                                                                        steer_ids: batch.ids.clone(),
+                                                                        session_id: thread_id_owned.clone(),
+                                                                        preview: batch.preview.clone(),
+                                                                        count: batch.count,
+                                                                    },
+                                                                );
+                                                                next_content = batch.content;
+                                                                continuation_from_supervisor = false;
+                                                                continuation_from_background_task = true;
+                                                                continue 'workflow_loop;
+                                                            }
+                                                        } else {
+                                                            next_content = fallback_content;
+                                                            continuation_from_supervisor = false;
+                                                            continuation_from_background_task = true;
+                                                            continue 'workflow_loop;
+                                                        }
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                }
+                                            }
+                                            side_event = background_side_events.recv() => {
+                                                match side_event {
+                                                    Ok((event_thread_id, event)) if event_thread_id == thread_id_owned => {
+                                                        yield event;
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if !round_opts.supervisor_run
                                     && !user_question_requested_this_round
                                     && !workflow_interrupted_this_round
@@ -2745,106 +2855,6 @@ impl CatBot {
                                         continuation_from_supervisor = false;
                                         continuation_from_background_task = true;
                                         continue 'workflow_loop;
-                                    }
-                                }
-                                if round_opts.async_agent {
-                                    loop {
-                                        while let Some(event) = try_recv_background_side_event(
-                                            &mut background_side_events,
-                                            &thread_id_owned,
-                                        ) {
-                                            yield event;
-                                        }
-                                        if let Some(task) = try_recv_completed_tool_task(
-                                            &mut completed_tool_tasks,
-                                            &thread_id_owned,
-                                        ) {
-                                            let fallback_content =
-                                                background_task_completion_content(&task);
-                                            if let Some(steer) = steer_queue.as_ref() {
-                                                steer.push(background_task_completion_steer_input(&task));
-                                            }
-                                            yield CatEvent::ToolTaskCompleted(task);
-                                            if let Some(steer) = steer_queue.as_ref() {
-                                                if let Some(batch) = steer.drain_batch() {
-                                                    yield CatEvent::SteerInjected(
-                                                        crate::SteerInjectedEvent {
-                                                            steer_ids: batch.ids.clone(),
-                                                            session_id: thread_id_owned.clone(),
-                                                            preview: batch.preview.clone(),
-                                                            count: batch.count,
-                                                        },
-                                                    );
-                                                    next_content = batch.content;
-                                                    continuation_from_supervisor = false;
-                                                    continuation_from_background_task = true;
-                                                    continue 'workflow_loop;
-                                                }
-                                            } else {
-                                                next_content = fallback_content;
-                                                continuation_from_supervisor = false;
-                                                continuation_from_background_task = true;
-                                                continue 'workflow_loop;
-                                            }
-                                            continue;
-                                        }
-                                        while let Some(event) = try_recv_background_side_event(
-                                            &mut background_side_events,
-                                            &thread_id_owned,
-                                        ) {
-                                            yield event;
-                                        }
-                                        if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
-                                            break;
-                                        }
-                                        tokio::select! {
-                                            completed = completed_tool_tasks.recv() => {
-                                                match completed {
-                                                    Ok(task) if task.thread_id == thread_id_owned => {
-                                                        let fallback_content =
-                                                            background_task_completion_content(&task);
-                                                        if let Some(steer) = steer_queue.as_ref() {
-                                                            steer.push(background_task_completion_steer_input(&task));
-                                                        }
-                                                        yield CatEvent::ToolTaskCompleted(task);
-                                                        if let Some(steer) = steer_queue.as_ref() {
-                                                            if let Some(batch) = steer.drain_batch() {
-                                                                yield CatEvent::SteerInjected(
-                                                                    crate::SteerInjectedEvent {
-                                                                        steer_ids: batch.ids.clone(),
-                                                                        session_id: thread_id_owned.clone(),
-                                                                        preview: batch.preview.clone(),
-                                                                        count: batch.count,
-                                                                    },
-                                                                );
-                                                                next_content = batch.content;
-                                                                continuation_from_supervisor = false;
-                                                                continuation_from_background_task = true;
-                                                                continue 'workflow_loop;
-                                                            }
-                                                        } else {
-                                                            next_content = fallback_content;
-                                                            continuation_from_supervisor = false;
-                                                            continuation_from_background_task = true;
-                                                            continue 'workflow_loop;
-                                                        }
-                                                    }
-                                                    Ok(_) => {}
-                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                                }
-                                            }
-                                            side_event = background_side_events.recv() => {
-                                                match side_event {
-                                                    Ok((event_thread_id, event)) if event_thread_id == thread_id_owned => {
-                                                        yield event;
-                                                    }
-                                                    Ok(_) => {}
-                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 yield CatEvent::Done;
@@ -4657,10 +4667,56 @@ mod tests {
         assert!(text.contains("Background tool task completed."));
         assert!(text.contains("tool: bash"));
         assert!(text.contains("task_id: task-1"));
+        assert!(text.contains("args: {\"command\":\"sleep 60\"}"));
         assert!(text.contains("elapsed_ms: 60000"));
         assert!(text.contains("last line"));
         assert!(text.contains("done"));
+        assert_eq!(
+            steer
+                .message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("args"))
+                .and_then(|args| args.as_str()),
+            Some("{\"command\":\"sleep 60\"}")
+        );
         assert_eq!(steer.user_name, None);
+    }
+
+    #[test]
+    fn background_task_completion_steer_input_truncates_args_preview() {
+        let task = crate::ToolTaskRecord {
+            task_id: "task-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({"command": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}),
+            status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-09T00:01:00Z".to_string()),
+            elapsed_ms: Some(60_000),
+            success: Some(true),
+            result_preview: None,
+            recent_output: Vec::new(),
+            message: None,
+        };
+
+        let steer = background_task_completion_steer_input(&task);
+        let expected = "{\"command\":\"abcdefghijklmnopqrstuvwxyz0123456789AB";
+
+        assert_eq!(expected.chars().count(), 50);
+        assert!(steer
+            .content
+            .text_content()
+            .contains(&format!("args: {expected}")));
+        assert_eq!(
+            steer
+                .message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("args"))
+                .and_then(|args| args.as_str()),
+            Some(expected)
+        );
     }
 
     #[tokio::test]

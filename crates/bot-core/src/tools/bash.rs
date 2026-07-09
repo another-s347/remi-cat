@@ -54,12 +54,16 @@ impl Tool for WorkspaceBashTool {
          program supports its own timeout flag, choose a generous timeout."
     }
     fn parameters_schema(&self) -> serde_json::Value {
+        let mut props = serde_json::json!({
+            "command":    { "type": "string",  "description": "Shell command to execute" },
+            "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." }
+        });
+        if !super::async_agent_enabled() {
+            props["timeout"] = serde_json::json!({ "type": "integer", "description": "Optional timeout in seconds. If the program supports its own timeout flag, prefer that and set this to a generous value." });
+        }
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "command":    { "type": "string",  "description": "Shell command to execute" },
-                "named":      { "type": "string",  "description": "Optional named shell session. Calls with the same name preserve shell state." }
-            },
+            "properties": props,
             "required": ["command"]
         })
     }
@@ -83,7 +87,11 @@ impl Tool for WorkspaceBashTool {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
-            let timeout_ms = u64::MAX / 2;
+            let timeout_ms = arguments["timeout"]
+                .as_u64()
+                .filter(|v| *v > 0)
+                .map(|s| s.saturating_mul(1000))
+                .unwrap_or(u64::MAX / 2);
             let cancel = Some(ctx.runtime().cancellation());
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));

@@ -32,6 +32,17 @@ pub use redactor::{SecretRedactor, SharedRedactor};
 
 mod ssh;
 pub use ssh::WorkspaceSshTool;
+
+/// Returns true when async-agent mode is enabled via config/env.
+fn async_agent_enabled() -> bool {
+    std::env::var("REMI_ASYNC_AGENT")
+        .ok()
+        .map(|value| {
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 use ssh::{parse_ssh_target, ssh_command_args, validate_ssh_named, SshTarget};
 
