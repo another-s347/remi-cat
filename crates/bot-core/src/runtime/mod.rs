@@ -228,10 +228,9 @@ fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreS
 pub const ASYNC_TOOL_SYSTEM_PROMPT: &str = "\
 Async tool execution:
 - Tool calls can keep running in the background after the foreground observation window closes.
-- If a tool result includes a `task_id`, that exact task is already running. Do not call the same tool, a sub-agent, or an equivalent replacement to duplicate the same objective.
+- You are free to process other user request, any other tasks or patiently waiting by doing nothing.
 - Do not continuously poll background tasks. The system will automatically send a system message with the tool name, task_id, elapsed time, and result when the task finishes.
-- Use `tool_tasks` only when you need to inspect current status/recent output or cancel an existing background task.
-- Background sub-agent and ACP sessions may still emit approval or user-question interactions while running; handle those interactions normally instead of starting duplicate work.";
+- Use `tool_tasks` only when you need to inspect current status/recent output or cancel an existing background task.";
 
 fn insert_async_tool_system_prompt(history: &mut Vec<Message>, insertion_index: usize) {
     history.insert(

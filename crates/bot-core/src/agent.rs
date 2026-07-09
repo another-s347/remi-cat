@@ -2486,8 +2486,11 @@ mod tests {
         assert!(result.contains("Tool `bash` is already running in the background."));
         assert!(result.contains("task_id: task-1"));
         assert!(!result.contains("Do not call"));
-        assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Do not call the same tool"));
+        assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains(
+            "You are free to process other user request, any other tasks or patiently waiting by doing nothing."
+        ));
         assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("automatically send"));
+        assert!(!crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Background sub-agent"));
     }
 
     #[test]
