@@ -430,14 +430,23 @@ function ToolPart({ toolName, args, argsText, result, status }: ToolCallMessageP
   if (pretty) {
     const patchText = pretty.tool_name === "apply_patch" ? patchTextFromPretty(pretty) : undefined;
     const icon = pretty.status === "error" ? "❌" : pretty.status === "success" ? "✅" : "⏳";
-    const liveElapsedMs =
-      pretty.elapsed_ms ??
-      (pretty.status === "running" && pretty.started_at_ms != null
-        ? performance.now() - pretty.started_at_ms
+    const now = performance.now();
+    const preparationElapsedMs =
+      pretty.preparation_elapsed_ms ??
+      (pretty.started_at_ms != null && pretty.execution_started_at_ms != null
+        ? Math.max(0, pretty.execution_started_at_ms - pretty.started_at_ms)
         : null);
-    const elapsedLabel = liveElapsedMs == null
-      ? pretty.status === "running" ? "执行中" : "已完成"
-      : formatDuration(liveElapsedMs);
+    const livePreparationMs =
+      preparationElapsedMs ??
+      (pretty.status === "running" && pretty.started_at_ms != null
+        ? Math.max(0, now - pretty.started_at_ms)
+        : null);
+    const liveExecutionMs =
+      pretty.elapsed_ms ??
+      (pretty.status === "running" && pretty.execution_started_at_ms != null
+        ? Math.max(0, now - pretty.execution_started_at_ms)
+        : null);
+    const elapsedLabel = toolElapsedLabel(pretty.status, livePreparationMs, liveExecutionMs);
     const imagePreview = workspaceImagePreview(pretty);
     return (
       <details className={`tool pretty-tool ${pretty.status}`} open={status.type === "running"}>
@@ -629,6 +638,18 @@ function SubSessionPart({ args, result, status }: ToolCallMessagePartProps) {
 function formatDuration(value?: number | null) {
   if (value === undefined || value === null) return "N/A";
   return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(2)} s`;
+}
+
+function toolElapsedLabel(
+  status: PrettyToolCall["status"],
+  preparationMs?: number | null,
+  executionMs?: number | null,
+) {
+  const parts: string[] = [];
+  if (preparationMs != null) parts.push(`准备 ${formatDuration(preparationMs)}`);
+  if (executionMs != null) parts.push(`执行 ${formatDuration(executionMs)}`);
+  if (parts.length) return parts.join(" · ");
+  return status === "running" ? "执行中" : "已完成";
 }
 
 function formatTokens(value?: number) {
