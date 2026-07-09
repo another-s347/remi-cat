@@ -136,6 +136,8 @@ export type PrettyToolCall = {
   status: "running" | "success" | "error";
   elapsed_ms?: number | null;
   started_at_ms?: number | null;
+  execution_started_at_ms?: number | null;
+  preparation_elapsed_ms?: number | null;
   request: unknown;
   response?: string | null;
 };

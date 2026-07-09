@@ -910,6 +910,43 @@ pub(super) fn tool_meta(pretty: &PrettyToolCall) -> String {
         .unwrap_or_else(|| format_elapsed(0))
 }
 
+pub(super) fn running_tool_meta(
+    started_at: Instant,
+    execution_started_at: Option<Instant>,
+) -> String {
+    let preparation_ms = execution_started_at
+        .unwrap_or_else(Instant::now)
+        .saturating_duration_since(started_at)
+        .as_millis() as u64;
+    match execution_started_at {
+        Some(execution_started_at) => format!(
+            "准备 {} · 执行 {}",
+            format_elapsed(preparation_ms),
+            format_elapsed(execution_started_at.elapsed().as_millis() as u64)
+        ),
+        None => format!("准备 {}", format_elapsed(preparation_ms)),
+    }
+}
+
+pub(super) fn tool_elapsed_meta(
+    started_at: Option<Instant>,
+    execution_started_at: Option<Instant>,
+    execution_elapsed_ms: u64,
+) -> String {
+    match (started_at, execution_started_at) {
+        (Some(started_at), Some(execution_started_at)) => format!(
+            "准备 {} · 执行 {}",
+            format_elapsed(
+                execution_started_at
+                    .saturating_duration_since(started_at)
+                    .as_millis() as u64
+            ),
+            format_elapsed(execution_elapsed_ms)
+        ),
+        _ => format_elapsed(execution_elapsed_ms),
+    }
+}
+
 pub(super) fn append_token_meta(cell: &mut HistoryCell, delta: TokenDelta) {
     if delta.is_empty() {
         return;
@@ -940,7 +977,10 @@ pub(super) fn preserve_token_meta(mut meta: String, existing_meta: &str) -> Stri
 }
 
 pub(super) fn patch_tool_meta(pretty: &PrettyToolCall) -> String {
-    let elapsed = tool_meta(pretty);
+    patch_tool_meta_with_elapsed(tool_meta(pretty), pretty)
+}
+
+pub(super) fn patch_tool_meta_with_elapsed(elapsed: String, pretty: &PrettyToolCall) -> String {
     if pretty.summary.trim().is_empty() {
         elapsed
     } else {

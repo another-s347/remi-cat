@@ -31,6 +31,47 @@ function contentText(content: AppendMessage["content"]) {
     .join("");
 }
 
+function runningPrettyTool(
+  pretty: PrettyToolCall | undefined,
+  existing: PrettyToolCall | undefined,
+  partial: boolean,
+) {
+  if (!pretty) return existing;
+  const now = performance.now();
+  const startedAt = existing?.started_at_ms ?? pretty.started_at_ms ?? now;
+  const executionStartedAt = partial
+    ? (existing?.execution_started_at_ms ?? pretty.execution_started_at_ms ?? null)
+    : (existing?.execution_started_at_ms ?? pretty.execution_started_at_ms ?? now);
+  return {
+    ...pretty,
+    started_at_ms: startedAt,
+    execution_started_at_ms: executionStartedAt,
+    preparation_elapsed_ms:
+      executionStartedAt == null
+        ? (existing?.preparation_elapsed_ms ?? pretty.preparation_elapsed_ms ?? null)
+        : Math.max(0, executionStartedAt - startedAt),
+  };
+}
+
+function completedPrettyTool(
+  pretty: PrettyToolCall | undefined,
+  existing: PrettyToolCall | undefined,
+) {
+  if (!pretty) return undefined;
+  const startedAt = existing?.started_at_ms ?? pretty.started_at_ms ?? null;
+  const executionStartedAt =
+    existing?.execution_started_at_ms ?? pretty.execution_started_at_ms ?? null;
+  return {
+    ...pretty,
+    started_at_ms: startedAt,
+    execution_started_at_ms: executionStartedAt,
+    preparation_elapsed_ms:
+      startedAt != null && executionStartedAt != null
+        ? Math.max(0, executionStartedAt - startedAt)
+        : (existing?.preparation_elapsed_ms ?? pretty.preparation_elapsed_ms ?? null),
+  };
+}
+
 type PendingSteer = {
   messageId: string;
   text: string;
@@ -609,9 +650,11 @@ export function RemiRuntimeProvider({
                 const part = parts[existingIndex];
                 if (part?.type === "tool-call") {
                   const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
-                  const runningPretty = pretty
-                    ? { ...pretty, started_at_ms: existingPretty?.started_at_ms ?? performance.now() }
-                    : existingPretty;
+                  const runningPretty = runningPrettyTool(
+                    pretty,
+                    existingPretty,
+                    Boolean(data.partial),
+                  );
                   parts[existingIndex] = {
                     ...part,
                     toolName,
@@ -621,9 +664,7 @@ export function RemiRuntimeProvider({
                 }
                 break;
               }
-              const runningPretty = pretty
-                ? { ...pretty, started_at_ms: performance.now() }
-                : undefined;
+              const runningPretty = runningPrettyTool(pretty, undefined, Boolean(data.partial));
               toolIndexes.set(toolCallId, parts.length);
               runningToolIds.add(toolCallId);
               startTicker();
@@ -645,11 +686,15 @@ export function RemiRuntimeProvider({
               if (index === undefined) break;
               const part = parts[index];
               if (part?.type === "tool-call") {
+                const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
                 parts[index] = {
                   ...part,
                   result: {
                     raw: data.result,
-                    pretty: data.pretty as PrettyToolCall | undefined,
+                    pretty: completedPrettyTool(
+                      data.pretty as PrettyToolCall | undefined,
+                      existingPretty,
+                    ),
                   },
                 };
               }
@@ -903,9 +948,11 @@ export function RemiRuntimeProvider({
                 const part = parts[existingIndex];
                 if (part?.type === "tool-call") {
                   const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
-                  const runningPretty = pretty
-                    ? { ...pretty, started_at_ms: existingPretty?.started_at_ms ?? performance.now() }
-                    : existingPretty;
+                  const runningPretty = runningPrettyTool(
+                    pretty,
+                    existingPretty,
+                    Boolean(data.partial),
+                  );
                   parts[existingIndex] = {
                     ...part,
                     toolName,
@@ -915,9 +962,7 @@ export function RemiRuntimeProvider({
                 }
                 break;
               }
-              const runningPretty = pretty
-                ? { ...pretty, started_at_ms: performance.now() }
-                : undefined;
+              const runningPretty = runningPrettyTool(pretty, undefined, Boolean(data.partial));
               toolIndexes.set(toolCallId, parts.length);
               runningToolIds.add(toolCallId);
               startTicker();
@@ -939,11 +984,15 @@ export function RemiRuntimeProvider({
               if (index === undefined) break;
               const part = parts[index];
               if (part?.type === "tool-call") {
+                const existingPretty = (part.args as { pretty?: PrettyToolCall }).pretty;
                 parts[index] = {
                   ...part,
                   result: {
                     raw: data.result,
-                    pretty: data.pretty as PrettyToolCall | undefined,
+                    pretty: completedPrettyTool(
+                      data.pretty as PrettyToolCall | undefined,
+                      existingPretty,
+                    ),
                   },
                 };
               }

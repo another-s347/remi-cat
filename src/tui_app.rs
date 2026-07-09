@@ -691,6 +691,7 @@ struct TuiApp {
     active_tool_args: std::collections::HashMap<String, String>,
     active_tool_names: std::collections::HashMap<String, String>,
     active_tool_started_at: std::collections::HashMap<String, Instant>,
+    active_tool_execution_started_at: std::collections::HashMap<String, Instant>,
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
@@ -758,6 +759,7 @@ impl TuiApp {
             active_tool_args: std::collections::HashMap::new(),
             active_tool_names: std::collections::HashMap::new(),
             active_tool_started_at: std::collections::HashMap::new(),
+            active_tool_execution_started_at: std::collections::HashMap::new(),
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
@@ -1280,6 +1282,7 @@ impl TuiApp {
         self.active_tool_args.clear();
         self.active_tool_names.clear();
         self.active_tool_started_at.clear();
+        self.active_tool_execution_started_at.clear();
         self.sub_tool_args.clear();
         self.sub_tool_names.clear();
         self.sub_sessions.clear();
@@ -1357,12 +1360,17 @@ impl TuiApp {
                 self.active_tool_names.insert(id.clone(), name.clone());
                 self.active_tool_started_at
                     .insert(id.clone(), Instant::now());
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| running_tool_meta(*started, None))
+                    .unwrap_or_else(|| format_elapsed(0));
                 let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
                 if name == "apply_patch" {
                     self.cells.push(HistoryCell::patch_diff(
                         id.clone(),
                         "waiting for patch...".to_string(),
-                        format_elapsed(0),
+                        meta,
                         ToolVisualStatus::Running,
                     ));
                 } else {
@@ -1371,7 +1379,7 @@ impl TuiApp {
                         id.clone(),
                         pretty.title,
                         body,
-                        format_elapsed(0),
+                        meta,
                         ToolVisualStatus::Running,
                     ));
                 }
@@ -1420,6 +1428,19 @@ impl TuiApp {
                 self.active_tool_started_at
                     .entry(id.clone())
                     .or_insert_with(Instant::now);
+                self.active_tool_execution_started_at
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| {
+                        running_tool_meta(
+                            *started,
+                            self.active_tool_execution_started_at.get(&id).copied(),
+                        )
+                    })
+                    .unwrap_or_else(|| format_elapsed(0));
                 let args_value = parse_tool_args(&args).unwrap_or(serde_json::Value::Null);
                 let pretty = PrettyToolCall::started(&id, &name, &args_value);
                 let existing = self
@@ -1432,11 +1453,12 @@ impl TuiApp {
                         extract_patch_arg(&args).unwrap_or_else(|| "reading patch...".to_string());
                     if let Some(cell) = existing {
                         cell.body = body;
+                        cell.meta = preserve_token_meta(meta, &cell.meta);
                     } else {
                         self.cells.push(HistoryCell::patch_diff(
                             id.clone(),
                             body,
-                            format_elapsed(0),
+                            meta,
                             ToolVisualStatus::Running,
                         ));
                     }
@@ -1444,13 +1466,14 @@ impl TuiApp {
                     let body = tool_body(&pretty);
                     cell.title = pretty.title;
                     cell.body = body;
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
                 } else {
                     let body = tool_body(&pretty);
                     self.cells.push(HistoryCell::tool(
                         id.clone(),
                         pretty.title,
                         body,
-                        format_elapsed(0),
+                        meta,
                         ToolVisualStatus::Running,
                     ));
                 }
@@ -1477,7 +1500,8 @@ impl TuiApp {
                     args
                 };
                 self.active_tool_names.remove(&id);
-                self.active_tool_started_at.remove(&id);
+                let started_at = self.active_tool_started_at.remove(&id);
+                let execution_started_at = self.active_tool_execution_started_at.remove(&id);
                 let args_value = parse_tool_args(&args).unwrap_or(serde_json::Value::Null);
                 let pretty = PrettyToolCall::completed(
                     &id,
@@ -1490,7 +1514,10 @@ impl TuiApp {
                 if name == "apply_patch" {
                     let patch = extract_patch_arg(&args)
                         .unwrap_or_else(|| "patch arguments unavailable".to_string());
-                    let meta = patch_tool_meta(&pretty);
+                    let meta = patch_tool_meta_with_elapsed(
+                        tool_elapsed_meta(started_at, execution_started_at, elapsed_ms),
+                        &pretty,
+                    );
                     if let Some(cell) = self
                         .cells
                         .iter_mut()
@@ -1522,7 +1549,7 @@ impl TuiApp {
                     return;
                 }
                 let status = ToolVisualStatus::from_pretty(&pretty.status);
-                let meta = tool_meta(&pretty);
+                let meta = tool_elapsed_meta(started_at, execution_started_at, elapsed_ms);
                 if let Some(cell) = self
                     .cells
                     .iter_mut()
@@ -1561,7 +1588,12 @@ impl TuiApp {
                 let meta = self
                     .active_tool_started_at
                     .get(&id)
-                    .map(|started| format_elapsed(started.elapsed().as_millis() as u64))
+                    .map(|started| {
+                        running_tool_meta(
+                            *started,
+                            self.active_tool_execution_started_at.get(&id).copied(),
+                        )
+                    })
                     .unwrap_or_else(|| format_elapsed(0));
                 if let Some(cell) = self
                     .cells
@@ -1993,6 +2025,7 @@ impl TuiApp {
         self.active_tool_args.clear();
         self.active_tool_names.clear();
         self.active_tool_started_at.clear();
+        self.active_tool_execution_started_at.clear();
     }
 
     fn request_cancel_current_run(&mut self) {
@@ -2246,7 +2279,10 @@ impl TuiApp {
             let Some(started) = self.active_tool_started_at.get(tool_id) else {
                 continue;
             };
-            cell.meta = format_elapsed(started.elapsed().as_millis() as u64);
+            cell.meta = running_tool_meta(
+                *started,
+                self.active_tool_execution_started_at.get(tool_id).copied(),
+            );
         }
     }
 
@@ -2860,13 +2896,18 @@ impl TuiApp {
                 self.active_tool_names.insert(id.clone(), name.clone());
                 self.active_tool_started_at
                     .insert(id.clone(), Instant::now());
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| running_tool_meta(*started, None))
+                    .unwrap_or_else(|| format_elapsed(0));
                 let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
                 let body = tool_body(&pretty);
                 self.cells.push(HistoryCell::tool(
                     id.clone(),
                     pretty.title,
                     body,
-                    format_elapsed(0),
+                    meta,
                     ToolVisualStatus::Running,
                 ));
                 self.mark_token_cell(self.cells.len().saturating_sub(1));
@@ -2899,7 +2940,12 @@ impl TuiApp {
                 let meta = self
                     .active_tool_started_at
                     .get(&id)
-                    .map(|started| format_elapsed(started.elapsed().as_millis() as u64))
+                    .map(|started| {
+                        running_tool_meta(
+                            *started,
+                            self.active_tool_execution_started_at.get(&id).copied(),
+                        )
+                    })
                     .unwrap_or_else(|| format_elapsed(0));
                 if let Some(cell) = self
                     .cells
@@ -2936,7 +2982,8 @@ impl TuiApp {
                     args
                 };
                 self.active_tool_names.remove(&id);
-                self.active_tool_started_at.remove(&id);
+                let started_at = self.active_tool_started_at.remove(&id);
+                let execution_started_at = self.active_tool_execution_started_at.remove(&id);
                 let args_value = parse_tool_args(&args).unwrap_or(serde_json::Value::Null);
                 let pretty = PrettyToolCall::completed(
                     &id,
@@ -2947,7 +2994,7 @@ impl TuiApp {
                     elapsed_ms,
                 );
                 let status = ToolVisualStatus::from_pretty(&pretty.status);
-                let meta = tool_meta(&pretty);
+                let meta = tool_elapsed_meta(started_at, execution_started_at, elapsed_ms);
                 if let Some(cell) = self
                     .cells
                     .iter_mut()

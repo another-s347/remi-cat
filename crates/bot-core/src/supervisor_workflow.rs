@@ -872,7 +872,8 @@ fn render_supervisor_prompt(
          allowed_subtree is rooted at the current node; cycle_cut=true means the subtree was truncated at a repeated node and must not be expanded further.\n\
          Return only JSON with this shape, using the JSON null literal for absent optional fields, never the string \"null\":\n\
          {{\"target_node\":null,\"edge\":\"direct edge id\",\"agent_message\":\"required instruction for non-terminal transitions, otherwise null\",\"next_node_message\":null,\"reason\":\"short reason\"}}\n\
-         For a transition to a non-terminal node, agent_message must be non-empty. For a terminal transition it is ignored.\n\n{}",
+         For a transition to a non-terminal node, agent_message must be non-empty. For a terminal transition it is ignored.\n\
+         agent_message must tell the main agent the current node goal to execute now, summarize what later workflow nodes or phases may still follow based on allowed_outgoing_edges and allowed_subtree, and explicitly instruct the main agent to complete only the current node goal without performing later-node goals early.\n\n{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     ))
 }
@@ -1088,6 +1089,10 @@ mod tests {
         assert!(prompt.contains("\"allowed_subtree\""));
         assert!(prompt.contains("\"allowed_jump_targets\""));
         assert!(prompt.contains("\"main_agent_history\": []"));
+        assert!(prompt.contains("current node goal to execute now"));
+        assert!(prompt.contains("later workflow nodes or phases may still follow"));
+        assert!(prompt.contains("complete only the current node goal"));
+        assert!(prompt.contains("without performing later-node goals early"));
     }
 
     #[test]
