@@ -1418,7 +1418,8 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn steer_start_input(state: AgentState, batch: CoreSteerBatch) -> LoopInput {
+fn steer_start_input(mut state: AgentState, batch: CoreSteerBatch) -> LoopInput {
+    complete_pending_tool_calls_in_state(&mut state);
     let mut input = LoopInput::start_content(batch.content)
         .history(state.messages)
         .user_state(state.user_state);
@@ -1440,6 +1441,7 @@ fn steer_start_input_after_tool_results(
     batch: CoreSteerBatch,
 ) -> LoopInput {
     append_tool_results_to_history(&mut state.messages, results);
+    complete_pending_tool_calls_in_state(&mut state);
     steer_start_input(state, batch)
 }
 
@@ -2362,14 +2364,14 @@ mod tests {
         collect_tool_results_parallel, complete_interrupted_tool_results,
         complete_pending_tool_calls_in_state, fs_read_overflow_summary,
         outer_thread_id_from_metadata, spawn_background_side_event_forwarder, split_utf8_chunks,
-        tool_foreground_timeout, tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome,
-        INTERRUPTED_TOOL_RESULT_ERROR,
+        steer_start_input, steer_start_input_after_tool_results, tool_foreground_timeout,
+        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
     use crate::user_question::UserQuestionManager;
     use bot_runtime_core::ToolContext;
-    use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
+    use bot_runtime_core::{CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreStreamOptions};
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, CancellationToken, Checkpoint, CheckpointStatus, Content,
@@ -2495,6 +2497,87 @@ mod tests {
         ));
         assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("automatically send"));
         assert!(!crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Background sub-agent"));
+    }
+
+    fn test_steer_batch(text: &str) -> CoreSteerBatch {
+        CoreSteerBatch {
+            ids: vec!["steer-1".to_string()],
+            content: Content::text(text),
+            preview: text.to_string(),
+            count: 1,
+            message_metadata: None,
+            user_name: None,
+        }
+    }
+
+    #[test]
+    fn steer_start_input_closes_pending_tool_calls_before_user_message() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.messages = vec![Message::assistant_with_tool_calls(
+            "",
+            vec![test_tool_call_message("call-1", "read")],
+            None,
+        )];
+
+        let input = steer_start_input(state, test_steer_batch("steer"));
+
+        match input {
+            LoopInput::Start {
+                history, message, ..
+            } => {
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[1].role, Role::Tool);
+                assert_eq!(history[1].tool_call_id.as_deref(), Some("call-1"));
+                assert!(history[1]
+                    .content
+                    .text_content()
+                    .contains(INTERRUPTED_TOOL_RESULT_ERROR));
+                assert_eq!(message.content.text_content(), "steer");
+            }
+            other => panic!("expected start input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steer_after_tool_results_preserves_results_and_closes_remaining_calls() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.messages = vec![Message::assistant_with_tool_calls(
+            "",
+            vec![
+                test_tool_call_message("call-1", "read"),
+                test_tool_call_message("call-2", "write"),
+            ],
+            None,
+        )];
+        let results = vec![ToolCallOutcome::Result {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            content: Content::text("done"),
+        }];
+
+        let input = steer_start_input_after_tool_results(state, results, test_steer_batch("steer"));
+
+        match input {
+            LoopInput::Start { history, .. } => {
+                let result_messages = history
+                    .iter()
+                    .filter_map(|message| {
+                        Some((
+                            message.tool_call_id.as_deref()?,
+                            message.content.text_content(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(result_messages.len(), 2);
+                assert!(result_messages
+                    .iter()
+                    .any(|(id, text)| *id == "call-1" && text == "done"));
+                assert!(result_messages.iter().any(|(id, text)| {
+                    *id == "call-2" && text.contains(INTERRUPTED_TOOL_RESULT_ERROR)
+                }));
+            }
+            other => panic!("expected start input, got {other:?}"),
+        }
     }
 
     #[test]
