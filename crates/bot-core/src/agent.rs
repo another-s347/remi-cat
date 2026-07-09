@@ -1884,11 +1884,7 @@ enum ForegroundToolOutcome {
 fn background_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolResult {
     CollectedToolResult::text(format!(
         "Tool `{tool_name}` is already running in the background.\n\
-         task_id: {task_id}\n\n\
-         Do not call `{tool_name}` again to continue or duplicate this same work. \
-         Do not start a replacement task for the same objective. \
-         The system will automatically send you the result when this task finishes; continue only after that notification unless the user explicitly asks you to cancel or start a different task. \
-         Use tool_tasks only to inspect recent output/status or cancel the existing task."
+         task_id: {task_id}"
     ))
 }
 
@@ -2485,11 +2481,13 @@ mod tests {
     }
 
     #[test]
-    fn background_task_prompt_tells_agent_not_to_duplicate_work() {
-        let prompt = background_task_tool_result("task-1", "bash").preview;
-        assert!(prompt.contains("Do not call `bash` again"));
-        assert!(prompt.contains("Do not start a replacement task"));
-        assert!(prompt.contains("automatically send you the result"));
+    fn background_task_tool_result_only_reports_existing_task() {
+        let result = background_task_tool_result("task-1", "bash").preview;
+        assert!(result.contains("Tool `bash` is already running in the background."));
+        assert!(result.contains("task_id: task-1"));
+        assert!(!result.contains("Do not call"));
+        assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Do not call the same tool"));
+        assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("automatically send"));
     }
 
     #[test]

@@ -225,6 +225,21 @@ fn background_task_completion_steer_input(task: &crate::ToolTaskRecord) -> CoreS
     }
 }
 
+pub const ASYNC_TOOL_SYSTEM_PROMPT: &str = "\
+Async tool execution:
+- Tool calls can keep running in the background after the foreground observation window closes.
+- If a tool result includes a `task_id`, that exact task is already running. Do not call the same tool, a sub-agent, or an equivalent replacement to duplicate the same objective.
+- Do not continuously poll background tasks. The system will automatically send a system message with the tool name, task_id, elapsed time, and result when the task finishes.
+- Use `tool_tasks` only when you need to inspect current status/recent output or cancel an existing background task.
+- Background sub-agent and ACP sessions may still emit approval or user-question interactions while running; handle those interactions normally instead of starting duplicate work.";
+
+fn insert_async_tool_system_prompt(history: &mut Vec<Message>, insertion_index: usize) {
+    history.insert(
+        insertion_index.min(history.len()),
+        Message::system(ASYNC_TOOL_SYSTEM_PROMPT),
+    );
+}
+
 // -- StreamOptions ----------------------------------------------------------
 
 /// Per-turn options for [`CatBot::stream_with_options`].
@@ -2024,6 +2039,12 @@ impl CatBot {
                     &self.pinned_skill_summaries,
                     effective_model.profile.context_tokens,
                     skill_prompt_tools,
+                );
+                insert_async_tool_system_prompt(
+                    &mut history,
+                    agent_header_count
+                        + round_opts.skill_injections.len()
+                        + usize::from(!self.pinned_skill_summaries.is_empty()),
                 );
                 insert_single_chat_sender_system_prompt(
                     &mut history,
@@ -4396,14 +4417,14 @@ mod tests {
     use super::{
         append_thread_todo_system_prompt, background_task_completion_steer_input,
         context_percent_tokens, default_system_prompt, format_subagent_tool_result,
-        insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
-        local_acp_thread_id, model_input_snapshot_from_loop_input, prepend_group_sender_username,
-        route_thread_todo_prompt, single_chat_sender_system_prompt,
+        insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
+        install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
+        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, AgentModelBindings, CatBotBuilder,
         CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
         ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
         SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
-        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
@@ -5523,6 +5544,26 @@ You are Remi.
             contents[2],
             "当前是单聊场景。当前正在与你对话的用户是 Alice（内部ID: uuid-1）。"
         );
+        assert_eq!(contents[3], "long-term");
+    }
+
+    #[test]
+    fn async_tool_system_prompt_is_inserted_after_skill_prompts() {
+        let mut history = vec![
+            Message::system("agent"),
+            Message::system("skill"),
+            Message::system("long-term"),
+        ];
+
+        insert_async_tool_system_prompt(&mut history, 2);
+
+        let contents: Vec<String> = history
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect();
+        assert_eq!(contents[0], "agent");
+        assert_eq!(contents[1], "skill");
+        assert_eq!(contents[2], ASYNC_TOOL_SYSTEM_PROMPT);
         assert_eq!(contents[3], "long-term");
     }
 
