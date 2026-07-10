@@ -193,7 +193,7 @@ impl CoreLoopDriver {
         match event {
             AgentEvent::TextDelta(delta) => CoreDriveEvent::Text(delta),
             AgentEvent::ThinkingDelta(delta) => CoreDriveEvent::ThinkingDelta(delta),
-            AgentEvent::ThinkingEnd { .. } => CoreDriveEvent::Ignored,  // content already streamed via ThinkingDelta
+            AgentEvent::ThinkingEnd { .. } => CoreDriveEvent::Thinking(String::new()),  // signal phase end; content already streamed via deltas
             AgentEvent::ToolCallStart { id, name } => CoreDriveEvent::ToolCallStart { id, name },
             AgentEvent::ToolCallArgumentsDelta { id, delta } => {
                 CoreDriveEvent::ToolCallArgumentsDelta { id, delta }
