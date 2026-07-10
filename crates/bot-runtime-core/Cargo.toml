@@ -12,7 +12,7 @@ publish = false
 doctest = false
 
 [dependencies]
-remi-agentloop = { path = "/home/skye/remi-agentloop/remi-agentloop", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5", features = [
     "tracing-langsmith",
 ] }
 anyhow = "1"
