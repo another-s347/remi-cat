@@ -80,7 +80,6 @@ const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
 const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 const MAX_TUI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const TUI_WORKSPACE_DIR_METADATA_KEY: &str = "tui_workspace_dir";
-const GIT_BRANCH_EVENT_DEBOUNCE: Duration = Duration::from_millis(200);
 const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
@@ -802,7 +801,7 @@ struct TuiApp {
     // filesystem notifications.
     _git_watcher: Option<RecommendedWatcher>,
     git_change_rx: mpsc::UnboundedReceiver<()>,
-    git_branch_refresh_after: Option<Instant>,
+    is_sub_session_view: bool,
     // Cell rendering (especially streamed Markdown) dominates redraw cost.
     // Cache each rendered cell independently so a new delta only re-renders
     // that cell instead of rebuilding the entire visible transcript.
@@ -871,6 +870,12 @@ impl TuiApp {
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
         let git_status = current_git_status(&workspace_dir);
+        let is_sub_session_view = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(&session_id, "sub_session_thread_id")
+            .is_some();
         let (git_watcher, git_change_rx) = watch_git_metadata(&workspace_dir)
             .map(|(watcher, rx)| (Some(watcher), rx))
             .unwrap_or_else(|| {
@@ -890,7 +895,7 @@ impl TuiApp {
             git_status,
             _git_watcher: git_watcher,
             git_change_rx,
-            git_branch_refresh_after: None,
+            is_sub_session_view,
             history_line_cache: std::collections::HashMap::new(),
             file_query: None,
             file_matches: Vec::new(),
@@ -953,10 +958,12 @@ impl TuiApp {
 
     async fn run(&mut self, terminal: &mut CrosstermTerminal) -> anyhow::Result<()> {
         let mut events = EventStream::new();
-        // Animate active state at roughly 60fps without polling the
-        // filesystem/session store at that same rate.
+        // This timer is enabled only while the agent is active. Idle TUI
+        // sessions wait on terminal, bot, and filesystem events instead.
         let mut tick = tokio::time::interval(ACTIVE_FRAME_INTERVAL);
-        let mut last_background_poll = Instant::now();
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut sub_session_tick = tokio::time::interval(BACKGROUND_POLL_INTERVAL);
+        sub_session_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut needs_draw = true;
 
         loop {
@@ -987,22 +994,19 @@ impl TuiApp {
                         break;
                     }
                 }
-                _ = tick.tick() => {
-                    let active_frame = self.running || self.active_tool_count() > 0;
-                    if active_frame {
-                        self.flush_status_elapsed();
+                Some(_) = self.git_change_rx.recv() => {
+                    if self.refresh_git_branch_from_events() {
                         needs_draw = true;
                     }
-                    if last_background_poll.elapsed() >= BACKGROUND_POLL_INTERVAL {
-                        let sub_session_event_log_lines = self.sub_session_event_log_lines;
-                        self.poll_sub_session_history().await;
-                        let git_refreshed = self.refresh_git_branch_from_events();
-                        last_background_poll = Instant::now();
-                        // An idle TUI waits for actual events. Background
-                        // polling can still redraw when it discovers a change.
-                        needs_draw |= self.sub_session_event_log_lines != sub_session_event_log_lines
-                            || git_refreshed;
-                    }
+                }
+                _ = tick.tick(), if self.running || self.active_tool_count() > 0 => {
+                    self.flush_status_elapsed();
+                    needs_draw = true;
+                }
+                _ = sub_session_tick.tick(), if self.is_sub_session_view => {
+                    let sub_session_event_log_lines = self.sub_session_event_log_lines;
+                    self.poll_sub_session_history().await;
+                    needs_draw |= self.sub_session_event_log_lines != sub_session_event_log_lines;
                 }
             }
         }
@@ -1010,18 +1014,9 @@ impl TuiApp {
     }
 
     fn refresh_git_branch_from_events(&mut self) -> bool {
-        while self.git_change_rx.try_recv().is_ok() {
-            self.git_branch_refresh_after = Some(Instant::now() + GIT_BRANCH_EVENT_DEBOUNCE);
-        }
-        if self
-            .git_branch_refresh_after
-            .is_some_and(|when| Instant::now() >= when)
-        {
-            self.git_status = current_git_status(&self.workspace_dir);
-            self.git_branch_refresh_after = None;
-            return true;
-        }
-        false
+        while self.git_change_rx.try_recv().is_ok() {}
+        self.git_status = current_git_status(&self.workspace_dir);
+        true
     }
 
     async fn handle_terminal_event(&mut self, event: Event) -> anyhow::Result<bool> {
@@ -1481,6 +1476,13 @@ impl TuiApp {
         let old_session_id = self.session_id.clone();
         let old_had_activity = self.has_activity;
         self.session_id = session_id;
+        self.is_sub_session_view = self
+            .runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(&self.session_id, "sub_session_thread_id")
+            .is_some();
         self.has_activity = false;
         self.cells.clear();
         self.history_line_cache.clear();
