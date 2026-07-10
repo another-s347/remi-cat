@@ -43,6 +43,10 @@ pub struct ToolTaskRecord {
     pub recent_output: Vec<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub notify_on_finish: bool,
+    #[serde(default)]
+    pub notification_delivered: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -54,7 +58,6 @@ struct ToolTaskStore {
 struct RunningTask {
     cancel: CancellationToken,
     abort: Option<tokio::task::AbortHandle>,
-    notify_on_finish: bool,
 }
 
 #[derive(Debug)]
@@ -120,13 +123,14 @@ impl ToolTaskManager {
             result_preview: None,
             recent_output: Vec::new(),
             message: None,
+            notify_on_finish: false,
+            notification_delivered: false,
         };
         self.running.lock().await.insert(
             task_id.clone(),
             RunningTask {
                 cancel,
                 abort: None,
-                notify_on_finish: false,
             },
         );
         self.store
@@ -147,17 +151,58 @@ impl ToolTaskManager {
     }
 
     pub async fn enable_completion_notification(&self, task_id: &str) -> Option<ToolTaskRecord> {
-        if let Some(running) = self.running.lock().await.get_mut(task_id) {
-            running.notify_on_finish = true;
+        let mut store = self.store.lock().await;
+        let record = store.tasks.get_mut(task_id)?;
+        record.notify_on_finish = true;
+        let snapshot = record.clone();
+        drop(store);
+        let _ = self.save().await;
+        if snapshot.status == TOOL_TASK_RUNNING {
             return None;
         }
-        let record = self.store.lock().await.tasks.get(task_id).cloned();
-        if let Some(record) = record.as_ref() {
-            if record.status != TOOL_TASK_RUNNING {
-                let _ = self.completed_tx.send(record.clone());
+        if !snapshot.notification_delivered {
+            let _ = self.completed_tx.send(snapshot.clone());
+        }
+        Some(snapshot)
+    }
+
+    pub async fn claim_completion_notification(&self, task_id: &str) -> bool {
+        let mut store = self.store.lock().await;
+        let Some(record) = store.tasks.get_mut(task_id) else {
+            return false;
+        };
+        if record.status == TOOL_TASK_RUNNING
+            || !record.notify_on_finish
+            || record.notification_delivered
+        {
+            return false;
+        }
+        record.notification_delivered = true;
+        drop(store);
+        let _ = self.save().await;
+        true
+    }
+
+    pub async fn claim_pending_completion_notification(
+        &self,
+        thread_id: &str,
+    ) -> Option<ToolTaskRecord> {
+        let mut store = self.store.lock().await;
+        for record in store.tasks.values_mut() {
+            if record.thread_id == thread_id
+                && record.status != TOOL_TASK_RUNNING
+                && record.notify_on_finish
+                && !record.notification_delivered
+            {
+                record.notification_delivered = true;
+                let pending = record.clone();
+                drop(store);
+                let _ = self.save().await;
+                return Some(pending);
             }
         }
-        record
+        drop(store);
+        None
     }
 
     pub async fn append_output(&self, task_id: &str, line: impl Into<String>) {
@@ -180,13 +225,7 @@ impl ToolTaskManager {
         elapsed_ms: u64,
         result_preview: String,
     ) -> Option<ToolTaskRecord> {
-        let notify_on_finish = self
-            .running
-            .lock()
-            .await
-            .remove(task_id)
-            .map(|running| running.notify_on_finish)
-            .unwrap_or(false);
+        self.running.lock().await.remove(task_id);
         let mut store = self.store.lock().await;
         let record = store.tasks.get_mut(task_id)?;
         if record.status != TOOL_TASK_RUNNING {
@@ -202,6 +241,7 @@ impl ToolTaskManager {
         record.elapsed_ms = Some(elapsed_ms);
         record.success = Some(success);
         record.result_preview = Some(result_preview);
+        let notify_on_finish = record.notify_on_finish && !record.notification_delivered;
         let cloned = record.clone();
         drop(store);
         let _ = self.save().await;
@@ -357,12 +397,23 @@ impl Tool for ToolTasksTool {
                             .unwrap_or_else(|_| serde_json::json!([])),
                         "get" => {
                             let task_id = arguments["task_id"].as_str().unwrap_or_default();
-                            serde_json::to_value(manager.get(task_id).await)
+                            let task = manager.get(task_id).await;
+                            let task = task.filter(|task| task.thread_id == thread_id);
+                            serde_json::to_value(task)
                                 .unwrap_or(serde_json::Value::Null)
                         }
                         "cancel" => {
                             let task_id = arguments["task_id"].as_str().unwrap_or_default();
-                            serde_json::to_value(manager.cancel(task_id).await)
+                            let task = manager.get(task_id).await;
+                            let task = if task
+                                .as_ref()
+                                .is_some_and(|task| task.thread_id == thread_id)
+                            {
+                                manager.cancel(task_id).await
+                            } else {
+                                None
+                            };
+                            serde_json::to_value(task)
                                 .unwrap_or(serde_json::Value::Null)
                         }
                         other => serde_json::json!({"error": format!("unsupported action `{other}`")}),
@@ -532,5 +583,35 @@ mod tests {
         let completed = completed_rx.recv().await.unwrap();
         assert_eq!(completed.task_id, task_id);
         assert_eq!(completed.status, TOOL_TASK_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn completion_notification_claim_is_idempotent() {
+        let manager = ToolTaskManager::load(temp_data_dir("claim")).unwrap();
+        let mut completed_rx = manager.subscribe_completed();
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({"command": "sleep 10"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.enable_completion_notification(&task_id).await;
+        manager
+            .finish(&task_id, true, 10_000, "done".to_string())
+            .await
+            .unwrap();
+
+        assert!(manager.claim_completion_notification(&task_id).await);
+        assert!(!manager.claim_completion_notification(&task_id).await);
+        assert!(manager
+            .claim_pending_completion_notification("thread-a")
+            .await
+            .is_none());
+        assert_eq!(completed_rx.recv().await.unwrap().task_id, task_id);
     }
 }

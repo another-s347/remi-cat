@@ -14,6 +14,18 @@ use crate::channel::feishu::collect_cli_bot_reply;
 use crate::channel::{Channel, ChannelKind};
 use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
 
+fn async_agent_enabled() -> bool {
+    std::env::var("REMI_ASYNC_AGENT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) struct CliChannel {
     config: CliConfig,
 }
@@ -73,7 +85,7 @@ pub(crate) async fn process_prompt_message(
         &runtime.root_agent_id,
     )?;
     let request = ChatRequest::text(session_id, ChatChannel::Cli, text)
-        .with_async_agent(cli.wait_background_tasks);
+        .with_async_agent(cli.async_agent || cli.wait_background_tasks || async_agent_enabled());
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let mut output = String::new();
     let timeout = tokio::time::sleep(Duration::from_secs(300));

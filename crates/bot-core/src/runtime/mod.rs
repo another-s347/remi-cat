@@ -2352,7 +2352,9 @@ impl CatBot {
                         }
                         completed = completed_tool_tasks.recv() => {
                             if let Ok(task) = completed {
-                                if task.thread_id == thread_id_owned {
+                                if task.thread_id == thread_id_owned
+                                    && self.tool_tasks.claim_completion_notification(&task.task_id).await
+                                {
                                     if let Some(steer) = steer_queue.as_ref() {
                                         steer.push(background_task_completion_steer_input(&task));
                                     }
@@ -2668,6 +2670,13 @@ impl CatBot {
                                             &mut completed_tool_tasks,
                                             &thread_id_owned,
                                         ) {
+                                            if !self
+                                                .tool_tasks
+                                                .claim_completion_notification(&task.task_id)
+                                                .await
+                                            {
+                                                continue;
+                                            }
                                             let fallback_content =
                                                 background_task_completion_content(&task);
                                             if let Some(steer) = steer_queue.as_ref() {
@@ -2703,6 +2712,56 @@ impl CatBot {
                                         ) {
                                             yield event;
                                         }
+                                        if let Some(steer) = steer_queue.as_ref() {
+                                            if let Some(batch) = steer.drain_batch() {
+                                                yield CatEvent::SteerInjected(
+                                                    crate::SteerInjectedEvent {
+                                                        steer_ids: batch.ids.clone(),
+                                                        session_id: thread_id_owned.clone(),
+                                                        preview: batch.preview.clone(),
+                                                        count: batch.count,
+                                                    },
+                                                );
+                                                next_content = batch.content;
+                                                continuation_from_supervisor = false;
+                                                continuation_from_background_task = true;
+                                                continue 'workflow_loop;
+                                            }
+                                        }
+                                        let pending_completion = self
+                                            .tool_tasks
+                                            .claim_pending_completion_notification(&thread_id_owned)
+                                            .await;
+                                        if let Some(task) = pending_completion {
+                                            let fallback_content =
+                                                background_task_completion_content(&task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                steer.push(background_task_completion_steer_input(&task));
+                                            }
+                                            yield CatEvent::ToolTaskCompleted(task);
+                                            if let Some(steer) = steer_queue.as_ref() {
+                                                if let Some(batch) = steer.drain_batch() {
+                                                    yield CatEvent::SteerInjected(
+                                                        crate::SteerInjectedEvent {
+                                                            steer_ids: batch.ids.clone(),
+                                                            session_id: thread_id_owned.clone(),
+                                                            preview: batch.preview.clone(),
+                                                            count: batch.count,
+                                                        },
+                                                    );
+                                                    next_content = batch.content;
+                                                    continuation_from_supervisor = false;
+                                                    continuation_from_background_task = true;
+                                                    continue 'workflow_loop;
+                                                }
+                                            } else {
+                                                next_content = fallback_content;
+                                                continuation_from_supervisor = false;
+                                                continuation_from_background_task = true;
+                                                continue 'workflow_loop;
+                                            }
+                                            continue;
+                                        }
                                         if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
                                             break;
                                         }
@@ -2710,6 +2769,13 @@ impl CatBot {
                                             completed = completed_tool_tasks.recv() => {
                                                 match completed {
                                                     Ok(task) if task.thread_id == thread_id_owned => {
+                                                        if !self
+                                                            .tool_tasks
+                                                            .claim_completion_notification(&task.task_id)
+                                                            .await
+                                                        {
+                                                            continue;
+                                                        }
                                                         let fallback_content =
                                                             background_task_completion_content(&task);
                                                         if let Some(steer) = steer_queue.as_ref() {
@@ -4563,6 +4629,27 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
+    fn run_large_stack_local_test<F, Fut>(test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name("bot-core-local-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build test runtime");
+                let local = tokio::task::LocalSet::new();
+                runtime.block_on(local.run_until(test()));
+            })
+            .expect("spawn large-stack test thread")
+            .join()
+            .expect("large-stack test thread panicked");
+    }
+
     fn test_model_profile() -> ModelProfileConfig {
         ModelProfileConfig {
             id: "default".to_string(),
@@ -4658,6 +4745,8 @@ mod tests {
             result_preview: Some("done".to_string()),
             recent_output: vec!["last line".to_string()],
             message: None,
+            notify_on_finish: true,
+            notification_delivered: false,
         };
 
         let steer = background_task_completion_steer_input(&task);
@@ -4699,6 +4788,8 @@ mod tests {
             result_preview: None,
             recent_output: Vec::new(),
             message: None,
+            notify_on_finish: true,
+            notification_delivered: false,
         };
 
         let steer = background_task_completion_steer_input(&task);
@@ -5871,214 +5962,218 @@ You are Remi.
             .contains("Run verification"));
     }
 
-    #[tokio::test]
-    async fn active_supervisor_routes_existing_todo_only_to_supervisor_end_to_end() {
-        std::env::set_var("OPENAI_API_KEY", "test");
-        let responses = vec![
-            sse_tool_call(
-                "call_add",
-                "todo__add",
-                json!({
-                    "title": "Supervisor routing",
-                    "items": [
-                        {"title": "检查主agent不直接接收todo"},
-                        {"title": "确认supervisor接收todo"}
-                    ]
-                }),
-            ),
-            sse_text("todo created"),
-            sse_text("main agent ran without direct todo injection"),
-            sse_text(
-                r#"{"edge":"complete","agent_message":null,"next_node_message":null,"reason":"todo routing verified"}"#,
-            ),
-        ];
-        let (base_url, requests) = start_openai_mock_server(responses).await;
-        let data_dir = tempfile::tempdir().unwrap();
-        let skills_dir = data_dir.path().join("skills");
-        let agents_dir = data_dir.path().join("agents");
-        let models_dir = data_dir.path().join("models");
-        install_embedded_model_profiles(&models_dir).unwrap();
-        let mut model_profile = test_model_profile();
-        model_profile.base_url = Some(base_url);
-        model_profile.model = "mock-model".to_string();
-        let bot = CatBotBuilder {
-            api_key: "test".to_string(),
-            model_profile,
-            runtime_model_locked: false,
-            system: default_system_prompt(),
-            skills_dir,
-            data_dir: data_dir.path().to_path_buf(),
-            agent_md_path: None,
-            short_term_tokens: None,
-            overflow_bytes: None,
-            memory_days: 7,
-            sandbox_config: SandboxConfig::Disabled {
-                host_dir: data_dir.path().to_path_buf(),
-            },
-            im_bridge: None,
-            extra_options: serde_json::Map::new(),
-            tool_allowlist: None,
-            delegate_ids: Vec::new(),
-            active_agent_id: DEFAULT_AGENT_ID.to_string(),
-            model_bindings: AgentModelBindings::default(),
-            approval_model_profile_id: None,
-            agents_dir,
-            max_turns: Some(8),
-            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
-            acp_client_tools: None,
-        }
-        .build()
-        .unwrap();
-
-        let thread_id = "todo-supervisor-routing-e2e";
-        bot.approval_manager().grant_session(thread_id).await;
-        collect_stream(bot.stream(thread_id, "create todo")).await;
-        bot.set_goal(thread_id, "verify todo routing", GoalMaxRounds::Limited(1))
-            .await
+    #[test]
+    fn active_supervisor_routes_existing_todo_only_to_supervisor_end_to_end() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            let responses = vec![
+                sse_tool_call(
+                    "call_add",
+                    "todo__add",
+                    json!({
+                        "title": "Supervisor routing",
+                        "items": [
+                            {"title": "检查主agent不直接接收todo"},
+                            {"title": "确认supervisor接收todo"}
+                        ]
+                    }),
+                ),
+                sse_text("todo created"),
+                sse_text("main agent ran without direct todo injection"),
+                sse_text(
+                    r#"{"edge":"complete","agent_message":null,"next_node_message":null,"reason":"todo routing verified"}"#,
+                ),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let skills_dir = data_dir.path().join("skills");
+            let agents_dir = data_dir.path().join("agents");
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let mut model_profile = test_model_profile();
+            model_profile.base_url = Some(base_url);
+            model_profile.model = "mock-model".to_string();
+            let bot = CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile,
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir,
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                short_term_tokens: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir,
+                max_turns: Some(8),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+            }
+            .build()
             .unwrap();
-        let events = collect_stream(bot.stream(thread_id, "continue")).await;
-        assert!(events
+
+            let thread_id = "todo-supervisor-routing-e2e";
+            bot.approval_manager().grant_session(thread_id).await;
+            collect_stream(bot.stream(thread_id, "create todo")).await;
+            bot.set_goal(thread_id, "verify todo routing", GoalMaxRounds::Limited(1))
+                .await
+                .unwrap();
+            let events = collect_stream(bot.stream(thread_id, "continue")).await;
+            assert!(events
             .iter()
             .any(|event| matches!(event, CatEvent::Supervisor(report) if report.reason == "todo routing verified")));
 
-        let requests = requests.lock().expect("request lock poisoned");
-        assert_eq!(requests.len(), 4);
-        assert!(
-            !requests[2].contains("[CURRENT TODO BATCH]"),
-            "main-agent request unexpectedly contained todo injection: {}",
-            requests[2]
-        );
-        assert!(
-            requests[3].contains("[CURRENT TODO BATCH]"),
-            "supervisor request did not contain todo injection: {}",
-            requests[3]
-        );
-        assert!(requests[3].contains("确认supervisor接收todo"));
+            let requests = requests.lock().expect("request lock poisoned");
+            assert_eq!(requests.len(), 4);
+            assert!(
+                !requests[2].contains("[CURRENT TODO BATCH]"),
+                "main-agent request unexpectedly contained todo injection: {}",
+                requests[2]
+            );
+            assert!(
+                requests[3].contains("[CURRENT TODO BATCH]"),
+                "supervisor request did not contain todo injection: {}",
+                requests[3]
+            );
+            assert!(requests[3].contains("确认supervisor接收todo"));
+        });
     }
 
-    #[tokio::test]
-    async fn user_question_moves_workflow_through_ask_user_for_help_without_supervisor_stop() {
-        std::env::set_var("OPENAI_API_KEY", "test");
-        let responses = vec![
-            sse_tool_call(
-                "call_ask",
-                "ask_user_question",
-                json!({
-                    "question": "Need user input?",
-                    "allow_free_text": true
-                }),
-            ),
-            sse_text("Thanks, continuing with the answer."),
-        ];
-        let (base_url, requests) = start_openai_mock_server(responses).await;
-        let data_dir = tempfile::tempdir().unwrap();
-        let skills_dir = data_dir.path().join("skills");
-        let agents_dir = data_dir.path().join("agents");
-        let models_dir = data_dir.path().join("models");
-        install_embedded_model_profiles(&models_dir).unwrap();
-        let mut model_profile = test_model_profile();
-        model_profile.base_url = Some(base_url);
-        model_profile.model = "mock-model".to_string();
-        let bot = CatBotBuilder {
-            api_key: "test".to_string(),
-            model_profile,
-            runtime_model_locked: false,
-            system: default_system_prompt(),
-            skills_dir,
-            data_dir: data_dir.path().to_path_buf(),
-            agent_md_path: None,
-            short_term_tokens: None,
-            overflow_bytes: None,
-            memory_days: 7,
-            sandbox_config: SandboxConfig::Disabled {
-                host_dir: data_dir.path().to_path_buf(),
-            },
-            im_bridge: None,
-            extra_options: serde_json::Map::new(),
-            tool_allowlist: None,
-            delegate_ids: Vec::new(),
-            active_agent_id: DEFAULT_AGENT_ID.to_string(),
-            model_bindings: AgentModelBindings::default(),
-            approval_model_profile_id: None,
-            agents_dir,
-            max_turns: Some(8),
-            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
-            acp_client_tools: None,
-        }
-        .build()
-        .unwrap();
+    #[test]
+    fn user_question_moves_workflow_through_ask_user_for_help_without_supervisor_stop() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            let responses = vec![
+                sse_tool_call(
+                    "call_ask",
+                    "ask_user_question",
+                    json!({
+                        "question": "Need user input?",
+                        "allow_free_text": true
+                    }),
+                ),
+                sse_text("Thanks, continuing with the answer."),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let skills_dir = data_dir.path().join("skills");
+            let agents_dir = data_dir.path().join("agents");
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let mut model_profile = test_model_profile();
+            model_profile.base_url = Some(base_url);
+            model_profile.model = "mock-model".to_string();
+            let bot = CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile,
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir,
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                short_term_tokens: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir,
+                max_turns: Some(8),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+            }
+            .build()
+            .unwrap();
 
-        let thread_id = "ask-user-supervisor-control-node";
-        bot.set_goal(
-            thread_id,
-            "complete after user input",
-            GoalMaxRounds::Limited(1),
-        )
-        .await
-        .unwrap();
-        let mut stream = std::pin::pin!(bot.stream(thread_id, "ask if needed"));
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            if let CatEvent::Error(err) = &event {
-                panic!("stream error: {err}");
+            let thread_id = "ask-user-supervisor-control-node";
+            bot.set_goal(
+                thread_id,
+                "complete after user input",
+                GoalMaxRounds::Limited(1),
+            )
+            .await
+            .unwrap();
+            let mut stream = std::pin::pin!(bot.stream(thread_id, "ask if needed"));
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                if let CatEvent::Error(err) = &event {
+                    panic!("stream error: {err}");
+                }
+                if let CatEvent::UserQuestionRequested(request) = &event {
+                    assert_eq!(request.session_id, thread_id);
+                    bot.answer_user_question(
+                        &request.id,
+                        UserQuestionResponse {
+                            question_id: request.id.clone(),
+                            status: UserQuestionStatus::Answered,
+                            selected_option_ids: Vec::new(),
+                            free_text: Some("user supplied detail".to_string()),
+                            answer_text: Some("user supplied detail".to_string()),
+                            answered_at: None,
+                            source: Some("test".to_string()),
+                        },
+                    )
+                    .await;
+                }
+                let done = matches!(event, CatEvent::Done);
+                events.push(event);
+                if done {
+                    break;
+                }
             }
-            if let CatEvent::UserQuestionRequested(request) = &event {
-                assert_eq!(request.session_id, thread_id);
-                bot.answer_user_question(
-                    &request.id,
-                    UserQuestionResponse {
-                        question_id: request.id.clone(),
-                        status: UserQuestionStatus::Answered,
-                        selected_option_ids: Vec::new(),
-                        free_text: Some("user supplied detail".to_string()),
-                        answer_text: Some("user supplied detail".to_string()),
-                        answered_at: None,
-                        source: Some("test".to_string()),
-                    },
-                )
-                .await;
-            }
-            let done = matches!(event, CatEvent::Done);
-            events.push(event);
-            if done {
-                break;
-            }
-        }
 
-        let supervisor_events = events
-            .iter()
-            .filter_map(|event| match event {
-                CatEvent::Supervisor(report) => Some(format!(
-                    "{} -> {} ({:?}) {}",
-                    report.from_node, report.to_node, report.status, report.reason
+            let supervisor_events = events
+                .iter()
+                .filter_map(|event| match event {
+                    CatEvent::Supervisor(report) => Some(format!(
+                        "{} -> {} ({:?}) {}",
+                        report.from_node, report.to_node, report.status, report.reason
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    CatEvent::Supervisor(report)
+                        if report.to_node == supervisor_workflow::ASK_USER_FOR_HELP_NODE
+                            && report.status == WorkflowStatus::Paused
                 )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            events.iter().any(|event| matches!(
+                "supervisor events: {supervisor_events:?}"
+            );
+            assert!(!events.iter().any(|event| matches!(
                 event,
-                CatEvent::Supervisor(report)
-                    if report.to_node == supervisor_workflow::ASK_USER_FOR_HELP_NODE
-                        && report.status == WorkflowStatus::Paused
-            )),
-            "supervisor events: {supervisor_events:?}"
-        );
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            CatEvent::Supervisor(report) if report.status == WorkflowStatus::Completed
-        )));
-        let instance = bot.workflow_status(thread_id).await.unwrap();
-        assert_eq!(instance.status, WorkflowStatus::Active);
-        assert_eq!(instance.current_node, "review");
-        assert!(instance.ask_user_for_help.is_none());
+                CatEvent::Supervisor(report) if report.status == WorkflowStatus::Completed
+            )));
+            let instance = bot.workflow_status(thread_id).await.unwrap();
+            assert_eq!(instance.status, WorkflowStatus::Active);
+            assert_eq!(instance.current_node, "review");
+            assert!(instance.ask_user_for_help.is_none());
 
-        let requests = requests.lock().expect("request lock poisoned");
-        assert_eq!(
-            requests.len(),
-            2,
-            "supervisor evaluation should be skipped after user-question round"
-        );
+            let requests = requests.lock().expect("request lock poisoned");
+            assert_eq!(
+                requests.len(),
+                2,
+                "supervisor evaluation should be skipped after user-question round"
+            );
+        });
     }
 
     #[tokio::test]
@@ -6196,116 +6291,119 @@ You are Remi.
         assert!(!pinned_prompt.contains("scope=skills"), "{pinned_prompt}");
     }
 
-    #[tokio::test]
-    async fn search_tool_tokenized_query_matches_memory_and_skills_end_to_end() {
-        std::env::set_var("OPENAI_API_KEY", "test");
-        let responses = vec![
-            sse_tool_call(
-                "call_search",
-                "search",
-                json!({
-                    "query": "我想找靠窗座位相关内容",
-                    "scope": "local",
-                    "limit": 10
-                }),
-            ),
-            sse_text("search observed"),
-        ];
-        let (base_url, requests) = start_openai_mock_server(responses).await;
-        let data_dir = tempfile::tempdir().unwrap();
-        let skills_dir = data_dir.path().join("skills");
-        let skill_dir = skills_dir.join("window-seat");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
+    #[test]
+    fn search_tool_tokenized_query_matches_memory_and_skills_end_to_end() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            let responses = vec![
+                sse_tool_call(
+                    "call_search",
+                    "search",
+                    json!({
+                        "query": "我想找靠窗座位相关内容",
+                        "scope": "local",
+                        "limit": 10
+                    }),
+                ),
+                sse_text("search observed"),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let skills_dir = data_dir.path().join("skills");
+            let skill_dir = skills_dir.join("window-seat");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: window-seat\ndescription: 靠窗座位偏好处理流程\n---\n\nUse this skill when seating preferences mention windows.",
         )
         .unwrap();
-        let agents_dir = data_dir.path().join("agents");
-        let models_dir = data_dir.path().join("models");
-        install_embedded_model_profiles(&models_dir).unwrap();
-        let mut model_profile = test_model_profile();
-        model_profile.base_url = Some(base_url);
-        model_profile.model = "mock-model".to_string();
-        let bot = CatBotBuilder {
-            api_key: "test".to_string(),
-            model_profile,
-            runtime_model_locked: false,
-            system: default_system_prompt(),
-            skills_dir,
-            data_dir: data_dir.path().to_path_buf(),
-            agent_md_path: None,
-            short_term_tokens: None,
-            overflow_bytes: None,
-            memory_days: 7,
-            sandbox_config: SandboxConfig::Disabled {
-                host_dir: data_dir.path().to_path_buf(),
-            },
-            im_bridge: None,
-            extra_options: serde_json::Map::new(),
-            tool_allowlist: None,
-            delegate_ids: Vec::new(),
-            active_agent_id: DEFAULT_AGENT_ID.to_string(),
-            model_bindings: AgentModelBindings::default(),
-            approval_model_profile_id: None,
-            agents_dir,
-            max_turns: Some(4),
-            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
-            acp_client_tools: None,
-        }
-        .build()
-        .unwrap();
-        bot.memory
-            .upsert_named_memory(
-                DEFAULT_AGENT_ID,
-                "seat-preference",
-                "用户旅行偏好：坐飞机时优先选择靠窗位置。",
-            )
-            .await
+            let agents_dir = data_dir.path().join("agents");
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let mut model_profile = test_model_profile();
+            model_profile.base_url = Some(base_url);
+            model_profile.model = "mock-model".to_string();
+            let bot = CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile,
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir,
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                short_term_tokens: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir,
+                max_turns: Some(4),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+            }
+            .build()
             .unwrap();
+            bot.memory
+                .upsert_named_memory(
+                    DEFAULT_AGENT_ID,
+                    "seat-preference",
+                    "用户旅行偏好：坐飞机时优先选择靠窗位置。",
+                )
+                .await
+                .unwrap();
 
-        let events = collect_stream(bot.stream("search-tokenized-e2e", "帮我找靠窗座位资料")).await;
-        assert!(events.iter().any(
-            |event| matches!(event, CatEvent::Text(text) if text.contains("search observed"))
-        ));
-        let search_result = events
-            .iter()
-            .find_map(|event| match event {
-                CatEvent::ToolCallResult {
-                    name,
-                    result,
-                    success,
-                    ..
-                } if name == "search" && *success => Some(result),
-                _ => None,
-            })
-            .expect("search tool should return a successful result");
-        let value: serde_json::Value =
-            serde_json::from_str(search_result).expect("search result should be JSON");
-        let results = value["results"]
-            .as_array()
-            .expect("search result should contain results");
-        assert!(
-            results.iter().any(|item| item["scope"] == "memory"
-                && item["snippet"]
-                    .as_str()
-                    .is_some_and(|snippet| snippet.contains("靠窗位置"))),
-            "search result did not include tokenized memory match: {search_result}"
-        );
-        assert!(
-            results
+            let events =
+                collect_stream(bot.stream("search-tokenized-e2e", "帮我找靠窗座位资料")).await;
+            assert!(events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text.contains("search observed"))
+            ));
+            let search_result = events
                 .iter()
-                .any(|item| item["scope"] == "skills" && item["name"] == "window-seat"),
-            "search result did not include tokenized skill match: {search_result}"
-        );
+                .find_map(|event| match event {
+                    CatEvent::ToolCallResult {
+                        name,
+                        result,
+                        success,
+                        ..
+                    } if name == "search" && *success => Some(result),
+                    _ => None,
+                })
+                .expect("search tool should return a successful result");
+            let value: serde_json::Value =
+                serde_json::from_str(search_result).expect("search result should be JSON");
+            let results = value["results"]
+                .as_array()
+                .expect("search result should contain results");
+            assert!(
+                results.iter().any(|item| item["scope"] == "memory"
+                    && item["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains("靠窗位置"))),
+                "search result did not include tokenized memory match: {search_result}"
+            );
+            assert!(
+                results
+                    .iter()
+                    .any(|item| item["scope"] == "skills" && item["name"] == "window-seat"),
+                "search result did not include tokenized skill match: {search_result}"
+            );
 
-        let requests = requests.lock().expect("request lock poisoned");
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests[1].contains("靠窗位置") && requests[1].contains("window-seat"),
-            "second model request did not include local search tool results: {}",
-            requests[1]
-        );
+            let requests = requests.lock().expect("request lock poisoned");
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1].contains("靠窗位置") && requests[1].contains("window-seat"),
+                "second model request did not include local search tool results: {}",
+                requests[1]
+            );
+        });
     }
 
     async fn collect_stream(stream: impl futures::Stream<Item = CatEvent>) -> Vec<CatEvent> {

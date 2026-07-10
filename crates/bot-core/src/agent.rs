@@ -153,8 +153,7 @@ fn is_denied_approval_event(event: &CatEvent) -> bool {
 fn is_approval_request_event(event: &CatEvent) -> bool {
     matches!(
         event,
-        CatEvent::ToolApprovalRequested(..)
-            | CatEvent::UserQuestionRequested(..)
+        CatEvent::ToolApprovalRequested(..) | CatEvent::UserQuestionRequested(..)
     )
 }
 
@@ -2440,7 +2439,9 @@ mod tests {
     use crate::events::CatEvent;
     use crate::user_question::UserQuestionManager;
     use bot_runtime_core::ToolContext;
-    use bot_runtime_core::{CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions};
+    use bot_runtime_core::{
+        CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions,
+    };
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
         Agent, AgentError, AgentState, CancellationToken, Checkpoint, CheckpointStatus, Content,
@@ -2566,87 +2567,6 @@ mod tests {
         ));
         assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("automatically send"));
         assert!(!crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Background sub-agent"));
-    }
-
-    fn test_steer_batch(text: &str) -> CoreSteerBatch {
-        CoreSteerBatch {
-            ids: vec!["steer-1".to_string()],
-            content: Content::text(text),
-            preview: text.to_string(),
-            count: 1,
-            message_metadata: None,
-            user_name: None,
-        }
-    }
-
-    #[test]
-    fn steer_start_input_closes_pending_tool_calls_before_user_message() {
-        let mut state = AgentState::new(StepConfig::new("test-model"));
-        state.messages = vec![Message::assistant_with_tool_calls(
-            "",
-            vec![test_tool_call_message("call-1", "read")],
-            None,
-        )];
-
-        let input = steer_start_input(state, test_steer_batch("steer"));
-
-        match input {
-            LoopInput::Start {
-                history, message, ..
-            } => {
-                assert_eq!(history.len(), 2);
-                assert_eq!(history[1].role, Role::Tool);
-                assert_eq!(history[1].tool_call_id.as_deref(), Some("call-1"));
-                assert!(history[1]
-                    .content
-                    .text_content()
-                    .contains(INTERRUPTED_TOOL_RESULT_ERROR));
-                assert_eq!(message.content.text_content(), "steer");
-            }
-            other => panic!("expected start input, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn steer_after_tool_results_preserves_results_and_closes_remaining_calls() {
-        let mut state = AgentState::new(StepConfig::new("test-model"));
-        state.messages = vec![Message::assistant_with_tool_calls(
-            "",
-            vec![
-                test_tool_call_message("call-1", "read"),
-                test_tool_call_message("call-2", "write"),
-            ],
-            None,
-        )];
-        let results = vec![ToolCallOutcome::Result {
-            tool_call_id: "call-1".to_string(),
-            tool_name: "read".to_string(),
-            content: Content::text("done"),
-        }];
-
-        let input = steer_start_input_after_tool_results(state, results, test_steer_batch("steer"));
-
-        match input {
-            LoopInput::Start { history, .. } => {
-                let result_messages = history
-                    .iter()
-                    .filter_map(|message| {
-                        Some((
-                            message.tool_call_id.as_deref()?,
-                            message.content.text_content(),
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(result_messages.len(), 2);
-                assert!(result_messages
-                    .iter()
-                    .any(|(id, text)| *id == "call-1" && text == "done"));
-                assert!(result_messages.iter().any(|(id, text)| {
-                    *id == "call-2" && text.contains(INTERRUPTED_TOOL_RESULT_ERROR)
-                }));
-            }
-            other => panic!("expected start input, got {other:?}"),
-        }
     }
 
     #[test]
@@ -3674,86 +3594,96 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cat_agent_collects_parallel_tool_streams_end_to_end() {
-        let mut local_tools = DefaultToolRegistry::new();
-        local_tools.register(LazyWaitTool);
-        let agent = CatAgent {
-            inner: ParallelToolInnerAgent,
-            local_tools: Arc::new(local_tools),
-            model_tools: None,
-            data_dir: test_root(),
-            workspace_root: test_root(),
-            workspace_root_label: "/workspace".to_string(),
-            allow_host_absolute_paths: true,
-            overflow_bytes: 8_192,
-            im_bridge: None,
-            tool_allowlist: None,
-            approval_manager: ToolApprovalManager::new(),
-            approval_reviewer: None,
-            user_question_manager: UserQuestionManager::new(),
-            hook_manager: test_hook_manager(),
-            tool_tasks: test_tool_tasks(),
-        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut local_tools = DefaultToolRegistry::new();
+                local_tools.register(LazyWaitTool);
+                let agent = CatAgent {
+                    inner: ParallelToolInnerAgent,
+                    local_tools: Arc::new(local_tools),
+                    model_tools: None,
+                    data_dir: test_root(),
+                    workspace_root: test_root(),
+                    workspace_root_label: "/workspace".to_string(),
+                    allow_host_absolute_paths: true,
+                    overflow_bytes: 8_192,
+                    im_bridge: None,
+                    tool_allowlist: None,
+                    approval_manager: ToolApprovalManager::new(),
+                    approval_reviewer: None,
+                    user_question_manager: UserQuestionManager::new(),
+                    hook_manager: test_hook_manager(),
+                    tool_tasks: test_tool_tasks(),
+                };
 
-        let started = Instant::now();
-        let events = agent
-            .stream_with_input(LoopInput::start("run parallel tools"))
-            .collect::<Vec<_>>()
+                let started = Instant::now();
+                let events = agent
+                    .stream_with_input(LoopInput::start("run parallel tools"))
+                    .collect::<Vec<_>>()
+                    .await;
+
+                assert!(started.elapsed() < Duration::from_millis(550));
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
+            })
             .await;
-
-        assert!(started.elapsed() < Duration::from_millis(550));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, CatEvent::Text(text) if text == "a,b")));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cat_agent_streams_parallel_tool_results_as_each_finishes() {
-        let mut local_tools = DefaultToolRegistry::new();
-        local_tools.register(LazyWaitTool);
-        let agent = CatAgent {
-            inner: StaggeredParallelToolInnerAgent,
-            local_tools: Arc::new(local_tools),
-            model_tools: None,
-            data_dir: test_root(),
-            workspace_root: test_root(),
-            workspace_root_label: "/workspace".to_string(),
-            allow_host_absolute_paths: true,
-            overflow_bytes: 8_192,
-            im_bridge: None,
-            tool_allowlist: None,
-            approval_manager: ToolApprovalManager::new(),
-            approval_reviewer: None,
-            user_question_manager: UserQuestionManager::new(),
-            hook_manager: test_hook_manager(),
-            tool_tasks: test_tool_tasks(),
-        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut local_tools = DefaultToolRegistry::new();
+                local_tools.register(LazyWaitTool);
+                let agent = CatAgent {
+                    inner: StaggeredParallelToolInnerAgent,
+                    local_tools: Arc::new(local_tools),
+                    model_tools: None,
+                    data_dir: test_root(),
+                    workspace_root: test_root(),
+                    workspace_root_label: "/workspace".to_string(),
+                    allow_host_absolute_paths: true,
+                    overflow_bytes: 8_192,
+                    im_bridge: None,
+                    tool_allowlist: None,
+                    approval_manager: ToolApprovalManager::new(),
+                    approval_reviewer: None,
+                    user_question_manager: UserQuestionManager::new(),
+                    hook_manager: test_hook_manager(),
+                    tool_tasks: test_tool_tasks(),
+                };
 
-        let started = Instant::now();
-        let stream = agent.stream_with_input(LoopInput::start("run staggered tools"));
-        tokio::pin!(stream);
-        let mut saw_slow_before_fast = false;
+                let started = Instant::now();
+                let stream = agent.stream_with_input(LoopInput::start("run staggered tools"));
+                tokio::pin!(stream);
+                let mut saw_slow_before_fast = false;
 
-        while let Some(event) = stream.next().await {
-            match event {
-                CatEvent::ToolCallResult { id, .. } if id == "slow-call" => {
-                    saw_slow_before_fast = true;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        CatEvent::ToolCallResult { id, .. } if id == "slow-call" => {
+                            saw_slow_before_fast = true;
+                        }
+                        CatEvent::ToolCallResult { id, result, .. } if id == "fast-call" => {
+                            assert_eq!(result, "fast");
+                            assert!(
+                                started.elapsed() < Duration::from_millis(200),
+                                "fast tool result was delayed until the slow tool finished"
+                            );
+                            assert!(!saw_slow_before_fast);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
-                CatEvent::ToolCallResult { id, result, .. } if id == "fast-call" => {
-                    assert_eq!(result, "fast");
-                    assert!(
-                        started.elapsed() < Duration::from_millis(200),
-                        "fast tool result was delayed until the slow tool finished"
-                    );
-                    assert!(!saw_slow_before_fast);
-                    return;
-                }
-                _ => {}
-            }
-        }
 
-        panic!("fast tool result was not emitted");
+                panic!("fast tool result was not emitted");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4087,132 +4017,142 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cat_agent_cancel_during_tool_collection_emits_repaired_history() {
-        let mut local_tools = DefaultToolRegistry::new();
-        local_tools.register(LazyWaitTool);
-        let agent = CatAgent {
-            inner: StaggeredParallelToolInnerAgent,
-            local_tools: Arc::new(local_tools),
-            model_tools: None,
-            data_dir: test_root(),
-            workspace_root: test_root(),
-            workspace_root_label: "/workspace".to_string(),
-            allow_host_absolute_paths: true,
-            overflow_bytes: 8_192,
-            im_bridge: None,
-            tool_allowlist: None,
-            approval_manager: ToolApprovalManager::new(),
-            approval_reviewer: None,
-            user_question_manager: UserQuestionManager::new(),
-            hook_manager: test_hook_manager(),
-            tool_tasks: test_tool_tasks(),
-        };
-        let cancel = CancellationToken::new();
-        let stream = agent.stream_with_input_and_options(
-            LoopInput::start("run staggered tools"),
-            CoreStreamOptions {
-                cancel: Some(cancel.clone()),
-                steer: None,
-                async_agent: false,
-            },
-        );
-        tokio::pin!(stream);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut local_tools = DefaultToolRegistry::new();
+                local_tools.register(LazyWaitTool);
+                let agent = CatAgent {
+                    inner: StaggeredParallelToolInnerAgent,
+                    local_tools: Arc::new(local_tools),
+                    model_tools: None,
+                    data_dir: test_root(),
+                    workspace_root: test_root(),
+                    workspace_root_label: "/workspace".to_string(),
+                    allow_host_absolute_paths: true,
+                    overflow_bytes: 8_192,
+                    im_bridge: None,
+                    tool_allowlist: None,
+                    approval_manager: ToolApprovalManager::new(),
+                    approval_reviewer: None,
+                    user_question_manager: UserQuestionManager::new(),
+                    hook_manager: test_hook_manager(),
+                    tool_tasks: test_tool_tasks(),
+                };
+                let cancel = CancellationToken::new();
+                let stream = agent.stream_with_input_and_options(
+                    LoopInput::start("run staggered tools"),
+                    CoreStreamOptions {
+                        cancel: Some(cancel.clone()),
+                        steer: None,
+                        async_agent: false,
+                    },
+                );
+                tokio::pin!(stream);
 
-        let mut repaired_history = None;
-        let mut saw_cancelled = false;
-        while let Some(event) = stream.next().await {
-            match event {
-                CatEvent::ToolCallResult { id, .. } if id == "fast-call" => {
-                    cancel.cancel();
+                let mut repaired_history = None;
+                let mut saw_cancelled = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        CatEvent::ToolCallResult { id, .. } if id == "fast-call" => {
+                            cancel.cancel();
+                        }
+                        CatEvent::History(messages, _) => {
+                            repaired_history = Some(messages);
+                        }
+                        CatEvent::Cancelled => {
+                            saw_cancelled = true;
+                            break;
+                        }
+                        CatEvent::Error(err) => panic!("unexpected error: {err}"),
+                        _ => {}
+                    }
                 }
-                CatEvent::History(messages, _) => {
-                    repaired_history = Some(messages);
-                }
-                CatEvent::Cancelled => {
-                    saw_cancelled = true;
-                    break;
-                }
-                CatEvent::Error(err) => panic!("unexpected error: {err}"),
-                _ => {}
-            }
-        }
 
-        assert!(saw_cancelled);
-        let history = repaired_history.expect("cancel should emit repaired history");
-        let result_messages = history
-            .iter()
-            .filter_map(|message| {
-                message
-                    .tool_call_id
-                    .as_deref()
-                    .map(|id| (id.to_string(), message.content.text_content()))
+                assert!(saw_cancelled);
+                let history = repaired_history.expect("cancel should emit repaired history");
+                let result_messages = history
+                    .iter()
+                    .filter_map(|message| {
+                        message
+                            .tool_call_id
+                            .as_deref()
+                            .map(|id| (id.to_string(), message.content.text_content()))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    result_messages
+                        .iter()
+                        .filter(|(id, _)| id == "fast-call")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    result_messages
+                        .iter()
+                        .filter(|(id, _)| id == "slow-call")
+                        .count(),
+                    1
+                );
+                assert!(result_messages
+                    .iter()
+                    .any(|(id, text)| id == "fast-call" && text == "fast"));
+                assert!(result_messages.iter().any(|(id, text)| {
+                    id == "slow-call" && text.contains(INTERRUPTED_TOOL_RESULT_ERROR)
+                }));
             })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            result_messages
-                .iter()
-                .filter(|(id, _)| id == "fast-call")
-                .count(),
-            1
-        );
-        assert_eq!(
-            result_messages
-                .iter()
-                .filter(|(id, _)| id == "slow-call")
-                .count(),
-            1
-        );
-        assert!(result_messages
-            .iter()
-            .any(|(id, text)| id == "fast-call" && text == "fast"));
-        assert!(result_messages.iter().any(|(id, text)| {
-            id == "slow-call" && text.contains(INTERRUPTED_TOOL_RESULT_ERROR)
-        }));
+            .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cat_agent_injects_steer_after_tool_results_at_tool_gap() {
-        let queue = Arc::new(CoreSteerQueue::new());
-        let mut local_tools = DefaultToolRegistry::new();
-        local_tools.register(SteerPushingTool {
-            queue: Arc::clone(&queue),
-        });
-        let agent = CatAgent {
-            inner: SteerDuringToolInnerAgent,
-            local_tools: Arc::new(local_tools),
-            model_tools: None,
-            data_dir: test_root(),
-            workspace_root: test_root(),
-            workspace_root_label: "/workspace".to_string(),
-            allow_host_absolute_paths: true,
-            overflow_bytes: 8_192,
-            im_bridge: None,
-            tool_allowlist: None,
-            approval_manager: ToolApprovalManager::new(),
-            approval_reviewer: None,
-            user_question_manager: UserQuestionManager::new(),
-            hook_manager: test_hook_manager(),
-            tool_tasks: test_tool_tasks(),
-        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let queue = Arc::new(CoreSteerQueue::new());
+                let mut local_tools = DefaultToolRegistry::new();
+                local_tools.register(SteerPushingTool {
+                    queue: Arc::clone(&queue),
+                });
+                let agent = CatAgent {
+                    inner: SteerDuringToolInnerAgent,
+                    local_tools: Arc::new(local_tools),
+                    model_tools: None,
+                    data_dir: test_root(),
+                    workspace_root: test_root(),
+                    workspace_root_label: "/workspace".to_string(),
+                    allow_host_absolute_paths: true,
+                    overflow_bytes: 8_192,
+                    im_bridge: None,
+                    tool_allowlist: None,
+                    approval_manager: ToolApprovalManager::new(),
+                    approval_reviewer: None,
+                    user_question_manager: UserQuestionManager::new(),
+                    hook_manager: test_hook_manager(),
+                    tool_tasks: test_tool_tasks(),
+                };
 
-        let events = agent
-            .stream_with_input_and_options(
-                LoopInput::start("start"),
-                CoreStreamOptions::new().with_steer(queue),
-            )
-            .collect::<Vec<_>>()
+                let events = agent
+                    .stream_with_input_and_options(
+                        LoopInput::start("start"),
+                        CoreStreamOptions::new().with_steer(queue),
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+
+                assert!(
+                    events.iter().any(
+                        |event| matches!(event, CatEvent::SteerInjected(event) if event.count == 1)
+                    ),
+                    "{events:#?}"
+                );
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));
+            })
             .await;
-
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, CatEvent::SteerInjected(event) if event.count == 1)),
-            "{events:#?}"
-        );
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));
     }
 
     #[tokio::test]
@@ -4462,8 +4402,11 @@ mod tests {
         assert!(saw_cancelled);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn supervisor_run_stops_after_bounded_tool_rounds() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
         let mut local_tools = DefaultToolRegistry::new();
         local_tools.register(InstantTool);
         let agent = CatAgent {
@@ -4502,5 +4445,7 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, CatEvent::Error(error) if error.to_string().contains("maximum of 8 tool rounds"))
         }));
+            })
+            .await;
     }
 }

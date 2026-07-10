@@ -26,7 +26,7 @@ impl Tool for PublicEchoTool {
         &self,
         _arguments: serde_json::Value,
         _resume: Option<bot_runtime_core::ResumePayload>,
-        _ctx: &ToolContext,
+        _ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
         Ok(ToolResult::Output(stream::iter(vec![ToolOutput::text(
             "public-tool-output",
@@ -41,7 +41,11 @@ impl Agent for PublicInnerAgent {
     type Response = AgentEvent;
     type Error = AgentError;
 
-    async fn chat(&self, req: Self::Request) -> Result<impl Stream<Item = AgentEvent>, AgentError> {
+    async fn chat(
+        &self,
+        _ctx: bot_runtime_core::ChatCtx,
+        req: Self::Request,
+    ) -> Result<impl Stream<Item = AgentEvent>, AgentError> {
         let LoopInput::Start {
             history,
             extra_tools,
@@ -96,7 +100,8 @@ Public markdown prompt.
         &profile.tools,
     );
     let run_input = inject_extra_tools(input, tool_definitions);
-    let inner_events = PublicInnerAgent.chat(run_input).await.unwrap();
+    let chat_ctx = bot_runtime_core::chat_ctx_from_input(&run_input, None);
+    let inner_events = PublicInnerAgent.chat(chat_ctx, run_input).await.unwrap();
     let mut agent_loop = CoreAgentLoop::new(CoreDriveConfig::default());
     let events = agent_loop.drive(inner_events).collect::<Vec<_>>().await;
 

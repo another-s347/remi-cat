@@ -1609,6 +1609,8 @@ mod tests {
             result_preview: Some("result body".to_string()),
             recent_output: vec!["tail line".to_string()],
             message: None,
+            notify_on_finish: false,
+            notification_delivered: false,
         }
     }
 

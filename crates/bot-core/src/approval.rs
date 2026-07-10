@@ -400,7 +400,9 @@ fn classify_known_tool_risk(tool_name: &str, args: &serde_json::Value) -> Option
     match tool_name {
         "fs_read" | "fs_ls" | "rg" | "search" | "skill__get" | "skill__search"
         | "memory__get_detail" | "memory__recall" | "todo__list" | "web_search" | "now"
-        | "instant" | "lazy_wait" | "sleep" | "ask_user_question" | "tool_tasks" => Some(ToolRiskLevel::Low),
+        | "instant" | "lazy_wait" | "sleep" | "ask_user_question" | "tool_tasks" => {
+            Some(ToolRiskLevel::Low)
+        }
         "fetch" => Some(classify_fetch_risk(args)),
         "workspace_bash" | "bash" => Some(classify_bash_risk(args)),
         "ssh" => Some(classify_ssh_risk(args)),

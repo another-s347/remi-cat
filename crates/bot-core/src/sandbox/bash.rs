@@ -409,14 +409,16 @@ pub(super) async fn run_command_with_timeout(
         })
         .await;
     spawn_cancel_watcher(Arc::clone(&task), cancel.clone());
-    spawn_reader(stdout, Arc::clone(&task), true);
-    spawn_reader(stderr, Arc::clone(&task), false);
+    let stdout_reader = spawn_reader(stdout, Arc::clone(&task), true);
+    let stderr_reader = spawn_reader(stderr, Arc::clone(&task), false);
     tokio::spawn({
         let wait_task = Arc::clone(&task);
         async move {
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        let _ = stdout_reader.await;
+                        let _ = stderr_reader.await;
                         let mut task = wait_task.lock().await;
                         if task.status == BashTaskStatus::Running {
                             task.exit_code = Some(status.code().unwrap_or(-1));
@@ -594,7 +596,11 @@ fn take_incremental(buffer: &str, cursor: &mut usize) -> String {
     out
 }
 
-fn spawn_reader<R>(mut reader: R, task: Arc<Mutex<BashTaskState>>, stdout: bool)
+fn spawn_reader<R>(
+    mut reader: R,
+    task: Arc<Mutex<BashTaskState>>,
+    stdout: bool,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -617,7 +623,7 @@ where
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_cancel_watcher(task: Arc<Mutex<BashTaskState>>, cancel: Option<CancellationToken>) {

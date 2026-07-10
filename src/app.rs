@@ -283,6 +283,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
             }
             apply_runtime_env_defaults(&mut data_dir, cli.tui);
+            if cli.async_agent {
+                unsafe {
+                    std::env::set_var("REMI_ASYNC_AGENT", "true");
+                }
+            }
             if cli.tui {
                 let workspace_dir =
                     std::env::current_dir().context("resolving current workspace")?;
@@ -581,7 +586,13 @@ async fn wait_for_cli_background_tasks(runtime: Rc<Runtime>, cli: &CliConfig) {
     if !cli.wait_background_tasks {
         return;
     }
-    while runtime.bot.is_thread_running(&cli.channel_id).await {
+    while runtime
+        .bot
+        .list_background_tasks(Some(&cli.channel_id))
+        .await
+        .iter()
+        .any(|task| task.status == bot_core::tool_tasks::TOOL_TASK_RUNNING)
+    {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }

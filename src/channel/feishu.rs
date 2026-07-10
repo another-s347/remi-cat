@@ -210,6 +210,18 @@ pub(crate) async fn collect_cli_bot_reply(
     collect_bot_reply(runtime, CLI_CHANNEL, msg, sender_username, None).await
 }
 
+fn async_agent_enabled() -> bool {
+    std::env::var("REMI_ASYNC_AGENT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 async fn collect_bot_reply(
     runtime: Rc<Runtime>,
     platform: &str,
@@ -272,6 +284,7 @@ async fn collect_bot_reply(
         .with_sender(msg.sender_user_id.clone(), sender_username)
         .with_message(msg.message_id.clone(), msg.chat_type.clone())
         .with_platform(Some(platform.to_string()))
+        .with_async_agent(async_agent_enabled())
         .enable_sdk_todo()
         .with_im_context(im_attachments, im_documents);
     let debug_enabled = runtime
