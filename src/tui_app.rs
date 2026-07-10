@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,14 +74,24 @@ const FOOTER_INDENT: &str = "  ";
 const HISTORY_GUTTER_WIDTH: u16 = 2;
 const MAX_TOOL_BODY_CHARS: usize = 240;
 const MAX_HISTORY_BODY_LINES: usize = 220;
+const MAX_HISTORY_LINE_CACHE_CELLS: usize = 64;
 const QUIT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
 const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
 const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 const MAX_TUI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const TUI_WORKSPACE_DIR_METADATA_KEY: &str = "tui_workspace_dir";
 const GIT_BRANCH_EVENT_DEBOUNCE: Duration = Duration::from_millis(200);
+const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+#[derive(Clone)]
+struct CachedHistoryCell {
+    width: u16,
+    fingerprint: u64,
+    lines: Vec<Line<'static>>,
+}
 
 pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Result<()> {
     let current_workspace_dir = current_tui_workspace_dir()?;
@@ -792,6 +803,10 @@ struct TuiApp {
     _git_watcher: Option<RecommendedWatcher>,
     git_change_rx: mpsc::UnboundedReceiver<()>,
     git_branch_refresh_after: Option<Instant>,
+    // Cell rendering (especially streamed Markdown) dominates redraw cost.
+    // Cache each rendered cell independently so a new delta only re-renders
+    // that cell instead of rebuilding the entire visible transcript.
+    history_line_cache: std::collections::HashMap<usize, CachedHistoryCell>,
     file_query: Option<String>,
     file_matches: Vec<WorkspaceFileMatch>,
     popup_selected: usize,
@@ -876,6 +891,7 @@ impl TuiApp {
             _git_watcher: git_watcher,
             git_change_rx,
             git_branch_refresh_after: None,
+            history_line_cache: std::collections::HashMap::new(),
             file_query: None,
             file_matches: Vec::new(),
             popup_selected: 0,
@@ -937,12 +953,19 @@ impl TuiApp {
 
     async fn run(&mut self, terminal: &mut CrosstermTerminal) -> anyhow::Result<()> {
         let mut events = EventStream::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(120));
+        // Animate active state at roughly 60fps without polling the
+        // filesystem/session store at that same rate.
+        let mut tick = tokio::time::interval(ACTIVE_FRAME_INTERVAL);
+        let mut last_background_poll = Instant::now();
+        let mut needs_draw = true;
 
         loop {
-            terminal
-                .draw(|frame| self.render(frame))
-                .context("draw TUI frame")?;
+            if needs_draw {
+                terminal
+                    .draw(|frame| self.render(frame))
+                    .context("draw TUI frame")?;
+                needs_draw = false;
+            }
 
             tokio::select! {
                 maybe_event = events.next() => {
@@ -951,6 +974,7 @@ impl TuiApp {
                             if self.handle_terminal_event(event).await? {
                                 break;
                             }
+                            needs_draw = true;
                         }
                         Some(Err(err)) => return Err(anyhow::Error::from(err)).context("read terminal event"),
                         None => break,
@@ -958,21 +982,34 @@ impl TuiApp {
                 }
                 Some(event) = self.bot_rx.next() => {
                     self.handle_bot_event(event).await;
+                    needs_draw = true;
                     if self.exit_after_run && !self.running {
                         break;
                     }
                 }
                 _ = tick.tick() => {
-                    self.flush_status_elapsed();
-                    self.poll_sub_session_history().await;
-                    self.refresh_git_branch_from_events();
+                    let active_frame = self.running || self.active_tool_count() > 0;
+                    if active_frame {
+                        self.flush_status_elapsed();
+                        needs_draw = true;
+                    }
+                    if last_background_poll.elapsed() >= BACKGROUND_POLL_INTERVAL {
+                        let sub_session_event_log_lines = self.sub_session_event_log_lines;
+                        self.poll_sub_session_history().await;
+                        let git_refreshed = self.refresh_git_branch_from_events();
+                        last_background_poll = Instant::now();
+                        // An idle TUI waits for actual events. Background
+                        // polling can still redraw when it discovers a change.
+                        needs_draw |= self.sub_session_event_log_lines != sub_session_event_log_lines
+                            || git_refreshed;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn refresh_git_branch_from_events(&mut self) {
+    fn refresh_git_branch_from_events(&mut self) -> bool {
         while self.git_change_rx.try_recv().is_ok() {
             self.git_branch_refresh_after = Some(Instant::now() + GIT_BRANCH_EVENT_DEBOUNCE);
         }
@@ -982,7 +1019,9 @@ impl TuiApp {
         {
             self.git_status = current_git_status(&self.workspace_dir);
             self.git_branch_refresh_after = None;
+            return true;
         }
+        false
     }
 
     async fn handle_terminal_event(&mut self, event: Event) -> anyhow::Result<bool> {
@@ -1444,6 +1483,7 @@ impl TuiApp {
         self.session_id = session_id;
         self.has_activity = false;
         self.cells.clear();
+        self.history_line_cache.clear();
         self.composer.clear();
         self.scroll = 0;
         self.popup_selected = 0;
@@ -3714,7 +3754,11 @@ async fn run_bot_turn(
         .with_platform(Some(TUI_CHANNEL.to_string()))
         .with_async_agent(async_agent)
         .with_cancel(cancel);
-    let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
+    // `Runtime::chat` composes the agent and workflow streams into a very
+    // large concrete future. Keep that state on the heap: polling it directly
+    // from the TUI's local task can otherwise exhaust the main thread stack
+    // before the first model event is emitted.
+    let mut stream = Box::pin(Rc::clone(&runtime).chat(request));
     while let Some(event) = stream.next().await {
         if forward_core_event_to_tui(event, &tx, is_clear_command) {
             break;

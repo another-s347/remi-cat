@@ -477,25 +477,47 @@ impl TuiApp {
         }
     }
 
-    fn render_history(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_history(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let visible_lines = self.visible_history_lines(area);
         let paragraph = Paragraph::new(visible_lines).style(Style::default().fg(Color::Gray));
         frame.render_widget(Clear, area);
         frame.render_widget(paragraph, area);
     }
 
-    fn visible_history_lines(&self, area: Rect) -> Vec<Line<'static>> {
+    fn visible_history_lines(&mut self, area: Rect) -> Vec<Line<'static>> {
         let height = area.height as usize;
         if height == 0 {
             return Vec::new();
         }
         let needed = height.saturating_add(self.scroll as usize);
         let mut lines = Vec::with_capacity(needed.min(height.saturating_mul(2).max(1)));
-        for cell in self.cells.iter().rev() {
+        let mut visited_cache_indices = Vec::new();
+        self.history_line_cache
+            .retain(|index, _| *index < self.cells.len());
+        for index in (0..self.cells.len()).rev() {
+            let cell = &self.cells[index];
             if self.is_pending_action_history_cell(cell) {
                 continue;
             }
-            let cell_lines = cell.lines(area.width);
+            let fingerprint = Self::history_cell_fingerprint(cell);
+            let cell_lines = match self.history_line_cache.get(&index) {
+                Some(cached) if cached.width == area.width && cached.fingerprint == fingerprint => {
+                    cached.lines.clone()
+                }
+                _ => {
+                    let lines = cell.lines(area.width);
+                    self.history_line_cache.insert(
+                        index,
+                        CachedHistoryCell {
+                            width: area.width,
+                            fingerprint,
+                            lines: lines.clone(),
+                        },
+                    );
+                    lines
+                }
+            };
+            visited_cache_indices.push(index);
             for line in cell_lines.into_iter().rev() {
                 lines.push(line);
                 if lines.len() >= needed {
@@ -506,8 +528,27 @@ impl TuiApp {
                 break;
             }
         }
+        // Keep the cache proportional to the viewport rather than to every
+        // cell a user has scrolled through in a long-running session.
+        let retained_indices = visited_cache_indices
+            .into_iter()
+            .rev()
+            .take(MAX_HISTORY_LINE_CACHE_CELLS)
+            .collect::<std::collections::HashSet<_>>();
+        self.history_line_cache
+            .retain(|index, _| retained_indices.contains(index));
         lines.reverse();
         lines.into_iter().take(height).collect()
+    }
+
+    fn history_cell_fingerprint(cell: &HistoryCell) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(&cell.kind).hash(&mut hasher);
+        cell.title.hash(&mut hasher);
+        cell.body.hash(&mut hasher);
+        cell.meta.hash(&mut hasher);
+        cell.status.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn is_pending_action_history_cell(&self, cell: &HistoryCell) -> bool {

@@ -1253,8 +1253,8 @@ impl CatBot {
                 }
                 WorkflowRoundOutcome::Continue { report, message } => {
                     yield CatEvent::Supervisor(report);
-                    let mut main_stream = std::pin::pin!(
-                        self.stream_with_options(&thread_id_owned, Content::text(message), opts)
+                    let mut main_stream = Box::pin(
+                        self.stream_with_options(&thread_id_owned, Content::text(message), opts),
                     );
                     while let Some(event) = main_stream.next().await {
                         yield event;
@@ -1290,9 +1290,10 @@ impl CatBot {
                 .await
                 .filter(|instance| instance.status == WorkflowStatus::Active)
             else {
-                let mut stream = std::pin::pin!(
-                    self.stream_with_options(&thread_id_owned, content, opts)
-                );
+                // This branch is the normal non-workflow turn. Boxing keeps
+                // the substantially larger agent stream out of the workflow
+                // dispatch stream's concrete future type.
+                let mut stream = Box::pin(self.stream_with_options(&thread_id_owned, content, opts));
                 while let Some(event) = stream.next().await {
                     yield event;
                 }
@@ -1374,7 +1375,7 @@ impl CatBot {
                                 preview: batch.preview.clone(),
                                 count: batch.count,
                             });
-                            let mut stream = std::pin::pin!(self.stream_with_options(
+                            let mut stream = Box::pin(self.stream_with_options(
                                 &thread_id_owned,
                                 batch.content,
                                 opts,
@@ -1394,7 +1395,7 @@ impl CatBot {
                     agent_opts.message_id = None;
                     agent_opts.im_attachments.clear();
                     agent_opts.im_documents.clear();
-                    let mut stream = std::pin::pin!(self.stream_with_options(
+                    let mut stream = Box::pin(self.stream_with_options(
                         &thread_id_owned,
                         Content::text(message),
                         agent_opts,
@@ -3001,7 +3002,35 @@ impl CatBot {
                                         if !self.tool_tasks.is_thread_running(&thread_id_owned).await {
                                             break;
                                         }
+                                        // The foreground agent has already
+                                        // finished at this point, so its inner
+                                        // stream can no longer observe the
+                                        // turn cancellation token. Include it
+                                        // in this wait explicitly; otherwise a
+                                        // Ctrl+C can leave the TUI stuck in
+                                        // "cancelling" until a sub-task emits
+                                        // another event or finishes.
+                                        let cancel_wait = async {
+                                            match round_opts.cancel.as_ref() {
+                                                Some(cancel) => cancel.cancelled().await,
+                                                None => std::future::pending::<()>().await,
+                                            }
+                                        };
+                                        tokio::pin!(cancel_wait);
                                         tokio::select! {
+                                            _ = &mut cancel_wait => {
+                                                let cancelled_tasks = self
+                                                    .cancel_background_tasks(&thread_id_owned)
+                                                    .await;
+                                                tracing::info!(
+                                                    thread_id = %thread_id_owned,
+                                                    cancelled_task_count = cancelled_tasks.len(),
+                                                    "agent_turn.cancelled_while_waiting_for_background_tasks"
+                                                );
+                                                yield CatEvent::Cancelled;
+                                                yield CatEvent::Done;
+                                                return;
+                                            }
                                             completed = completed_tool_tasks.recv() => {
                                                 match completed {
                                                     Ok(task) if task.thread_id == thread_id_owned => {

@@ -356,7 +356,7 @@ pub(super) struct HistoryCell {
     pub(super) status: ToolVisualStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ToolVisualStatus {
     Neutral,
     Running,

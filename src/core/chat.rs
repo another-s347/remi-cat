@@ -250,15 +250,17 @@ impl Runtime {
                                 ..StreamOptions::default()
                             };
                             yield CoreChatEvent::SupervisorStarted;
-                            let mut stream = std::pin::pin!(
-                                self.bot.stream_workflow_start_with_options(
-                                    &request.session_id,
-                                    workflow_id,
-                                    context,
-                                    max_rounds,
-                                    opts,
-                                )
-                            );
+                            // Keep the workflow implementation behind a heap
+                            // boundary. Its concrete async-stream type contains
+                            // supervisor and agent branches that do not belong
+                            // in this channel dispatcher's state machine.
+                            let mut stream = Box::pin(self.bot.stream_workflow_start_with_options(
+                                &request.session_id,
+                                workflow_id,
+                                context,
+                                max_rounds,
+                                opts,
+                            ));
                             while let Some(event) = stream.next().await {
                                 let done = matches!(event, CatEvent::Done);
                                 yield CoreChatEvent::Bot(event);
@@ -326,9 +328,12 @@ impl Runtime {
             {
                 yield CoreChatEvent::SupervisorStarted;
             }
-            let mut stream = std::pin::pin!(
+            // The workflow dispatcher may contain a supervisor evaluation and
+            // several continuation streams. Store it separately so this outer
+            // chat stream remains small regardless of those branches.
+            let mut stream = Box::pin(
                 self.bot
-                    .stream_active_workflow_with_options(&session_id, content, opts)
+                    .stream_active_workflow_with_options(&session_id, content, opts),
             );
             while let Some(event) = stream.next().await {
                 if persist_agent_child_turn {
