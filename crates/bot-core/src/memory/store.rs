@@ -542,6 +542,16 @@ impl MemoryStore {
                     id: message.id.0,
                     role: match message.role {
                         Role::System => "system",
+                        Role::User
+                            if message.metadata.as_ref().is_some_and(|metadata| {
+                                metadata
+                                    .get("internal_supervisor_message")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false)
+                            }) =>
+                        {
+                            "supervisor"
+                        }
                         Role::User => "user",
                         Role::Assistant => "assistant",
                         Role::Tool => "tool",

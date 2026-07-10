@@ -867,7 +867,8 @@ fn render_supervisor_prompt(
         "main_agent_history": history,
     });
     Ok(format!(
-        "You are a supervisor workflow agent. Use tools when needed to verify the main agent's work.\n\
+        "You are a supervisor workflow agent. You have no tools; make decisions from the workflow payload and main agent history.\n\
+         Do not overthink: make the shortest sound decision from the available evidence and keep reasoning focused.\n\
          Select either a direct edge from allowed_outgoing_edges or any target_node from allowed_jump_targets. Use target_node when the main agent appears to have already completed intermediate workflow nodes.\n\
          allowed_subtree is rooted at the current node; cycle_cut=true means the subtree was truncated at a repeated node and must not be expanded further.\n\
          Return only JSON with this shape, using the JSON null literal for absent optional fields, never the string \"null\":\n\
@@ -1084,6 +1085,8 @@ mod tests {
         assert!(prompt.contains("check the tests next"));
         assert!(prompt.contains("[CURRENT TODO BATCH]"));
         assert!(prompt.contains("check the tests"));
+        assert!(prompt.contains("You have no tools"));
+        assert!(!prompt.contains("Use tools when needed"));
         assert!(prompt.contains("Choose when more main-agent work is required."));
         assert!(prompt.contains("Review the complete main-agent history"));
         assert!(prompt.contains("\"allowed_subtree\""));

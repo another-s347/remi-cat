@@ -637,6 +637,7 @@ impl AcpEventForwarder {
         event: CoreChatEvent,
     ) -> agent_client_protocol::Result<ForwardStatus> {
         match event {
+            CoreChatEvent::SupervisorStarted => {}
             CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
                 self.send_message_chunk(text)?;
             }
@@ -741,6 +742,7 @@ impl AcpEventForwarder {
                 CatEvent::History(..)
                 | CatEvent::Skill(_)
                 | CatEvent::Todo(_)
+                | CatEvent::BackgroundTasksWaiting { .. }
                 | CatEvent::ModelInputSnapshot(_) => {}
             },
         }

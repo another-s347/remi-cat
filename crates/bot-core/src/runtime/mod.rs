@@ -177,6 +177,61 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(map))
 }
 
+fn user_message_metadata(opts: &StreamOptions) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(value) = opts.sender_user_id.as_deref() {
+        map.insert(
+            "sender_user_id".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = opts
+        .sender_username
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        map.insert(
+            "sender_username".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = opts.message_id.as_deref() {
+        map.insert(
+            "message_id".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = opts.chat_type.as_deref() {
+        map.insert(
+            "chat_type".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if let Some(value) = opts.platform.as_deref() {
+        map.insert(
+            "platform".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    if !opts.im_attachments.is_empty() {
+        map.insert(
+            "im_attachments".into(),
+            serde_json::Value::String(
+                serde_json::to_string(&opts.im_attachments).unwrap_or_default(),
+            ),
+        );
+    }
+    if !opts.im_documents.is_empty() {
+        map.insert(
+            "im_documents".into(),
+            serde_json::Value::String(
+                serde_json::to_string(&opts.im_documents).unwrap_or_default(),
+            ),
+        );
+    }
+    (!map.is_empty()).then_some(serde_json::Value::Object(map))
+}
+
 fn background_task_completion_content(task: &crate::ToolTaskRecord) -> Content {
     let args_preview = background_task_args_preview(&task.args);
     let mut text = format!(
@@ -320,6 +375,10 @@ pub struct StreamOptions {
     /// Marks the request as an internal supervisor run.
     /// Goal supervision is disabled for these runs to avoid recursive loops.
     pub supervisor_run: bool,
+    /// Marks a user-role message as an internal supervisor instruction. It
+    /// remains a user message in model context, but UIs can render it as a
+    /// supervisor event when rebuilding persisted history.
+    pub internal_supervisor_message: bool,
     /// Downloadable IM attachments referenced by the current message.
     pub im_attachments: Vec<ImAttachment>,
     /// Feishu document links referenced by the current message.
@@ -368,10 +427,14 @@ struct SteerQueueRegistration {
     session_id: String,
     queue: Arc<CoreSteerQueue>,
     active: ActiveSteerQueues,
+    removes_queue_on_drop: bool,
 }
 
 impl Drop for SteerQueueRegistration {
     fn drop(&mut self) {
+        if !self.removes_queue_on_drop {
+            return;
+        }
         let mut active = self
             .active
             .lock()
@@ -513,15 +576,23 @@ impl CatBot {
         &self,
         session_id: &str,
     ) -> (Arc<CoreSteerQueue>, SteerQueueRegistration) {
-        let queue = Arc::new(CoreSteerQueue::new());
-        self.active_steers
+        let mut active = self
+            .active_steers
             .lock()
-            .expect("active steer queue lock poisoned")
-            .insert(session_id.to_string(), Arc::clone(&queue));
+            .expect("active steer queue lock poisoned");
+        let (queue, removes_queue_on_drop) = match active.get(session_id) {
+            Some(queue) => (Arc::clone(queue), false),
+            None => {
+                let queue = Arc::new(CoreSteerQueue::new());
+                active.insert(session_id.to_string(), Arc::clone(&queue));
+                (queue, true)
+            }
+        };
         let guard = SteerQueueRegistration {
             session_id: session_id.to_string(),
             queue: Arc::clone(&queue),
             active: Arc::clone(&self.active_steers),
+            removes_queue_on_drop,
         };
         (queue, guard)
     }
@@ -849,7 +920,6 @@ impl CatBot {
     /// | `REMI_REASONING_EFFORT`   | Optional reasoning effort override (`auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
     /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers auto compression (default: 80) |
-    /// | `REMI_SHORT_TERM_TOKENS`  | Absolute auto-compression token threshold override    |
     /// | `LANGSMITH_API_KEY`       | Enable LangSmith tracing (optional)                   |
     /// | `LANGSMITH_PROJECT`       | LangSmith project name (default: `remi-cat`)          |
     pub fn from_env() -> anyhow::Result<Self> {
@@ -1187,6 +1257,149 @@ impl CatBot {
                         self.stream_with_options(&thread_id_owned, Content::text(message), opts)
                     );
                     while let Some(event) = main_stream.next().await {
+                        yield event;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles a user turn for an already active workflow. The supervisor is
+    /// always the first model invoked; its message is then passed to the
+    /// selected workflow agent as an internal supervisor run.
+    pub fn stream_active_workflow_with_options<'a>(
+        &'a self,
+        thread_id: &'a str,
+        content: Content,
+        opts: StreamOptions,
+    ) -> impl Stream<Item = CatEvent> + 'a {
+        let thread_id_owned = thread_id.to_string();
+        stream! {
+            // Register before any workflow I/O so a second user input during
+            // supervisor evaluation is queued as a steer instead of starting
+            // a competing workflow turn. The inner agent run reuses this
+            // registration and drains the same queue at its normal gaps.
+            let steer_registration = (!opts.supervisor_run).then(|| {
+                self.register_steer_queue(&thread_id_owned)
+            });
+            let steer_queue = steer_registration
+                .as_ref()
+                .map(|(queue, _)| Arc::clone(queue));
+            let Some(instance) = self
+                .workflow_status(&thread_id_owned)
+                .await
+                .filter(|instance| instance.status == WorkflowStatus::Active)
+            else {
+                let mut stream = std::pin::pin!(
+                    self.stream_with_options(&thread_id_owned, content, opts)
+                );
+                while let Some(event) = stream.next().await {
+                    yield event;
+                }
+                return;
+            };
+
+            let user_message = Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: opts.sender_username.clone(),
+                reasoning_content: None,
+                metadata: user_message_metadata(&opts),
+            };
+            if let Err(error) = self
+                .append_thread_messages(&thread_id_owned, vec![user_message])
+                .await
+            {
+                yield CatEvent::Error(error);
+                return;
+            }
+
+            let ctx = match self.memory.load_context(&thread_id_owned).await {
+                Ok(ctx) => ctx,
+                Err(error) => {
+                    yield CatEvent::Error(error);
+                    return;
+                }
+            };
+            let history = build_injected_history(&ctx);
+            let todo_prompt = todo::latest_unfinished_batch_system_prompt(&ctx.user_state);
+            let round = instance.last_report.as_ref().map(|report| report.round).unwrap_or(0);
+            let supervisor_model_profile_id = opts.model_profile_id.clone();
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+            let evaluation = self.evaluate_workflow_after_round(
+                &thread_id_owned,
+                &history,
+                todo_prompt,
+                round,
+                supervisor_model_profile_id.as_deref(),
+                opts.cancel.clone(),
+                progress_tx,
+            );
+            tokio::pin!(evaluation);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut evaluation => break outcome,
+                    progress = progress_rx.recv() => {
+                        if let Some(progress) = progress {
+                            yield CatEvent::SupervisorProgress(progress);
+                        }
+                    }
+                }
+            };
+            while let Ok(progress) = progress_rx.try_recv() {
+                yield CatEvent::SupervisorProgress(progress);
+            }
+
+            match outcome {
+                WorkflowRoundOutcome::Cancelled => {
+                    yield CatEvent::Cancelled;
+                    yield CatEvent::Done;
+                }
+                WorkflowRoundOutcome::NoWorkflow => {}
+                WorkflowRoundOutcome::Report(report) => {
+                    yield CatEvent::Supervisor(report);
+                    // A steer can arrive while the supervisor is deciding. If
+                    // the decision terminates this workflow node there is no
+                    // inner agent stream to drain that queue, so explicitly
+                    // inject it into a normal post-workflow turn instead of
+                    // dropping it with the registration guard.
+                    if let Some(steer) = steer_queue.as_ref() {
+                        if let Some(batch) = steer.drain_batch() {
+                            yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                steer_ids: batch.ids.clone(),
+                                session_id: thread_id_owned.clone(),
+                                preview: batch.preview.clone(),
+                                count: batch.count,
+                            });
+                            let mut stream = std::pin::pin!(self.stream_with_options(
+                                &thread_id_owned,
+                                batch.content,
+                                opts,
+                            ));
+                            while let Some(event) = stream.next().await {
+                                yield event;
+                            }
+                        }
+                    }
+                }
+                WorkflowRoundOutcome::Continue { report, message } => {
+                    yield CatEvent::Supervisor(report);
+                    let mut agent_opts = opts;
+                    agent_opts.internal_supervisor_message = true;
+                    agent_opts.sender_username = Some("supervisor".to_string());
+                    agent_opts.sender_user_id = Some("supervisor".to_string());
+                    agent_opts.message_id = None;
+                    agent_opts.im_attachments.clear();
+                    agent_opts.im_documents.clear();
+                    let mut stream = std::pin::pin!(self.stream_with_options(
+                        &thread_id_owned,
+                        Content::text(message),
+                        agent_opts,
+                    ));
+                    while let Some(event) = stream.next().await {
                         yield event;
                     }
                 }
@@ -1745,7 +1958,10 @@ impl CatBot {
                 let mut stream = std::pin::pin!(active_agent
                     .stream_with_input_and_tool_allowlist_and_options(
                         input,
-                        Some(vec!["rg".to_string()]),
+                        // Supervisor decisions are made solely from the
+                        // workflow payload and main-agent history. Do not
+                        // expose runtime, dynamic, or model-provided tools.
+                        Some(Vec::new()),
                         CoreStreamOptions {
                             cancel: cancel.clone(),
                             steer: None,
@@ -2134,6 +2350,12 @@ impl CatBot {
                 }
 
                 let mut msg_meta = serde_json::Map::new();
+                if round_opts.internal_supervisor_message {
+                    msg_meta.insert(
+                        "internal_supervisor_message".into(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
                 if let Some(ref sid) = round_opts.sender_user_id {
                     msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
                     meta["sender_user_id"] = serde_json::Value::String(sid.clone());
@@ -2659,6 +2881,20 @@ impl CatBot {
                                     }
                                 }
                                 if round_opts.async_agent {
+                                    let background_task_count = self
+                                        .tool_tasks
+                                        .list(Some(&thread_id_owned))
+                                        .await
+                                        .into_iter()
+                                        .filter(|task| {
+                                            task.status == crate::tool_tasks::TOOL_TASK_RUNNING
+                                        })
+                                        .count();
+                                    if background_task_count > 0 {
+                                        yield CatEvent::BackgroundTasksWaiting {
+                                            count: background_task_count,
+                                        };
+                                    }
                                     loop {
                                         while let Some(event) = try_recv_background_side_event(
                                             &mut background_side_events,
@@ -3174,8 +3410,6 @@ pub struct CatBotBuilder {
     /// Allows placing Agent.md outside the agent's writable sandbox.
     agent_md_path: Option<PathBuf>,
     /// None → derive from model profile.
-    short_term_tokens: Option<usize>,
-    /// None → derive from model profile.
     overflow_bytes: Option<usize>,
     memory_days: u64,
     sandbox_config: SandboxConfig,
@@ -3198,9 +3432,6 @@ impl CatBotBuilder {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(7_u64);
-        let short_term_tokens = std::env::var("REMI_SHORT_TERM_TOKENS")
-            .ok()
-            .and_then(|value| value.parse().ok());
         let overflow_bytes = tool_output_overflow_bytes_from_env()?;
         let bash_mode = match std::env::var("REMI_SHELL_MODE")
             .or_else(|_| std::env::var("REMI_BASH_MODE"))
@@ -3231,7 +3462,6 @@ impl CatBotBuilder {
             skills_dir,
             data_dir: data_dir.clone(),
             agent_md_path,
-            short_term_tokens,
             overflow_bytes,
             memory_days,
             sandbox_config,
@@ -3276,14 +3506,6 @@ impl CatBotBuilder {
 
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = dir.into();
-        self
-    }
-
-    /// Override the short-term memory token budget.
-    /// By default this is derived from the model profile context window and
-    /// `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` (80% when unset).
-    pub fn short_term_tokens(mut self, n: usize) -> Self {
-        self.short_term_tokens = Some(n);
         self
     }
 
@@ -3356,9 +3578,7 @@ impl CatBotBuilder {
     pub fn build(self) -> anyhow::Result<CatBot> {
         let profile = self.model_profile.clone();
         let auto_compress_context_percent = auto_compress_context_percent()?;
-        let short_term_tokens = self
-            .short_term_tokens
-            .unwrap_or_else(|| context_percent_tokens(&profile, auto_compress_context_percent));
+        let short_term_tokens = context_percent_tokens(&profile, auto_compress_context_percent);
         let overflow_bytes = self.overflow_bytes.unwrap_or(profile.overflow_bytes);
         let resolved_base_url = profile.base_url.clone();
         let approval_profile = if let Some(profile_id) = self.approval_model_profile_id.as_deref() {
@@ -4663,7 +4883,7 @@ mod tests {
             max_output_tokens: 4096,
             context_tokens: 128000,
             supports_images: true,
-            short_term_tokens: 8192,
+            legacy_short_term_tokens: None,
             overflow_bytes: 16384,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -4899,7 +5119,6 @@ mod tests {
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -4952,7 +5171,6 @@ mod tests {
                 skills_dir: skills_dir.clone(),
                 data_dir: data_dir.path().to_path_buf(),
                 agent_md_path: None,
-                short_term_tokens: None,
                 overflow_bytes: None,
                 memory_days: 7,
                 sandbox_config: SandboxConfig::Disabled {
@@ -5043,7 +5261,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5164,7 +5381,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5241,7 +5457,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5328,7 +5543,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5442,7 +5656,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5639,7 +5852,6 @@ You are Remi.
             skills_dir: PathBuf::from("skills"),
             data_dir: PathBuf::from("data"),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5693,7 +5905,7 @@ You are Remi.
                 max_output_tokens: 393216,
                 context_tokens: 1_000_000,
                 supports_images: false,
-                short_term_tokens: 16000,
+                legacy_short_term_tokens: None,
                 overflow_bytes: 24000,
                 auto_compress: true,
                 extra_options: serde_json::Map::new(),
@@ -5703,7 +5915,6 @@ You are Remi.
             skills_dir: PathBuf::from("skills"),
             data_dir: PathBuf::from("data"),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -5745,7 +5956,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.clone(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -6001,7 +6211,6 @@ You are Remi.
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
                 agent_md_path: None,
-                short_term_tokens: None,
                 overflow_bytes: None,
                 memory_days: 7,
                 sandbox_config: SandboxConfig::Disabled {
@@ -6081,7 +6290,6 @@ You are Remi.
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
                 agent_md_path: None,
-                short_term_tokens: None,
                 overflow_bytes: None,
                 memory_days: 7,
                 sandbox_config: SandboxConfig::Disabled {
@@ -6211,7 +6419,6 @@ You are Remi.
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
             agent_md_path: None,
-            short_term_tokens: None,
             overflow_bytes: None,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
@@ -6331,7 +6538,6 @@ You are Remi.
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
                 agent_md_path: None,
-                short_term_tokens: None,
                 overflow_bytes: None,
                 memory_days: 7,
                 sandbox_config: SandboxConfig::Disabled {

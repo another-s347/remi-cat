@@ -423,6 +423,7 @@ struct FeishuEventForwarder<'a, 'b> {
 impl FeishuEventForwarder<'_, '_> {
     async fn forward_core_event(&mut self, event: CoreChatEvent) -> bool {
         match event {
+            CoreChatEvent::SupervisorStarted => false,
             CoreChatEvent::Prefix(prefix) | CoreChatEvent::Reply(prefix) => {
                 self.append(FeishuReplyKind::Text, &prefix).await;
                 false

@@ -222,7 +222,11 @@ pub struct ModelProfileConfig {
     pub max_output_tokens: u32,
     pub context_tokens: u32,
     pub supports_images: bool,
-    pub short_term_tokens: usize,
+    /// Backward-compatible parser sink for retired model-profile YAML. The
+    /// value is intentionally ignored; compaction now uses the context ratio.
+    #[doc(hidden)]
+    #[serde(default, rename = "short_term_tokens", skip_serializing)]
+    pub legacy_short_term_tokens: Option<usize>,
     pub overflow_bytes: usize,
     pub auto_compress: bool,
     #[serde(default)]
@@ -249,9 +253,6 @@ impl ModelProfileConfig {
         }
         if self.context_tokens == 0 {
             bail!("model profile {} context_tokens must be > 0", self.id);
-        }
-        if self.short_term_tokens == 0 {
-            bail!("model profile {} short_term_tokens must be > 0", self.id);
         }
         if self.overflow_bytes == 0 {
             bail!("model profile {} overflow_bytes must be > 0", self.id);
@@ -831,10 +832,6 @@ fn legacy_profile_from_env() -> Result<ModelProfileConfig> {
         .or_else(|_| std::env::var("REMI_BASE_URL"))
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let short_term_tokens = std::env::var("REMI_SHORT_TERM_TOKENS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(8_192);
     let overflow_bytes = std::env::var("REMI_OVERFLOW_BYTES")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -856,7 +853,7 @@ fn legacy_profile_from_env() -> Result<ModelProfileConfig> {
                 .or_else(|_| std::env::var("REMI_MODEL"))
                 .unwrap_or_else(|_| "gpt-4o".to_string()),
         ),
-        short_term_tokens,
+        legacy_short_term_tokens: None,
         overflow_bytes,
         auto_compress: true,
         extra_options: serde_json::Map::new(),
@@ -933,7 +930,7 @@ mod tests {
             max_output_tokens: 4096,
             context_tokens: 128000,
             supports_images: false,
-            short_term_tokens: 8192,
+            legacy_short_term_tokens: None,
             overflow_bytes: 16384,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -954,7 +951,6 @@ base_url: https://api.openai.com/v1
 max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
-short_term_tokens: 8192
 overflow_bytes: 16384
 auto_compress: true
 "#,
@@ -970,7 +966,6 @@ base_url: https://api.deepseek.com
 max_output_tokens: 8192
 context_tokens: 128000
 supports_images: false
-short_term_tokens: 12000
 overflow_bytes: 24000
 auto_compress: false
 "#,
@@ -980,6 +975,27 @@ auto_compress: false
         assert_eq!(registry.list().len(), 2);
         assert!(registry.get("default").is_some());
         assert!(registry.get("deepseek-v4-flash").is_some());
+    }
+
+    #[test]
+    fn accepts_retired_short_term_tokens_field() {
+        let profile: ModelProfileConfig = serde_yaml::from_str(
+            r#"
+id: legacy
+name: Legacy
+model: gpt-4o
+max_output_tokens: 4096
+context_tokens: 128000
+supports_images: true
+short_term_tokens: 16000
+overflow_bytes: 16384
+auto_compress: true
+"#,
+        )
+        .expect("retired field remains configuration-compatible");
+
+        assert_eq!(profile.legacy_short_term_tokens, Some(16_000));
+        profile.validate().unwrap();
     }
 
     #[test]
@@ -995,7 +1011,6 @@ model: a
 max_output_tokens: 1
 context_tokens: 1
 supports_images: false
-short_term_tokens: 1
 overflow_bytes: 1
 auto_compress: true
 "#,
@@ -1010,7 +1025,6 @@ model: b
 max_output_tokens: 1
 context_tokens: 1
 supports_images: false
-short_term_tokens: 1
 overflow_bytes: 1
 auto_compress: true
 "#,
@@ -1033,7 +1047,6 @@ model: gpt-4o
 max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
-short_term_tokens: 8192
 overflow_bytes: 16384
 auto_compress: true
 "#,
@@ -1061,7 +1074,6 @@ model: gpt-4o
 max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
-short_term_tokens: 8192
 overflow_bytes: 16384
 auto_compress: true
 "#,
@@ -1077,7 +1089,6 @@ base_url: https://api.deepseek.com
 max_output_tokens: 8192
 context_tokens: 128000
 supports_images: false
-short_term_tokens: 12000
 overflow_bytes: 24000
 auto_compress: false
 "#,
@@ -1112,7 +1123,6 @@ model: gpt-4o
 max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
-short_term_tokens: 8192
 overflow_bytes: 16384
 auto_compress: true
 "#,
@@ -1136,7 +1146,6 @@ auto_compress: true
             "REMI_REASONING_EFFORT",
             "OPENAI_MODEL",
             "OPENAI_BASE_URL",
-            "REMI_SHORT_TERM_TOKENS",
             "REMI_OVERFLOW_BYTES",
         ]);
         let temp = tempdir().unwrap();
@@ -1146,7 +1155,6 @@ auto_compress: true
             std::env::remove_var("REMI_REASONING_EFFORT");
             std::env::set_var("OPENAI_MODEL", "gpt-4o");
             std::env::set_var("OPENAI_BASE_URL", "https://api.openai.com/v1");
-            std::env::set_var("REMI_SHORT_TERM_TOKENS", "9999");
             std::env::set_var("REMI_OVERFLOW_BYTES", "22222");
         }
 
@@ -1157,7 +1165,6 @@ auto_compress: true
             resolved.profile.base_url.as_deref(),
             Some("https://api.openai.com/v1")
         );
-        assert_eq!(resolved.profile.short_term_tokens, 9999);
         assert_eq!(resolved.profile.overflow_bytes, 22222);
     }
 
@@ -1175,7 +1182,7 @@ auto_compress: true
             max_output_tokens: 4096,
             context_tokens: 128000,
             supports_images: false,
-            short_term_tokens: 8192,
+            legacy_short_term_tokens: None,
             overflow_bytes: 16384,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -1297,7 +1304,7 @@ auto_compress: true
             max_output_tokens: 131072,
             context_tokens: 1000000,
             supports_images: false,
-            short_term_tokens: 24000,
+            legacy_short_term_tokens: None,
             overflow_bytes: 32000,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -1327,7 +1334,7 @@ auto_compress: true
             max_output_tokens: 393216,
             context_tokens: 1000000,
             supports_images: false,
-            short_term_tokens: 24000,
+            legacy_short_term_tokens: None,
             overflow_bytes: 32000,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -1357,7 +1364,7 @@ auto_compress: true
             max_output_tokens: 131072,
             context_tokens: 256000,
             supports_images: false,
-            short_term_tokens: 24000,
+            legacy_short_term_tokens: None,
             overflow_bytes: 32000,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -1393,7 +1400,7 @@ auto_compress: true
             max_output_tokens: 131072,
             context_tokens: 1000000,
             supports_images: false,
-            short_term_tokens: 24000,
+            legacy_short_term_tokens: None,
             overflow_bytes: 32000,
             auto_compress: true,
             extra_options: serde_json::Map::new(),

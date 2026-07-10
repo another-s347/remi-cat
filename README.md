@@ -281,7 +281,6 @@ base_url: https://api.deepseek.com
 max_output_tokens: 393216
 context_tokens: 1000000
 supports_images: false
-short_term_tokens: 16000
 overflow_bytes: 24000
 auto_compress: true
 ```

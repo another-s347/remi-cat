@@ -61,6 +61,11 @@ impl SessionRuntime {
     pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let path = data_dir.into().join("sessions.json");
         let store = match std::fs::read_to_string(&path) {
+            // A process can be interrupted after creating the file but before
+            // its first contents reach disk. Treat that same empty-file state
+            // as a missing store so a broken session index never prevents the
+            // application from starting.
+            Ok(raw) if raw.trim().is_empty() => SessionStore::default(),
             Ok(raw) => serde_json::from_str(&raw).context("parsing session store")?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => SessionStore::default(),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
@@ -423,7 +428,20 @@ impl SessionRuntime {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let raw = serde_json::to_string_pretty(&self.store).context("serializing session store")?;
-        std::fs::write(&self.path, raw).with_context(|| format!("writing {}", self.path.display()))
+        let parent = self
+            .path
+            .parent()
+            .expect("session store path always has a parent");
+        let temp_path = parent.join(format!(".sessions-{}.tmp", Uuid::new_v4()));
+        std::fs::write(&temp_path, raw).with_context(|| {
+            format!(
+                "writing temporary session store for {}",
+                self.path.display()
+            )
+        })?;
+        std::fs::rename(&temp_path, &self.path)
+            .with_context(|| format!("replacing {}", self.path.display()))?;
+        Ok(())
     }
 }
 
@@ -470,6 +488,23 @@ mod tests {
         let second = runtime.resolve_channel("cli", "b", "default").unwrap();
         assert_ne!(first, second);
         assert_eq!(runtime.list().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_session_store_recovers_as_a_fresh_store() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sessions.json"), "\n  \t").unwrap();
+
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        assert!(runtime.list().is_empty());
+        runtime
+            .resolve_channel("cli", "local-dev", "default")
+            .unwrap();
+
+        let saved = std::fs::read_to_string(dir.join("sessions.json")).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&saved).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 

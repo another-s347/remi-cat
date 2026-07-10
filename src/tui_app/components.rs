@@ -49,6 +49,8 @@ pub(super) struct SupervisorUiState {
     pub(super) to_node: Option<String>,
     pub(super) edge: Option<String>,
     pub(super) status: Option<String>,
+    pub(super) executing: bool,
+    pub(super) decision_cell_open: bool,
     pub(super) reason: Option<String>,
     pub(super) events: Vec<SupervisorEventDisplay>,
 }
@@ -61,7 +63,6 @@ pub(super) struct SupervisorEventDisplay {
 }
 
 impl SupervisorUiState {
-    #[cfg(test)]
     pub(super) fn push_event(&mut self, event: SupervisorEventDisplay) {
         if matches!(event.kind, "output") {
             if let Some(existing) = self
@@ -91,6 +92,7 @@ impl SupervisorUiState {
         self.to_node = Some(report.to_node.clone());
         self.edge = report.edge.clone();
         self.status = Some(format!("{:?}", report.status));
+        self.executing = false;
         if !report.reason.trim().is_empty() {
             self.reason = Some(truncate_chars(
                 &single_line(&report.reason),
@@ -105,6 +107,14 @@ impl SupervisorUiState {
         let to = self.to_node.as_deref().unwrap_or("?");
         let status = self.status.as_deref().unwrap_or("done");
         format!("supervisor · {workflow} · {from} -> {to} · {status}")
+    }
+
+    pub(super) fn display_name(&self) -> String {
+        self.workflow_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("supervisor")
+            .to_string()
     }
 
     pub(super) fn meta(&self) -> String {
@@ -212,16 +222,7 @@ impl SubSessionUiState {
     }
 
     pub(super) fn title(&self) -> String {
-        let indent = "  ".repeat(self.depth as usize);
-        format!(
-            "{indent}sub-agent · {} · calling {} tool{}",
-            self.agent_name,
-            self.tools.len(),
-            if self.tools.len() == 1 { "" } else { "s" }
-        )
-    }
-
-    pub(super) fn meta(&self) -> String {
+        let indent = " ".repeat(self.depth as usize);
         let state = if self.failed {
             "failed"
         } else if self.done {
@@ -230,15 +231,19 @@ impl SubSessionUiState {
             "running"
         };
         format!(
-            "depth {} · parent {} · thread {} · {state}",
-            self.depth,
-            short_session_id(&self.parent_tool_call_id),
-            short_session_id(&self.thread_id)
+            "{indent}sub-agent · {} · calling {} tool{} · {state}",
+            self.agent_name,
+            self.tools.len(),
+            if self.tools.len() == 1 { "" } else { "s" }
         )
     }
 
+    pub(super) fn meta(&self) -> String {
+        String::new()
+    }
+
     pub(super) fn body(&self) -> String {
-        let nested = "  ".repeat(self.depth.saturating_add(1) as usize);
+        let nested = " ".repeat(self.depth.saturating_add(1) as usize);
         let mut lines = Vec::new();
         if let Some(input) = self
             .input
@@ -625,6 +630,11 @@ impl HistoryCell {
                 self.status.style().add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::White),
             ),
+            CellKind::SupervisorStream { .. } if self.title == "supervisor thinking" => (
+                "?",
+                Style::default().fg(CODEX_DIM),
+                Style::default().fg(CODEX_DIM),
+            ),
             CellKind::SupervisorStream { .. } => (
                 "⌁",
                 self.status.style().add_modifier(Modifier::BOLD),
@@ -670,6 +680,84 @@ impl HistoryCell {
                 Style::default().fg(CODEX_DIM),
             ),
         };
+        let inline_body = matches!(
+            self.kind,
+            CellKind::User
+                | CellKind::Assistant
+                | CellKind::Thinking
+                | CellKind::System
+                | CellKind::Supervisor { .. }
+                | CellKind::SupervisorStream { .. }
+        );
+        if inline_body {
+            let raw_body = if self.body.trim().is_empty() {
+                "(no content)".to_string()
+            } else if matches!(
+                self.kind,
+                CellKind::Supervisor { .. } | CellKind::SupervisorStream { .. }
+            ) {
+                format!("{}: {}", self.title, self.body.trim_end())
+            } else {
+                self.body.trim_end().to_string()
+            };
+            let body = sanitize_tui_text(&raw_body);
+            // Model reasoning frequently contains blank paragraph delimiters.
+            // `wrap_text` faithfully renders those delimiters as empty rows,
+            // which made both main-agent and supervisor thinking look like
+            // separate, spaced-out entries. Keep meaningful line breaks but
+            // remove empty reasoning rows consistently for both kinds.
+            let body = if matches!(self.kind, CellKind::Thinking)
+                || matches!(self.kind, CellKind::SupervisorStream { .. })
+                    && self.title == "supervisor thinking"
+            {
+                compact_thinking_lines(&body)
+            } else {
+                body
+            };
+            if matches!(self.kind, CellKind::Assistant) {
+                let wrapped = render_markdown_lines(
+                    body.trim_end(),
+                    width.max(1),
+                    MarkdownTheme {
+                        base: body_style,
+                        dim: CODEX_DIM,
+                        accent: CODEX_CYAN,
+                        code: Color::Yellow,
+                        quote: CODEX_DIM,
+                    },
+                );
+                for (index, line) in wrapped.into_iter().take(MAX_HISTORY_BODY_LINES).enumerate() {
+                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                    if index == 0 {
+                        spans.push(Span::styled(history_gutter(prefix), title_style));
+                    } else {
+                        spans.push(Span::raw(" ".repeat(HISTORY_GUTTER_WIDTH as usize)));
+                    }
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
+            } else {
+                for (index, line) in wrap_text(
+                    body.trim_end(),
+                    width.saturating_sub(HISTORY_GUTTER_WIDTH).max(1),
+                )
+                .into_iter()
+                .take(MAX_HISTORY_BODY_LINES)
+                .enumerate()
+                {
+                    let gutter = if index == 0 {
+                        Span::styled(history_gutter(prefix), title_style)
+                    } else {
+                        Span::raw(" ".repeat(HISTORY_GUTTER_WIDTH as usize))
+                    };
+                    lines.push(Line::from(vec![gutter, Span::styled(line, body_style)]));
+                }
+            }
+            // Keep cell boundaries readable even when supervisor events arrive
+            // back-to-back. Thinking content is compacted separately above.
+            lines.push(Line::from(""));
+            return lines;
+        }
         let title = if self.meta.is_empty() {
             self.title.clone()
         } else if self.status == ToolVisualStatus::Neutral {
@@ -755,6 +843,13 @@ impl HistoryCell {
     }
 }
 
+fn compact_thinking_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) fn history_gutter(prefix: &str) -> String {
     let used = UnicodeWidthStr::width(prefix) as u16;
     let spaces = HISTORY_GUTTER_WIDTH.saturating_sub(used).max(1);
@@ -838,6 +933,12 @@ pub(super) fn context_compaction_cell(event: ContextCompactionEvent) -> HistoryC
 pub(super) fn history_cell(message: ThreadHistoryMessage) -> Option<HistoryCell> {
     match message.role.as_str() {
         "user" => Some(HistoryCell::user(message.text)),
+        "supervisor" => Some(HistoryCell::supervisor_stream(
+            format!("history:{}", message.id),
+            "supervisor".to_string(),
+            message.text,
+            ToolVisualStatus::Success,
+        )),
         "assistant" => {
             if message.text.trim().is_empty() {
                 None
@@ -947,32 +1048,11 @@ pub(super) fn tool_elapsed_meta(
     }
 }
 
-pub(super) fn append_token_meta(cell: &mut HistoryCell, delta: TokenDelta) {
-    if delta.is_empty() {
-        return;
-    }
-    let token_meta = format!(
-        "tokens +{}p/+{}c",
-        delta.prompt_tokens, delta.completion_tokens
-    );
-    if cell.meta.is_empty() {
-        cell.meta = token_meta;
-    } else {
-        cell.meta.push_str(" · ");
-        cell.meta.push_str(&token_meta);
-    }
+pub(super) fn append_token_meta(_cell: &mut HistoryCell, _delta: TokenDelta) {
+    // Per-cell token accounting is intentionally omitted from the compact TUI.
 }
 
-pub(super) fn preserve_token_meta(mut meta: String, existing_meta: &str) -> String {
-    for part in existing_meta
-        .split(" · ")
-        .filter(|part| part.starts_with("tokens +"))
-    {
-        if !meta.is_empty() {
-            meta.push_str(" · ");
-        }
-        meta.push_str(part);
-    }
+pub(super) fn preserve_token_meta(meta: String, _existing_meta: &str) -> String {
     meta
 }
 
@@ -1340,7 +1420,9 @@ pub(super) fn format_todo_state(items: &[bot_core::todo::TodoItem]) -> String {
 }
 
 pub(super) fn latest_active_todo_label(items: &[bot_core::todo::TodoItem]) -> Option<String> {
-    let item = items.iter().rev().find(|item| !item.done)?;
+    // The active todo is the next unfinished item in the declared plan order,
+    // not the most recently created unfinished item.
+    let item = items.iter().find(|item| !item.done)?;
     let mut label = format!("todo #{} {}", item.id, single_line(&item.content));
     if let Some(batch) = item
         .batch_title

@@ -896,6 +896,7 @@ impl WebCoreEventMapper {
 
     fn map(&mut self, runtime: &Runtime, session_id: &str, event: CoreChatEvent) -> WebEventMap {
         match event {
+            CoreChatEvent::SupervisorStarted => WebEventMap::Skip,
             CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
                 self.mark_first_response();
                 WebEventMap::Emit("text_delta", serde_json::json!({"text": text}))

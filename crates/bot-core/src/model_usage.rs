@@ -212,7 +212,7 @@ mod tests {
             max_output_tokens: 1,
             context_tokens: 1,
             supports_images: false,
-            short_term_tokens: 1,
+            legacy_short_term_tokens: None,
             overflow_bytes: 1,
             auto_compress: true,
             description: None,

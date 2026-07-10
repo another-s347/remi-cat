@@ -26,8 +26,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
+use git2::{BranchType, RepositoryState, Status, StatusOptions};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -68,7 +70,7 @@ const CODEX_DIM: Color = crate::tui_theme::DIM;
 const CODEX_BORDER: Color = crate::tui_theme::BORDER;
 const CODEX_GREEN: Color = crate::tui_theme::SUCCESS;
 const FOOTER_INDENT: &str = "  ";
-const HISTORY_GUTTER_WIDTH: u16 = 4;
+const HISTORY_GUTTER_WIDTH: u16 = 2;
 const MAX_TOOL_BODY_CHARS: usize = 240;
 const MAX_HISTORY_BODY_LINES: usize = 220;
 const QUIT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -76,6 +78,7 @@ const PASTE_CHUNK_LINE_THRESHOLD: usize = 3;
 const PASTE_CHUNK_CHAR_THRESHOLD: usize = 1000;
 const MAX_TUI_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const TUI_WORKSPACE_DIR_METADATA_KEY: &str = "tui_workspace_dir";
+const GIT_BRANCH_EVENT_DEBOUNCE: Duration = Duration::from_millis(200);
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -639,24 +642,138 @@ fn compact_workspace_label(label: &str) -> String {
     trimmed.to_string()
 }
 
-fn current_git_branch(workspace_dir: &std::path::Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn current_git_status(workspace_dir: &std::path::Path) -> Option<String> {
+    let repository = git2::Repository::discover(workspace_dir).ok()?;
+    let head = repository.head().ok()?;
+    let branch = if head.is_branch() {
+        head.shorthand().ok()?.trim().to_string()
+    } else {
+        format!(
+            "detached {}",
+            head.target()?
+                .to_string()
+                .chars()
+                .take(7)
+                .collect::<String>()
+        )
+    };
+    if branch.is_empty() {
         return None;
     }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if branch.is_empty() || branch == "HEAD" {
-        None
-    } else {
-        Some(branch)
+
+    let mut parts = vec![branch.clone()];
+    if head.is_branch() {
+        if let Ok(local) = repository.find_branch(&branch, BranchType::Local) {
+            if let Ok(upstream) = local.upstream() {
+                if let (Some(local_oid), Some(upstream_oid)) =
+                    (local.get().target(), upstream.get().target())
+                {
+                    if let Ok((ahead, behind)) =
+                        repository.graph_ahead_behind(local_oid, upstream_oid)
+                    {
+                        if ahead > 0 {
+                            parts.push(format!("↑{ahead}"));
+                        }
+                        if behind > 0 {
+                            parts.push(format!("↓{behind}"));
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    if let Some(operation) = git_operation_label(repository.state()) {
+        parts.push(operation.to_string());
+    }
+
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false);
+    if let Ok(statuses) = repository.statuses(Some(&mut options)) {
+        let mut staged = 0;
+        let mut modified = 0;
+        let mut untracked = 0;
+        let mut conflicts = 0;
+        for entry in statuses.iter() {
+            let status = entry.status();
+            if status.contains(Status::CONFLICTED) {
+                conflicts += 1;
+            }
+            if status.intersects(
+                Status::INDEX_NEW
+                    | Status::INDEX_MODIFIED
+                    | Status::INDEX_DELETED
+                    | Status::INDEX_RENAMED
+                    | Status::INDEX_TYPECHANGE,
+            ) {
+                staged += 1;
+            }
+            if status.intersects(
+                Status::WT_MODIFIED
+                    | Status::WT_DELETED
+                    | Status::WT_RENAMED
+                    | Status::WT_TYPECHANGE
+                    | Status::WT_UNREADABLE,
+            ) {
+                modified += 1;
+            }
+            if status.contains(Status::WT_NEW) {
+                untracked += 1;
+            }
+        }
+        if conflicts > 0 {
+            parts.push(format!("conflicts {conflicts}"));
+        }
+        if staged > 0 {
+            parts.push(format!("staged {staged}"));
+        }
+        if modified > 0 {
+            parts.push(format!("modified {modified}"));
+        }
+        if untracked > 0 {
+            parts.push(format!("untracked {untracked}"));
+        }
+    }
+    Some(parts.join(" · "))
+}
+
+fn git_operation_label(state: RepositoryState) -> Option<&'static str> {
+    match state {
+        RepositoryState::Clean => None,
+        RepositoryState::Merge => Some("merge"),
+        RepositoryState::Revert | RepositoryState::RevertSequence => Some("revert"),
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => Some("cherry-pick"),
+        RepositoryState::Bisect => Some("bisect"),
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge => Some("rebase"),
+        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => Some("apply"),
+    }
+}
+
+fn watch_git_metadata(
+    workspace_dir: &std::path::Path,
+) -> Option<(RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
+    let repository = git2::Repository::discover(workspace_dir).ok()?;
+    let git_dir = repository.path().to_path_buf();
+    let common_dir = repository.commondir().to_path_buf();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok() {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher
+        .watch(workspace_dir, RecursiveMode::Recursive)
+        .ok()?;
+    watcher.watch(&git_dir, RecursiveMode::Recursive).ok()?;
+    if common_dir != git_dir {
+        watcher.watch(&common_dir, RecursiveMode::Recursive).ok()?;
+    }
+    Some((watcher, rx))
 }
 
 struct TuiApp {
@@ -669,19 +786,27 @@ struct TuiApp {
     command_catalog: Vec<CommandEntry>,
     workspace_dir: std::path::PathBuf,
     workspace_root_label: String,
-    git_branch: Option<String>,
+    git_status: Option<String>,
+    // Must remain alive for the lifetime of the TUI; dropping it stops native
+    // filesystem notifications.
+    _git_watcher: Option<RecommendedWatcher>,
+    git_change_rx: mpsc::UnboundedReceiver<()>,
+    git_branch_refresh_after: Option<Instant>,
     file_query: Option<String>,
     file_matches: Vec<WorkspaceFileMatch>,
     popup_selected: usize,
     show_shortcuts: bool,
     quit_hint_until: Option<Instant>,
     running: bool,
+    awaiting_background_tasks: bool,
+    background_task_count: usize,
     run_started_at: Option<Instant>,
     interrupt_requested: bool,
     exit_after_run: bool,
     cancel: Option<CancellationToken>,
     run_handle: Option<JoinHandle<()>>,
     queued_inputs: VecDeque<SubmittedInput>,
+    pending_steers: VecDeque<PendingSteer>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: Option<String>,
@@ -697,7 +822,6 @@ struct TuiApp {
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
-    opened_sub_session_panes: std::collections::HashSet<String>,
     supervisors: std::collections::HashMap<String, SupervisorUiState>,
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
@@ -721,12 +845,23 @@ struct SubmittedInput {
     content: Content,
 }
 
+struct PendingSteer {
+    steer_id: String,
+    display_text: String,
+}
+
 impl TuiApp {
     async fn new(runtime: Rc<Runtime>, cli: CliConfig, session_id: String) -> Self {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
-        let git_branch = current_git_branch(&workspace_dir);
+        let git_status = current_git_status(&workspace_dir);
+        let (git_watcher, git_change_rx) = watch_git_metadata(&workspace_dir)
+            .map(|(watcher, rx)| (Some(watcher), rx))
+            .unwrap_or_else(|| {
+                let (_tx, rx) = mpsc::unbounded_channel();
+                (None, rx)
+            });
         let mut app = Self {
             runtime,
             cli,
@@ -737,19 +872,25 @@ impl TuiApp {
             command_catalog: Vec::new(),
             workspace_dir,
             workspace_root_label,
-            git_branch,
+            git_status,
+            _git_watcher: git_watcher,
+            git_change_rx,
+            git_branch_refresh_after: None,
             file_query: None,
             file_matches: Vec::new(),
             popup_selected: 0,
             show_shortcuts: false,
             quit_hint_until: None,
             running: false,
+            awaiting_background_tasks: false,
+            background_task_count: 0,
             run_started_at: None,
             interrupt_requested: false,
             exit_after_run: false,
             cancel: None,
             run_handle: None,
             queued_inputs: VecDeque::new(),
+            pending_steers: VecDeque::new(),
             input_history: Vec::new(),
             history_index: None,
             history_draft: None,
@@ -765,7 +906,6 @@ impl TuiApp {
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
-            opened_sub_session_panes: std::collections::HashSet::new(),
             supervisors: std::collections::HashMap::new(),
             pending_approval: None,
             approval_selected: 0,
@@ -785,7 +925,7 @@ impl TuiApp {
         app.refresh_command_catalog();
         app.load_input_history().await;
         app.cells.push(HistoryCell::system(
-            "Remi Cat TUI ready. Type / for commands. Ctrl+C cancels a run or exits when idle.",
+            "Remi Cat TUI ready. Type / for commands. Ctrl+C clears input, cancels a run, or exits when idle.",
         ));
         app.cells.push(HistoryCell::system(format!(
             "session id: {}",
@@ -825,10 +965,24 @@ impl TuiApp {
                 _ = tick.tick() => {
                     self.flush_status_elapsed();
                     self.poll_sub_session_history().await;
+                    self.refresh_git_branch_from_events();
                 }
             }
         }
         Ok(())
+    }
+
+    fn refresh_git_branch_from_events(&mut self) {
+        while self.git_change_rx.try_recv().is_ok() {
+            self.git_branch_refresh_after = Some(Instant::now() + GIT_BRANCH_EVENT_DEBOUNCE);
+        }
+        if self
+            .git_branch_refresh_after
+            .is_some_and(|when| Instant::now() >= when)
+        {
+            self.git_status = current_git_status(&self.workspace_dir);
+            self.git_branch_refresh_after = None;
+        }
     }
 
     async fn handle_terminal_event(&mut self, event: Event) -> anyhow::Result<bool> {
@@ -963,6 +1117,10 @@ impl TuiApp {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('c') if !self.composer.is_empty() => {
+                    self.clear_composer_draft();
+                    return Ok(false);
+                }
                 KeyCode::Char('c') | KeyCode::Char('d') => return Ok(self.handle_cancel_or_quit()),
                 KeyCode::Char('l') => {
                     self.scroll = 0;
@@ -1151,9 +1309,9 @@ impl TuiApp {
             return Ok(false);
         }
         if self.running && text.trim_start().starts_with('/') {
-            self.cells.push(HistoryCell::user(display_text.clone()));
             match process_runtime_commands(&self.runtime, &self.session_id, text.trim()).await {
                 Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                    self.cells.push(HistoryCell::user(display_text));
                     self.cells.push(HistoryCell::system(reply));
                 }
                 Ok(RuntimeCommandPipelineResult::StartWorkflow { .. })
@@ -1162,11 +1320,9 @@ impl TuiApp {
                         display_text,
                         content,
                     });
-                    self.cells.push(HistoryCell::system(
-                        "当前 session 正在运行，该命令会在当前 run 结束后执行。",
-                    ));
                 }
                 Err(error) => {
+                    self.cells.push(HistoryCell::user(display_text));
                     self.cells
                         .push(HistoryCell::system(format!("command failed: {error:#}")));
                 }
@@ -1182,20 +1338,16 @@ impl TuiApp {
             match self.runtime.submit_steer(request) {
                 SteerSubmitResult::Queued(event) => {
                     self.has_activity = true;
-                    self.cells.push(HistoryCell::user(display_text));
-                    self.cells.push(HistoryCell::system(format!(
-                        "Steer 已接收，将在下一次模型/工具空隙注入。id: {}",
-                        event.steer_id
-                    )));
+                    self.pending_steers.push_back(PendingSteer {
+                        steer_id: event.steer_id,
+                        display_text,
+                    });
                 }
                 SteerSubmitResult::NotRunning => {
                     self.queued_inputs.push_back(SubmittedInput {
                         display_text,
                         content,
                     });
-                    self.cells.push(HistoryCell::system(
-                        "当前 run 尚未开放 steer 队列，已暂存到下一轮输入队列。",
-                    ));
                 }
             }
             return Ok(false);
@@ -1300,6 +1452,7 @@ impl TuiApp {
         self.show_shortcuts = false;
         self.quit_hint_until = None;
         self.queued_inputs.clear();
+        self.pending_steers.clear();
         self.input_history.clear();
         self.history_index = None;
         self.history_draft = None;
@@ -1311,7 +1464,6 @@ impl TuiApp {
         self.sub_tool_args.clear();
         self.sub_tool_names.clear();
         self.sub_sessions.clear();
-        self.opened_sub_session_panes.clear();
         self.supervisors.clear();
         self.pending_approval = None;
         self.approval_selected = 0;
@@ -1343,6 +1495,8 @@ impl TuiApp {
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
         self.running = true;
+        self.awaiting_background_tasks = false;
+        self.background_task_count = 0;
         self.run_started_at = Some(Instant::now());
         self.interrupt_requested = false;
         self.exit_after_run = false;
@@ -1376,88 +1530,40 @@ impl TuiApp {
 
     async fn handle_bot_event(&mut self, event: BotEvent) {
         match event {
+            BotEvent::BackgroundTasksWaiting { count } => {
+                self.awaiting_background_tasks = count > 0;
+                self.background_task_count = count;
+            }
+            BotEvent::SupervisorStarted => self.begin_supervisor_execution(),
             BotEvent::Prefix(text) => {
+                self.awaiting_background_tasks = false;
                 self.cells.push(HistoryCell::assistant(text));
                 self.mark_token_cell(self.cells.len().saturating_sub(1));
             }
-            BotEvent::Text(delta) => self.push_assistant_delta(&delta),
-            BotEvent::Thinking(delta) => self.push_thinking_delta(&delta),
+            BotEvent::Text(delta) => {
+                self.awaiting_background_tasks = false;
+                self.push_assistant_delta(&delta);
+            }
+            BotEvent::Thinking(delta) => {
+                self.awaiting_background_tasks = false;
+                self.push_thinking_delta(&delta);
+            }
             BotEvent::ToolStart { id, name } => {
+                self.awaiting_background_tasks = false;
                 self.active_tool_args.insert(id.clone(), String::new());
                 self.active_tool_names.insert(id.clone(), name.clone());
-                self.active_tool_started_at
-                    .insert(id.clone(), Instant::now());
-                let meta = self
-                    .active_tool_started_at
-                    .get(&id)
-                    .map(|started| running_tool_meta(*started, None))
-                    .unwrap_or_else(|| format_elapsed(0));
-                let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
-                if name == "apply_patch" {
-                    self.cells.push(HistoryCell::patch_diff(
-                        id.clone(),
-                        "waiting for patch...".to_string(),
-                        meta,
-                        ToolVisualStatus::Running,
-                    ));
-                } else {
-                    let body = tool_body(&pretty);
-                    self.cells.push(HistoryCell::tool(
-                        id.clone(),
-                        pretty.title,
-                        body,
-                        meta,
-                        ToolVisualStatus::Running,
-                    ));
-                }
-                if let Some(index) = self
-                    .cells
-                    .iter()
-                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    self.mark_token_cell(index);
-                }
             }
             BotEvent::ToolArgs { id, delta } => {
                 let args = self.active_tool_args.entry(id.clone()).or_default();
                 args.push_str(&delta);
-                let is_patch = self
-                    .active_tool_names
-                    .get(&id)
-                    .is_some_and(|name| name == "apply_patch");
-                if let Some(cell) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    if is_patch {
-                        if let Some(patch) = extract_patch_arg(args) {
-                            cell.body = patch;
-                        }
-                    } else {
-                        if let (Some(name), Some(args_value)) =
-                            (self.active_tool_names.get(&id), parse_tool_args(args))
-                        {
-                            let pretty = PrettyToolCall::started(&id, name, &args_value);
-                            let body = tool_body(&pretty);
-                            cell.title = pretty.title;
-                            cell.body = body;
-                        } else if cell.body.trim().is_empty() {
-                            cell.body = "reading tool arguments...".to_string();
-                        }
-                    }
-                }
             }
             BotEvent::ToolCall { id, name, args } => {
                 self.active_tool_args.insert(id.clone(), args.clone());
                 self.active_tool_names.insert(id.clone(), name.clone());
                 self.active_tool_started_at
-                    .entry(id.clone())
-                    .or_insert_with(Instant::now);
+                    .insert(id.clone(), Instant::now());
                 self.active_tool_execution_started_at
-                    .entry(id.clone())
-                    .or_insert_with(Instant::now);
+                    .insert(id.clone(), Instant::now());
                 let meta = self
                     .active_tool_started_at
                     .get(&id)
@@ -1658,7 +1764,15 @@ impl TuiApp {
             BotEvent::TodoState {
                 body,
                 latest_active,
+                has_items,
             } => {
+                if !has_items {
+                    self.cells
+                        .retain(|cell| !matches!(cell.kind, CellKind::TodoState));
+                    self.last_todo_body = None;
+                    self.latest_active_todo_label = None;
+                    return;
+                }
                 if self.last_todo_body.as_deref() == Some(body.as_str()) {
                     self.latest_active_todo_label = latest_active;
                     return;
@@ -1763,21 +1877,49 @@ impl TuiApp {
                     Some(response.status),
                 ));
             }
-            BotEvent::SteerInjected { count, preview } => {
-                self.cells.push(HistoryCell::system(format!(
-                    "Steer 已注入（{} 条）：{}",
-                    count, preview
-                )));
+            BotEvent::SteerInjected { steer_ids, .. } => {
+                self.discard_unexecuted_tool_proposals();
+                for steer_id in steer_ids {
+                    if let Some(index) = self
+                        .pending_steers
+                        .iter()
+                        .position(|steer| steer.steer_id == steer_id)
+                    {
+                        if let Some(steer) = self.pending_steers.remove(index) {
+                            self.cells.push(HistoryCell::user(steer.display_text));
+                        }
+                    }
+                }
             }
             BotEvent::ToolTaskCompleted(task) => {
                 self.has_activity = true;
-                self.cells.push(HistoryCell::system(format!(
-                    "后台工具任务完成\n任务: {}\n工具: {}\n状态: {}\n耗时: {}ms",
-                    task.task_id,
-                    task.tool_name,
-                    task.status,
-                    task.elapsed_ms.unwrap_or(0)
-                )));
+                self.background_task_count = self.background_task_count.saturating_sub(1);
+                self.awaiting_background_tasks = self.background_task_count > 0;
+                let status = tool_task_visual_status(&task);
+                let body = tool_task_result_body(&task);
+                let meta = format!(
+                    "background · {}",
+                    format_elapsed(task.elapsed_ms.unwrap_or(0))
+                );
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|id| id == task.tool_call_id))
+                {
+                    cell.title = format!("调用 {}", task.tool_name);
+                    cell.body = body;
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
+                    cell.status = status;
+                } else {
+                    self.cells.push(HistoryCell::tool(
+                        task.tool_call_id,
+                        format!("调用 {}", task.tool_name),
+                        body,
+                        meta,
+                        status,
+                    ));
+                }
             }
             BotEvent::Stats {
                 prompt_tokens,
@@ -1813,46 +1955,45 @@ impl TuiApp {
                 self.status.last_error = Some(message.clone());
                 self.cells.push(HistoryCell::error(message));
                 self.running = false;
+                self.awaiting_background_tasks = false;
+                self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.cancel = None;
                 self.run_handle = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
-                self.opened_sub_session_panes.clear();
-                self.supervisors.clear();
                 self.pending_approval = None;
                 self.pending_user_question = None;
-                self.active_supervisor_id = None;
                 self.status.state = "error".to_string();
             }
             BotEvent::Cancelled => {
                 self.has_activity = true;
                 self.running = false;
+                self.awaiting_background_tasks = false;
+                self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.cancel = None;
                 self.run_handle = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
-                self.opened_sub_session_panes.clear();
-                self.supervisors.clear();
                 self.pending_approval = None;
                 self.pending_user_question = None;
-                self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
                 self.refresh_command_catalog();
             }
             BotEvent::Done => {
                 self.has_activity = true;
                 self.running = false;
+                self.awaiting_background_tasks = false;
+                self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.cancel = None;
                 self.run_handle = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
-                self.opened_sub_session_panes.clear();
                 self.supervisors.clear();
                 self.pending_approval = None;
                 self.pending_user_question = None;
@@ -1861,6 +2002,7 @@ impl TuiApp {
                 self.refresh_command_catalog();
                 if self.exit_after_run {
                     self.queued_inputs.clear();
+                    self.pending_steers.clear();
                 } else if let Some(next) = self.queued_inputs.pop_front() {
                     self.start_turn(next);
                 }
@@ -2073,6 +2215,15 @@ impl TuiApp {
         false
     }
 
+    fn clear_composer_draft(&mut self) {
+        self.composer.clear();
+        self.file_query = None;
+        self.file_matches.clear();
+        self.popup_selected = 0;
+        self.quit_hint_until = None;
+        self.reset_history_navigation();
+    }
+
     fn cancel_active_tool_cells(&mut self, reason: &str) {
         let ids = self
             .active_tool_started_at
@@ -2086,6 +2237,14 @@ impl TuiApp {
         self.active_tool_execution_started_at.clear();
     }
 
+    fn discard_unexecuted_tool_proposals(&mut self) {
+        retain_executing_tool_proposals(
+            &mut self.active_tool_args,
+            &mut self.active_tool_names,
+            &self.active_tool_started_at,
+        );
+    }
+
     fn request_cancel_current_run(&mut self) {
         if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
             self.status.state = "cancelling".to_string();
@@ -2095,11 +2254,11 @@ impl TuiApp {
             cancel.cancel();
         }
         self.status.state = "cancelling".to_string();
+        self.awaiting_background_tasks = false;
         self.cancel_active_tool_cells("cancelled by user");
         self.sub_tool_args.clear();
         self.sub_tool_names.clear();
         self.sub_sessions.clear();
-        self.opened_sub_session_panes.clear();
         self.supervisors.clear();
         self.pending_approval = None;
         self.approval_selected = 0;
@@ -2498,12 +2657,10 @@ impl TuiApp {
     }
 
     fn upsert_supervisor_progress(&mut self, progress: SupervisorTraceEvent) {
-        let id = self
-            .active_supervisor_id
-            .clone()
-            .unwrap_or_else(|| "supervisor".to_string());
+        self.begin_supervisor_execution();
         match progress {
             SupervisorTraceEvent::Thinking { content } => {
+                let id = self.current_supervisor_id();
                 self.upsert_supervisor_stream_cell(
                     format!("{id}:thinking"),
                     "supervisor thinking".to_string(),
@@ -2512,28 +2669,17 @@ impl TuiApp {
                     ToolVisualStatus::Running,
                 );
             }
-            SupervisorTraceEvent::OutputDelta { content } => {
-                self.upsert_supervisor_stream_cell(
-                    format!("{id}:output"),
-                    "supervisor output".to_string(),
-                    content,
-                    true,
-                    ToolVisualStatus::Running,
-                );
-            }
-            SupervisorTraceEvent::Output { content } => {
-                self.upsert_supervisor_stream_cell(
-                    format!("{id}:output"),
-                    "supervisor output".to_string(),
-                    pretty_supervisor_output(&content),
-                    false,
-                    ToolVisualStatus::Success,
-                );
+            SupervisorTraceEvent::OutputDelta { .. } | SupervisorTraceEvent::Output { .. } => {
+                // Supervisor output follows its thinking. Reserve a compact
+                // transition cell here so it never appears before the
+                // thinking stream, then resolve it when the report arrives.
+                self.ensure_supervisor_decision_cell();
             }
             SupervisorTraceEvent::AgentMessage { content } => {
+                let id = self.current_supervisor_id();
                 self.upsert_supervisor_stream_cell(
                     format!("{id}:agent-message"),
-                    "supervisor message".to_string(),
+                    "supervisor".to_string(),
                     content,
                     false,
                     ToolVisualStatus::Success,
@@ -2544,6 +2690,41 @@ impl TuiApp {
             | SupervisorTraceEvent::ToolCall { .. }
             | SupervisorTraceEvent::ToolResult { .. } => {}
         }
+    }
+
+    fn current_supervisor_id(&self) -> String {
+        self.active_supervisor_id
+            .clone()
+            .unwrap_or_else(|| "supervisor".to_string())
+    }
+
+    fn begin_supervisor_execution(&mut self) {
+        let id = self.current_supervisor_id();
+        let state = self.supervisors.entry(id).or_default();
+        if !state.executing {
+            state.decision_cell_open = false;
+        }
+        state.executing = true;
+    }
+
+    fn ensure_supervisor_decision_cell(&mut self) {
+        let id = self.current_supervisor_id();
+        let title = {
+            let state = self.supervisors.entry(id.clone()).or_default();
+            state.executing = true;
+            if state.decision_cell_open {
+                return;
+            }
+            state.decision_cell_open = true;
+            state.display_name()
+        };
+        self.cells.push(HistoryCell::supervisor(
+            id,
+            title,
+            "making decision".to_string(),
+            String::new(),
+            ToolVisualStatus::Running,
+        ));
     }
 
     fn upsert_supervisor_stream_cell(
@@ -2566,19 +2747,27 @@ impl TuiApp {
     }
 
     fn upsert_supervisor_report(&mut self, report: WorkflowReport) {
-        let id = self
-            .active_supervisor_id
-            .clone()
-            .unwrap_or_else(|| "supervisor".to_string());
+        let id = self.current_supervisor_id();
         let state = self.supervisors.entry(id.clone()).or_default();
+        let has_open_decision_cell = state.decision_cell_open;
         state.apply_report(&report);
-        let title = state.resolved_title();
+        state.decision_cell_open = false;
+        let title = state.display_name();
         let body = state.body();
         let meta = state.meta();
         let status = supervisor_visual_status(&report.status);
-        if let Some(cell) = self.cells.iter_mut().rev().find(
+        // A progress event opens a dedicated decision cell. Keep that cell in
+        // place while thinking and other supervisor events stream after it;
+        // the report then resolves the same cell. If a backend returns only a
+        // report, append a completed cell instead of rewriting an older round.
+        if let Some(cell) = has_open_decision_cell
+            .then(|| {
+                self.cells.iter_mut().rev().find(
             |cell| matches!(&cell.kind, CellKind::Supervisor { id: cell_id } if cell_id == &id),
-        ) {
+            )
+            })
+            .flatten()
+        {
             cell.title = title;
             cell.body = body;
             cell.meta = meta;
@@ -2778,28 +2967,6 @@ impl TuiApp {
                 "sub-session 事件写入失败: {error:#}"
             )));
         }
-
-        if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
-            return;
-        }
-        let pane_key = format!("{}:{}", self.session_id, event.sub_thread_id.0);
-        if !self.opened_sub_session_panes.insert(pane_key) {
-            return;
-        }
-        match open_tui_session_in_new_pane(&child_session_id, &self.cli) {
-            Ok(Some(kind)) => self.cells.push(HistoryCell::system(format!(
-                "sub-session 已在新的 {kind} pane 中打开。\nagent: {}\nsession: {}",
-                event.agent_name, child_session_id
-            ))),
-            Ok(None) => self.cells.push(HistoryCell::system(format!(
-                "sub-session 已创建独立 TUI session，可手动打开：\nremi-cat tui resume {}",
-                child_session_id
-            ))),
-            Err(error) => self.cells.push(HistoryCell::system(format!(
-                "sub-session 独立 TUI session 已创建，但自动打开 pane 失败。\nsession: {}\n错误: {error:#}",
-                child_session_id
-            ))),
-        }
     }
 
     async fn load_thread_history(&mut self) {
@@ -2961,14 +3128,32 @@ impl TuiApp {
                     .unwrap_or_else(|| format_elapsed(0));
                 let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
                 let body = tool_body(&pretty);
-                self.cells.push(HistoryCell::tool(
-                    id.clone(),
-                    pretty.title,
-                    body,
-                    meta,
-                    ToolVisualStatus::Running,
-                ));
-                self.mark_token_cell(self.cells.len().saturating_sub(1));
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    cell.title = pretty.title;
+                    cell.body = body;
+                    cell.meta = preserve_token_meta(meta, &cell.meta);
+                    cell.status = ToolVisualStatus::Running;
+                } else {
+                    self.cells.push(HistoryCell::tool(
+                        id.clone(),
+                        pretty.title,
+                        body,
+                        meta,
+                        ToolVisualStatus::Running,
+                    ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
+                }
             }
             BotEvent::ToolArgs { id, delta } => {
                 let args = self.active_tool_args.entry(id.clone()).or_default();
@@ -3100,8 +3285,13 @@ impl TuiApp {
     }
 
     fn activity_height(&self) -> u16 {
+        let pending_count = self.queued_inputs.len() + self.pending_steers.len();
         u16::from(self.running && self.active_tool_count() > 0)
-            + u16::from(!self.queued_inputs.is_empty())
+            + if pending_count == 0 {
+                0
+            } else {
+                1 + pending_count.min(3) as u16
+            }
     }
 
     fn action_panel_height(&self, root_height: u16) -> u16 {
@@ -3118,7 +3308,7 @@ impl TuiApp {
 
     fn footer_height(&self) -> u16 {
         if self.show_shortcuts {
-            3
+            4
         } else {
             1
         }
@@ -3539,6 +3729,10 @@ fn forward_core_event_to_tui(
     clear_on_reply: bool,
 ) -> bool {
     match event {
+        CoreChatEvent::SupervisorStarted => {
+            let _ = tx.send(BotEvent::SupervisorStarted);
+            false
+        }
         CoreChatEvent::Prefix(prefix) => {
             let _ = tx.send(BotEvent::Prefix(prefix));
             false
@@ -3596,6 +3790,9 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
         CatEvent::ToolTaskCompleted(task) => {
             let _ = tx.send(BotEvent::ToolTaskCompleted(task));
         }
+        CatEvent::BackgroundTasksWaiting { count } => {
+            let _ = tx.send(BotEvent::BackgroundTasksWaiting { count });
+        }
         CatEvent::SubSession(event) => {
             let _ = tx.send(BotEvent::SubSession(event));
         }
@@ -3629,8 +3826,7 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
         }
         CatEvent::SteerInjected(event) => {
             let _ = tx.send(BotEvent::SteerInjected {
-                count: event.count,
-                preview: event.preview,
+                steer_ids: event.steer_ids,
             });
         }
         CatEvent::StateUpdate(user_state) => {
@@ -3638,6 +3834,7 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
             let _ = tx.send(BotEvent::TodoState {
                 body: format_todo_state(&items),
                 latest_active: latest_active_todo_label(&items),
+                has_items: !items.is_empty(),
             });
         }
         CatEvent::Stats {
@@ -3717,6 +3914,25 @@ fn supervisor_visual_status(status: &WorkflowStatus) -> ToolVisualStatus {
     }
 }
 
+fn tool_task_visual_status(task: &bot_core::ToolTaskRecord) -> ToolVisualStatus {
+    match task.success {
+        Some(true) => ToolVisualStatus::Success,
+        Some(false) => ToolVisualStatus::Error,
+        None if task.status == "completed" => ToolVisualStatus::Success,
+        None if task.status == "failed" || task.status == "cancelled" => ToolVisualStatus::Error,
+        None => ToolVisualStatus::Running,
+    }
+}
+
+fn tool_task_result_body(task: &bot_core::ToolTaskRecord) -> String {
+    task.result_preview
+        .as_deref()
+        .or_else(|| task.recent_output.last().map(String::as_str))
+        .or(task.message.as_deref())
+        .map(|text| truncate_chars(&single_line(text), MAX_TOOL_BODY_CHARS))
+        .unwrap_or_default()
+}
+
 fn push_or_update_current_supervisor_stream_cell(
     cells: &mut Vec<HistoryCell>,
     id: String,
@@ -3762,6 +3978,15 @@ fn mark_tool_cells_cancelled(cells: &mut [HistoryCell], ids: &[String], reason: 
             }
         }
     }
+}
+
+fn retain_executing_tool_proposals(
+    tool_args: &mut std::collections::HashMap<String, String>,
+    tool_names: &mut std::collections::HashMap<String, String>,
+    executing: &std::collections::HashMap<String, Instant>,
+) {
+    tool_args.retain(|id, _| executing.contains_key(id));
+    tool_names.retain(|id, _| executing.contains_key(id));
 }
 
 fn pretty_supervisor_output(content: &str) -> String {
@@ -3928,6 +4153,10 @@ async fn run_tui_new_command(
 
 #[derive(Debug)]
 enum BotEvent {
+    BackgroundTasksWaiting {
+        count: usize,
+    },
+    SupervisorStarted,
     Prefix(String),
     Text(String),
     Thinking(String),
@@ -3966,6 +4195,7 @@ enum BotEvent {
     TodoState {
         body: String,
         latest_active: Option<String>,
+        has_items: bool,
     },
     ApprovalRequested(ToolApprovalRequest),
     ApprovalUpdated(ToolApprovalRequest),
@@ -3980,8 +4210,7 @@ enum BotEvent {
         response: UserQuestionResponse,
     },
     SteerInjected {
-        count: usize,
-        preview: String,
+        steer_ids: Vec<String>,
     },
     Stats {
         prompt_tokens: u32,
@@ -4586,7 +4815,7 @@ mod tests {
             max_output_tokens: 131_072,
             context_tokens: 1_000_000,
             supports_images: false,
-            short_term_tokens: 24_000,
+            legacy_short_term_tokens: None,
             overflow_bytes: 32_000,
             auto_compress: true,
             extra_options: serde_json::Map::new(),
@@ -4948,7 +5177,27 @@ mod tests {
     #[test]
     fn history_gutter_has_stable_display_width() {
         for prefix in ["›", "•", "↳", "·", "?", "x", "!", "□", "Δ"] {
-            assert_eq!(UnicodeWidthStr::width(history_gutter(prefix).as_str()), 4);
+            assert_eq!(
+                UnicodeWidthStr::width(history_gutter(prefix).as_str()),
+                HISTORY_GUTTER_WIDTH as usize
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_cells_compact_blank_content_rows_but_keep_cell_spacing() {
+        let main = HistoryCell::thinking("first\n\nsecond");
+        let supervisor = HistoryCell::supervisor_stream(
+            "supervisor-1:thinking".to_string(),
+            "supervisor thinking".to_string(),
+            "first\n\nsecond".to_string(),
+            ToolVisualStatus::Running,
+        );
+
+        for cell in [main, supervisor] {
+            let lines = cell.lines(80);
+            // Two content rows plus the standard blank row separating cells.
+            assert_eq!(lines.len(), 3);
         }
     }
 
@@ -5052,6 +5301,23 @@ mod tests {
                 "rendered cell still contains controls: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn persisted_supervisor_instruction_reloads_as_supervisor_cell() {
+        let cell = history_cell(ThreadHistoryMessage {
+            id: "supervisor-message-1".to_string(),
+            role: "supervisor".to_string(),
+            text: "Inspect the current node only.".to_string(),
+            timestamp: None,
+            tool_call_id: None,
+            tool_calls: None,
+            pretty: None,
+        })
+        .expect("supervisor history is visible");
+
+        assert!(matches!(cell.kind, CellKind::SupervisorStream { .. }));
+        assert_eq!(cell.title, "supervisor");
     }
 
     #[test]
@@ -5201,6 +5467,27 @@ mod tests {
     }
 
     #[test]
+    fn steer_discards_only_unexecuted_tool_proposals() {
+        let mut args = std::collections::HashMap::from([
+            ("proposal".to_string(), "{\"path\":\".\"}".to_string()),
+            ("executing".to_string(), "{\"path\":\"src\"}".to_string()),
+        ]);
+        let mut names = std::collections::HashMap::from([
+            ("proposal".to_string(), "fs_read".to_string()),
+            ("executing".to_string(), "fs_read".to_string()),
+        ]);
+        let executing =
+            std::collections::HashMap::from([("executing".to_string(), Instant::now())]);
+
+        retain_executing_tool_proposals(&mut args, &mut names, &executing);
+
+        assert!(!args.contains_key("proposal"));
+        assert!(!names.contains_key("proposal"));
+        assert!(args.contains_key("executing"));
+        assert!(names.contains_key("executing"));
+    }
+
+    #[test]
     fn supervisor_state_keeps_recent_events_and_report_summary() {
         let mut state = SupervisorUiState::default();
         for index in 0..5 {
@@ -5248,7 +5535,7 @@ mod tests {
             supervisor_visual_status(&WorkflowStatus::Error),
         );
         let lines = cell.lines(100);
-        assert!(lines.len() > 2);
+        assert!(lines.len() >= 2);
         assert_eq!(cell.status, ToolVisualStatus::Error);
         assert!(lines[0]
             .spans
@@ -5728,9 +6015,12 @@ mod tests {
             ));
         }
 
-        assert_eq!(state.title(), "  sub-agent · explorer · calling 5 tools");
+        assert_eq!(
+            state.title(),
+            " sub-agent · explorer · calling 5 tools · running"
+        );
         let body = state.body();
-        assert!(body.contains("  input: Explore this workspace in detail"));
+        assert!(body.contains(" input: Explore this workspace in detail"));
         assert!(!body.contains("path-1"));
         assert!(body.contains("path-2"));
         assert!(body.contains("path-4"));
@@ -5788,13 +6078,13 @@ mod tests {
     }
 
     #[test]
-    fn latest_active_todo_label_uses_last_unfinished_item() {
+    fn latest_active_todo_label_uses_first_unfinished_item() {
         let items = vec![
             bot_core::todo::TodoItem {
                 id: 1,
                 content: "Draft release notes".to_string(),
                 description: None,
-                done: false,
+                done: true,
                 batch_id: Some(7),
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(0),
@@ -5817,6 +6107,15 @@ mod tests {
                 batch_title: Some("Release".to_string()),
                 batch_index: Some(1),
             },
+            bot_core::todo::TodoItem {
+                id: 4,
+                content: "Publish release".to_string(),
+                description: None,
+                done: false,
+                batch_id: Some(7),
+                batch_title: Some("Release".to_string()),
+                batch_index: Some(2),
+            },
         ];
 
         assert_eq!(
@@ -5833,7 +6132,7 @@ mod tests {
     }
 
     #[test]
-    fn appends_token_meta_to_history_cell() {
+    fn per_cell_token_meta_is_omitted() {
         let mut cell = HistoryCell::assistant("hello");
         append_token_meta(
             &mut cell,
@@ -5843,13 +6142,13 @@ mod tests {
             },
         );
 
-        assert_eq!(cell.meta, "tokens +12p/+3c");
+        assert!(cell.meta.is_empty());
     }
 
     #[test]
-    fn preserves_token_meta_when_replacing_tool_meta() {
+    fn tool_meta_replacement_omits_prior_token_meta() {
         let meta = preserve_token_meta("120ms".to_string(), "tokens +12p/+3c");
-        assert_eq!(meta, "120ms · tokens +12p/+3c");
+        assert_eq!(meta, "120ms");
     }
 
     #[test]

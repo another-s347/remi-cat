@@ -155,6 +155,8 @@ impl From<ChatRequest> for SteerInput {
 pub(crate) enum CoreChatEvent {
     Prefix(String),
     Reply(String),
+    /// An active workflow is about to be evaluated by its supervisor.
+    SupervisorStarted,
     Bot(CatEvent),
     Done,
 }
@@ -247,6 +249,7 @@ impl Runtime {
                                 async_agent: request.async_agent,
                                 ..StreamOptions::default()
                             };
+                            yield CoreChatEvent::SupervisorStarted;
                             let mut stream = std::pin::pin!(
                                 self.bot.stream_workflow_start_with_options(
                                     &request.session_id,
@@ -313,7 +316,20 @@ impl Runtime {
             };
             let user_text_for_history = content.text_content();
             let mut assistant_text_for_history = String::new();
-            let mut stream = std::pin::pin!(self.bot.stream_with_options(&session_id, content, opts));
+            if self
+                .bot
+                .workflow_status(&session_id)
+                .await
+                .is_some_and(|instance| {
+                    matches!(instance.status, bot_core::WorkflowStatus::Active)
+                })
+            {
+                yield CoreChatEvent::SupervisorStarted;
+            }
+            let mut stream = std::pin::pin!(
+                self.bot
+                    .stream_active_workflow_with_options(&session_id, content, opts)
+            );
             while let Some(event) = stream.next().await {
                 if persist_agent_child_turn {
                     if let CatEvent::Text(delta) = &event {

@@ -7,6 +7,5 @@ base_url: https://api.moonshot.cn/v1
 max_output_tokens: 131072
 context_tokens: 256000
 supports_images: true
-short_term_tokens: 24000
 overflow_bytes: 32000
 auto_compress: true

@@ -145,6 +145,9 @@ pub enum CatEvent {
     Todo(TodoEvent),
     /// A nested ACP or sub-agent session emitted observable progress.
     SubSession(SubSessionEvent),
+    /// The foreground agent has completed its model round and the turn is
+    /// waiting only for background tool tasks.
+    BackgroundTasksWaiting { count: usize },
     /// Supervisor evaluated the active workflow after a main-agent round.
     Supervisor(WorkflowReport),
     /// Live progress emitted while the supervisor evaluates a workflow node.
