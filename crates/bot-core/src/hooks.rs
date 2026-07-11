@@ -180,19 +180,7 @@ impl HookManager {
         }
     }
 
-    pub async fn reload(&self) {
-        let hooks = discover_hooks(&self.workspace_root, &self.data_dir);
-        let trusted = read_hash_set(&self.trust_path);
-        let disabled = read_hash_set(&self.disabled_path);
-        *self.inner.write().await = HookState {
-            hooks,
-            trusted,
-            disabled,
-        };
-    }
-
     pub async fn statuses(&self) -> Vec<HookStatus> {
-        self.reload().await;
         let state = self.inner.read().await;
         state
             .hooks
@@ -256,7 +244,6 @@ impl HookManager {
         context: &HookContext,
         event_payload: Value,
     ) -> HookOutcome {
-        self.reload().await;
         let state = self.inner.read().await.clone();
         let hooks = state
             .hooks

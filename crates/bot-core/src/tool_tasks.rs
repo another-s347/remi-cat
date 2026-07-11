@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, Mutex};
 use crate::CatEvent;
 
 const STORE_FILE: &str = "tool_tasks.json";
+const MAX_COMPLETED_TASKS: usize = 100;
 pub const TOOL_TASK_RUNNING: &str = "running";
 pub const TOOL_TASK_COMPLETED: &str = "completed";
 pub const TOOL_TASK_FAILED: &str = "failed";
@@ -64,6 +65,7 @@ struct RunningTask {
 pub struct ToolTaskManager {
     path: PathBuf,
     store: Mutex<ToolTaskStore>,
+    persist_lock: Mutex<()>,
     running: Mutex<HashMap<String, RunningTask>>,
     completed_tx: broadcast::Sender<ToolTaskRecord>,
     side_event_tx: broadcast::Sender<(String, CatEvent)>,
@@ -87,10 +89,12 @@ impl ToolTaskManager {
                 task.message = Some("cancelled because remi-cat restarted".to_string());
             }
         }
+        prune_completed_tasks(&mut store);
         save_store(&path, &store)?;
         let manager = Arc::new(Self {
             path,
             store: Mutex::new(store),
+            persist_lock: Mutex::new(()),
             running: Mutex::new(HashMap::new()),
             completed_tx: broadcast::channel(64).0,
             side_event_tx: broadcast::channel(256).0,
@@ -156,7 +160,6 @@ impl ToolTaskManager {
         record.notify_on_finish = true;
         let snapshot = record.clone();
         drop(store);
-        let _ = self.save().await;
         if snapshot.status == TOOL_TASK_RUNNING {
             return None;
         }
@@ -178,8 +181,6 @@ impl ToolTaskManager {
             return false;
         }
         record.notification_delivered = true;
-        drop(store);
-        let _ = self.save().await;
         true
     }
 
@@ -196,8 +197,6 @@ impl ToolTaskManager {
             {
                 record.notification_delivered = true;
                 let pending = record.clone();
-                drop(store);
-                let _ = self.save().await;
                 return Some(pending);
             }
         }
@@ -214,8 +213,6 @@ impl ToolTaskManager {
                 record.recent_output.drain(0..drop_count);
             }
         }
-        drop(store);
-        let _ = self.save().await;
     }
 
     pub async fn finish(
@@ -272,15 +269,19 @@ impl ToolTaskManager {
         }
         let mut store = self.store.lock().await;
         let record = store.tasks.get_mut(task_id)?;
+        let mut changed = false;
         if record.status == TOOL_TASK_RUNNING {
             record.status = TOOL_TASK_CANCELLED.to_string();
             record.completed_at = Some(Utc::now().to_rfc3339());
             record.success = Some(false);
             record.message = Some("cancelled".to_string());
+            changed = true;
         }
         let cloned = record.clone();
         drop(store);
-        let _ = self.save().await;
+        if changed {
+            let _ = self.save().await;
+        }
         Some(cloned)
     }
 
@@ -329,17 +330,52 @@ impl ToolTaskManager {
     }
 
     async fn save(&self) -> Result<()> {
-        let store = self.store.lock().await;
-        save_store(&self.path, &store)
+        let _persist_guard = self.persist_lock.lock().await;
+        let mut store = self.store.lock().await;
+        prune_completed_tasks(&mut store);
+        let raw = serde_json::to_string_pretty(&*store)?;
+        let path = self.path.clone();
+        drop(store);
+        tokio::task::spawn_blocking(move || save_store_raw(&path, raw))
+            .await
+            .map_err(|err| anyhow::anyhow!("tool task store writer failed: {err}"))?
+    }
+}
+
+fn prune_completed_tasks(store: &mut ToolTaskStore) {
+    let mut completed = store
+        .tasks
+        .values()
+        .filter(|task| task.status != TOOL_TASK_RUNNING)
+        .map(|task| {
+            (
+                task.completed_at.as_deref().unwrap_or_default().to_string(),
+                task.task_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if completed.len() <= MAX_COMPLETED_TASKS {
+        return;
+    }
+    completed.sort_unstable();
+    let remove_count = completed.len() - MAX_COMPLETED_TASKS;
+    for (_, task_id) in completed.into_iter().take(remove_count) {
+        store.tasks.remove(&task_id);
     }
 }
 
 fn save_store(path: &Path, store: &ToolTaskStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let raw = serde_json::to_string_pretty(store)?;
-    std::fs::write(path, raw)?;
+    save_store_raw(path, serde_json::to_string_pretty(store)?)
+}
+
+fn save_store_raw(path: &Path, raw: String) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("tool task store path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temp_path = parent.join(format!(".tool-tasks-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp_path, raw)?;
+    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -495,6 +531,126 @@ mod tests {
         assert_eq!(cancelled[0].status, TOOL_TASK_CANCELLED);
         assert!(second_cancel.is_cancelled());
         assert!(!manager.is_thread_running("thread-b").await);
+    }
+
+    #[tokio::test]
+    async fn output_is_persisted_only_when_task_finishes() {
+        let dir = temp_data_dir("output-boundary");
+        let manager = ToolTaskManager::load(&dir).unwrap();
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        manager.append_output(&task_id, "cached output").await;
+        let before_finish = ToolTaskManager::load(&dir).unwrap();
+        assert!(before_finish
+            .get(&task_id)
+            .await
+            .unwrap()
+            .recent_output
+            .is_empty());
+
+        manager
+            .finish(&task_id, true, 10, "done".to_string())
+            .await
+            .unwrap();
+        let after_finish = ToolTaskManager::load(&dir).unwrap();
+        assert_eq!(
+            after_finish.get(&task_id).await.unwrap().recent_output,
+            vec!["cached output"]
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_keeps_only_the_newest_completed_tasks() {
+        let dir = temp_data_dir("retention");
+        let manager = ToolTaskManager::load(&dir).unwrap();
+        {
+            let mut store = manager.store.lock().await;
+            for index in 0..=MAX_COMPLETED_TASKS {
+                let task_id = format!("task-{index:03}");
+                store.tasks.insert(
+                    task_id.clone(),
+                    ToolTaskRecord {
+                        task_id,
+                        thread_id: "thread-a".to_string(),
+                        run_id: "run-a".to_string(),
+                        tool_call_id: format!("call-{index}"),
+                        tool_name: "bash".to_string(),
+                        args: serde_json::json!({}),
+                        status: TOOL_TASK_COMPLETED.to_string(),
+                        started_at: format!("2026-01-01T00:00:{index:03}Z"),
+                        completed_at: Some(format!("2026-01-01T00:00:{index:03}Z")),
+                        elapsed_ms: Some(1),
+                        success: Some(true),
+                        result_preview: None,
+                        recent_output: Vec::new(),
+                        message: None,
+                        notify_on_finish: false,
+                        notification_delivered: false,
+                    },
+                );
+            }
+        }
+        manager.save().await.unwrap();
+
+        assert_eq!(manager.list(None).await.len(), MAX_COMPLETED_TASKS);
+        assert!(manager.get("task-000").await.is_none());
+        assert!(manager
+            .get(&format!("task-{MAX_COMPLETED_TASKS:03}"))
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_finishes_persist_the_latest_combined_state() {
+        let dir = temp_data_dir("concurrent-finish");
+        let manager = ToolTaskManager::load(&dir).unwrap();
+        let first = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-b".to_string(),
+                "bash".to_string(),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        tokio::join!(
+            manager.finish(&first, true, 1, "first".to_string()),
+            manager.finish(&second, true, 1, "second".to_string()),
+        );
+
+        let reloaded = ToolTaskManager::load(&dir).unwrap();
+        assert_eq!(
+            reloaded.get(&first).await.unwrap().status,
+            TOOL_TASK_COMPLETED
+        );
+        assert_eq!(
+            reloaded.get(&second).await.unwrap().status,
+            TOOL_TASK_COMPLETED
+        );
     }
 
     #[tokio::test]

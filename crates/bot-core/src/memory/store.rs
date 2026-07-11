@@ -22,10 +22,13 @@
 //!     <name>.md             ← agent-maintained named memory
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use remi_agentloop::prelude::{AgentError, Message, Role};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::token_usage::estimate_memory_message_tokens;
@@ -134,6 +137,11 @@ fn emit_compaction_event(
 }
 
 const MEMORY_RECALL_SNIPPET_CHARS: usize = 2_000;
+static SHORT_TERM_TOKEN_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn short_term_token_counts() -> &'static Mutex<HashMap<String, usize>> {
+    SHORT_TERM_TOKEN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -150,6 +158,9 @@ fn sanitize_id(id: &str) -> String {
 }
 
 impl MemoryStore {
+    fn token_cache_key(&self, thread_id: &str) -> String {
+        format!("{}\0{}", self.data_dir.display(), sanitize_id(thread_id))
+    }
     fn thread_dir(&self, thread_id: &str) -> PathBuf {
         self.data_dir.join("memory").join(sanitize_id(thread_id))
     }
@@ -260,6 +271,38 @@ impl MemoryStore {
             .await
             .map_err(|e| AgentError::Io(e.to_string()))?;
         tokio::fs::write(path, lines)
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))
+    }
+
+    async fn append_short_term(path: &PathBuf, msgs: &[Message]) -> Result<(), AgentError> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AgentError::Io(e.to_string()))?;
+        }
+        let lines = msgs
+            .iter()
+            .filter_map(|message| serde_json::to_string(message).ok())
+            .map(|line| line + "\n")
+            .collect::<String>();
+        let blobs_dir = path
+            .parent()
+            .map(|parent| parent.join("blobs"))
+            .unwrap_or_else(|| PathBuf::from("blobs"));
+        let lines = super::blob::extract_blobs(&lines, &blobs_dir)
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        file.write_all(lines.as_bytes())
             .await
             .map_err(|e| AgentError::Io(e.to_string()))
     }
@@ -492,6 +535,11 @@ impl MemoryStore {
         let long_term = Self::read_index(&self.long_term_dir(thread_id)).await;
         let mid_term = Self::read_index(&self.mid_term_dir(thread_id)).await;
         let short_term = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let short_term_tokens = estimate_memory_message_tokens(&short_term);
+        short_term_token_counts()
+            .lock()
+            .expect("short-term token cache lock poisoned")
+            .insert(self.token_cache_key(thread_id), short_term_tokens);
         let user_state = self.load_user_state(thread_id).await;
 
         Ok(MemoryContext {
@@ -620,9 +668,6 @@ impl MemoryStore {
         mut new_msgs: Vec<Message>,
         mut compaction_sink: Option<ContextCompactionSink<'_>>,
     ) -> Result<(), AgentError> {
-        let short_path = self.short_term_path(thread_id);
-        let mut all_msgs = Self::read_short_term(&short_path).await;
-
         // Attach turn timestamp to the first user message's metadata.
         let ts = Utc::now().to_rfc3339();
         if let Some(msg) = new_msgs.iter_mut().find(|m| matches!(m.role, Role::User)) {
@@ -634,6 +679,28 @@ impl MemoryStore {
                     .or_insert(serde_json::Value::String(ts));
             }
         }
+        let short_path = self.short_term_path(thread_id);
+        let new_tokens = estimate_memory_message_tokens(&new_msgs);
+        let token_cache_key = self.token_cache_key(thread_id);
+        let cached_tokens = short_term_token_counts()
+            .lock()
+            .expect("short-term token cache lock poisoned")
+            .get(&token_cache_key)
+            .copied();
+        if !self.auto_compress
+            || cached_tokens.is_some_and(|tokens| tokens + new_tokens <= self.short_term_tokens)
+        {
+            Self::append_short_term(&short_path, &new_msgs).await?;
+            if let Some(tokens) = cached_tokens {
+                short_term_token_counts()
+                    .lock()
+                    .expect("short-term token cache lock poisoned")
+                    .insert(token_cache_key, tokens + new_tokens);
+            }
+            return Ok(());
+        }
+
+        let mut all_msgs = Self::read_short_term(&short_path).await;
         all_msgs.append(&mut new_msgs);
 
         if self.auto_compress {
@@ -687,7 +754,12 @@ impl MemoryStore {
             }
         }
 
-        Self::write_short_term(&short_path, &all_msgs).await
+        Self::write_short_term(&short_path, &all_msgs).await?;
+        short_term_token_counts()
+            .lock()
+            .expect("short-term token cache lock poisoned")
+            .insert(token_cache_key, estimate_memory_message_tokens(&all_msgs));
+        Ok(())
     }
 
     fn plan_mid_term_compression(&self, msgs: &[Message]) -> PlannedCompaction {
@@ -794,6 +866,10 @@ impl MemoryStore {
             );
             // Clear short-term (these messages were uncompressible).
             Self::write_short_term(&short_path, &[]).await?;
+            short_term_token_counts()
+                .lock()
+                .expect("short-term token cache lock poisoned")
+                .insert(self.token_cache_key(thread_id), 0);
             return Ok(0);
         }
 
@@ -827,6 +903,10 @@ impl MemoryStore {
 
         // ── Clear short-term ──────────────────────────────────────────────
         Self::write_short_term(&short_path, &[]).await?;
+        short_term_token_counts()
+            .lock()
+            .expect("short-term token cache lock poisoned")
+            .insert(self.token_cache_key(thread_id), 0);
 
         Ok(short_count)
     }
@@ -836,6 +916,10 @@ impl MemoryStore {
     pub async fn clear_thread(&self, thread_id: &str) -> Result<(), AgentError> {
         let short_path = self.short_term_path(thread_id);
         Self::write_short_term(&short_path, &[]).await?;
+        short_term_token_counts()
+            .lock()
+            .expect("short-term token cache lock poisoned")
+            .insert(self.token_cache_key(thread_id), 0);
 
         for dir in [
             self.mid_term_dir(thread_id),

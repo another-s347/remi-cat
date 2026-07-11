@@ -196,6 +196,20 @@ impl SessionRuntime {
         Ok(true)
     }
 
+    pub fn set_metadata_values(
+        &mut self,
+        session_id: &str,
+        values: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> Result<bool> {
+        let Some(session) = self.store.sessions.get_mut(session_id) else {
+            return Ok(false);
+        };
+        session.metadata.extend(values);
+        session.updated_at = Utc::now().to_rfc3339();
+        self.save()?;
+        Ok(true)
+    }
+
     pub fn remove_metadata(&mut self, session_id: &str, key: &str) -> Result<bool> {
         let Some(session) = self.store.sessions.get_mut(session_id) else {
             return Ok(false);

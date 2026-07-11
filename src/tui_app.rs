@@ -27,7 +27,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
-use git2::{BranchType, RepositoryState, Status, StatusOptions};
+use git2::Repository;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -35,7 +35,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use remi_agentloop::prelude::{CancellationToken, ProtocolEvent, SubSessionEvent};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -653,7 +653,7 @@ fn compact_workspace_label(label: &str) -> String {
 }
 
 fn current_git_status(workspace_dir: &std::path::Path) -> Option<String> {
-    let repository = git2::Repository::discover(workspace_dir).ok()?;
+    let repository = Repository::discover(workspace_dir).ok()?;
     let head = repository.head().ok()?;
     let branch = if head.is_branch() {
         head.shorthand().ok()?.trim().to_string()
@@ -670,97 +670,7 @@ fn current_git_status(workspace_dir: &std::path::Path) -> Option<String> {
     if branch.is_empty() {
         return None;
     }
-
-    let mut parts = vec![branch.clone()];
-    if head.is_branch() {
-        if let Ok(local) = repository.find_branch(&branch, BranchType::Local) {
-            if let Ok(upstream) = local.upstream() {
-                if let (Some(local_oid), Some(upstream_oid)) =
-                    (local.get().target(), upstream.get().target())
-                {
-                    if let Ok((ahead, behind)) =
-                        repository.graph_ahead_behind(local_oid, upstream_oid)
-                    {
-                        if ahead > 0 {
-                            parts.push(format!("↑{ahead}"));
-                        }
-                        if behind > 0 {
-                            parts.push(format!("↓{behind}"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(operation) = git_operation_label(repository.state()) {
-        parts.push(operation.to_string());
-    }
-
-    let mut options = StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(false);
-    if let Ok(statuses) = repository.statuses(Some(&mut options)) {
-        let mut staged = 0;
-        let mut modified = 0;
-        let mut untracked = 0;
-        let mut conflicts = 0;
-        for entry in statuses.iter() {
-            let status = entry.status();
-            if status.contains(Status::CONFLICTED) {
-                conflicts += 1;
-            }
-            if status.intersects(
-                Status::INDEX_NEW
-                    | Status::INDEX_MODIFIED
-                    | Status::INDEX_DELETED
-                    | Status::INDEX_RENAMED
-                    | Status::INDEX_TYPECHANGE,
-            ) {
-                staged += 1;
-            }
-            if status.intersects(
-                Status::WT_MODIFIED
-                    | Status::WT_DELETED
-                    | Status::WT_RENAMED
-                    | Status::WT_TYPECHANGE
-                    | Status::WT_UNREADABLE,
-            ) {
-                modified += 1;
-            }
-            if status.contains(Status::WT_NEW) {
-                untracked += 1;
-            }
-        }
-        if conflicts > 0 {
-            parts.push(format!("conflicts {conflicts}"));
-        }
-        if staged > 0 {
-            parts.push(format!("staged {staged}"));
-        }
-        if modified > 0 {
-            parts.push(format!("modified {modified}"));
-        }
-        if untracked > 0 {
-            parts.push(format!("untracked {untracked}"));
-        }
-    }
-    Some(parts.join(" · "))
-}
-
-fn git_operation_label(state: RepositoryState) -> Option<&'static str> {
-    match state {
-        RepositoryState::Clean => None,
-        RepositoryState::Merge => Some("merge"),
-        RepositoryState::Revert | RepositoryState::RevertSequence => Some("revert"),
-        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => Some("cherry-pick"),
-        RepositoryState::Bisect => Some("bisect"),
-        RepositoryState::Rebase
-        | RepositoryState::RebaseInteractive
-        | RepositoryState::RebaseMerge => Some("rebase"),
-        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => Some("apply"),
-    }
+    Some(branch)
 }
 
 fn watch_git_metadata(
@@ -768,7 +678,6 @@ fn watch_git_metadata(
 ) -> Option<(RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
     let repository = git2::Repository::discover(workspace_dir).ok()?;
     let git_dir = repository.path().to_path_buf();
-    let common_dir = repository.commondir().to_path_buf();
     let (tx, rx) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if event.is_ok() {
@@ -776,13 +685,10 @@ fn watch_git_metadata(
         }
     })
     .ok()?;
-    watcher
-        .watch(workspace_dir, RecursiveMode::Recursive)
-        .ok()?;
-    watcher.watch(&git_dir, RecursiveMode::Recursive).ok()?;
-    if common_dir != git_dir {
-        watcher.watch(&common_dir, RecursiveMode::Recursive).ok()?;
-    }
+    // A branch switch changes HEAD in the per-worktree Git directory. Watching
+    // only that directory's immediate entries avoids traversing refs and the
+    // object database, which is especially expensive on WSL-mounted drives.
+    watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
     Some((watcher, rx))
 }
 
@@ -801,6 +707,10 @@ struct TuiApp {
     // filesystem notifications.
     _git_watcher: Option<RecommendedWatcher>,
     git_change_rx: mpsc::UnboundedReceiver<()>,
+    git_status_tx: mpsc::UnboundedSender<Option<String>>,
+    git_status_rx: mpsc::UnboundedReceiver<Option<String>>,
+    git_refresh_in_flight: bool,
+    git_refresh_dirty: bool,
     is_sub_session_view: bool,
     // Cell rendering (especially streamed Markdown) dominates redraw cost.
     // Cache each rendered cell independently so a new delta only re-renders
@@ -836,6 +746,7 @@ struct TuiApp {
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
+    sub_session_event_log_writers: std::collections::HashMap<String, tokio::fs::File>,
     supervisors: std::collections::HashMap<String, SupervisorUiState>,
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
@@ -848,6 +759,8 @@ struct TuiApp {
     latest_active_todo_label: Option<String>,
     loaded_thread_history_len: usize,
     sub_session_event_log_lines: usize,
+    sub_session_event_log_offset: u64,
+    sub_session_event_log_remainder: String,
     has_activity: bool,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
@@ -869,7 +782,12 @@ impl TuiApp {
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_workspace_dir(&runtime.data_dir);
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
-        let git_status = current_git_status(&workspace_dir);
+        let git_status_workspace = workspace_dir.clone();
+        let git_status =
+            tokio::task::spawn_blocking(move || current_git_status(&git_status_workspace))
+                .await
+                .ok()
+                .flatten();
         let is_sub_session_view = runtime
             .sessions
             .lock()
@@ -882,6 +800,7 @@ impl TuiApp {
                 let (_tx, rx) = mpsc::unbounded_channel();
                 (None, rx)
             });
+        let (git_status_tx, git_status_rx) = mpsc::unbounded_channel();
         let mut app = Self {
             runtime,
             cli,
@@ -895,6 +814,10 @@ impl TuiApp {
             git_status,
             _git_watcher: git_watcher,
             git_change_rx,
+            git_status_tx,
+            git_status_rx,
+            git_refresh_in_flight: false,
+            git_refresh_dirty: false,
             is_sub_session_view,
             history_line_cache: std::collections::HashMap::new(),
             file_query: None,
@@ -927,6 +850,7 @@ impl TuiApp {
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
+            sub_session_event_log_writers: std::collections::HashMap::new(),
             supervisors: std::collections::HashMap::new(),
             pending_approval: None,
             approval_selected: 0,
@@ -939,6 +863,8 @@ impl TuiApp {
             latest_active_todo_label: None,
             loaded_thread_history_len: 0,
             sub_session_event_log_lines: 0,
+            sub_session_event_log_offset: 0,
+            sub_session_event_log_remainder: String::new(),
             has_activity: false,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
@@ -995,8 +921,15 @@ impl TuiApp {
                     }
                 }
                 Some(_) = self.git_change_rx.recv() => {
-                    if self.refresh_git_branch_from_events() {
-                        needs_draw = true;
+                    while self.git_change_rx.try_recv().is_ok() {}
+                    self.schedule_git_status_refresh();
+                }
+                Some(status) = self.git_status_rx.recv() => {
+                    self.git_status = status;
+                    self.git_refresh_in_flight = false;
+                    needs_draw = true;
+                    if std::mem::take(&mut self.git_refresh_dirty) {
+                        self.schedule_git_status_refresh();
                     }
                 }
                 _ = tick.tick(), if self.running || self.active_tool_count() > 0 => {
@@ -1013,10 +946,21 @@ impl TuiApp {
         Ok(())
     }
 
-    fn refresh_git_branch_from_events(&mut self) -> bool {
-        while self.git_change_rx.try_recv().is_ok() {}
-        self.git_status = current_git_status(&self.workspace_dir);
-        true
+    fn schedule_git_status_refresh(&mut self) {
+        if self.git_refresh_in_flight {
+            self.git_refresh_dirty = true;
+            return;
+        }
+        self.git_refresh_in_flight = true;
+        let workspace_dir = self.workspace_dir.clone();
+        let tx = self.git_status_tx.clone();
+        tokio::spawn(async move {
+            let status = tokio::task::spawn_blocking(move || current_git_status(&workspace_dir))
+                .await
+                .ok()
+                .flatten();
+            let _ = tx.send(status);
+        });
     }
 
     async fn handle_terminal_event(&mut self, event: Event) -> anyhow::Result<bool> {
@@ -3002,13 +2946,47 @@ impl TuiApp {
                 )));
             }
         }
-        if let Err(error) =
-            append_sub_session_event_log(&self.runtime.data_dir, &child_session_id, &event).await
+        if let Err(error) = self
+            .append_sub_session_event_log(&child_session_id, &event)
+            .await
         {
             self.cells.push(HistoryCell::error(format!(
                 "sub-session 事件写入失败: {error:#}"
             )));
         }
+    }
+
+    async fn append_sub_session_event_log(
+        &mut self,
+        session_id: &str,
+        event: &SubSessionEvent,
+    ) -> anyhow::Result<()> {
+        if !self.sub_session_event_log_writers.contains_key(session_id) {
+            let path = sub_session_event_log_path(&self.runtime.data_dir, session_id);
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await?;
+            self.sub_session_event_log_writers
+                .insert(session_id.to_string(), file);
+        }
+
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        let result = self
+            .sub_session_event_log_writers
+            .get_mut(session_id)
+            .expect("sub-session event writer was just initialized")
+            .write_all(&line)
+            .await;
+        if result.is_err() || sub_session_status_label(event.event.as_ref()) != "running" {
+            self.sub_session_event_log_writers.remove(session_id);
+        }
+        result.map_err(Into::into)
     }
 
     async fn load_thread_history(&mut self) {
@@ -3052,16 +3030,40 @@ impl TuiApp {
 
     async fn poll_sub_session_event_log(&mut self) {
         let path = sub_session_event_log_path(&self.runtime.data_dir, &self.session_id);
-        let Ok(content) = tokio::fs::read_to_string(path).await else {
+        let Ok(mut file) = tokio::fs::File::open(path).await else {
             return;
         };
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.len() <= self.sub_session_event_log_lines {
+        let Ok(metadata) = file.metadata().await else {
+            return;
+        };
+        if metadata.len() < self.sub_session_event_log_offset {
+            self.sub_session_event_log_offset = 0;
+            self.sub_session_event_log_lines = 0;
+            self.sub_session_event_log_remainder.clear();
+        }
+        if file
+            .seek(std::io::SeekFrom::Start(self.sub_session_event_log_offset))
+            .await
+            .is_err()
+        {
             return;
         }
-        let previous_lines = self.sub_session_event_log_lines;
-        self.sub_session_event_log_lines = lines.len();
-        for line in lines.into_iter().skip(previous_lines) {
+        let mut appended = String::new();
+        let Ok(bytes_read) = file.read_to_string(&mut appended).await else {
+            return;
+        };
+        if bytes_read == 0 {
+            return;
+        }
+        self.sub_session_event_log_offset += bytes_read as u64;
+        self.sub_session_event_log_remainder.push_str(&appended);
+        let Some(last_newline) = self.sub_session_event_log_remainder.rfind('\n') else {
+            return;
+        };
+        let complete = self.sub_session_event_log_remainder[..=last_newline].to_string();
+        self.sub_session_event_log_remainder.drain(..=last_newline);
+        for line in complete.lines().filter(|line| !line.trim().is_empty()) {
+            self.sub_session_event_log_lines += 1;
             match serde_json::from_str::<SubSessionEvent>(line) {
                 Ok(event) => self.apply_sub_session_event_as_session_view(event),
                 Err(error) => self.cells.push(HistoryCell::error(format!(
@@ -3419,14 +3421,23 @@ async fn ensure_tui_sub_session_channel_session(
             },
         );
     }
-    let _ = sessions.set_metadata_string(
+    let _ = sessions.set_metadata_values(
         &session.id,
-        "sub_session_parent_session_id",
-        parent_session_id,
+        [
+            (
+                "sub_session_parent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.to_string()),
+            ),
+            (
+                "sub_session_thread_id".to_string(),
+                serde_json::Value::String(event.sub_thread_id.0.clone()),
+            ),
+            (
+                "sub_session_agent".to_string(),
+                serde_json::Value::String(event.agent_name.clone()),
+            ),
+        ],
     );
-    let _ =
-        sessions.set_metadata_string(&session.id, "sub_session_thread_id", &event.sub_thread_id.0);
-    let _ = sessions.set_metadata_string(&session.id, "sub_session_agent", &event.agent_name);
     drop(sessions);
     if event.agent_name == "acp" {
         if let Some(acp_session_id) = runtime
@@ -3450,6 +3461,7 @@ fn sub_session_event_log_path(data_dir: &Path, session_id: &str) -> PathBuf {
         .join(format!("{session_id}.jsonl"))
 }
 
+#[cfg(test)]
 async fn append_sub_session_event_log(
     data_dir: &Path,
     session_id: &str,

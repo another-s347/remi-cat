@@ -2172,12 +2172,12 @@ fn spawn_background_tool_result(
             elapsed_ms,
             "tool_task.completed"
         );
+        if let Some(completed_tx) = completed_tx {
+            let _ = completed_tx.send((call_id.clone(), collected.clone()));
+        }
         let _ = tool_tasks
             .finish(&task_id, success, elapsed_ms, collected.preview.clone())
             .await;
-        if let Some(completed_tx) = completed_tx {
-            let _ = completed_tx.send((call_id, collected));
-        }
     });
     tokio::task::spawn_local(async move {
         task_manager
