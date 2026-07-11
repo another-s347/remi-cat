@@ -88,6 +88,10 @@ impl ToolTaskManager {
                 task.success = Some(false);
                 task.message = Some("cancelled because remi-cat restarted".to_string());
             }
+            // Completion notifications are process-local. Any record loaded
+            // after restart is historical and must not be injected into a
+            // later, unrelated agent run.
+            task.notification_delivered = true;
         }
         prune_completed_tasks(&mut store);
         save_store(&path, &store)?;
@@ -769,5 +773,35 @@ mod tests {
             .await
             .is_none());
         assert_eq!(completed_rx.recv().await.unwrap().task_id, task_id);
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_replay_historical_completion_notification() {
+        let dir = temp_data_dir("restart-notification");
+        let manager = ToolTaskManager::load(&dir).unwrap();
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.enable_completion_notification(&task_id).await;
+        manager
+            .finish(&task_id, true, 10, "done".to_string())
+            .await
+            .unwrap();
+        drop(manager);
+
+        let reloaded = ToolTaskManager::load(&dir).unwrap();
+        assert!(reloaded
+            .claim_pending_completion_notification("thread-a")
+            .await
+            .is_none());
+        assert!(!reloaded.claim_completion_notification(&task_id).await);
     }
 }

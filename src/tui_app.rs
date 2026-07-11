@@ -5379,6 +5379,39 @@ mod tests {
     }
 
     #[test]
+    fn persisted_subagent_result_reloads_as_compact_sub_session_cell() {
+        let pretty = PrettyToolCall::completed(
+            "call-agent",
+            "agent__explorer",
+            &serde_json::json!({"task": "Inspect the repository"}),
+            &serde_json::json!({
+                "sub_session_id": "subagent:explorer-1",
+                "agent": "explorer",
+                "success": true,
+                "final_output": "a very large report that must stay hidden"
+            })
+            .to_string(),
+            true,
+            42,
+        );
+        let cell = history_cell(ThreadHistoryMessage {
+            id: "tool-message".to_string(),
+            role: "tool".to_string(),
+            text: pretty.response.clone().unwrap(),
+            timestamp: None,
+            tool_call_id: Some("call-agent".to_string()),
+            tool_calls: None,
+            pretty: Some(pretty),
+        })
+        .expect("subagent history is visible");
+
+        assert!(matches!(cell.kind, CellKind::SubSession { .. }));
+        assert_eq!(cell.title, "sub-agent · explorer · done");
+        assert!(cell.body.contains("Inspect the repository"));
+        assert!(!cell.body.contains("large report"));
+    }
+
+    #[test]
     fn composer_display_strips_controls_but_keeps_submitted_text() {
         let raw = "show\x1b[31m red\x1b[0m\nnext\x07";
         let mut input = ComposerInput::default();

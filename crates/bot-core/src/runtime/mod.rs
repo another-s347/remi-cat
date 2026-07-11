@@ -2357,6 +2357,12 @@ impl CatBot {
                         serde_json::Value::Bool(true),
                     );
                 }
+                if background_task_continuation {
+                    msg_meta.insert(
+                        "background_tool_task".into(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
                 if let Some(ref sid) = round_opts.sender_user_id {
                     msg_meta.insert("sender_user_id".into(), serde_json::Value::String(sid.clone()));
                     meta["sender_user_id"] = serde_json::Value::String(sid.clone());

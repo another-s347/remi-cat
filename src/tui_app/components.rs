@@ -948,7 +948,9 @@ pub(super) fn history_cell(message: ThreadHistoryMessage) -> Option<HistoryCell>
         }
         "tool" => {
             if let Some(pretty) = message.pretty {
-                if pretty.tool_name == "apply_patch" {
+                if pretty.tool_name.starts_with("agent__") {
+                    Some(persisted_sub_session_cell(pretty))
+                } else if pretty.tool_name == "apply_patch" {
                     let patch = pretty
                         .request
                         .get("patch")
@@ -982,6 +984,51 @@ pub(super) fn history_cell(message: ThreadHistoryMessage) -> Option<HistoryCell>
         }
         _ => None,
     }
+}
+
+fn persisted_sub_session_cell(pretty: PrettyToolCall) -> HistoryCell {
+    let result = pretty
+        .response
+        .as_deref()
+        .and_then(|response| serde_json::from_str::<serde_json::Value>(response).ok());
+    let agent_name = result
+        .as_ref()
+        .and_then(|value| value.get("agent"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| pretty.tool_name.trim_start_matches("agent__").to_string());
+    let id = result
+        .as_ref()
+        .and_then(|value| value.get("sub_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| pretty.id.clone());
+    let success = result
+        .as_ref()
+        .and_then(|value| value.get("success"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| matches!(&pretty.status, PrettyToolStatus::Success));
+    let input = pretty
+        .request
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" input: {value}"))
+        .unwrap_or_default();
+    let state = if success { "done" } else { "failed" };
+    HistoryCell::sub_session(
+        id,
+        format!("sub-agent · {agent_name} · {state}"),
+        input,
+        String::new(),
+        if success {
+            ToolVisualStatus::Success
+        } else {
+            ToolVisualStatus::Error
+        },
+    )
 }
 
 pub(super) fn extract_patch_arg(args: &str) -> Option<String> {

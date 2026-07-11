@@ -600,6 +600,20 @@ impl MemoryStore {
                         {
                             "supervisor"
                         }
+                        Role::User
+                            if message.metadata.as_ref().is_some_and(|metadata| {
+                                metadata
+                                    .get("background_tool_task")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false)
+                            }) || message.content.text_content().starts_with(
+                                "[Background tool task completed while this run was active]",
+                            ) || message.content.text_content().starts_with(
+                                "[Background tool tasks completed while this run was active]",
+                            ) =>
+                        {
+                            "internal"
+                        }
                         Role::User => "user",
                         Role::Assistant => "assistant",
                         Role::Tool => "tool",
@@ -1554,6 +1568,31 @@ mod tests {
             crate::supervisor_workflow::instance_from_user_state(&restored_state).unwrap();
         assert_eq!(restored, instance);
         assert_eq!(restored_state["__todos"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn background_task_completion_stays_in_context_but_is_internal_ui_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let mut message = Message::user("Background tool task completed.");
+        message.metadata = Some(serde_json::json!({"background_tool_task": true}));
+        let legacy_message = Message::user(
+            "[Background tool task completed while this run was active]\nlegacy completion",
+        );
+        store
+            .save_turn("thread-background", vec![message, legacy_message])
+            .await
+            .unwrap();
+
+        let context = store.load_context("thread-background").await.unwrap();
+        assert_eq!(context.short_term.len(), 2);
+        assert_eq!(
+            context.short_term[0].content.text_content(),
+            "Background tool task completed."
+        );
+        let history = store.thread_history("thread-background").await;
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|message| message.role == "internal"));
     }
 
     #[test]
