@@ -2206,7 +2206,9 @@ fn spawn_background_side_event_forwarder(
 ) {
     tokio::task::spawn_local(async move {
         while let Some(event) = side_rx.recv().await {
-            tool_tasks.publish_side_event(thread_id.clone(), event);
+            tool_tasks
+                .publish_side_event(thread_id.clone(), event)
+                .await;
         }
     });
 }
@@ -3707,7 +3709,7 @@ mod tests {
             .run_until(async {
                 let root = test_root();
                 let tool_tasks = test_tool_tasks();
-                let mut completed_rx = tool_tasks.subscribe_completed();
+                let mut completed_rx = tool_tasks.subscribe_completed("thread-1").await;
                 let tool_names =
                     HashMap::from([("slow-call".to_string(), "lazy_wait".to_string())]);
                 let calls = vec![ParsedToolCall {
@@ -3763,7 +3765,7 @@ mod tests {
             .run_until(async {
                 let root = test_root();
                 let tool_tasks = test_tool_tasks();
-                let mut completed_rx = tool_tasks.subscribe_completed();
+                let mut completed_rx = tool_tasks.subscribe_completed("thread-1").await;
                 let tool_names =
                     HashMap::from([("slow-call".to_string(), "lazy_wait".to_string())]);
                 let calls = vec![ParsedToolCall {
@@ -3816,7 +3818,7 @@ mod tests {
             .run_until(async {
                 let root = test_root();
                 let tool_tasks = test_tool_tasks();
-                let mut completed_rx = tool_tasks.subscribe_completed();
+                let mut completed_rx = tool_tasks.subscribe_completed("thread-1").await;
                 let tool_names =
                     HashMap::from([("fast-call".to_string(), "lazy_wait".to_string())]);
                 let calls = vec![ParsedToolCall {
@@ -3877,7 +3879,7 @@ mod tests {
             .run_until(async {
                 let root = test_root();
                 let tool_tasks = test_tool_tasks();
-                let mut side_events = tool_tasks.subscribe_side_events();
+                let mut side_events = tool_tasks.subscribe_side_events("thread-1").await;
                 let (side_tx, side_rx) = mpsc::unbounded_channel();
                 let tool_names = HashMap::from([("sub-call".to_string(), "sub_agent".to_string())]);
                 let calls = vec![ParsedToolCall {
@@ -3956,7 +3958,7 @@ mod tests {
             .run_until(async {
                 let root = test_root();
                 let tool_tasks = test_tool_tasks();
-                let mut side_events = tool_tasks.subscribe_side_events();
+                let mut side_events = tool_tasks.subscribe_side_events("thread-1").await;
                 let (side_tx, side_rx) = mpsc::unbounded_channel();
                 let tool_names = HashMap::from([("sub-call".to_string(), "sub_agent".to_string())]);
                 let calls = vec![ParsedToolCall {

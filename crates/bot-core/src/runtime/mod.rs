@@ -598,6 +598,14 @@ impl CatBot {
     }
 
     pub fn submit_steer(&self, input: SteerInput) -> SteerSubmitResult {
+        self.submit_queued_input(input, CoreSteerSource::User)
+    }
+
+    pub fn submit_next_turn(&self, input: SteerInput) -> SteerSubmitResult {
+        self.submit_queued_input(input, CoreSteerSource::UserNextTurn)
+    }
+
+    fn submit_queued_input(&self, input: SteerInput, source: CoreSteerSource) -> SteerSubmitResult {
         let queue = {
             self.active_steers
                 .lock()
@@ -617,7 +625,7 @@ impl CatBot {
             preview: preview.clone(),
             message_metadata,
             user_name: input.sender_username.clone(),
-            source: CoreSteerSource::User,
+            source,
         });
         SteerSubmitResult::Queued(SteerQueuedEvent {
             steer_id,
@@ -2568,8 +2576,8 @@ impl CatBot {
                     },
                 );
                 let mut inner_stream = std::pin::pin!(inner_stream);
-                let mut completed_tool_tasks = self.tool_tasks.subscribe_completed();
-                let mut background_side_events = self.tool_tasks.subscribe_side_events();
+                let mut completed_tool_tasks = self.tool_tasks.subscribe_completed(&thread_id_owned).await;
+                let mut background_side_events = self.tool_tasks.subscribe_side_events(&thread_id_owned).await;
 
                 loop {
                     let ev = tokio::select! {
@@ -3023,6 +3031,13 @@ impl CatBot {
                                             }
                                         };
                                         tokio::pin!(cancel_wait);
+                                        let steer_wait = async {
+                                            match steer_queue.as_ref() {
+                                                Some(steer) => steer.notified().await,
+                                                None => std::future::pending::<()>().await,
+                                            }
+                                        };
+                                        tokio::pin!(steer_wait);
                                         tokio::select! {
                                             _ = &mut cancel_wait => {
                                                 let cancelled_tasks = self
@@ -3037,6 +3052,7 @@ impl CatBot {
                                                 yield CatEvent::Done;
                                                 return;
                                             }
+                                            _ = &mut steer_wait => {}
                                             completed = completed_tool_tasks.recv() => {
                                                 match completed {
                                                     Ok(task) if task.thread_id == thread_id_owned => {
@@ -5069,7 +5085,7 @@ mod tests {
     async fn completed_tool_task_buffer_is_drained_before_running_check() {
         let data_dir = tempfile::tempdir().unwrap();
         let manager = crate::ToolTaskManager::load(data_dir.path()).unwrap();
-        let mut completed_rx = manager.subscribe_completed();
+        let mut completed_rx = manager.subscribe_completed("thread-1").await;
         let task_id = manager
             .start(
                 "thread-1".to_string(),
@@ -5098,8 +5114,10 @@ mod tests {
     async fn background_side_event_buffer_is_drained_before_running_check() {
         let data_dir = tempfile::tempdir().unwrap();
         let manager = crate::ToolTaskManager::load(data_dir.path()).unwrap();
-        let mut side_rx = manager.subscribe_side_events();
-        manager.publish_side_event("thread-1".to_string(), CatEvent::Text("side".to_string()));
+        let mut side_rx = manager.subscribe_side_events("thread-1").await;
+        manager
+            .publish_side_event("thread-1".to_string(), CatEvent::Text("side".to_string()))
+            .await;
 
         assert!(!manager.is_thread_running("thread-1").await);
         let event = try_recv_background_side_event(&mut side_rx, "thread-1")

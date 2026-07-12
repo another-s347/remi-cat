@@ -41,6 +41,15 @@ impl WorkspaceBashTool {
     }
 }
 
+fn bash_timeout_ms(arguments: &serde_json::Value) -> u64 {
+    arguments["timeout"]
+        .as_u64()
+        .or_else(|| arguments["timeout"].as_str()?.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|seconds| seconds.saturating_mul(1000))
+        .unwrap_or(u64::MAX / 2)
+}
+
 impl Tool for WorkspaceBashTool {
     fn name(&self) -> &str {
         "bash"
@@ -87,11 +96,7 @@ impl Tool for WorkspaceBashTool {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
-            let timeout_ms = arguments["timeout"]
-                .as_u64()
-                .filter(|v| *v > 0)
-                .map(|s| s.saturating_mul(1000))
-                .unwrap_or(u64::MAX / 2);
+            let timeout_ms = bash_timeout_ms(&arguments);
             let cancel = Some(ctx.runtime().cancellation());
             Ok(ToolResult::Output(stream! {
                 yield ToolOutput::Delta(format!("$ {}", command));
@@ -187,5 +192,22 @@ impl Tool for WorkspaceBashTool {
                 }
             }.boxed()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bash_timeout_ms;
+
+    #[test]
+    fn timeout_accepts_number_and_numeric_string() {
+        assert_eq!(
+            bash_timeout_ms(&serde_json::json!({"timeout": 300})),
+            300_000
+        );
+        assert_eq!(
+            bash_timeout_ms(&serde_json::json!({"timeout": "300"})),
+            300_000
+        );
     }
 }

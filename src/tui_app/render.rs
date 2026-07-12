@@ -243,10 +243,18 @@ impl TuiApp {
                 .iter()
                 .take(area.height.saturating_sub(lines.len() as u16) as usize)
             {
+                let label = if steer.next_turn {
+                    "  ↳ next · "
+                } else {
+                    "  ↳ steer · "
+                };
                 lines.push(Line::from(vec![
-                    dim_span("  ↳ steer · "),
+                    dim_span(label),
                     Span::styled(
-                        truncate_for_width(&steer.display_text, area.width.saturating_sub(13)),
+                        truncate_for_width(
+                            &steer.display_text,
+                            area.width.saturating_sub(label.len() as u16),
+                        ),
                         Style::default().fg(CODEX_DIM),
                     ),
                 ]));

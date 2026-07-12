@@ -114,7 +114,12 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             (format!("查看目录 {path}"), "列出目录内容".to_string())
         }
         "rg" => {
-            let pattern = string_arg(args, "query").unwrap_or("内容");
+            let pattern = args
+                .get("args")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("内容");
             (
                 format!("搜索 {pattern}"),
                 "使用 ripgrep 搜索工作区".to_string(),

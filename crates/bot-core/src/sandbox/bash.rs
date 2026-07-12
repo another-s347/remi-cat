@@ -409,16 +409,29 @@ pub(super) async fn run_command_with_timeout(
         })
         .await;
     spawn_cancel_watcher(Arc::clone(&task), cancel.clone());
-    let stdout_reader = spawn_reader(stdout, Arc::clone(&task), true);
-    let stderr_reader = spawn_reader(stderr, Arc::clone(&task), false);
+    let mut stdout_reader = spawn_reader(stdout, Arc::clone(&task), true);
+    let mut stderr_reader = spawn_reader(stderr, Arc::clone(&task), false);
     tokio::spawn({
         let wait_task = Arc::clone(&task);
         async move {
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let _ = stdout_reader.await;
-                        let _ = stderr_reader.await;
+                        // A shell-launched background descendant can inherit
+                        // these pipes after the direct shell has exited. Give
+                        // buffered output a brief chance to drain, then stop
+                        // the readers so task completion follows the process
+                        // we actually spawned rather than an unrelated daemon.
+                        if tokio::time::timeout(Duration::from_millis(100), async {
+                            let _ = (&mut stdout_reader).await;
+                            let _ = (&mut stderr_reader).await;
+                        })
+                        .await
+                        .is_err()
+                        {
+                            stdout_reader.abort();
+                            stderr_reader.abort();
+                        }
                         let mut task = wait_task.lock().await;
                         if task.status == BashTaskStatus::Running {
                             task.exit_code = Some(status.code().unwrap_or(-1));

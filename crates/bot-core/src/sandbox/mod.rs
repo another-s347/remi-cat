@@ -736,6 +736,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unnamed_bash_completes_when_background_descendant_keeps_pipe_open() {
+        let root = test_root();
+        let sandbox = NoSandbox::new(root.clone());
+        let started = std::time::Instant::now();
+        let out = sandbox
+            .bash("setsid -f sleep 2 & echo launched", None, 3_000, None)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, SandboxBashStatus::Completed);
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains("launched"));
+        assert!(started.elapsed() < Duration::from_millis(1_800));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn no_sandbox_named_bash_preserves_and_isolates_state() {
         let root = test_root();
         let sandbox = NoSandbox::new(root.clone());

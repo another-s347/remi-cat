@@ -1393,7 +1393,6 @@ fn rg_args_from_arguments(arguments: &serde_json::Value) -> Result<Vec<String>, 
     normalize_rg_args(args)
 }
 
-
 fn normalize_rg_args(mut args: Vec<String>) -> Result<Vec<String>, AgentError> {
     if matches!(args.first().map(String::as_str), Some("rg" | "ripgrep")) {
         args.remove(0);
@@ -1609,10 +1608,9 @@ impl Tool for ExaSearchTool {
 mod tests {
     use super::{
         format_command_output, format_utc_offset, parse_apply_patch, parse_manage_yourself_command,
-        parse_ssh_target, parse_timezone_spec, rg_args_from_arguments,
-        ssh_command_args, validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool,
-        RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
-        WorkspaceSshTool,
+        parse_ssh_target, parse_timezone_spec, rg_args_from_arguments, ssh_command_args,
+        validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool, RootedFsApplyPatchTool,
+        RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool, WorkspaceSshTool,
     };
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use bot_runtime_core::ToolContext;
@@ -1777,11 +1775,6 @@ mod tests {
             }
         }
     }
-
-
-
-
-
 
     #[test]
     fn rg_args_accept_structured_complex_values() {

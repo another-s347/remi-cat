@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::Notify;
 
 use remi_agentloop::prelude::{
     AgentConfig, AgentState, CancellationToken, ChatCtx, ChatCtxState, Content, ContentPart,
@@ -40,6 +41,7 @@ impl CoreStreamOptions {
 #[derive(Debug, Clone)]
 pub enum CoreSteerSource {
     User,
+    UserNextTurn,
     BackgroundToolCompletion,
 }
 
@@ -66,6 +68,7 @@ pub struct CoreSteerBatch {
 #[derive(Debug, Default)]
 pub struct CoreSteerQueue {
     pending: Mutex<VecDeque<CoreSteerInput>>,
+    notify: Notify,
 }
 
 impl CoreSteerQueue {
@@ -78,6 +81,11 @@ impl CoreSteerQueue {
             .lock()
             .expect("steer queue lock poisoned")
             .push_back(input);
+        self.notify.notify_one();
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
     }
 
     pub fn drain_batch(&self) -> Option<CoreSteerBatch> {
@@ -104,7 +112,11 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
         .collect::<Vec<_>>()
         .join(" / ");
     let content = if inputs.len() == 1 {
-        prefixed_steer_content(steer_prefix(&inputs[0]), inputs[0].content.clone())
+        if matches!(inputs[0].source, CoreSteerSource::UserNextTurn) {
+            inputs[0].content.clone()
+        } else {
+            prefixed_steer_content(steer_prefix(&inputs[0]), inputs[0].content.clone())
+        }
     } else {
         let mut parts = vec![ContentPart::text(steer_batch_prefix(&inputs))];
         for (idx, input) in inputs.iter().enumerate() {
@@ -134,6 +146,7 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
 fn steer_prefix(input: &CoreSteerInput) -> &'static str {
     match input.source {
         CoreSteerSource::User => "[User steer received while this run was active]\n",
+        CoreSteerSource::UserNextTurn => "",
         CoreSteerSource::BackgroundToolCompletion => {
             "[Background tool task completed while this run was active]\n"
         }
@@ -144,8 +157,13 @@ fn steer_batch_prefix(inputs: &[CoreSteerInput]) -> String {
     let all_background = inputs
         .iter()
         .all(|input| matches!(input.source, CoreSteerSource::BackgroundToolCompletion));
+    let all_next_turn = inputs
+        .iter()
+        .all(|input| matches!(input.source, CoreSteerSource::UserNextTurn));
     if all_background {
         "[Background tool tasks completed while this run was active]\nMultiple queued inputs arrived in order:\n".to_string()
+    } else if all_next_turn {
+        "[Queued user messages]\nMultiple user messages arrived in order:\n".to_string()
     } else {
         "[Queued inputs received while this run was active]\nMultiple queued inputs arrived in order:\n".to_string()
     }
@@ -154,6 +172,7 @@ fn steer_batch_prefix(inputs: &[CoreSteerInput]) -> String {
 fn steer_item_label(input: &CoreSteerInput) -> &'static str {
     match input.source {
         CoreSteerSource::User => "User steer: ",
+        CoreSteerSource::UserNextTurn => "User message: ",
         CoreSteerSource::BackgroundToolCompletion => "Background tool task completion: ",
     }
 }
@@ -469,6 +488,44 @@ You are a markdown agent.
         assert!(text.contains("1. User steer: first"));
         assert!(text.contains("2. User steer: second"));
         assert!(queue.drain_batch().is_none());
+    }
+
+    #[tokio::test]
+    async fn steer_queue_notifies_background_waiters() {
+        let queue = Arc::new(CoreSteerQueue::new());
+        let waiter = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.notified().await })
+        };
+        queue.push(CoreSteerInput {
+            id: "next".to_string(),
+            content: Content::text("continue now"),
+            preview: "continue now".to_string(),
+            message_metadata: None,
+            user_name: None,
+            source: CoreSteerSource::User,
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should wake")
+            .expect("waiter task should succeed");
+    }
+
+    #[test]
+    fn next_turn_input_is_not_prefixed_as_a_steer() {
+        let queue = CoreSteerQueue::new();
+        queue.push(CoreSteerInput {
+            id: "next".to_string(),
+            content: Content::text("normal user message"),
+            preview: "normal user message".to_string(),
+            message_metadata: None,
+            user_name: None,
+            source: CoreSteerSource::UserNextTurn,
+        });
+
+        let batch = queue.drain_batch().expect("batch should be present");
+        assert_eq!(batch.content.text_content(), "normal user message");
     }
 
     #[test]

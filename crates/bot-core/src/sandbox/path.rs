@@ -42,13 +42,23 @@ fn clean_relative_components(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Expand a leading `~` to the user home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") || path == "~" {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            return home.join(path.strip_prefix("~/").unwrap_or(""));
+        }
+    }
+    PathBuf::from(path)
+}
+
 pub(super) async fn resolve_local_path(root: &Path, path: &str) -> Result<PathBuf> {
     tokio::fs::create_dir_all(root)
         .await
         .with_context(|| format!("creating local root {}", root.display()))?;
-    let input = Path::new(path);
+    let input = expand_tilde(path);
     if input.is_absolute() {
-        Ok(input.to_path_buf())
+        Ok(input)
     } else {
         Ok(root.join(input))
     }

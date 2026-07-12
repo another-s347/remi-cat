@@ -1438,11 +1438,7 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         None => (false, None),
     };
     // TUI defaults to async-agent mode; --sync opts out, --async keeps the default.
-    let async_agent = if args.sync {
-        false
-    } else {
-        true
-    };
+    let async_agent = if args.sync { false } else { true };
     CliConfig {
         enabled: true,
         tui: true,

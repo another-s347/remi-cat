@@ -744,8 +744,18 @@ fn find_action_is_destructive(words: &[String]) -> bool {
 fn is_destructive_find_exec_program(program: &str) -> bool {
     matches!(
         shell_program_name(program),
-        "rm" | "rmdir" | "sudo" | "dd" | "mkfs" | "shred" | "chmod" | "chown" | "mv" | "cp"
-            | "install" | "truncate" | "tee"
+        "rm" | "rmdir"
+            | "sudo"
+            | "dd"
+            | "mkfs"
+            | "shred"
+            | "chmod"
+            | "chown"
+            | "mv"
+            | "cp"
+            | "install"
+            | "truncate"
+            | "tee"
     ) || program.is_empty()
 }
 

@@ -28,7 +28,7 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use git2::Repository;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
@@ -597,6 +597,8 @@ impl TerminalGuard {
         )
         .context("leave alternate screen")?;
         self.terminal.show_cursor().context("show cursor")?;
+        // Reset terminal title to a generic label on exit.
+        set_terminal_title(&std::env::current_dir().unwrap_or_default(), "exited");
         self.restored = true;
         Ok(())
     }
@@ -680,7 +682,7 @@ fn watch_git_metadata(
     let git_dir = repository.path().to_path_buf();
     let (tx, rx) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok() {
+        if event.as_ref().is_ok_and(git_event_affects_head) {
             let _ = tx.send(());
         }
     })
@@ -690,6 +692,17 @@ fn watch_git_metadata(
     // object database, which is especially expensive on WSL-mounted drives.
     watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
     Some((watcher, rx))
+}
+
+fn git_event_affects_head(event: &notify::Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "HEAD" | "HEAD.lock"))
+    })
 }
 
 struct TuiApp {
@@ -776,6 +789,18 @@ struct PendingSteer {
     steer_id: String,
     display_text: String,
     content: Content,
+    next_turn: bool,
+}
+
+/// Update the terminal window title with the current workspace and agent state.
+fn set_terminal_title(workspace: &Path, status: &str) {
+    use std::io::Write;
+    let dir = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string());
+    let _ = write!(io::stdout(), "\x1b]0;remi-cat: {dir} [{status}]\x07");
+    let _ = io::stdout().flush();
 }
 
 impl TuiApp {
@@ -893,6 +918,7 @@ impl TuiApp {
         sub_session_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut needs_draw = true;
 
+        set_terminal_title(&self.workspace_dir, "idle");
         loop {
             if needs_draw {
                 terminal
@@ -1314,10 +1340,28 @@ impl TuiApp {
         // workflow, but new user input belongs to the next turn rather than
         // that internal continuation.
         if should_queue_for_next_turn(self.running, self.awaiting_background_tasks) {
-            self.queued_inputs.push_back(SubmittedInput {
-                display_text,
-                content,
-            });
+            let request = ChatRequest::text(self.session_id.clone(), ChatChannel::Tui, text)
+                .with_content(content.clone())
+                .with_sender(self.cli.user_id.clone(), Some(self.cli.username.clone()))
+                .with_message(format!("tui-next-{}", uuid::Uuid::new_v4()), "p2p")
+                .with_platform(Some(TUI_CHANNEL.to_string()));
+            match self.runtime.submit_next_turn(request) {
+                SteerSubmitResult::Queued(event) => {
+                    self.has_activity = true;
+                    self.pending_steers.push_back(PendingSteer {
+                        steer_id: event.steer_id,
+                        display_text,
+                        content,
+                        next_turn: true,
+                    });
+                }
+                SteerSubmitResult::NotRunning => {
+                    self.queued_inputs.push_back(SubmittedInput {
+                        display_text,
+                        content,
+                    });
+                }
+            }
             return Ok(false);
         }
         if self.running {
@@ -1333,6 +1377,7 @@ impl TuiApp {
                         steer_id: event.steer_id,
                         display_text,
                         content,
+                        next_turn: false,
                     });
                 }
                 SteerSubmitResult::NotRunning => {
@@ -1501,6 +1546,7 @@ impl TuiApp {
         self.interrupt_requested = false;
         self.exit_after_run = false;
         self.status.state = "running".to_string();
+        set_terminal_title(&self.workspace_dir, "running");
         self.status.last_error = None;
         self.last_stats_snapshot = TokenStatsSnapshot::default();
         self.pending_token_delta = TokenDelta::default();
@@ -1533,6 +1579,13 @@ impl TuiApp {
             BotEvent::BackgroundTasksWaiting { count } => {
                 self.awaiting_background_tasks = count > 0;
                 self.background_task_count = count;
+                set_terminal_title(
+                    &self.workspace_dir,
+                    &format!(
+                        "{count} background task{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                );
             }
             BotEvent::SupervisorStarted => self.begin_supervisor_execution(),
             BotEvent::Prefix(text) => {
@@ -1972,6 +2025,7 @@ impl TuiApp {
                 self.pending_approval = None;
                 self.pending_user_question = None;
                 self.status.state = "error".to_string();
+                set_terminal_title(&self.workspace_dir, "error");
             }
             BotEvent::Cancelled => {
                 self.has_activity = true;
@@ -1991,6 +2045,7 @@ impl TuiApp {
                 self.pending_approval = None;
                 self.pending_user_question = None;
                 self.status.state = "idle".to_string();
+                set_terminal_title(&self.workspace_dir, "idle");
                 self.refresh_command_catalog();
             }
             BotEvent::Done => {
@@ -2009,6 +2064,7 @@ impl TuiApp {
                 self.pending_user_question = None;
                 self.active_supervisor_id = None;
                 self.status.state = "idle".to_string();
+                set_terminal_title(&self.workspace_dir, "idle");
                 self.refresh_command_catalog();
                 if self.exit_after_run {
                     self.queued_inputs.clear();
@@ -2274,6 +2330,7 @@ impl TuiApp {
             cancel.cancel();
         }
         self.status.state = "cancelling".to_string();
+        set_terminal_title(&self.workspace_dir, "cancelling");
         self.awaiting_background_tasks = false;
         self.cancel_active_tool_cells("cancelled by user");
         self.sub_tool_args.clear();
@@ -5068,11 +5125,8 @@ mod tests {
 
     #[test]
     fn tui_resume_args_preserve_sync_agent_flag() {
-        let args = tui_resume_command_args(
-            Path::new("/tmp/remi-cat"),
-            "session-1",
-            &test_cli_config(),
-        );
+        let args =
+            tui_resume_command_args(Path::new("/tmp/remi-cat"), "session-1", &test_cli_config());
         let rendered = os_args_to_strings(&args);
 
         assert_eq!(rendered[0], "/tmp/remi-cat");
@@ -6488,17 +6542,34 @@ mod tests {
     }
 
     #[test]
+    fn git_watcher_ignores_head_reads_but_accepts_head_changes() {
+        let head = PathBuf::from("/repo/.git/HEAD");
+        let read = notify::Event::new(EventKind::Access(notify::event::AccessKind::Read))
+            .add_path(head.clone());
+        let modify =
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(head);
+        let unrelated = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/repo/.git/index"));
+
+        assert!(!git_event_affects_head(&read));
+        assert!(git_event_affects_head(&modify));
+        assert!(!git_event_affects_head(&unrelated));
+    }
+
+    #[test]
     fn cancelled_run_promotes_pending_steers_in_submission_order() {
         let mut pending = VecDeque::from([
             PendingSteer {
                 steer_id: "steer-1".to_string(),
                 display_text: "first".to_string(),
                 content: Content::text("first"),
+                next_turn: false,
             },
             PendingSteer {
                 steer_id: "steer-2".to_string(),
                 display_text: "second".to_string(),
                 content: Content::text("second"),
+                next_turn: false,
             },
         ]);
         let mut queued = VecDeque::from([SubmittedInput {

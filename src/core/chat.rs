@@ -166,6 +166,10 @@ impl Runtime {
         self.bot.submit_steer(request.into())
     }
 
+    pub(crate) fn submit_next_turn(&self, request: ChatRequest) -> SteerSubmitResult {
+        self.bot.submit_next_turn(request.into())
+    }
+
     pub(crate) fn chat(self: Rc<Self>, request: ChatRequest) -> impl Stream<Item = CoreChatEvent> {
         async_stream::stream! {
             let user_text = request.content.text_content();
