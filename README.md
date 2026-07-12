@@ -37,10 +37,16 @@ cargo run -- feishu init
 
 ## Run
 
-Start the terminal UI with asynchronous background-tool handling:
+Start the terminal UI (async background-tool handling is enabled by default):
 
 ```bash
-cargo run -- tui --async
+cargo run -- tui
+```
+
+Use synchronous tool handling instead:
+
+```bash
+cargo run -- tui --sync
 ```
 
 Start the default Web Chat and IM runtime:

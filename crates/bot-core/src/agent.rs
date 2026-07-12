@@ -700,7 +700,7 @@ where
                                     Arc::clone(&self.tool_tasks),
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
-                                    tool_foreground_timeout(),
+                                    tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
@@ -1140,7 +1140,7 @@ where
                                     Arc::clone(&self.tool_tasks),
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
-                                    tool_foreground_timeout(),
+                                    tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
@@ -1900,15 +1900,27 @@ fn build_dynamic_tools(
 /// [`CatAgent::overflow_bytes`] which is derived from the model profile.
 const _OVERFLOW_THRESHOLD_DEFAULT: usize = 20_000;
 const TOOL_OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 512;
-const DEFAULT_TOOL_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// Async mode keeps a short foreground wait so tools can go background quickly.
+// Sync mode waits longer before treating a tool as timed out.
+const DEFAULT_ASYNC_TOOL_FOREGROUND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+const DEFAULT_SYNC_TOOL_FOREGROUND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
 
-fn tool_foreground_timeout() -> std::time::Duration {
-    std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS")
+fn tool_foreground_timeout(async_agent: bool) -> std::time::Duration {
+    if let Some(timeout) = std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
-        .unwrap_or(DEFAULT_TOOL_FOREGROUND_TIMEOUT)
+    {
+        return timeout;
+    }
+    if async_agent {
+        DEFAULT_ASYNC_TOOL_FOREGROUND_TIMEOUT
+    } else {
+        DEFAULT_SYNC_TOOL_FOREGROUND_TIMEOUT
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2535,17 +2547,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_foreground_timeout_defaults_to_ten_seconds_and_env_overrides() {
+    fn tool_foreground_timeout_defaults_depend_on_mode_and_env_overrides() {
         let previous = std::env::var("REMI_TOOL_FOREGROUND_TIMEOUT_MS").ok();
         unsafe {
             std::env::remove_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS");
         }
-        assert_eq!(tool_foreground_timeout(), Duration::from_secs(10));
+        assert_eq!(tool_foreground_timeout(true), Duration::from_secs(10));
+        assert_eq!(tool_foreground_timeout(false), Duration::from_secs(300));
 
         unsafe {
             std::env::set_var("REMI_TOOL_FOREGROUND_TIMEOUT_MS", "2500");
         }
-        assert_eq!(tool_foreground_timeout(), Duration::from_millis(2500));
+        assert_eq!(tool_foreground_timeout(true), Duration::from_millis(2500));
+        assert_eq!(tool_foreground_timeout(false), Duration::from_millis(2500));
 
         unsafe {
             match previous {

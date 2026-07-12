@@ -552,9 +552,15 @@ struct TuiArgs {
     common: LocalCommonArgs,
     #[arg(
         long = "async",
-        help = "Enable automatic async-agent handling for background tool tasks"
+        help = "Enable automatic async-agent handling for background tool tasks (default for TUI)"
     )]
     async_agent: bool,
+    #[arg(
+        long = "sync",
+        help = "Disable async-agent handling; wait synchronously for tool tasks",
+        conflicts_with = "async_agent"
+    )]
+    sync: bool,
     #[command(subcommand)]
     command: Option<TuiCliCommand>,
 }
@@ -918,7 +924,9 @@ impl CliConfig {
         let mut user_id = CLI_USER_ID.to_string();
         let mut username = CLI_USERNAME.to_string();
         let mut wait_background_tasks = false;
-        let mut async_agent = false;
+        // TUI defaults to async-agent mode unless --sync is provided.
+        let mut async_agent = tui;
+        let mut sync = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -929,6 +937,9 @@ impl CliConfig {
                 "tui" => {
                     enabled = true;
                     tui = true;
+                    if !sync {
+                        async_agent = true;
+                    }
                 }
                 "resume" if tui => {
                     resume = true;
@@ -964,6 +975,9 @@ impl CliConfig {
                     enabled = true;
                     tui = true;
                     resume = true;
+                    if !sync {
+                        async_agent = true;
+                    }
                     if let Some(value) = optional_arg(args, i) {
                         resume_session_id = Some(value);
                         i += 1;
@@ -982,6 +996,11 @@ impl CliConfig {
                 }
                 "--async" => {
                     async_agent = true;
+                    sync = false;
+                }
+                "--sync" => {
+                    async_agent = false;
+                    sync = true;
                 }
                 value if enabled && !value.starts_with('-') => {
                     once = Some(args[i..].join(" "));
@@ -1418,6 +1437,12 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         }
         None => (false, None),
     };
+    // TUI defaults to async-agent mode; --sync opts out, --async keeps the default.
+    let async_agent = if args.sync {
+        false
+    } else {
+        true
+    };
     CliConfig {
         enabled: true,
         tui: true,
@@ -1430,7 +1455,7 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         user_id,
         username,
         wait_background_tasks: false,
-        async_agent: args.async_agent,
+        async_agent,
     }
 }
 

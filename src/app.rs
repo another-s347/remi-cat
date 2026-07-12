@@ -287,6 +287,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 unsafe {
                     std::env::set_var("REMI_ASYNC_AGENT", "true");
                 }
+            } else {
+                unsafe {
+                    std::env::set_var("REMI_ASYNC_AGENT", "false");
+                }
             }
             if cli.tui {
                 let workspace_dir =
@@ -789,7 +793,15 @@ mod cli_tests {
         assert_eq!(config.user_id, "u1");
         assert_eq!(config.username, "Alice");
         assert_eq!(config.once, None);
-        assert!(!config.async_agent);
+        assert!(config.async_agent);
+    }
+
+    #[test]
+    fn tui_subcommand_defaults_to_async_agent_mode() {
+        let config = CliConfig::from_args(&args(&["tui"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(config.async_agent);
     }
 
     #[test]
@@ -798,6 +810,14 @@ mod cli_tests {
         assert!(config.enabled);
         assert!(config.tui);
         assert!(config.async_agent);
+    }
+
+    #[test]
+    fn tui_subcommand_can_disable_async_agent_mode() {
+        let config = CliConfig::from_args(&args(&["tui", "--sync"])).unwrap();
+        assert!(config.enabled);
+        assert!(config.tui);
+        assert!(!config.async_agent);
     }
 
     #[test]

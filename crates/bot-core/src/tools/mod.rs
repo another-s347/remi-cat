@@ -1293,8 +1293,8 @@ impl Tool for RipgrepTool {
     }
     fn description(&self) -> &str {
         "Search workspace files with ripgrep. Prefer this for text/code search. \
-         Prefer structured args like {\"args\":[\"TODO\",\"src\",\"-g\",\"*.rs\"]}; \
-         query is kept for shell-style compatibility. Do not shell-quote args entries. \
+         Use structured args like {\"args\":[\"TODO\",\"src\",\"-g\",\"*.rs\"]}. \
+         Do not shell-quote args entries. \
          Use -F for literal text so regex metacharacters like parentheses do not need regex escaping. \
          Paths are workspace-relative. Results include file paths, line numbers, and columns."
     }
@@ -1307,16 +1307,12 @@ impl Tool for RipgrepTool {
                     "items": { "type": "string" },
                     "description": "Preferred. Exact rg argv without the rg binary, for example [\"TODO\", \"src\", \"-g\", \"*.rs\"] or [\"-F\", \"info!(\\\"ready\\\")\", \"src\"]. Do not shell-quote entries; use separate array elements. Use -F for literal text to avoid regex escaping."
                 },
-                "query": { "type": "string", "description": "Compatibility fallback. Arguments to pass to rg, for example \"TODO src -g '*.rs'\". Parsed shell-style, then executed as rg argv." },
                 "max_bytes": {
                     "type": "integer",
                     "description": format!("Maximum output bytes to return (default {DEFAULT_FS_READ_LENGTH}).")
                 }
             },
-            "anyOf": [
-                { "required": ["args"] },
-                { "required": ["query"] }
-            ]
+            "required": ["args"]
         })
     }
     fn execute(
@@ -1380,35 +1376,23 @@ impl Tool for RipgrepTool {
 }
 
 fn rg_args_from_arguments(arguments: &serde_json::Value) -> Result<Vec<String>, AgentError> {
-    let args = if let Some(values) = arguments.get("args").and_then(|value| value.as_array()) {
-        let mut args = Vec::new();
-        for value in values {
-            let arg = value
-                .as_str()
-                .ok_or_else(|| AgentError::tool("rg", "'args' entries must be strings"))?
-                .trim();
-            if !arg.is_empty() {
-                args.push(arg.to_string());
-            }
-        }
-        args
-    } else {
-        let query = arguments["query"]
+    let values = arguments
+        .get("args")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| AgentError::tool("rg", "missing required 'args' parameter"))?;
+    let mut args = Vec::new();
+    for value in values {
+        let arg = value
             .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentError::tool("rg", "missing 'args' or 'query'"))?;
-        parse_rg_query(query)?
-    };
+            .ok_or_else(|| AgentError::tool("rg", "'args' entries must be strings"))?
+            .trim();
+        if !arg.is_empty() {
+            args.push(arg.to_string());
+        }
+    }
     normalize_rg_args(args)
 }
 
-fn parse_rg_query(query: &str) -> Result<Vec<String>, AgentError> {
-    normalize_rg_args(
-        split_rg_query_preserving_regex_escapes(query)
-            .ok_or_else(|| AgentError::tool("rg", "failed to parse query; check shell quoting"))?,
-    )
-}
 
 fn normalize_rg_args(mut args: Vec<String>) -> Result<Vec<String>, AgentError> {
     if matches!(args.first().map(String::as_str), Some("rg" | "ripgrep")) {
@@ -1418,89 +1402,6 @@ fn normalize_rg_args(mut args: Vec<String>) -> Result<Vec<String>, AgentError> {
         return Err(AgentError::tool("rg", "missing ripgrep arguments"));
     }
     Ok(args)
-}
-
-fn split_rg_query_preserving_regex_escapes(query: &str) -> Option<Vec<String>> {
-    #[derive(Copy, Clone, Eq, PartialEq)]
-    enum Quote {
-        None,
-        Single,
-        Double,
-    }
-
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote = Quote::None;
-    let mut chars = query.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match quote {
-            Quote::None => match ch {
-                '\'' => quote = Quote::Single,
-                '"' => quote = Quote::Double,
-                '\\' => {
-                    if let Some(next) = chars.peek().copied() {
-                        if current.is_empty() && matches!(next, '\'' | '"') {
-                            quote = if next == '\'' {
-                                Quote::Single
-                            } else {
-                                Quote::Double
-                            };
-                            chars.next();
-                        } else if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') {
-                            current.push(next);
-                            chars.next();
-                        } else {
-                            current.push(ch);
-                        }
-                    } else {
-                        current.push(ch);
-                    }
-                }
-                ch if ch.is_whitespace() => {
-                    if !current.is_empty() {
-                        args.push(std::mem::take(&mut current));
-                    }
-                }
-                _ => current.push(ch),
-            },
-            Quote::Single => match ch {
-                '\'' => quote = Quote::None,
-                _ => current.push(ch),
-            },
-            Quote::Double => match ch {
-                '"' => quote = Quote::None,
-                '\\' => {
-                    if let Some(next) = chars.peek().copied() {
-                        if next == '"' {
-                            chars.next();
-                            if chars.peek().is_none_or(|after| after.is_whitespace()) {
-                                quote = Quote::None;
-                            } else {
-                                current.push(next);
-                            }
-                        } else if next == '\\' {
-                            current.push(next);
-                            chars.next();
-                        } else {
-                            current.push(ch);
-                        }
-                    } else {
-                        current.push(ch);
-                    }
-                }
-                _ => current.push(ch),
-            },
-        }
-    }
-
-    if quote != Quote::None {
-        return None;
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    Some(args)
 }
 
 fn rg_command(query_args: &[String]) -> String {
@@ -1708,7 +1609,7 @@ impl Tool for ExaSearchTool {
 mod tests {
     use super::{
         format_command_output, format_utc_offset, parse_apply_patch, parse_manage_yourself_command,
-        parse_rg_query, parse_ssh_target, parse_timezone_spec, rg_args_from_arguments, rg_command,
+        parse_ssh_target, parse_timezone_spec, rg_args_from_arguments,
         ssh_command_args, validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool,
         RootedFsApplyPatchTool, RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool,
         WorkspaceSshTool,
@@ -1877,45 +1778,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rg_command_quotes_arguments() {
-        let args = parse_rg_query(r#""can't touch this" src/lib.rs -g '*.rs' -t rust"#)
-            .expect("query should parse");
-        let command = rg_command(&args);
-        assert!(command.contains("'can'\"'\"'t touch this'"));
-        assert!(command.contains("'-g' '*.rs'"));
-        assert!(command.contains("'-t' 'rust'"));
-        assert!(command.ends_with("'-t' 'rust'"));
-    }
 
-    #[test]
-    fn rg_query_preserves_regex_escapes() {
-        let args = parse_rg_query(r#"info!\( src/ --max-count 10"#).expect("query should parse");
-        assert_eq!(args[0], r#"info!\("#);
 
-        let command = rg_command(&args);
-        assert!(command.contains(r#"'info!\('"#));
-    }
 
-    #[test]
-    fn rg_query_still_supports_shell_style_quotes() {
-        let args =
-            parse_rg_query(r#"alpha\ beta "quoted value" 'glob*.rs'"#).expect("query should parse");
-        assert_eq!(args, vec!["alpha beta", "quoted value", "glob*.rs"]);
-    }
 
-    #[test]
-    fn rg_query_accepts_json_style_escaped_quotes() {
-        let args =
-            parse_rg_query(r#"alpha \"src/lib.rs\" -g \"*.rs\""#).expect("query should parse");
-        assert_eq!(args, vec!["alpha", "src/lib.rs", "-g", "*.rs"]);
-    }
-
-    #[test]
-    fn rg_query_strips_accidental_binary_prefix() {
-        let args = parse_rg_query(r#"rg alpha src -g '*.rs'"#).expect("query should parse");
-        assert_eq!(args, vec!["alpha", "src", "-g", "*.rs"]);
-    }
 
     #[test]
     fn rg_args_accept_structured_complex_values() {
@@ -1966,7 +1832,7 @@ mod tests {
             <RipgrepTool as Tool>::execute(
                 &tool,
                 json!({
-                    "query": "alpha src -g '*.rs'"
+                    "args": ["alpha", "src", "-g", "*.rs"]
                 }),
                 None,
                 ctx.clone(),
@@ -2001,7 +1867,7 @@ mod tests {
             <RipgrepTool as Tool>::execute(
                 &tool,
                 json!({
-                    "query": r#"alpha \"src/lib.rs\""#
+                    "args": ["alpha", "src/lib.rs", "-g", "*.rs"]
                 }),
                 None,
                 ctx.clone(),
@@ -2115,7 +1981,7 @@ mod tests {
             <RipgrepTool as Tool>::execute(
                 &tool,
                 json!({
-                    "query": r#"info!\( src --max-count 10"#
+                    "args": ["info!\\(", "src", "--max-count", "10"]
                 }),
                 None,
                 ctx.clone(),

@@ -775,6 +775,7 @@ struct SubmittedInput {
 struct PendingSteer {
     steer_id: String,
     display_text: String,
+    content: Content,
 }
 
 impl TuiApp {
@@ -1307,6 +1308,18 @@ impl TuiApp {
             }
             return Ok(false);
         }
+        // The foreground turn has already yielded when the runtime is only
+        // waiting for asynchronous tool tasks. The runtime intentionally
+        // keeps its steer queue registered so task completions can resume the
+        // workflow, but new user input belongs to the next turn rather than
+        // that internal continuation.
+        if should_queue_for_next_turn(self.running, self.awaiting_background_tasks) {
+            self.queued_inputs.push_back(SubmittedInput {
+                display_text,
+                content,
+            });
+            return Ok(false);
+        }
         if self.running {
             let request = ChatRequest::text(self.session_id.clone(), ChatChannel::Tui, text)
                 .with_content(content.clone())
@@ -1319,6 +1332,7 @@ impl TuiApp {
                     self.pending_steers.push_back(PendingSteer {
                         steer_id: event.steer_id,
                         display_text,
+                        content,
                     });
                 }
                 SteerSubmitResult::NotRunning => {
@@ -1940,6 +1954,12 @@ impl TuiApp {
                 self.has_activity = true;
                 self.status.last_error = Some(message.clone());
                 self.cells.push(HistoryCell::error(message));
+                // Preserve user input submitted while the run was still active
+                // so it is not silently dropped on error.
+                promote_pending_steers_to_queued_inputs(
+                    &mut self.pending_steers,
+                    &mut self.queued_inputs,
+                );
                 self.running = false;
                 self.awaiting_background_tasks = false;
                 self.background_task_count = 0;
@@ -1955,6 +1975,10 @@ impl TuiApp {
             }
             BotEvent::Cancelled => {
                 self.has_activity = true;
+                promote_pending_steers_to_queued_inputs(
+                    &mut self.pending_steers,
+                    &mut self.queued_inputs,
+                );
                 self.running = false;
                 self.awaiting_background_tasks = false;
                 self.background_task_count = 0;
@@ -1989,8 +2013,18 @@ impl TuiApp {
                 if self.exit_after_run {
                     self.queued_inputs.clear();
                     self.pending_steers.clear();
-                } else if let Some(next) = self.queued_inputs.pop_front() {
-                    self.start_turn(next);
+                } else {
+                    // Some cancellation paths terminate directly with Done
+                    // instead of emitting a distinct Cancelled event first.
+                    // Preserve any steer that the old run did not consume and
+                    // immediately hand it to a fresh turn.
+                    promote_pending_steers_to_queued_inputs(
+                        &mut self.pending_steers,
+                        &mut self.queued_inputs,
+                    );
+                    if let Some(next) = self.queued_inputs.pop_front() {
+                        self.start_turn(next);
+                    }
                 }
             }
         }
@@ -3370,6 +3404,22 @@ impl TuiApp {
     }
 }
 
+fn should_queue_for_next_turn(running: bool, awaiting_background_tasks: bool) -> bool {
+    running && awaiting_background_tasks
+}
+
+fn promote_pending_steers_to_queued_inputs(
+    pending_steers: &mut VecDeque<PendingSteer>,
+    queued_inputs: &mut VecDeque<SubmittedInput>,
+) {
+    while let Some(steer) = pending_steers.pop_back() {
+        queued_inputs.push_front(SubmittedInput {
+            display_text: steer.display_text,
+            content: steer.content,
+        });
+    }
+}
+
 async fn ensure_tui_sub_session_channel_session(
     runtime: &Rc<Runtime>,
     parent_session_id: &str,
@@ -4558,8 +4608,9 @@ fn build_warp_open_command(config_name: &str) -> PaneLaunchCommand {
 
 fn tui_resume_command_args(exe: &Path, session_id: &str, cli: &CliConfig) -> Vec<OsString> {
     let mut args = vec![exe.as_os_str().to_os_string(), OsString::from("tui")];
-    if cli.async_agent {
-        args.push(OsString::from("--async"));
+    // TUI defaults to async; only emit an explicit mode flag when opting out.
+    if !cli.async_agent {
+        args.push(OsString::from("--sync"));
     }
     args.extend([
         OsString::from("resume"),
@@ -4918,7 +4969,7 @@ mod tests {
 
     #[test]
     fn tmux_pane_launch_command_resumes_session() {
-        let cli = test_cli_config();
+        let cli = test_async_cli_config();
         let command =
             build_pane_launch_command(true, true, Path::new("/tmp/remi-cat"), "session-1", &cli)
                 .expect("tmux should be preferred");
@@ -4944,7 +4995,7 @@ mod tests {
 
     #[test]
     fn zellij_pane_launch_command_resumes_session() {
-        let cli = test_cli_config();
+        let cli = test_async_cli_config();
         let command =
             build_pane_launch_command(false, true, Path::new("/tmp/remi-cat"), "session-1", &cli)
                 .expect("zellij should be supported");
@@ -4973,7 +5024,7 @@ mod tests {
 
     #[test]
     fn pane_launch_command_is_absent_without_supported_multiplexer() {
-        let cli = test_cli_config();
+        let cli = test_async_cli_config();
         assert!(build_pane_launch_command(
             false,
             false,
@@ -4986,7 +5037,7 @@ mod tests {
 
     #[test]
     fn warp_tab_config_runs_resume_command() {
-        let cli = test_cli_config();
+        let cli = test_async_cli_config();
         let toml = warp_tab_config_toml(
             "remi_cat_fork_session1",
             Path::new("/tmp/remi cat"),
@@ -5001,7 +5052,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_resume_args_preserve_async_agent_flag() {
+    fn tui_resume_args_omit_async_flag_when_default_enabled() {
         let args = tui_resume_command_args(
             Path::new("/tmp/remi-cat"),
             "session-1",
@@ -5011,7 +5062,22 @@ mod tests {
 
         assert_eq!(rendered[0], "/tmp/remi-cat");
         assert_eq!(rendered[1], "tui");
-        assert_eq!(rendered[2], "--async");
+        assert_eq!(rendered[2], "resume");
+        assert_eq!(rendered[3], "session-1");
+    }
+
+    #[test]
+    fn tui_resume_args_preserve_sync_agent_flag() {
+        let args = tui_resume_command_args(
+            Path::new("/tmp/remi-cat"),
+            "session-1",
+            &test_cli_config(),
+        );
+        let rendered = os_args_to_strings(&args);
+
+        assert_eq!(rendered[0], "/tmp/remi-cat");
+        assert_eq!(rendered[1], "tui");
+        assert_eq!(rendered[2], "--sync");
         assert_eq!(rendered[3], "resume");
         assert_eq!(rendered[4], "session-1");
     }
@@ -6408,6 +6474,48 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn input_waiting_only_on_background_tasks_queues_for_next_turn() {
+        assert!(should_queue_for_next_turn(true, true));
+    }
+
+    #[test]
+    fn input_during_foreground_execution_remains_a_steer() {
+        assert!(!should_queue_for_next_turn(true, false));
+        assert!(!should_queue_for_next_turn(false, true));
+    }
+
+    #[test]
+    fn cancelled_run_promotes_pending_steers_in_submission_order() {
+        let mut pending = VecDeque::from([
+            PendingSteer {
+                steer_id: "steer-1".to_string(),
+                display_text: "first".to_string(),
+                content: Content::text("first"),
+            },
+            PendingSteer {
+                steer_id: "steer-2".to_string(),
+                display_text: "second".to_string(),
+                content: Content::text("second"),
+            },
+        ]);
+        let mut queued = VecDeque::from([SubmittedInput {
+            display_text: "already queued".to_string(),
+            content: Content::text("already queued"),
+        }]);
+
+        promote_pending_steers_to_queued_inputs(&mut pending, &mut queued);
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.display_text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "already queued"]
+        );
     }
 
     // ── Empty-session cleanup decision logic ──────────────────────────────

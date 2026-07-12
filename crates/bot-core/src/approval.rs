@@ -674,12 +674,7 @@ fn is_readonly_command_segment(segment: &str) -> bool {
 
 fn is_readonly_program_invocation(program: &str, words: &[String]) -> bool {
     match program {
-        "find" => !words.iter().any(|word| {
-            matches!(
-                word.as_str(),
-                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
-            )
-        }),
+        "find" => is_readonly_find_invocation(words),
         "sed" => !words
             .iter()
             .skip(1)
@@ -720,6 +715,113 @@ fn shell_program_name(word: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(word)
+}
+
+/// Find is treated as read-only when it only inspects files.
+///
+/// `-delete` is always destructive. `-exec/-execdir/-ok/-okdir` are:
+/// - read-only when every executed program is on the read-only allowlist
+/// - high-risk when any executed program is a known destructive tool
+/// - medium otherwise (unknown / non-readonly program)
+fn is_readonly_find_invocation(words: &[String]) -> bool {
+    if words.iter().any(|word| word == "-delete") {
+        return false;
+    }
+    find_exec_programs(words)
+        .into_iter()
+        .all(|(prog, args)| is_readonly_find_exec_program(prog, args))
+}
+
+fn find_action_is_destructive(words: &[String]) -> bool {
+    if words.iter().any(|word| word == "-delete") {
+        return true;
+    }
+    find_exec_programs(words)
+        .into_iter()
+        .any(|(prog, _args)| is_destructive_find_exec_program(prog))
+}
+
+fn is_destructive_find_exec_program(program: &str) -> bool {
+    matches!(
+        shell_program_name(program),
+        "rm" | "rmdir" | "sudo" | "dd" | "mkfs" | "shred" | "chmod" | "chown" | "mv" | "cp"
+            | "install" | "truncate" | "tee"
+    ) || program.is_empty()
+}
+
+fn is_readonly_find_exec_program(program: &str, exec_args: &[String]) -> bool {
+    if shell_program_name(program) == "sed" {
+        return !exec_args.iter().any(|arg| arg == "-i");
+    }
+    matches!(
+        shell_program_name(program),
+        "pwd"
+            | "ls"
+            | "cat"
+            | "head"
+            | "tail"
+            | "wc"
+            | "nl"
+            | "sort"
+            | "uniq"
+            | "cut"
+            | "tr"
+            | "file"
+            | "stat"
+            | "du"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "ripgrep"
+            | "date"
+            | "env"
+            | "printenv"
+            | "which"
+            | "whereis"
+            | "type"
+            | "command"
+            | "ps"
+            | "df"
+            | "free"
+            | "uname"
+            | "id"
+            | "whoami"
+            | "hostname"
+            | "realpath"
+            | "readlink"
+            | "basename"
+            | "dirname"
+            | "jq"
+            | "tree"
+    )
+}
+
+fn find_exec_programs(words: &[String]) -> Vec<(&str, &[String])> {
+    let mut programs: Vec<(&str, &[String])> = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if !matches!(word, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            index += 1;
+            continue;
+        }
+        let Some(program) = words.get(index + 1).map(String::as_str) else {
+            // Missing program after an action predicate is not trusted as read-only.
+            programs.push(("", &[]));
+            break;
+        };
+        index += 2;
+        let args_start = index;
+        while index < words.len() && !matches!(words[index].as_str(), ";" | "+") {
+            index += 1;
+        }
+        programs.push((program, &words[args_start..index]));
+        if index < words.len() {
+            index += 1;
+        }
+    }
+    programs
 }
 
 fn classify_fs_remove_risk(args: &serde_json::Value) -> ToolRiskLevel {
@@ -834,12 +936,7 @@ fn is_destructive_command(command: &str, words: &[String]) -> bool {
                 .any(|word| is_high_risk_delete_path(word) || has_broad_wildcard(word));
     }
     if program == "find" {
-        return words.iter().any(|word| {
-            matches!(
-                word.as_str(),
-                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
-            )
-        });
+        return find_action_is_destructive(words);
     }
     false
 }
@@ -1249,6 +1346,9 @@ mod tests {
             "tail -n 20 src/main.rs",
             "wc -l src/main.rs",
             "find . -type f",
+            "find . -type f -exec ls -lh {} ;",
+            "find . -type f -exec cat {} +",
+            "find . -name '*.rs' -exec rg -n needle {} +",
             "sed -n 1,20p src/main.rs",
             "grep needle file.txt",
             "rg needle",
@@ -1282,6 +1382,8 @@ mod tests {
             "rm /tmp/x",
             "rm -rf /tmp/x",
             "find . -type f -delete",
+            "find . -type f -exec rm {} +",
+            "find . -type f -ok rm {} ;",
             "sudo apt-get remove libc6",
         ] {
             assert_eq!(
@@ -1294,10 +1396,14 @@ mod tests {
         for command in [
             "rm file.txt",
             "sed -i s/a/b/ .env",
+            "find . -type f -exec sed -i s/a/b/ {} +",
             "grep $(whoami) file.txt",
             "python3 script.py",
             "cargo test -p bot-core",
             "touch file.txt",
+            "find . -type f 2>/dev/null",
+            "find . -type f -exec python3 script.py {} +",
+            "find . -type f -execdir custom_tool {} +",
             "echo hi > file.txt",
         ] {
             assert_eq!(
