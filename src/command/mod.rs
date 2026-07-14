@@ -163,7 +163,16 @@ pub(crate) async fn handle_runtime_command(
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
     if command == "/tasks" || command.starts_with("/tasks ") {
-        let reply = handle_tasks_command(&runtime.bot, session_id, command).await?;
+        let task_thread_id = {
+            let sessions = runtime.sessions.lock().await;
+            resolve_task_thread_id(
+                session_id,
+                sessions
+                    .metadata_string(session_id, "sub_session_thread_id")
+                    .as_deref(),
+            )
+        };
+        let reply = handle_tasks_command(&runtime.bot, &task_thread_id, command).await?;
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
     if command == "/skill" || command.starts_with("/skill ") || command.starts_with("/skill:") {
@@ -286,6 +295,14 @@ fn runtime_command_help() -> String {
         "- `/clear` - clear chat memory for this session",
     ]
     .join("\n")
+}
+
+fn resolve_task_thread_id(session_id: &str, sub_session_thread_id: Option<&str>) -> String {
+    sub_session_thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .unwrap_or(session_id)
+        .to_string()
 }
 
 async fn handle_tasks_command(
@@ -1731,5 +1748,21 @@ mod tests {
         assert!(!task_belongs_to_session(&task, "session-2"));
         task.background = false;
         assert!(!task_belongs_to_session(&task, "session-1"));
+    }
+
+    #[test]
+    fn task_thread_id_uses_sub_session_thread_when_present() {
+        assert_eq!(
+            resolve_task_thread_id("ui-session", Some("subagent:actual-thread")),
+            "subagent:actual-thread"
+        );
+        assert_eq!(
+            resolve_task_thread_id("normal-session", None),
+            "normal-session"
+        );
+        assert_eq!(
+            resolve_task_thread_id("normal-session", Some("   ")),
+            "normal-session"
+        );
     }
 }

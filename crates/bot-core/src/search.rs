@@ -326,6 +326,7 @@ mod tests {
                 "test-key".to_string(),
                 None,
                 "gpt-4o-mini".to_string(),
+                128_000,
                 4096,
                 serde_json::Map::new(),
             ),

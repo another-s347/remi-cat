@@ -209,6 +209,32 @@ where
         Error = AgentError,
     >,
 {
+    /// Materialize the exact runtime tool definitions that will be injected
+    /// for this input. Budget preflight and dispatch must share this path.
+    pub(crate) fn tool_definitions_for_input(
+        &self,
+        input: &LoopInput,
+        tool_allowlist_override: Option<&[String]>,
+    ) -> Vec<ToolDefinition> {
+        let tool_def_ctx = build_tool_definition_ctx(input);
+        let dynamic_tools = build_dynamic_tools(
+            tool_def_ctx.metadata.clone(),
+            self.workspace_root.clone(),
+            self.workspace_root_label.clone(),
+            self.allow_host_absolute_paths,
+            self.im_bridge.clone(),
+        );
+        let tool_allowlist = tool_allowlist_override.or(self.tool_allowlist.as_deref());
+        merge_runtime_tool_definitions(
+            &self.local_tools,
+            self.model_tools.as_ref(),
+            &dynamic_tools,
+            &tool_def_ctx,
+            &[],
+            tool_allowlist,
+        )
+    }
+
     /// Drive the agent from a pre-built `LoopInput`.
     ///
     /// Called by `CatBot::stream()` in lib.rs after injecting memory context.

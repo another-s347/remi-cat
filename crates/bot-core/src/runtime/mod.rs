@@ -113,6 +113,19 @@ fn memory_compaction_budget_tokens(
         .max(1) as usize
 }
 
+fn model_request_budget_tokens(profile: &ModelProfileConfig, context_percent: usize) -> u32 {
+    let percent_budget = context_percent_tokens(profile, context_percent) as u32;
+    let safety_margin = profile.context_tokens.saturating_mul(5).div_ceil(100);
+    percent_budget
+        .min(
+            profile
+                .context_tokens
+                .saturating_sub(profile.max_output_tokens)
+                .saturating_sub(safety_margin),
+        )
+        .max(1)
+}
+
 fn system_prompt_with_agent_md_notice_for_current_dir(system_prompt: String) -> String {
     let Ok(cwd) = std::env::current_dir() else {
         return system_prompt;
@@ -446,6 +459,7 @@ struct LocalAcpAgentRunner {
     run_locks: ThreadRunLocks,
     system_prompt: String,
     environment_context_source: EnvironmentContextSource,
+    model_profile: ModelProfileConfig,
 }
 
 struct SteerQueueRegistration {
@@ -507,13 +521,54 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
             .await;
             let mut history = build_injected_history(&ctx);
             history.insert(0, Message::system(self.system_prompt.clone()));
-            insert_environment_context_prompt(&mut history, 1, environment_context.prompt);
+            insert_environment_context_prompt(&mut history, 1, environment_context.prompt.clone());
             append_thread_todo_system_prompt(&mut history, &ctx.user_state);
-            let skip_count = history.len();
-            let input = LoopInput::start(message)
+            let mut skip_count = history.len();
+            let user_state = ctx.user_state.clone();
+            let mut input = LoopInput::start(message)
                 .history(history)
                 .metadata(serde_json::json!({ "thread_id": &thread_id }))
-                .user_state(std::mem::take(&mut ctx.user_state));
+                .user_state(user_state.clone());
+            let budget = model_request_budget_tokens(
+                &self.model_profile,
+                auto_compress_context_percent().unwrap_or(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
+            );
+            loop {
+                let definitions = self.agent.tool_definitions_for_input(&input, None);
+                let estimated = model_input_snapshot_from_loop_input(
+                    &input,
+                    &definitions,
+                    &thread_id,
+                    None,
+                    &self.model_profile.id,
+                    &self.model_profile.model,
+                )
+                .map(|snapshot| snapshot.totals.estimated_tokens)
+                .unwrap_or(0);
+                if estimated <= budget {
+                    break;
+                }
+                self.memory.compact_for_request(&thread_id).await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "ACP request exceeds context budget ({estimated} > {budget}) and compression failed: {err}"
+                    )
+                })?;
+                let mut refreshed = self.memory.load_context(&thread_id).await?;
+                refreshed.user_state = user_state.clone();
+                let mut rebuilt = build_injected_history(&refreshed);
+                rebuilt.insert(0, Message::system(self.system_prompt.clone()));
+                insert_environment_context_prompt(
+                    &mut rebuilt,
+                    1,
+                    environment_context.prompt.clone(),
+                );
+                append_thread_todo_system_prompt(&mut rebuilt, &refreshed.user_state);
+                skip_count = rebuilt.len();
+                input = LoopInput::start(message)
+                    .history(rebuilt)
+                    .metadata(serde_json::json!({ "thread_id": &thread_id }))
+                    .user_state(user_state.clone());
+            }
             let mut stream = std::pin::pin!(self.agent.stream_with_input(input));
             let mut text = String::new();
             let mut raw_history: Option<Vec<Message>> = None;
@@ -982,7 +1037,11 @@ impl CatBot {
         thread_id: &str,
     ) -> Result<usize, remi_agentloop::prelude::AgentError> {
         let run_lock = self.thread_run_lock(thread_id).await;
-        let _run_guard = run_lock.lock().await;
+        let _run_guard = run_lock.try_lock().map_err(|_| {
+            remi_agentloop::prelude::AgentError::other(
+                "cannot compact memory while this session is running; wait for the current model/tool turn to finish or cancel it first",
+            )
+        })?;
         let context = self.hook_context(thread_id, Some(self.model_profile.model.clone()), None);
         let pre = self
             .hook_manager
@@ -2367,7 +2426,7 @@ impl CatBot {
                 insert_environment_context_prompt(
                     &mut history,
                     1,
-                    environment_context.prompt,
+                    environment_context.prompt.clone(),
                 );
                 let agent_header_count =
                     2 + usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
@@ -2404,7 +2463,7 @@ impl CatBot {
                     .is_some_and(|instance| instance.status == WorkflowStatus::Active);
                 let initial_supervisor_todo_prompt =
                     route_thread_todo_prompt(&mut history, &ctx.user_state, active_supervisor);
-                let skip_count;
+                let mut skip_count;
 
                 // 3. Build request-level metadata (thread_id for tools);
                 //    build per-message metadata (sender identity + message id).
@@ -2477,6 +2536,7 @@ impl CatBot {
                     requested_user_name.as_deref(),
                 );
 
+                let pre_hook_history_len = history.len();
                 let hook_context = self.hook_context(
                     &thread_id_owned,
                     Some(effective_model.profile.model.clone()),
@@ -2526,6 +2586,7 @@ impl CatBot {
                         history.push(hook_context_message("UserPromptSubmit", context));
                     }
                 }
+                let hook_messages = history[pre_hook_history_len..].to_vec();
                 skip_count = history.len();
 
                 let should_log_media_input = content.is_multimodal()
@@ -2595,27 +2656,141 @@ impl CatBot {
                     metadata: message_metadata.clone(),
                 };
                 let mut partial_base_history = history.clone();
-                partial_base_history.push(current_user_message);
+                partial_base_history.push(current_user_message.clone());
                 let mut partial_turn = PartialTurnRecorder::new(partial_base_history);
 
-                let mut input = LoopInput::start_content(content)
+                let mut input = LoopInput::start_content(content.clone())
                     .history(history)
-                    .metadata(meta)
+                    .metadata(meta.clone())
                     .user_state(ctx.user_state);
-                if let Some(user_name) = injected_user_name {
+                if let Some(user_name) = injected_user_name.clone() {
                     input = input.user_name(user_name);
                 }
-                if let Some(mm) = message_metadata {
+                if let Some(mm) = message_metadata.clone() {
                     input = input.message_metadata(mm);
                 }
 
-                if let Some(snapshot) = model_input_snapshot_from_loop_input(
-                    &input,
-                    &thread_id_owned,
-                    round_opts.message_id.as_deref(),
-                    &effective_model.profile.id,
-                    &effective_model.profile.model,
-                ) {
+                let request_budget = model_request_budget_tokens(
+                    &effective_model.profile,
+                    auto_compress_context_percent().unwrap_or(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
+                );
+                let final_snapshot = loop {
+                    let request_tool_definitions =
+                        active_agent.tool_definitions_for_input(&input, None);
+                    let snapshot = model_input_snapshot_from_loop_input(
+                        &input,
+                        &request_tool_definitions,
+                        &thread_id_owned,
+                        round_opts.message_id.as_deref(),
+                        &effective_model.profile.id,
+                        &effective_model.profile.model,
+                    );
+                    let Some(snapshot) = snapshot else { break None };
+                    if snapshot.totals.estimated_tokens <= request_budget {
+                        break Some(snapshot);
+                    }
+                    if !self.memory.auto_compress {
+                        let _ = self
+                            .memory
+                            .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                            .await;
+                        yield CatEvent::Error(AgentError::other(format!(
+                            "model request exceeds context budget: estimated {} tokens, limit {} tokens; automatic compression is disabled",
+                            snapshot.totals.estimated_tokens, request_budget
+                        )));
+                        return;
+                    }
+                    let compacted = match self.memory.compact_for_request(&thread_id_owned).await {
+                        Ok(count) if count > 0 => count,
+                        Ok(_) => {
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(AgentError::other(format!(
+                                "model request exceeds context budget: estimated {} tokens, limit {} tokens; no complete older exchange is eligible for compression",
+                                snapshot.totals.estimated_tokens, request_budget
+                            )));
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(AgentError::other(format!(
+                                "pre-request memory compression failed while reducing {} estimated tokens to the {} token limit: {err}",
+                                snapshot.totals.estimated_tokens, request_budget
+                            )));
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        thread_id = %thread_id_owned,
+                        compacted_messages = compacted,
+                        previous_estimated_tokens = snapshot.totals.estimated_tokens,
+                        request_budget,
+                        "pre-request memory compression completed"
+                    );
+
+                    let mut refreshed = match self.memory.load_context(&thread_id_owned).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(AgentError::other(format!(
+                                "reload memory after pre-request compression: {err}"
+                            )));
+                            return;
+                        }
+                    };
+                    refreshed.user_state = initial_user_state.clone();
+                    let mut rebuilt = build_injected_history(&refreshed);
+                    rebuilt.insert(0, Message::system(effective_agent.profile.system_prompt.clone()));
+                    insert_environment_context_prompt(&mut rebuilt, 1, environment_context.prompt.clone());
+                    insert_skill_injection_prompts(
+                        &mut rebuilt,
+                        agent_header_count,
+                        &round_opts.skill_injections,
+                        skill_prompt_tools,
+                    );
+                    insert_pinned_skill_prompt(
+                        &mut rebuilt,
+                        agent_header_count,
+                        &self.pinned_skill_summaries,
+                        effective_model.profile.context_tokens,
+                        skill_prompt_tools,
+                    );
+                    if round_opts.async_agent {
+                        insert_async_tool_system_prompt(
+                            &mut rebuilt,
+                            agent_header_count
+                                + round_opts.skill_injections.len()
+                                + usize::from(!self.pinned_skill_summaries.is_empty()),
+                        );
+                    }
+                    insert_single_chat_sender_system_prompt(
+                        &mut rebuilt,
+                        agent_header_count,
+                        single_chat_sender_prompt.clone(),
+                    );
+                    route_thread_todo_prompt(&mut rebuilt, &refreshed.user_state, active_supervisor);
+                    rebuilt.extend(hook_messages.clone());
+                    skip_count = rebuilt.len();
+                    input = LoopInput::start_content(content.clone())
+                        .history(rebuilt)
+                        .metadata(meta.clone())
+                        .user_state(initial_user_state.clone());
+                    if let Some(user_name) = injected_user_name.clone() {
+                        input = input.user_name(user_name);
+                    }
+                    if let Some(mm) = message_metadata.clone() {
+                        input = input.message_metadata(mm);
+                    }
+                };
+                if let Some(snapshot) = final_snapshot {
                     yield CatEvent::ModelInputSnapshot(snapshot);
                 }
 
@@ -3774,6 +3949,7 @@ impl CatBotBuilder {
             self.api_key.clone(),
             resolved_base_url.clone(),
             profile.model.clone(),
+            profile.context_tokens,
             profile.max_output_tokens,
             extra_options,
         );
@@ -3891,6 +4067,7 @@ impl CatBotBuilder {
             run_locks: Arc::clone(&run_locks),
             system_prompt: system_prompt.clone(),
             environment_context_source: environment_context_source.clone(),
+            model_profile: profile.clone(),
         }));
         let tool_deps = LocalToolDeps {
             skill_store: Arc::clone(&skill_store),
@@ -5000,8 +5177,8 @@ mod tests {
         context_percent_tokens, default_system_prompt, format_subagent_tool_result,
         insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
         install_embedded_model_profiles, local_acp_thread_id, memory_compaction_budget_tokens,
-        model_input_snapshot_from_loop_input, prepend_group_sender_username,
-        route_thread_todo_prompt, single_chat_sender_system_prompt,
+        model_input_snapshot_from_loop_input, model_request_budget_tokens,
+        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
         try_recv_completed_tool_task, AgentModelBindings, CatBotBuilder, CatEvent, Content,
         ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
@@ -5022,12 +5199,14 @@ mod tests {
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
+
+    static LARGE_STACK_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
     fn run_large_stack_local_test<F, Fut>(test: F)
     where
@@ -5038,6 +5217,10 @@ mod tests {
             .name("bot-core-local-test".to_string())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
+                let _guard = LARGE_STACK_TEST_LOCK
+                    .get_or_init(|| StdMutex::new(()))
+                    .lock()
+                    .expect("large-stack test lock poisoned");
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -5095,6 +5278,15 @@ mod tests {
     }
 
     #[test]
+    fn full_request_budget_uses_percent_and_output_safety_limit() {
+        let mut profile = test_model_profile();
+        profile.context_tokens = 100_000;
+        profile.max_output_tokens = 20_000;
+        assert_eq!(model_request_budget_tokens(&profile, 80), 75_000);
+        assert_eq!(model_request_budget_tokens(&profile, 60), 60_000);
+    }
+
+    #[test]
     fn model_input_snapshot_classifies_core_segments() {
         let mut assistant = Message::assistant("calling tool");
         assistant.tool_calls = Some(vec![ToolCallMessage {
@@ -5120,6 +5312,7 @@ mod tests {
             .user_state(json!({"todos": []}));
         let snapshot = model_input_snapshot_from_loop_input(
             &input,
+            &[],
             "thread",
             Some("run_1"),
             "default",
@@ -6828,6 +7021,175 @@ You are Remi.
         events
     }
 
+    fn tool_chain_messages(exchange: usize) -> Vec<Message> {
+        use remi_agentloop::types::{FunctionCall, ToolCallMessage};
+        let call_id = format!("call-{exchange}");
+        let mut assistant = Message::assistant(format!("checking exchange {exchange}"));
+        assistant.tool_calls = Some(vec![ToolCallMessage {
+            id: call_id.clone(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "now".to_string(),
+                arguments: format!(r#"{{"timezone":"UTC","exchange":{exchange}}}"#),
+            },
+        }]);
+        vec![
+            Message::user(format!("user exchange {exchange}")),
+            assistant,
+            Message::tool_result(call_id, format!("2026-07-14T00:00:{exchange:02}Z")),
+            Message::assistant(format!("exchange {exchange} complete")),
+        ]
+    }
+
+    #[test]
+    fn long_tool_history_compacts_and_continues_end_to_end() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "80");
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text("自由格式摘要：六个工具交换均已闭环，最后状态 exchange 6 complete。"),
+                sse_text("continuity preserved after compaction"),
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let mut profile = test_model_profile();
+            profile.base_url = Some(base_url);
+            profile.model = "mock-model".to_string();
+            profile.context_tokens = 128_000;
+            profile.max_output_tokens = 4_096;
+            let bot = CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile: profile,
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir: data_dir.path().join("skills"),
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir: data_dir.path().join("agents"),
+                max_turns: Some(4),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+            }
+            .build()
+            .unwrap();
+            let thread = "tool-chain-20-plus-e2e";
+            let run_lock = bot.thread_run_lock(thread).await;
+            let run_guard = run_lock.lock().await;
+            let busy_result =
+                tokio::time::timeout(Duration::from_millis(100), bot.compact_memory(thread))
+                    .await
+                    .expect("busy /compact must not wait on the session lock")
+                    .expect_err("busy /compact should return an explicit error");
+            assert!(busy_result.to_string().contains("session is running"));
+            drop(run_guard);
+            let messages = (1..=6).flat_map(tool_chain_messages).collect::<Vec<_>>();
+            assert_eq!(messages.len(), 24);
+            bot.memory
+                .append_failed_turn(thread, messages)
+                .await
+                .unwrap();
+            assert_eq!(bot.compact_memory(thread).await.unwrap(), 16);
+            let events = collect_stream(bot.stream(thread, "continue from exchange 6")).await;
+            assert!(events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text.contains("continuity preserved"))
+            ));
+            assert_eq!(bot.memory.thread_history(thread).await.len(), 26);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].contains("call-1") && requests[0].contains("2026-07-14T00:00:01Z"));
+            assert!(requests[1].contains("LATEST COMPRESSED MEMORY"));
+        });
+    }
+
+    #[test]
+    fn full_request_budget_triggers_pre_request_compaction_end_to_end() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "55");
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text("预算触发摘要：旧交换已压缩。"),
+                sse_text("automatic compaction completed before this answer"),
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let mut profile = test_model_profile();
+            profile.base_url = Some(base_url);
+            profile.model = "mock-model".to_string();
+            profile.context_tokens = 40_000;
+            profile.max_output_tokens = 4_096;
+            let bot = CatBotBuilder {
+                api_key: "test".to_string(),
+                model_profile: profile,
+                runtime_model_locked: false,
+                system: default_system_prompt(),
+                skills_dir: data_dir.path().join("skills"),
+                data_dir: data_dir.path().to_path_buf(),
+                agent_md_path: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir: data_dir.path().join("agents"),
+                max_turns: Some(4),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+            }
+            .build()
+            .unwrap();
+            let thread = "automatic-budget-compaction-e2e";
+            let messages = (1..=8)
+                .flat_map(|i| {
+                    vec![
+                        Message::user(format!("exchange {i}: {}", "context ".repeat(700))),
+                        Message::assistant(format!("answer {i}: {}", "evidence ".repeat(500))),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            bot.memory
+                .append_failed_turn(thread, messages)
+                .await
+                .unwrap();
+            let events = collect_stream(bot.stream(thread, "final continuity check")).await;
+            assert!(events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text.contains("automatic compaction"))
+            ));
+            assert_eq!(bot.memory.thread_history(thread).await.len(), 18);
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "compression must precede the main request"
+            );
+            assert!(!requests[0].contains("final continuity check"));
+            assert!(requests[1].contains("final continuity check"));
+            assert!(requests[1].contains("LATEST COMPRESSED MEMORY"));
+        });
+    }
+
     async fn start_openai_mock_server(
         responses: Vec<String>,
     ) -> (String, Arc<StdMutex<Vec<String>>>) {
@@ -7102,6 +7464,7 @@ You are Remi.
                 "test-key".to_string(),
                 None,
                 "gpt-4o-mini".to_string(),
+                128_000,
                 4096,
                 serde_json::Map::new(),
             ),

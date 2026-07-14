@@ -22,7 +22,7 @@
 //!     <name>.md             ← agent-maintained named memory
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -316,9 +316,15 @@ impl MemoryStore {
         &self,
         thread_id: &str,
         msgs: Vec<Message>,
+        desired_split: Option<usize>,
     ) -> Result<Vec<Message>, AgentError> {
-        let desired = (msgs.len() / 2).max(1);
+        let desired = desired_split.unwrap_or_else(|| (msgs.len() / 2).max(1));
         let split = safe_split_point(&msgs, desired);
+        if split == 0 {
+            return Err(AgentError::other(
+                "no protocol-safe complete exchange is eligible for compression",
+            ));
+        }
         let (oldest, remaining) = msgs.split_at(split);
         let oldest = oldest.to_vec();
         let remaining = remaining.to_vec();
@@ -517,7 +523,7 @@ impl MemoryStore {
         let covered_position = last_covered_position_across_tiers(&ledger, &mid_term, &long_term);
         let uncovered_start = covered_position.map_or(0, |position| position + 1);
         let recent_start = recent_complete_start(&ledger, 10);
-        let short_term = ledger[uncovered_start.min(recent_start)..].to_vec();
+        let short_term = protocol_safe_history(&ledger[uncovered_start.min(recent_start)..]);
         let uncovered_tokens = estimate_memory_message_tokens(&ledger[uncovered_start..]);
         short_term_token_counts()
             .lock()
@@ -737,6 +743,19 @@ impl MemoryStore {
             .await
     }
 
+    /// Append a failed/preflight-only turn without triggering compaction.
+    pub async fn append_failed_turn(
+        &self,
+        thread_id: &str,
+        messages: Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
+        Self::append_short_term(&self.short_term_path(thread_id), &messages).await?;
+        remove_thread_caches(&self.token_cache_key(thread_id));
+        Ok(())
+    }
+
     pub async fn save_turn_with_compaction_events(
         &self,
         thread_id: &str,
@@ -800,7 +819,10 @@ impl MemoryStore {
                 attempt.remaining_messages,
                 None,
             );
-            match self.compress_to_mid_term(thread_id, active.clone()).await {
+            match self
+                .compress_to_mid_term(thread_id, active.clone(), None)
+                .await
+            {
                 Ok(remaining) => {
                     cached_uncovered_tokens = estimate_memory_message_tokens(&remaining);
                     emit_compaction_event(
@@ -843,6 +865,50 @@ impl MemoryStore {
             compacted_messages: split,
             remaining_messages: msgs.len().saturating_sub(split),
         }
+    }
+
+    /// Compact the oldest uncovered complete exchanges for request preflight.
+    /// The ledger remains append-only; the returned count is newly covered raw
+    /// messages. Recent raw messages are retained whenever a safe boundary exists.
+    pub async fn compact_for_request(&self, thread_id: &str) -> Result<usize, AgentError> {
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
+        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let mid_idx = Self::read_index(&self.mid_term_dir(thread_id)).await;
+        let long_idx = Self::read_index(&self.long_term_dir(thread_id)).await;
+        let start = last_covered_position_across_tiers(&ledger, &mid_idx, &long_idx)
+            .map_or(0, |position| position + 1);
+        let active = ledger[start..].to_vec();
+        let keep_start = recent_complete_start(&active, 10);
+        let desired = if keep_start > 0 {
+            keep_start
+        } else {
+            safe_split_point(&active, (active.len() / 2).max(1))
+        };
+        let desired = (1..=desired)
+            .rev()
+            .find(|&end| {
+                end < active.len()
+                    && matches!(active[end].role, Role::User | Role::System)
+                    && tool_protocol_closed(&active[..end])
+                    && self.compressor.input_fits(&active[..end])
+            })
+            .or_else(|| {
+                (desired == active.len()
+                    && tool_protocol_closed(&active)
+                    && self.compressor.input_fits(&active))
+                .then_some(desired)
+            })
+            .unwrap_or(0);
+        if desired == 0 || active.len() <= 1 {
+            return Err(AgentError::other(
+                "no old complete exchange fits the compressor context while retaining the latest exchange",
+            ));
+        }
+        let remaining = self
+            .compress_to_mid_term(thread_id, active.clone(), Some(desired))
+            .await?;
+        Ok(active.len().saturating_sub(remaining.len()))
     }
 
     /// Persist tool-managed user_state (todos, etc.) to disk.
@@ -1272,8 +1338,106 @@ fn recent_complete_start(messages: &[Message], max_messages: usize) -> usize {
     }
     let desired = messages.len() - max_messages;
     (desired..messages.len())
-        .find(|&i| matches!(messages[i].role, Role::User | Role::System))
-        .unwrap_or(desired)
+        .find(|&i| {
+            matches!(messages[i].role, Role::User | Role::System)
+                && tool_protocol_closed(&messages[..i])
+        })
+        // Retaining extra raw history is safer than cutting through a tool
+        // exchange when no closed boundary exists.
+        .unwrap_or(0)
+}
+
+fn tool_protocol_closed(messages: &[Message]) -> bool {
+    let calls = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| call.id.as_str())
+        .collect::<HashSet<_>>();
+    let results = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<HashSet<_>>();
+    calls == results
+}
+
+/// Return model-safe history without mutating the append-only ledger.
+///
+/// Providers require every assistant tool call to be followed by matching tool
+/// results. Interrupted turns and legacy compression boundaries can leave a
+/// partial chain in durable history. Preserve that evidence as a protocol-
+/// neutral system record instead of repeatedly sending an invalid sequence.
+fn protocol_safe_history(messages: &[Message]) -> Vec<Message> {
+    let mut safe = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let message = &messages[i];
+        if let Some(calls) = message
+            .tool_calls
+            .as_ref()
+            .filter(|calls| !calls.is_empty())
+        {
+            let expected = calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut found = HashSet::new();
+            let mut j = i + 1;
+            while j < messages.len() && messages[j].role == Role::Tool {
+                if let Some(id) = messages[j].tool_call_id.as_deref() {
+                    if expected.contains(id) {
+                        found.insert(id);
+                    }
+                }
+                j += 1;
+            }
+            if found.len() == expected.len() {
+                safe.extend_from_slice(&messages[i..j]);
+            } else {
+                let call_list = calls
+                    .iter()
+                    .map(|call| {
+                        format!(
+                            "{}({}) id={}",
+                            call.function.name, call.function.arguments, call.id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let results = messages[i + 1..j]
+                    .iter()
+                    .map(|result| {
+                        format!(
+                            "id={} result={}",
+                            result.tool_call_id.as_deref().unwrap_or("unknown"),
+                            result.content.text_content()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                safe.push(Message::system(format!(
+                    "[INCOMPLETE HISTORICAL TOOL ACTIVITY]\nassistant_text={}\ncalls={}\n{}",
+                    message.content.text_content(),
+                    call_list,
+                    results
+                )));
+            }
+            i = j;
+            continue;
+        }
+        if message.role == Role::Tool {
+            safe.push(Message::system(format!(
+                "[ORPHANED HISTORICAL TOOL RESULT]\nid={}\n{}",
+                message.tool_call_id.as_deref().unwrap_or("unknown"),
+                message.content.text_content()
+            )));
+        } else {
+            safe.push(message.clone());
+        }
+        i += 1;
+    }
+    safe
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
@@ -1569,24 +1733,26 @@ fn safe_split_point(msgs: &[Message], desired: usize) -> usize {
     let desired = desired.clamp(1, msgs.len().saturating_sub(1));
 
     for i in desired..msgs.len() {
-        if matches!(msgs[i].role, Role::User | Role::System) {
+        if matches!(msgs[i].role, Role::User | Role::System) && tool_protocol_closed(&msgs[..i]) {
             return i;
         }
     }
     for i in (1..desired).rev() {
-        if matches!(msgs[i].role, Role::User | Role::System) {
+        if matches!(msgs[i].role, Role::User | Role::System) && tool_protocol_closed(&msgs[..i]) {
             return i;
         }
     }
 
-    // No safe boundary exists. Compact everything instead of repeatedly
-    // compacting one message and emitting a stream of tiny compaction events.
-    msgs.len()
+    // Compact everything only when the whole range is closed. An interrupted
+    // tool exchange must remain raw until its result arrives (or be neutralized
+    // by protocol_safe_history when building model context).
+    usize::from(tool_protocol_closed(msgs)) * msgs.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remi_agentloop::types::{FunctionCall, ToolCallMessage};
     use serde_json::json;
 
     fn test_store(data_dir: PathBuf) -> MemoryStore {
@@ -1597,6 +1763,7 @@ mod tests {
                 "test-key".to_string(),
                 None,
                 "gpt-4o-mini".to_string(),
+                128_000,
                 4096,
                 serde_json::Map::new(),
             ),
@@ -1774,13 +1941,25 @@ mod tests {
 
     #[test]
     fn safe_split_prefers_later_boundary_to_avoid_tiny_compactions() {
+        let tool_call = |id: &str, name: &str| {
+            let mut message = Message::assistant("");
+            message.tool_calls = Some(vec![ToolCallMessage {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]);
+            message
+        };
         let msgs = vec![
             Message::user("start"),
-            Message::assistant("a1"),
+            tool_call("call-1", "one"),
             Message::tool_result("call-1", "t1"),
-            Message::assistant("a2"),
+            tool_call("call-2", "two"),
             Message::tool_result("call-2", "t2"),
-            Message::assistant("a3"),
+            tool_call("call-3", "three"),
             Message::tool_result("call-3", "t3"),
             Message::user("next clean turn"),
             Message::assistant("a4"),
@@ -1790,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_split_compacts_all_when_no_clean_remaining_boundary_exists() {
+    fn safe_split_refuses_unclosed_tool_protocol() {
         let msgs = vec![
             Message::assistant("a1"),
             Message::tool_result("call-1", "t1"),
@@ -1798,7 +1977,80 @@ mod tests {
             Message::tool_result("call-2", "t2"),
         ];
 
-        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), msgs.len());
+        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), 0);
+    }
+
+    #[test]
+    fn safe_split_skips_system_message_inside_tool_chain() {
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCallMessage {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let msgs = vec![
+            Message::user("start"),
+            assistant,
+            Message::system("internal progress marker"),
+            Message::tool_result("call-1", "done"),
+            Message::user("next turn"),
+            Message::assistant("answer"),
+        ];
+
+        assert_eq!(safe_split_point(&msgs, 2), 4);
+    }
+
+    #[test]
+    fn protocol_safe_history_preserves_complete_tool_chain() {
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCallMessage {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{\"id\":1}".to_string(),
+            },
+        }]);
+        let result = Message::tool_result("call-1", "found");
+
+        let safe = protocol_safe_history(&[assistant.clone(), result.clone()]);
+        assert_eq!(safe.len(), 2);
+        assert_eq!(safe[0].id, assistant.id);
+        assert_eq!(safe[1].id, result.id);
+        assert_eq!(safe[1].role, Role::Tool);
+    }
+
+    #[test]
+    fn protocol_safe_history_neutralizes_incomplete_and_orphaned_tool_messages() {
+        let mut assistant = Message::assistant("working");
+        assistant.tool_calls = Some(vec![ToolCallMessage {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let wrong_result = Message::tool_result("other-call", "orphan data");
+
+        let safe = protocol_safe_history(&[assistant, wrong_result]);
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].role, Role::System);
+        let text = safe[0].content.text_content();
+        assert!(text.contains("INCOMPLETE HISTORICAL TOOL ACTIVITY"));
+        assert!(text.contains("lookup({}) id=call-1"));
+        assert!(text.contains("orphan data"));
+
+        let orphan = protocol_safe_history(&[Message::tool_result("call-2", "standalone")]);
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(orphan[0].role, Role::System);
+        assert!(orphan[0]
+            .content
+            .text_content()
+            .contains("ORPHANED HISTORICAL TOOL RESULT"));
     }
 
     #[tokio::test]

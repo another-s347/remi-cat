@@ -23,22 +23,21 @@ facts as losslessly as possible with their entity, attribute, exact value, times
 state transition when present. Preserve dependencies required to reproduce a stated or implied result, \
 not only the result itself. Do not replace an exact fact with a vague category or omit it merely because \
 it appears unrelated to the latest goal. \
-Return a concise, information-dense summary with exactly these non-empty headings:\n\
-## Goal and latest user intent\n\
-## Constraints and prohibitions\n\
-## Confirmed facts and decisions\n\
-## Completed work with evidence\n\
-## Current state\n\
-## Pending work and next action\n\
-## Failures and uncertainties\n\
-## Exact references\n\
+Return a concise, information-dense summary. Choose whatever structure best preserves the source. \
+Retain the latest user intent, constraints, confirmed facts and decisions, completed work and evidence, \
+current state, pending work, failures and uncertainties, and exact references whenever present. \
 For tool activity retain the tool name, concise arguments, success status, duration, key result, \
 errors, paths, IDs, and exact values. Output only the summary.";
 
 // ── LlmCompressor ────────────────────────────────────────────────────────────
 
 pub struct LlmCompressor {
-    inner: AgentLoop<OpenAIClient<ReqwestTransport>>,
+    api_key: String,
+    base_url: Option<String>,
+    model: String,
+    context_tokens: u32,
+    max_output_tokens: u32,
+    extra_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl LlmCompressor {
@@ -46,24 +45,58 @@ impl LlmCompressor {
         api_key: String,
         base_url: Option<String>,
         model: String,
+        context_tokens: u32,
         max_output_tokens: u32,
         extra_options: serde_json::Map<String, serde_json::Value>,
     ) -> Self {
-        let mut oai = OpenAIClient::new(api_key).with_model(model);
-        if let Some(url) = base_url {
+        Self {
+            api_key,
+            base_url,
+            model,
+            context_tokens,
+            max_output_tokens,
+            extra_options,
+        }
+    }
+
+    fn build_loop(&self, output_tokens: u32) -> AgentLoop<OpenAIClient<ReqwestTransport>> {
+        let mut oai = OpenAIClient::new(self.api_key.clone()).with_model(self.model.clone());
+        if let Some(url) = self.base_url.clone() {
             oai = oai.with_base_url(url);
         }
-        let agent_config = AgentConfig::default().with_max_tokens(max_output_tokens);
+        let agent_config = AgentConfig::default().with_max_tokens(output_tokens);
         let mut builder = AgentBuilder::new()
             .model(oai)
             .config(agent_config)
             .system(COMPRESSION_SYSTEM)
             .max_turns(1);
-        if !extra_options.is_empty() {
-            builder = builder.extra_options(extra_options);
+        if !self.extra_options.is_empty() {
+            builder = builder.extra_options(self.extra_options.clone());
         }
-        let inner = builder.build_loop();
-        Self { inner }
+        builder.build_loop()
+    }
+
+    fn output_budget(&self, source_tokens: u32) -> u32 {
+        source_tokens
+            .div_ceil(4)
+            .max(1_024)
+            .min(8_192)
+            .min((self.context_tokens / 10).max(1))
+            .min(self.max_output_tokens.max(1))
+    }
+
+    pub fn input_fits(&self, messages: &[Message]) -> bool {
+        let text = compression_input_text(messages);
+        let source = crate::estimate_model_input_tokens(&text);
+        let output = self.output_budget(source);
+        let safety = self.context_tokens.saturating_mul(5).div_ceil(100);
+        let system = crate::estimate_model_input_tokens(COMPRESSION_SYSTEM);
+        system
+            .saturating_add(source)
+            .saturating_add(output)
+            .saturating_add(safety)
+            .saturating_add(512)
+            <= self.context_tokens
     }
 
     /// Compress a slice of messages into a summary string.
@@ -75,39 +108,7 @@ impl LlmCompressor {
 
         // Tool results are part of the durable evidence. Bound only the input
         // presented to the compressor; the ledger always retains full content.
-        let text: String = messages
-            .iter()
-            .map(|m| {
-                let role = format!("{:?}", m.role);
-                let raw = m.content.text_content();
-                let body = truncate_tool_body(&role, &raw, 12_000);
-                if body.is_empty() {
-                    String::new()
-                } else {
-                    let calls = m.tool_calls.as_ref().map(|calls| {
-                        calls
-                            .iter()
-                            .map(|call| {
-                                format!(
-                                    "{}({}) id={}",
-                                    call.function.name, call.function.arguments, call.id
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    });
-                    format!(
-                        "[{role}] id={}{}\n{body}",
-                        m.id,
-                        calls
-                            .map(|v| format!(" tool_calls={v}"))
-                            .unwrap_or_default()
-                    )
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = compression_input_text(messages);
 
         if text.is_empty() {
             tracing::warn!(
@@ -117,9 +118,15 @@ impl LlmCompressor {
             return Ok(String::new());
         }
 
+        let source_tokens = crate::estimate_model_input_tokens(&text);
+        if !self.input_fits(messages) {
+            return Err(AgentError::other(format!(
+                "LlmCompressor: compression input does not fit model context (estimated {source_tokens} source tokens)"
+            )));
+        }
         let input = LoopInput::start(text);
-        let stream = self
-            .inner
+        let inner = self.build_loop(self.output_budget(source_tokens));
+        let stream = inner
             .chat(bot_runtime_core::chat_ctx_from_input(&input, None), input)
             .await?;
         let mut stream = std::pin::pin!(stream);
@@ -136,9 +143,43 @@ impl LlmCompressor {
                 "LlmCompressor: model returned empty summary".to_string(),
             ));
         }
-        validate_summary(&result)?;
         Ok(result)
     }
+}
+
+fn compression_input_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| {
+            let role = format!("{:?}", m.role);
+            let raw = m.content.text_content();
+            let body = truncate_tool_body(&role, &raw, 12_000);
+            if body.is_empty() {
+                return String::new();
+            }
+            let calls = m.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| {
+                        format!(
+                            "{}({}) id={}",
+                            call.function.name, call.function.arguments, call.id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            format!(
+                "[{role}] id={}{}\n{body}",
+                m.id,
+                calls
+                    .map(|v| format!(" tool_calls={v}"))
+                    .unwrap_or_default()
+            )
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn truncate_tool_body(role: &str, text: &str, max_chars: usize) -> String {
@@ -158,22 +199,41 @@ fn truncate_tool_body(role: &str, text: &str, max_chars: usize) -> String {
     format!("{head}\n...[tool result elided for summary input only]...\n{tail}")
 }
 
-fn validate_summary(summary: &str) -> Result<(), AgentError> {
-    const HEADINGS: [&str; 8] = [
-        "## Goal and latest user intent",
-        "## Constraints and prohibitions",
-        "## Confirmed facts and decisions",
-        "## Completed work with evidence",
-        "## Current state",
-        "## Pending work and next action",
-        "## Failures and uncertainties",
-        "## Exact references",
-    ];
-    if summary.chars().count() > 40_000 || HEADINGS.iter().any(|heading| !summary.contains(heading))
-    {
-        return Err(AgentError::other(
-            "LlmCompressor: summary failed structure/length validation",
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_prompt_allows_free_form_output() {
+        assert!(COMPRESSION_SYSTEM.contains("whatever structure"));
+        assert!(!COMPRESSION_SYSTEM.contains("exactly these non-empty headings"));
     }
-    Ok(())
+
+    #[test]
+    fn compression_output_budget_is_dynamic_and_bounded() {
+        let compressor = LlmCompressor::new(
+            "key".to_string(),
+            None,
+            "model".to_string(),
+            128_000,
+            32_000,
+            serde_json::Map::new(),
+        );
+        assert_eq!(compressor.output_budget(100), 1_024);
+        assert_eq!(compressor.output_budget(20_000), 5_000);
+        assert_eq!(compressor.output_budget(100_000), 8_192);
+    }
+
+    #[test]
+    fn compressor_preflight_rejects_source_that_cannot_fit() {
+        let compressor = LlmCompressor::new(
+            "key".to_string(),
+            None,
+            "model".to_string(),
+            4_096,
+            2_048,
+            serde_json::Map::new(),
+        );
+        assert!(!compressor.input_fits(&[Message::user("x".repeat(40_000))]));
+    }
 }

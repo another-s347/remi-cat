@@ -192,6 +192,33 @@ impl Runtime {
             let mut skill_injections = Vec::new();
             let mut persist_agent_child_turn = false;
 
+            // Session-local runtime commands must be handled before a TUI
+            // channel session is routed to its underlying sub-session. The
+            // command layer resolves the channel id to the task thread id.
+            if request.command_preprocess
+                && (user_text.trim() == "/tasks" || user_text.trim().starts_with("/tasks "))
+            {
+                match process_runtime_commands(&self, &request.session_id, user_text.trim()).await {
+                    Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+                        yield CoreChatEvent::Reply(reply);
+                    }
+                    Ok(_) => {
+                        yield CoreChatEvent::Bot(CatEvent::Error(
+                            remi_agentloop::prelude::AgentError::other(
+                                "unexpected non-reply result for /tasks",
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        yield CoreChatEvent::Bot(CatEvent::Error(
+                            remi_agentloop::prelude::AgentError::other(error.to_string()),
+                        ));
+                    }
+                }
+                yield CoreChatEvent::Done;
+                return;
+            }
+
             let sub_session_target = if request.sub_session_routing {
                 sub_session_input_target(&self, &session_id).await
             } else {

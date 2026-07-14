@@ -260,6 +260,7 @@ pub(crate) fn apply_skill_injections(user_state: &mut serde_json::Value, skills:
 
 pub(crate) fn model_input_snapshot_from_loop_input(
     input: &LoopInput,
+    tool_definitions: &[remi_agentloop::prelude::ToolDefinition],
     thread_id: &str,
     run_id: Option<&str>,
     model_profile_id: &str,
@@ -311,6 +312,26 @@ pub(crate) fn model_input_snapshot_from_loop_input(
             user_state,
         );
     }
+    for definition in tool_definitions {
+        append_segment(
+            &mut segments,
+            ModelInputSegmentCategory::ToolDefinition,
+            None,
+            format!("Tool definition: {}", definition.function.name),
+            serde_json::to_string(definition).unwrap_or_else(|_| format!("{definition:?}")),
+        );
+    }
+    // Account for role markers, message envelopes, tool-call framing and the
+    // request wrapper that are not present in segment content.
+    let protocol_tokens = 512_u32.saturating_add((segments.len() as u32).saturating_mul(12));
+    segments.push(ModelInputSegment {
+        id: format!("seg_{}", segments.len() + 1),
+        category: ModelInputSegmentCategory::ProtocolOverhead,
+        role: None,
+        title: "Protocol overhead".to_string(),
+        content: String::new(),
+        token_estimate: protocol_tokens,
+    });
 
     let estimated_tokens = segments.iter().fold(0_u32, |sum, segment| {
         sum.saturating_add(segment.token_estimate)

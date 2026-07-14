@@ -39,6 +39,8 @@ pub enum ModelInputSegmentCategory {
     History,
     ToolInput,
     ToolOutput,
+    ToolDefinition,
+    ProtocolOverhead,
     CurrentUser,
     Metadata,
     UserState,
