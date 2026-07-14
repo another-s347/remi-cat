@@ -185,7 +185,7 @@ async fn command_catalog(State(state): State<AdminState>) -> Json<Vec<CommandCat
     let mut skills = store.featured_summaries();
     skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
     entries.extend(skills.into_iter().map(|skill| CommandCatalogEntry {
-        value: format!("/skill:{} ", skill.name),
+        value: format!("/skill:{} ", skill.id),
         label: format!("Skill: {}", skill.name),
         description: skill.description,
         keywords: vec![
@@ -226,12 +226,6 @@ fn static_command_catalog() -> Vec<CommandCatalogEntry> {
             "/tasks",
             "查看后台任务",
             "显示当前 session 的后台工具任务",
-            false,
-        ),
-        (
-            "/tasks all",
-            "查看全部后台任务",
-            "显示所有 session 的后台工具任务",
             false,
         ),
         (

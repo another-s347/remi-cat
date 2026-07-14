@@ -11,6 +11,7 @@ use remi_agentloop::prelude::{
     AgentError, CancellationToken, ResumePayload, Tool, ToolOutput, ToolResult,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::CatEvent;
@@ -32,6 +33,8 @@ pub struct ToolTaskRecord {
     pub tool_name: String,
     pub args: serde_json::Value,
     pub status: String,
+    #[serde(default = "default_true")]
+    pub background: bool,
     pub started_at: String,
     #[serde(default)]
     pub completed_at: Option<String>,
@@ -49,6 +52,10 @@ pub struct ToolTaskRecord {
     pub notify_on_finish: bool,
     #[serde(default)]
     pub notification_delivered: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -91,6 +98,7 @@ impl PerThreadManager {
             tool_name,
             args,
             status: TOOL_TASK_RUNNING.to_string(),
+            background: false,
             started_at: Utc::now().to_rfc3339(),
             completed_at: None,
             elapsed_ms: None,
@@ -224,8 +232,16 @@ impl PerThreadManager {
         let record = store.tasks.get_mut(task_id)?;
         let mut changed = false;
         if record.status == TOOL_TASK_RUNNING {
+            let started_at = chrono::DateTime::parse_from_rfc3339(&record.started_at).ok();
             record.status = TOOL_TASK_CANCELLED.to_string();
-            record.completed_at = Some(Utc::now().to_rfc3339());
+            let completed_at = Utc::now();
+            record.completed_at = Some(completed_at.to_rfc3339());
+            record.elapsed_ms = started_at.map(|started_at| {
+                completed_at
+                    .signed_duration_since(started_at.with_timezone(&Utc))
+                    .num_milliseconds()
+                    .max(0) as u64
+            });
             record.success = Some(false);
             record.message = Some("cancelled".to_string());
             changed = true;
@@ -258,14 +274,48 @@ impl PerThreadManager {
     }
 
     async fn list(&self) -> Vec<ToolTaskRecord> {
-        let mut records: Vec<ToolTaskRecord> =
-            self.store.lock().await.tasks.values().cloned().collect();
+        let mut records: Vec<ToolTaskRecord> = self
+            .store
+            .lock()
+            .await
+            .tasks
+            .values()
+            .filter(|task| task.background)
+            .cloned()
+            .collect();
         records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         records
     }
 
     async fn get(&self, task_id: &str) -> Option<ToolTaskRecord> {
         self.store.lock().await.tasks.get(task_id).cloned()
+    }
+
+    async fn promote_to_background(&self, task_id: &str, notify: bool) -> Option<ToolTaskRecord> {
+        let mut store = self.store.lock().await;
+        let record = store.tasks.get_mut(task_id)?;
+        record.background = true;
+        if notify {
+            record.notify_on_finish = true;
+        }
+        let snapshot = record.clone();
+        drop(store);
+        let _ = self.save().await;
+        if snapshot.status != TOOL_TASK_RUNNING
+            && snapshot.notify_on_finish
+            && !snapshot.notification_delivered
+        {
+            let _ = self.completed_tx.send(snapshot.clone());
+        }
+        Some(snapshot)
+    }
+
+    async fn remove_foreground(&self, task_id: &str) {
+        self.running.lock().await.remove(task_id);
+        let removed = self.store.lock().await.tasks.remove(task_id).is_some();
+        if removed {
+            let _ = self.save().await;
+        }
     }
 
     async fn is_thread_running(&self) -> bool {
@@ -301,49 +351,72 @@ pub struct ToolTaskManager {
 impl ToolTaskManager {
     pub fn load(data_dir: impl AsRef<Path>) -> Result<Arc<Self>> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(data_dir.join(STORE_DIR))
-            .with_context(|| format!("creating tool task dir"))?;
-        // Migrate legacy shared file into per-thread directory
+        let store_dir = data_dir.join(STORE_DIR);
+        std::fs::create_dir_all(&store_dir).with_context(|| "creating tool task dir")?;
         let legacy = data_dir.join(LEGACY_STORE_FILE);
+        let mut source_paths = Vec::new();
         if legacy.exists() {
-            let dest = data_dir.join(STORE_DIR).join("_global.json");
-            if !dest.exists() {
-                let _ = std::fs::copy(&legacy, &dest);
-            }
-            let _ = std::fs::remove_file(&legacy);
+            source_paths.push(legacy);
         }
-        let mut threads = HashMap::new();
-        let mut task_thread_map = HashMap::new();
-        for entry in std::fs::read_dir(data_dir.join(STORE_DIR))? {
+        for entry in std::fs::read_dir(&store_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json")
-                || path.file_name().and_then(|value| value.to_str()) == Some("_global.json")
-            {
-                continue;
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                source_paths.push(path);
             }
+        }
+
+        let mut grouped: HashMap<String, ToolTaskStore> = HashMap::new();
+        for path in &source_paths {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let store = serde_json::from_str::<ToolTaskStore>(&raw)
                 .with_context(|| format!("parsing {}", path.display()))?;
-            let thread_id = store
-                .tasks
-                .values()
-                .find_map(|task| (!task.thread_id.is_empty()).then(|| task.thread_id.clone()))
-                .or_else(|| {
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .map(ToOwned::to_owned)
-                });
-            let Some(thread_id) = thread_id else {
-                continue;
-            };
-            let task_ids = store.tasks.keys().cloned().collect::<Vec<_>>();
-            let manager = Self::load_per_thread(&data_dir, &thread_id)?;
-            for task_id in task_ids {
-                task_thread_map.insert(task_id, thread_id.clone());
+            let fallback_thread_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            for (task_id, mut task) in store.tasks {
+                if task.thread_id.is_empty() {
+                    task.thread_id = fallback_thread_id.clone();
+                }
+                grouped
+                    .entry(task.thread_id.clone())
+                    .or_default()
+                    .tasks
+                    .insert(task_id, task);
             }
-            threads.insert(thread_id, manager);
+        }
+
+        let mut threads = HashMap::new();
+        let mut task_thread_map = HashMap::new();
+        let mut destination_paths = std::collections::HashSet::new();
+        for (thread_id, mut store) in grouped {
+            normalize_loaded_store(&mut store);
+            let path = thread_store_path(&data_dir, &thread_id);
+            save_store(&path, &store)?;
+            destination_paths.insert(path.clone());
+            for task_id in store.tasks.keys() {
+                task_thread_map.insert(task_id.clone(), thread_id.clone());
+            }
+            threads.insert(
+                thread_id.clone(),
+                Arc::new(PerThreadManager {
+                    thread_id,
+                    path,
+                    store: Mutex::new(store),
+                    persist_lock: Mutex::new(()),
+                    running: Mutex::new(HashMap::new()),
+                    completed_tx: broadcast::channel(64).0,
+                    side_event_tx: broadcast::channel(256).0,
+                }),
+            );
+        }
+        for path in source_paths {
+            if !destination_paths.contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
         }
         Ok(Arc::new(Self {
             data_dir,
@@ -352,42 +425,15 @@ impl ToolTaskManager {
         }))
     }
 
-    fn safe_thread_name(thread_id: &str) -> String {
-        thread_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
-
     fn load_per_thread(data_dir: &Path, thread_id: &str) -> Result<Arc<PerThreadManager>> {
-        let safe_name = Self::safe_thread_name(thread_id);
-        let path = data_dir.join(STORE_DIR).join(format!("{safe_name}.json"));
+        let path = thread_store_path(data_dir, thread_id);
         let mut store = match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str::<ToolTaskStore>(&raw)
                 .with_context(|| format!("parsing {}", path.display()))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => ToolTaskStore::default(),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
-        let now = Utc::now().to_rfc3339();
-        for task in store.tasks.values_mut() {
-            if task.thread_id.is_empty() {
-                task.thread_id = thread_id.to_string();
-            }
-            if task.status == TOOL_TASK_RUNNING {
-                task.status = TOOL_TASK_CANCELLED.to_string();
-                task.completed_at = Some(now.clone());
-                task.success = Some(false);
-                task.message = Some("cancelled because remi-cat restarted".to_string());
-            }
-            task.notification_delivered = true;
-        }
-        prune_completed_tasks(&mut store);
+        normalize_loaded_store(&mut store);
         save_store(&path, &store)?;
         Ok(Arc::new(PerThreadManager {
             thread_id: thread_id.to_string(),
@@ -449,6 +495,25 @@ impl ToolTaskManager {
         let thread_id = self.task_thread_map.lock().await.get(task_id)?.clone();
         let mgr = self.get_thread(&thread_id).await.ok()?;
         mgr.enable_completion_notification(task_id).await
+    }
+
+    pub async fn promote_to_background(
+        &self,
+        task_id: &str,
+        notify: bool,
+    ) -> Option<ToolTaskRecord> {
+        let thread_id = self.task_thread_map.lock().await.get(task_id)?.clone();
+        let mgr = self.get_thread(&thread_id).await.ok()?;
+        mgr.promote_to_background(task_id, notify).await
+    }
+
+    pub async fn remove_foreground(&self, task_id: &str) {
+        let thread_id = self.task_thread_map.lock().await.remove(task_id);
+        if let Some(thread_id) = thread_id {
+            if let Ok(mgr) = self.get_thread(&thread_id).await {
+                mgr.remove_foreground(task_id).await;
+            }
+        }
     }
 
     pub async fn claim_completion_notification(&self, task_id: &str) -> bool {
@@ -546,6 +611,24 @@ impl ToolTaskManager {
         }
     }
 
+    pub async fn list_session_background(&self, thread_id: &str) -> Vec<ToolTaskRecord> {
+        let records = self.list(Some(thread_id)).await;
+        let mut running = records
+            .iter()
+            .filter(|task| task.background && task.status == TOOL_TASK_RUNNING)
+            .cloned()
+            .collect::<Vec<_>>();
+        running.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        let mut completed = records
+            .into_iter()
+            .filter(|task| task.background && task.status != TOOL_TASK_RUNNING)
+            .collect::<Vec<_>>();
+        completed.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+        completed.truncate(5);
+        running.extend(completed);
+        running
+    }
+
     pub async fn get(&self, task_id: &str) -> Option<ToolTaskRecord> {
         let thread_id = self.task_thread_map.lock().await.get(task_id)?.clone();
         let mgr = self.get_thread(&thread_id).await.ok()?;
@@ -560,11 +643,35 @@ impl ToolTaskManager {
     }
 }
 
+fn thread_store_path(data_dir: &Path, thread_id: &str) -> PathBuf {
+    let digest = Sha256::digest(thread_id.as_bytes());
+    let name = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    data_dir.join(STORE_DIR).join(format!("{name}.json"))
+}
+
+fn normalize_loaded_store(store: &mut ToolTaskStore) {
+    store.tasks.retain(|_, task| task.background);
+    let now = Utc::now().to_rfc3339();
+    for task in store.tasks.values_mut() {
+        if task.status == TOOL_TASK_RUNNING {
+            task.status = TOOL_TASK_CANCELLED.to_string();
+            task.completed_at = Some(now.clone());
+            task.success = Some(false);
+            task.message = Some("cancelled because remi-cat restarted".to_string());
+        }
+        task.notification_delivered = true;
+    }
+    prune_completed_tasks(store);
+}
+
 fn prune_completed_tasks(store: &mut ToolTaskStore) {
     let mut completed = store
         .tasks
         .values()
-        .filter(|task| task.status != TOOL_TASK_RUNNING)
+        .filter(|task| task.background && task.status != TOOL_TASK_RUNNING)
         .map(|task| {
             (
                 task.completed_at.as_deref().unwrap_or_default().to_string(),
@@ -647,12 +754,12 @@ impl Tool for ToolTasksTool {
             Ok(ToolResult::Output(
                 stream! {
                     let value = match action.as_str() {
-                        "list" => serde_json::to_value(manager.list(Some(&thread_id)).await)
+                        "list" => serde_json::to_value(manager.list_session_background(&thread_id).await)
                             .unwrap_or_else(|_| serde_json::json!([])),
                         "get" => {
                             let task_id = arguments["task_id"].as_str().unwrap_or_default();
                             let task = manager.get(task_id).await;
-                            let task = task.filter(|task| task.thread_id == thread_id);
+                            let task = task.filter(|task| task.thread_id == thread_id && task.background);
                             serde_json::to_value(task)
                                 .unwrap_or(serde_json::Value::Null)
                         }
@@ -661,7 +768,7 @@ impl Tool for ToolTasksTool {
                             let task = manager.get(task_id).await;
                             let task = if task
                                 .as_ref()
-                                .is_some_and(|task| task.thread_id == thread_id)
+                                .is_some_and(|task| task.thread_id == thread_id && task.background)
                             {
                                 manager.cancel(task_id).await
                             } else {
@@ -693,6 +800,28 @@ mod tests {
         dir
     }
 
+    fn stored_task(task_id: &str, thread_id: &str) -> ToolTaskRecord {
+        ToolTaskRecord {
+            task_id: task_id.to_string(),
+            thread_id: thread_id.to_string(),
+            run_id: "run-a".to_string(),
+            tool_call_id: format!("call-{task_id}"),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({}),
+            status: TOOL_TASK_COMPLETED.to_string(),
+            background: true,
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-09T00:00:01Z".to_string()),
+            elapsed_ms: Some(1_000),
+            success: Some(true),
+            result_preview: Some("done".to_string()),
+            recent_output: Vec::new(),
+            message: None,
+            notify_on_finish: false,
+            notification_delivered: true,
+        }
+    }
+
     #[tokio::test]
     async fn manager_tracks_filters_finishes_and_cancels_tasks() {
         let dir = temp_data_dir("state");
@@ -721,6 +850,8 @@ mod tests {
             )
             .await
             .unwrap();
+        manager.promote_to_background(&first, false).await.unwrap();
+        manager.promote_to_background(&second, false).await.unwrap();
 
         assert_eq!(manager.list(Some("thread-a")).await.len(), 1);
         assert!(manager.is_thread_running("thread-a").await);
@@ -766,6 +897,10 @@ mod tests {
             )
             .await
             .unwrap();
+        manager
+            .promote_to_background(&task_id, false)
+            .await
+            .unwrap();
 
         manager.append_output(&task_id, "cached output").await;
         let before_finish = ToolTaskManager::load(&dir).unwrap();
@@ -802,6 +937,10 @@ mod tests {
                     serde_json::json!({}),
                     CancellationToken::new(),
                 )
+                .await
+                .unwrap();
+            manager
+                .promote_to_background(&task_id, false)
                 .await
                 .unwrap();
             manager
@@ -842,6 +981,8 @@ mod tests {
             )
             .await
             .unwrap();
+        manager.promote_to_background(&first, false).await.unwrap();
+        manager.promote_to_background(&second, false).await.unwrap();
 
         tokio::join!(
             manager.finish(&first, true, 1, "first".to_string()),
@@ -874,6 +1015,10 @@ mod tests {
             )
             .await
             .unwrap();
+        manager
+            .promote_to_background(&task_id, false)
+            .await
+            .unwrap();
         drop(manager);
 
         let reloaded = ToolTaskManager::load(&dir).unwrap();
@@ -901,6 +1046,7 @@ mod tests {
             )
             .await
             .unwrap();
+        manager.promote_to_background(&task_id, true).await.unwrap();
 
         manager.cancel(&task_id).await.unwrap();
         let finished = manager
@@ -962,6 +1108,7 @@ mod tests {
             )
             .await
             .unwrap();
+        manager.promote_to_background(&task_id, true).await.unwrap();
         manager.enable_completion_notification(&task_id).await;
         manager
             .finish(&task_id, true, 10_000, "done".to_string())
@@ -992,6 +1139,7 @@ mod tests {
             )
             .await
             .unwrap();
+        manager.promote_to_background(&task_id, true).await.unwrap();
         manager.enable_completion_notification(&task_id).await;
         manager
             .finish(&task_id, true, 10, "done".to_string())
@@ -1005,5 +1153,131 @@ mod tests {
             .await
             .is_none());
         assert!(!reloaded.claim_completion_notification(&task_id).await);
+    }
+
+    #[test]
+    fn legacy_record_defaults_to_background() {
+        let record: ToolTaskRecord = serde_json::from_value(serde_json::json!({
+            "task_id": "legacy",
+            "thread_id": "thread-a",
+            "run_id": "run-a",
+            "tool_call_id": "call-a",
+            "tool_name": "bash",
+            "args": {},
+            "status": "completed",
+            "started_at": "2026-07-09T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(record.background);
+    }
+
+    #[tokio::test]
+    async fn foreground_records_are_hidden_and_removed() {
+        let manager = ToolTaskManager::load(temp_data_dir("foreground-cleanup")).unwrap();
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({"command": "true"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.list(Some("thread-a")).await.is_empty());
+        manager.remove_foreground(&task_id).await;
+        assert!(manager.get(&task_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_list_keeps_all_running_and_latest_five_finished() {
+        let manager = ToolTaskManager::load(temp_data_dir("session-summary")).unwrap();
+        for index in 0..2 {
+            let task_id = manager
+                .start(
+                    "thread-a".to_string(),
+                    "run-a".to_string(),
+                    format!("running-{index}"),
+                    "bash".to_string(),
+                    serde_json::json!({"index": index}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            manager
+                .promote_to_background(&task_id, false)
+                .await
+                .unwrap();
+        }
+        for index in 0..7 {
+            let task_id = manager
+                .start(
+                    "thread-a".to_string(),
+                    "run-a".to_string(),
+                    format!("finished-{index}"),
+                    "bash".to_string(),
+                    serde_json::json!({"index": index}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            manager
+                .promote_to_background(&task_id, false)
+                .await
+                .unwrap();
+            manager
+                .finish(&task_id, true, index, format!("result-{index}"))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let tasks = manager.list_session_background("thread-a").await;
+        assert_eq!(tasks.len(), 7);
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.status == TOOL_TASK_RUNNING)
+                .count(),
+            2
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.status != TOOL_TASK_RUNNING)
+                .count(),
+            5
+        );
+        assert!(tasks.iter().all(|task| task.thread_id == "thread-a"));
+    }
+
+    #[tokio::test]
+    async fn colliding_legacy_thread_names_migrate_to_distinct_files() {
+        let dir = temp_data_dir("thread-hash");
+        let legacy_path = dir.join(STORE_DIR).join("team_a.json");
+        let legacy = ToolTaskStore {
+            tasks: HashMap::from([
+                (
+                    "task-slash".to_string(),
+                    stored_task("task-slash", "team/a"),
+                ),
+                (
+                    "task-colon".to_string(),
+                    stored_task("task-colon", "team:a"),
+                ),
+            ]),
+        };
+        save_store(&legacy_path, &legacy).unwrap();
+
+        let reloaded = ToolTaskManager::load(&dir).unwrap();
+        assert_eq!(reloaded.list(Some("team/a")).await.len(), 1);
+        assert_eq!(reloaded.list(Some("team:a")).await.len(), 1);
+        assert_ne!(
+            thread_store_path(&dir, "team/a"),
+            thread_store_path(&dir, "team:a")
+        );
+        assert!(!legacy_path.exists());
     }
 }

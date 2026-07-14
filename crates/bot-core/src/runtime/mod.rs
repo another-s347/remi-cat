@@ -35,6 +35,7 @@ use crate::{
 };
 
 mod approval_markers;
+mod environment_context;
 mod memory_runtime;
 mod model_provider;
 mod partial_turn;
@@ -46,6 +47,10 @@ pub(crate) use approval_markers::{
     cat_event_from_subagent_approval_marker, subagent_approval_marker,
     tool_approval_requested_marker, tool_approval_resolved_marker, tool_approval_updated_marker,
     user_question_requested_marker, user_question_resolved_marker, user_question_updated_marker,
+};
+use environment_context::{
+    ensure_environment_context, insert_environment_context_prompt, persist_new_environment_context,
+    remove_environment_context, EnvironmentContextSource,
 };
 use memory_runtime::{persist_intermediate_user_state, persist_turn};
 use model_provider::{
@@ -75,6 +80,7 @@ const SUPERVISOR_DECISION_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
+const MODEL_PROTOCOL_MARGIN_TOKENS: u32 = 512;
 const AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE: &str =
     "Agent.md exists in the current working directory; read it before substantive work and follow any applicable project instructions.";
 
@@ -87,6 +93,24 @@ fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
         .saturating_sub(profile.max_output_tokens)
         .saturating_sub(SUPERVISOR_PROMPT_MARGIN_TOKENS);
     percent_budget.min(output_budget).max(1)
+}
+
+fn memory_compaction_budget_tokens(
+    profile: &ModelProfileConfig,
+    context_percent: usize,
+    fixed_system_prompt: &str,
+) -> usize {
+    let percent_budget = context_percent_tokens(profile, context_percent) as u32;
+    let safety_margin = profile.context_tokens.saturating_mul(5) / 100;
+    let output_safe_budget = profile
+        .context_tokens
+        .saturating_sub(profile.max_output_tokens)
+        .saturating_sub(safety_margin);
+    percent_budget
+        .min(output_safe_budget)
+        .saturating_sub(crate::estimate_model_input_tokens(fixed_system_prompt))
+        .saturating_sub(MODEL_PROTOCOL_MARGIN_TOKENS)
+        .max(1) as usize
 }
 
 fn system_prompt_with_agent_md_notice_for_current_dir(system_prompt: String) -> String {
@@ -421,6 +445,7 @@ struct LocalAcpAgentRunner {
     memory: Arc<MemoryStore>,
     run_locks: ThreadRunLocks,
     system_prompt: String,
+    environment_context_source: EnvironmentContextSource,
 }
 
 struct SteerQueueRegistration {
@@ -471,8 +496,18 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
             let run_lock = thread_run_lock(&self.run_locks, &thread_id).await;
             let _run_guard = run_lock.lock().await;
             let mut ctx = self.memory.load_context(&thread_id).await?;
+            let environment_context =
+                ensure_environment_context(&mut ctx.user_state, &self.environment_context_source);
+            persist_new_environment_context(
+                &self.memory,
+                &thread_id,
+                &ctx.user_state,
+                environment_context.initialized,
+            )
+            .await;
             let mut history = build_injected_history(&ctx);
             history.insert(0, Message::system(self.system_prompt.clone()));
+            insert_environment_context_prompt(&mut history, 1, environment_context.prompt);
             append_thread_todo_system_prompt(&mut history, &ctx.user_state);
             let skip_count = history.len();
             let input = LoopInput::start(message)
@@ -540,6 +575,7 @@ pub struct CatBot {
     active_steers: ActiveSteerQueues,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
+    environment_context_source: EnvironmentContextSource,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
 }
@@ -700,6 +736,10 @@ impl CatBot {
 
     pub fn skill_summaries(&self) -> Vec<SkillSummary> {
         self.skill_store.featured_summaries()
+    }
+
+    pub fn all_skill_summaries(&self) -> Vec<SkillSummary> {
+        self.skill_store.all_summaries()
     }
 
     pub fn skill_load_diagnostics(&self) -> Vec<SkillLoadDiagnostic> {
@@ -1061,6 +1101,7 @@ impl CatBot {
             .fork_thread(source_thread_id, target_thread_id)
             .await?;
         let mut user_state = self.memory.load_user_state(target_thread_id).await;
+        remove_environment_context(&mut user_state);
         self.todo_backend
             .fork_thread_user_state(source_thread_id, target_thread_id, user_id, &mut user_state)
             .await
@@ -1613,7 +1654,10 @@ impl CatBot {
         &self,
         thread_id: Option<&str>,
     ) -> Vec<crate::ToolTaskRecord> {
-        self.tool_tasks.list(thread_id).await
+        match thread_id {
+            Some(thread_id) => self.tool_tasks.list_session_background(thread_id).await,
+            None => self.tool_tasks.list(None).await,
+        }
     }
 
     pub async fn get_background_task(&self, task_id: &str) -> Option<crate::ToolTaskRecord> {
@@ -2270,6 +2314,18 @@ impl CatBot {
                     );
                 }
 
+                let environment_context = ensure_environment_context(
+                    &mut ctx.user_state,
+                    &self.environment_context_source,
+                );
+                persist_new_environment_context(
+                    &self.memory,
+                    &thread_id_owned,
+                    &ctx.user_state,
+                    environment_context.initialized,
+                )
+                .await;
+
                 let mut round_opts = opts.clone();
                 let background_task_continuation = continuation_from_background_task;
                 if continuation_from_supervisor || background_task_continuation {
@@ -2308,8 +2364,13 @@ impl CatBot {
                     0,
                     Message::system(effective_agent.profile.system_prompt.clone()),
                 );
+                insert_environment_context_prompt(
+                    &mut history,
+                    1,
+                    environment_context.prompt,
+                );
                 let agent_header_count =
-                    1 + usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
+                    2 + usize::from(ctx.agent_md.is_some()) + usize::from(ctx.soul_md.is_some());
                 let skill_prompt_tools = skill_prompt_tool_availability(active_agent);
                 insert_skill_injection_prompts(
                     &mut history,
@@ -3362,6 +3423,7 @@ struct LocalToolDeps {
     todo_backend: Arc<todo::HybridTodoBackend>,
     acp_backend: Arc<acp::AcpBackend>,
     sandbox: Arc<dyn sandbox::Sandbox>,
+    environment_context_source: EnvironmentContextSource,
     bash_enabled: bool,
     redactor: SharedRedactor,
     data_dir: PathBuf,
@@ -3394,6 +3456,7 @@ impl LocalToolDeps {
             todo_backend: Arc::clone(&self.todo_backend),
             acp_backend: Arc::clone(&self.acp_backend),
             sandbox: Arc::clone(&self.sandbox),
+            environment_context_source: self.environment_context_source.clone(),
             bash_enabled: self.bash_enabled,
             redactor: Arc::clone(&self.redactor),
             data_dir: self.data_dir.clone(),
@@ -3614,6 +3677,7 @@ impl CatBotBuilder {
         self.active_agent_id = profile.id.clone();
         self.system = profile.system_prompt;
         let mut tools = profile.tools;
+        expand_skill_discovery_tools(&mut tools);
         for delegate in &profile.delegates {
             let name = delegate_tool_name(delegate);
             if !tools.iter().any(|tool| tool == &name) {
@@ -3629,7 +3693,12 @@ impl CatBotBuilder {
     pub fn build(self) -> anyhow::Result<CatBot> {
         let profile = self.model_profile.clone();
         let auto_compress_context_percent = auto_compress_context_percent()?;
-        let short_term_tokens = context_percent_tokens(&profile, auto_compress_context_percent);
+        let system_prompt = system_prompt_with_agent_md_notice_for_current_dir(self.system.clone());
+        let short_term_tokens = memory_compaction_budget_tokens(
+            &profile,
+            auto_compress_context_percent,
+            &system_prompt,
+        );
         let overflow_bytes = self.overflow_bytes.unwrap_or(profile.overflow_bytes);
         let resolved_base_url = profile.base_url.clone();
         let approval_profile = if let Some(profile_id) = self.approval_model_profile_id.as_deref() {
@@ -3675,8 +3744,6 @@ impl CatBotBuilder {
         if let Some(url) = resolved_base_url.clone() {
             oai = oai.with_base_url(url);
         }
-        let system_prompt = system_prompt_with_agent_md_notice_for_current_dir(self.system.clone());
-
         let extra_options = self.extra_options.clone();
         let agent_config = AgentConfig::default().with_max_tokens(profile.max_output_tokens);
         let mut inner_builder = AgentBuilder::new()
@@ -3721,6 +3788,8 @@ impl CatBotBuilder {
         });
 
         let workspace_root = self.sandbox_config.host_dir().to_path_buf();
+        let environment_context_source =
+            EnvironmentContextSource::from_sandbox_config(&self.sandbox_config);
         let skill_store = Arc::new(BuiltinSkillStore::new(
             FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone()),
             [remi_skill::builtin_remi_skill()],
@@ -3766,6 +3835,7 @@ impl CatBotBuilder {
             todo_backend: Arc::clone(&todo_backend),
             acp_backend: Arc::clone(&acp_backend),
             sandbox: Arc::clone(&sandbox),
+            environment_context_source: environment_context_source.clone(),
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
             data_dir: data_dir.clone(),
@@ -3820,6 +3890,7 @@ impl CatBotBuilder {
             memory: Arc::clone(&memory),
             run_locks: Arc::clone(&run_locks),
             system_prompt: system_prompt.clone(),
+            environment_context_source: environment_context_source.clone(),
         }));
         let tool_deps = LocalToolDeps {
             skill_store: Arc::clone(&skill_store),
@@ -3827,6 +3898,7 @@ impl CatBotBuilder {
             todo_backend: Arc::clone(&todo_backend),
             acp_backend: Arc::clone(&acp_backend),
             sandbox: Arc::clone(&sandbox),
+            environment_context_source: environment_context_source.clone(),
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
             data_dir: data_dir.clone(),
@@ -3956,6 +4028,7 @@ impl CatBotBuilder {
                 todo_backend: Arc::clone(&todo_backend),
                 acp_backend: Arc::clone(&acp_backend),
                 sandbox: Arc::clone(&sandbox),
+                environment_context_source: environment_context_source.clone(),
                 bash_enabled: self.sandbox_config.bash_enabled(),
                 redactor: Arc::clone(&redactor),
                 data_dir: data_dir.clone(),
@@ -4052,6 +4125,7 @@ impl CatBotBuilder {
             active_steers,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
+            environment_context_source,
             redactor,
         })
     }
@@ -4150,6 +4224,7 @@ fn delegate_tool_name(agent_id: &str) -> String {
 
 fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
     let mut tools = profile.tools.clone();
+    expand_skill_discovery_tools(&mut tools);
     for delegate in &profile.delegates {
         let name = delegate_tool_name(delegate);
         if !tools.iter().any(|tool| tool == &name) {
@@ -4157,6 +4232,15 @@ fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
         }
     }
     tools
+}
+
+fn expand_skill_discovery_tools(tools: &mut Vec<String>) {
+    if tools.iter().any(|tool| tool == "search")
+        && tools.iter().any(|tool| tool == "skill__get")
+        && !tools.iter().any(|tool| tool == "skill__search")
+    {
+        tools.push("skill__search".to_string());
+    }
 }
 
 const SUBAGENT_APPROVAL_MARKER_AGENT: &str = "__remi_tool_approval__";
@@ -4306,6 +4390,8 @@ impl Tool for RemiSubAgentTool {
         let metadata = subagent_metadata(ctx, &sub_thread_id_for_memory);
         let memory = Arc::clone(&self.deps.memory);
         let workspace_root = self.deps.workspace_root.clone();
+        let environment_context_source = self.deps.environment_context_source.clone();
+        let subagent_system_prompt = self.system_prompt.clone();
         let model_name = self.model_name.clone();
         let hook_manager = Arc::clone(&self.deps.hook_manager);
         let persistent = named.is_some();
@@ -4367,12 +4453,43 @@ impl Tool for RemiSubAgentTool {
             ));
 
             let mut final_output = String::new();
-            let mut skip_count = 0usize;
-            let mut input = LoopInput::start(&sub_task).metadata(metadata.clone());
+            let mut ephemeral_user_state = serde_json::Value::Null;
+            let ephemeral_environment_context = ensure_environment_context(
+                &mut ephemeral_user_state,
+                &environment_context_source,
+            );
+            let mut ephemeral_history = vec![Message::system(subagent_system_prompt.clone())];
+            insert_environment_context_prompt(
+                &mut ephemeral_history,
+                1,
+                ephemeral_environment_context.prompt,
+            );
+            let mut skip_count = ephemeral_history.len();
+            let mut input = LoopInput::start(&sub_task)
+                .history(ephemeral_history)
+                .metadata(metadata.clone())
+                .user_state(ephemeral_user_state);
             if persistent {
                 match memory.load_context(&sub_thread_id_for_memory).await {
                     Ok(mut ctx) => {
-                        let history = build_injected_history(&ctx);
+                        let environment_context = ensure_environment_context(
+                            &mut ctx.user_state,
+                            &environment_context_source,
+                        );
+                        persist_new_environment_context(
+                            &memory,
+                            &sub_thread_id_for_memory,
+                            &ctx.user_state,
+                            environment_context.initialized,
+                        )
+                        .await;
+                        let mut history = build_injected_history(&ctx);
+                        history.insert(0, Message::system(subagent_system_prompt.clone()));
+                        insert_environment_context_prompt(
+                            &mut history,
+                            1,
+                            environment_context.prompt,
+                        );
                         skip_count = history.len();
                         input = input
                             .history(history)
@@ -4597,7 +4714,17 @@ impl Tool for RemiSubAgentTool {
                                 LoopInput::start(&message).metadata(metadata.clone());
                             if persistent {
                                 if let Ok(mut ctx) = memory.load_context(&sub_thread_id_for_memory).await {
-                                    let history = build_injected_history(&ctx);
+                                    let environment_context = ensure_environment_context(
+                                        &mut ctx.user_state,
+                                        &environment_context_source,
+                                    );
+                                    let mut history = build_injected_history(&ctx);
+                                    history.insert(0, Message::system(subagent_system_prompt.clone()));
+                                    insert_environment_context_prompt(
+                                        &mut history,
+                                        1,
+                                        environment_context.prompt,
+                                    );
                                     skip_count = history.len();
                                     continuation_input = continuation_input
                                         .history(history)
@@ -4813,6 +4940,7 @@ fn register_delegate_agent_tools(
         let tool_extra_options = extra_options.clone();
         let persistent_sessions = profile.persistent_sessions;
         let mut tool_allowlist = profile.tools.clone();
+        expand_skill_discovery_tools(&mut tool_allowlist);
         for delegate in &profile.delegates {
             let name = delegate_tool_name(delegate);
             if !tool_allowlist.iter().any(|tool| tool == &name) {
@@ -4871,8 +4999,9 @@ mod tests {
         append_thread_todo_system_prompt, background_task_completion_steer_input,
         context_percent_tokens, default_system_prompt, format_subagent_tool_result,
         insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
-        install_embedded_model_profiles, local_acp_thread_id, model_input_snapshot_from_loop_input,
-        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
+        install_embedded_model_profiles, local_acp_thread_id, memory_compaction_budget_tokens,
+        model_input_snapshot_from_loop_input, prepend_group_sender_username,
+        route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
         try_recv_completed_tool_task, AgentModelBindings, CatBotBuilder, CatEvent, Content,
         ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
@@ -4951,6 +5080,21 @@ mod tests {
     }
 
     #[test]
+    fn memory_compaction_budget_accounts_for_output_margin_and_fixed_prompt() {
+        let mut profile = test_model_profile();
+        profile.context_tokens = 100_000;
+        profile.max_output_tokens = 30_000;
+
+        // 80% would be 80k, but output + 5% safety caps the request at 65k.
+        // The memory share then excludes the fixed system prompt and protocol.
+        let fixed = "x".repeat(4_000); // 1,000 estimated tokens
+        assert_eq!(
+            memory_compaction_budget_tokens(&profile, 80, &fixed),
+            63_488
+        );
+    }
+
+    #[test]
     fn model_input_snapshot_classifies_core_segments() {
         let mut assistant = Message::assistant("calling tool");
         assistant.tool_calls = Some(vec![ToolCallMessage {
@@ -5009,6 +5153,7 @@ mod tests {
             tool_name: "bash".to_string(),
             args: json!({"command": "sleep 60"}),
             status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            background: true,
             started_at: "2026-07-09T00:00:00Z".to_string(),
             completed_at: Some("2026-07-09T00:01:00Z".to_string()),
             elapsed_ms: Some(60_000),
@@ -5052,6 +5197,7 @@ mod tests {
             tool_name: "bash".to_string(),
             args: json!({"command": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}),
             status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            background: true,
             started_at: "2026-07-09T00:00:00Z".to_string(),
             completed_at: Some("2026-07-09T00:01:00Z".to_string()),
             elapsed_ms: Some(60_000),
@@ -6165,6 +6311,7 @@ You are Remi.
                 Message::user("previous user"),
                 Message::assistant("previous assistant"),
             ],
+            latest_summary: None,
             user_state,
         };
 

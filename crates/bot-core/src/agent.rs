@@ -2131,15 +2131,16 @@ fn collect_tool_result_futures_with_timeout(
                                 CollectedToolResult::text("error: background tool task was cancelled"),
                             )
                         });
+                        tool_tasks.remove_foreground(&task_id).await;
                         ForegroundToolOutcome::Completed {
                             call_id: completed_call_id,
                             collected,
                         }
                     }
                     _ = tokio::time::sleep(foreground_timeout) => {
-                        if async_agent {
-                            tool_tasks.enable_completion_notification(&task_id).await;
-                        }
+                        tool_tasks
+                            .promote_to_background(&task_id, async_agent)
+                            .await;
                         ForegroundToolOutcome::TimedOut {
                             call_id,
                             task_id,
@@ -3812,7 +3813,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn foreground_completed_tool_updates_task_without_completion_notification() {
+    async fn foreground_completed_tool_removes_task_without_completion_notification() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -3855,14 +3856,7 @@ mod tests {
                 assert_eq!(collected.preview, "fast");
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
 
-                let task = tool_tasks
-                    .list(Some("thread-1"))
-                    .await
-                    .into_iter()
-                    .find(|task| task.tool_call_id == "fast-call")
-                    .expect("foreground-completed task should still be recorded");
-                assert_eq!(task.status.as_str(), "completed");
-                assert_eq!(task.result_preview.as_deref(), Some("fast"));
+                assert!(tool_tasks.list(Some("thread-1")).await.is_empty());
                 assert!(
                     tokio::time::timeout(Duration::from_millis(25), completed_rx.recv())
                         .await

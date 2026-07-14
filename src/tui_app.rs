@@ -1605,18 +1605,78 @@ impl TuiApp {
                 self.awaiting_background_tasks = false;
                 self.active_tool_args.insert(id.clone(), String::new());
                 self.active_tool_names.insert(id.clone(), name.clone());
+                self.active_tool_started_at
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
+                let meta = self
+                    .active_tool_started_at
+                    .get(&id)
+                    .map(|started| running_tool_meta(*started, None))
+                    .unwrap_or_else(|| format_elapsed(0));
+                let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
+                if name == "apply_patch" {
+                    self.cells.push(HistoryCell::patch_diff(
+                        id.clone(),
+                        "waiting for patch...".to_string(),
+                        meta,
+                        ToolVisualStatus::Running,
+                    ));
+                } else {
+                    let body = tool_body(&pretty);
+                    self.cells.push(HistoryCell::tool(
+                        id.clone(),
+                        pretty.title,
+                        body,
+                        meta,
+                        ToolVisualStatus::Running,
+                    ));
+                }
+                if let Some(index) = self
+                    .cells
+                    .iter()
+                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    self.mark_token_cell(index);
+                }
             }
             BotEvent::ToolArgs { id, delta } => {
                 let args = self.active_tool_args.entry(id.clone()).or_default();
                 args.push_str(&delta);
+                let is_patch = self
+                    .active_tool_names
+                    .get(&id)
+                    .is_some_and(|name| name == "apply_patch");
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
+                {
+                    if is_patch {
+                        if let Some(patch) = extract_patch_arg(args) {
+                            cell.body = patch;
+                        }
+                    } else if let (Some(name), Some(args_value)) =
+                        (self.active_tool_names.get(&id), parse_tool_args(args))
+                    {
+                        let pretty = PrettyToolCall::started(&id, name, &args_value);
+                        let body = tool_body(&pretty);
+                        cell.title = pretty.title;
+                        cell.body = body;
+                    } else if cell.body.trim().is_empty() {
+                        cell.body = "reading tool arguments...".to_string();
+                    }
+                }
             }
             BotEvent::ToolCall { id, name, args } => {
                 self.active_tool_args.insert(id.clone(), args.clone());
                 self.active_tool_names.insert(id.clone(), name.clone());
                 self.active_tool_started_at
-                    .insert(id.clone(), Instant::now());
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
                 self.active_tool_execution_started_at
-                    .insert(id.clone(), Instant::now());
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
                 let meta = self
                     .active_tool_started_at
                     .get(&id)
@@ -2314,11 +2374,24 @@ impl TuiApp {
     }
 
     fn discard_unexecuted_tool_proposals(&mut self) {
+        let discarded = self
+            .active_tool_started_at
+            .keys()
+            .filter(|id| !self.active_tool_execution_started_at.contains_key(*id))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         retain_executing_tool_proposals(
             &mut self.active_tool_args,
             &mut self.active_tool_names,
-            &self.active_tool_started_at,
+            &self.active_tool_execution_started_at,
         );
+        self.active_tool_started_at
+            .retain(|id, _| !discarded.contains(id));
+        self.cells.retain(|cell| {
+            !cell
+                .tool_id()
+                .is_some_and(|tool_id| discarded.contains(tool_id))
+        });
     }
 
     fn request_cancel_current_run(&mut self) {
@@ -2430,7 +2503,7 @@ impl TuiApp {
         let mut skills = self.runtime.bot.skill_summaries();
         skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
         commands.extend(skills.into_iter().map(|skill| CommandEntry {
-            value: format!("/skill:{} ", skill.name),
+            value: format!("/skill:{} ", skill.id),
             description: skill.description,
             accepts_arguments: true,
             searchable: format!("skill {} 技能 {}", skill.name, skill.source),
@@ -4420,7 +4493,6 @@ fn static_commands() -> Vec<CommandEntry> {
         ("/quit", "退出 TUI", false),
         ("/tools", "显示当前 Agent 可用的工具", false),
         ("/tasks", "显示当前 session 后台任务", false),
-        ("/tasks all", "显示全部后台任务", false),
         ("/tasks get ", "查看后台任务详情", true),
         ("/tasks cancel ", "取消后台任务", true),
         ("/goal status", "查看当前会话目标", false),
@@ -4884,6 +4956,7 @@ mod tests {
             .iter()
             .any(|command| command.value == "/skill list"));
         assert!(commands.iter().any(|command| command.value == "/tasks"));
+        assert!(!commands.iter().any(|command| command.value == "/tasks all"));
         assert!(commands
             .iter()
             .any(|command| command.value == "/tasks get "));

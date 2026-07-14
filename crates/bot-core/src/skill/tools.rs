@@ -15,8 +15,9 @@ const LEGACY_ACTIVATED_SKILLS_STATE_KEY: &str = "__activated_skills";
 
 fn render_skill_summary(summary: &SkillSummary) -> String {
     format!(
-        "- {} - {} ({})",
-        summary.name, summary.description, summary.source
+        "- id={} name={} parent_id={} description={} source={} skill_file_path={} resource_root_path={}",
+        summary.id, summary.name, summary.parent_id.as_deref().unwrap_or("none"), summary.description, summary.source,
+        summary.skill_file_path.as_deref().unwrap_or("unavailable"), summary.resource_root_path.as_deref().unwrap_or("unavailable")
     )
 }
 
@@ -175,7 +176,7 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
             .to_string();
         let result = match self.store.get(&name).await? {
             Some(doc) => {
-                mark_skill_read(ctx, &doc.name);
+                mark_skill_read(ctx, &doc.id);
                 let diagnostics =
                     diagnostics_for_skill_name(&self.store.load_diagnostics(), &doc.name);
                 let resource_hint = match (&doc.skill_file_path, &doc.resource_root_path) {
@@ -187,10 +188,18 @@ impl<S: SkillStore + 'static> Tool for SkillGetTool<S> {
                 let mut text = format!(
                     "{}\n\n[skill read: {} from {}; {}]",
                     doc.content.trim_end(),
-                    doc.name,
+                    doc.id,
                     doc.source,
                     resource_hint
                 );
+                if !doc.children.is_empty() {
+                    text.push_str("\n\n[direct child skill metadata]\n");
+                    for child in &doc.children {
+                        text.push_str(&render_skill_summary(child));
+                        text.push('\n');
+                    }
+                    text.push_str("[end direct child skill metadata]");
+                }
                 text.push_str(&render_skill_diagnostics_summary(&diagnostics));
                 text
             }
@@ -450,10 +459,10 @@ mod tests {
             other => panic!("expected text output, got {other:?}"),
         };
 
-        assert!(output.contains("[skill read: loose-skill"));
+        assert!(output.contains("Skill 'loose-skill' not found"));
         assert!(output.contains("Skill load diagnostics"));
         assert!(output.contains("skill=loose-skill"));
-        assert!(output.contains("missing YAML frontmatter"));
+        assert!(output.contains("frontmatter description"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -529,7 +538,7 @@ mod tests {
 
         assert!(output.contains("loose-skill"));
         assert!(output.contains("Skill load diagnostics"));
-        assert!(output.contains("missing YAML frontmatter"));
+        assert!(output.contains("frontmatter description"));
 
         let _ = std::fs::remove_dir_all(primary);
         let _ = std::fs::remove_dir_all(compat);

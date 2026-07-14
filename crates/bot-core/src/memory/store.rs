@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use remi_agentloop::prelude::{AgentError, Message, Role};
@@ -48,6 +48,9 @@ pub struct MemoryContext {
     pub long_term: MemoryIndex,
     pub mid_term: MemoryIndex,
     pub short_term: Vec<Message>,
+    /// Full text of the newest non-overlapping summary selected for direct
+    /// context injection (mid-term preferred, long-term fallback).
+    pub latest_summary: Option<String>,
     /// Persisted tool-managed state (todos, etc.) restored from disk.
     pub user_state: serde_json::Value,
 }
@@ -138,9 +141,21 @@ fn emit_compaction_event(
 
 const MEMORY_RECALL_SNIPPET_CHARS: usize = 2_000;
 static SHORT_TERM_TOKEN_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static THREAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 fn short_term_token_counts() -> &'static Mutex<HashMap<String, usize>> {
     SHORT_TERM_TOKEN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn thread_lock(key: String) -> Arc<tokio::sync::Mutex<()>> {
+    THREAD_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("memory thread lock map poisoned")
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -202,10 +217,7 @@ impl MemoryStore {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| AgentError::Io(e.to_string()))?;
-        let path = dir.join("index.json");
-        tokio::fs::write(&path, idx.to_json())
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))
+        atomic_write(&dir.join("index.json"), idx.to_json().as_bytes()).await
     }
 
     // ── Short-term JSONL I/O ──────────────────────────────────────────────────
@@ -225,21 +237,7 @@ impl MemoryStore {
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
-        // Guard: drop any leading Tool/Assistant messages (orphaned tool results
-        // from a bad compression boundary).  The history passed to the API must
-        // always start with a User or System message, otherwise the API returns
-        // 400 "tool_call_id is not found".
-        let start = msgs
-            .iter()
-            .position(|m| matches!(m.role, Role::User | Role::System))
-            .unwrap_or(msgs.len());
-        if start > 0 {
-            tracing::warn!(
-                "short_term starts with {} orphaned non-user message(s); dropping them",
-                start
-            );
-        }
-        msgs[start..].to_vec()
+        msgs
     }
 
     async fn write_short_term(path: &PathBuf, msgs: &[Message]) -> Result<(), AgentError> {
@@ -304,38 +302,8 @@ impl MemoryStore {
             .map_err(|e| AgentError::Io(e.to_string()))?;
         file.write_all(lines.as_bytes())
             .await
-            .map_err(|e| AgentError::Io(e.to_string()))
-    }
-
-    // ── Raw archive ───────────────────────────────────────────────────────────
-
-    /// Write raw messages to `<tier_dir>/raw/<uuid>/<timestamp>.jsonl`
-    /// **before** any compression is performed.
-    async fn archive_raw(
-        tier_dir: &PathBuf,
-        uuid: &str,
-        msgs: &[Message],
-    ) -> Result<(), AgentError> {
-        let raw_dir = tier_dir.join("raw").join(uuid);
-        tokio::fs::create_dir_all(&raw_dir)
-            .await
             .map_err(|e| AgentError::Io(e.to_string()))?;
-        let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let path = raw_dir.join(format!("{ts}.jsonl"));
-        let lines: String = msgs
-            .iter()
-            .filter_map(|m| serde_json::to_string(m).ok())
-            .map(|l| l + "\n")
-            .collect();
-        // tier_dir is e.g. thread_dir/mid_term — blobs live in thread_dir/blobs
-        let blobs_dir = tier_dir
-            .parent()
-            .map(|p| p.join("blobs"))
-            .unwrap_or_else(|| tier_dir.join("blobs"));
-        let lines = super::blob::extract_blobs(&lines, &blobs_dir)
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
-        tokio::fs::write(&path, lines)
+        file.sync_all()
             .await
             .map_err(|e| AgentError::Io(e.to_string()))
     }
@@ -358,10 +326,7 @@ impl MemoryStore {
         let new_uuid = Uuid::new_v4().to_string();
         let mid_dir = self.mid_term_dir(thread_id);
 
-        // 1. Archive raw BEFORE compressing.
-        Self::archive_raw(&mid_dir, &new_uuid, &oldest).await?;
-
-        // 2. Compress.
+        // The ledger is the raw source of truth; no new raw archive is made.
         let summary = self.compressor.compress(&oldest).await?;
 
         // ── Skip empty compression results ───────────────────────────────
@@ -385,9 +350,7 @@ impl MemoryStore {
         let md_path = mid_dir.join(format!("{new_uuid}.md"));
         let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
         let summary_with_ts = format!("{ts_header}{summary}");
-        tokio::fs::write(&md_path, &summary_with_ts)
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
+        atomic_write(&md_path, summary_with_ts.as_bytes()).await?;
 
         // 4. Update index.
         let mut idx = Self::read_index(&mid_dir).await;
@@ -395,6 +358,10 @@ impl MemoryStore {
             uuid: new_uuid,
             created_at: Utc::now(),
             preview,
+            first_message_id: oldest.first().map(|m| m.id.to_string()),
+            last_message_id: oldest.last().map(|m| m.id.to_string()),
+            message_count: Some(oldest.len()),
+            status: Some("committed".to_string()),
         });
         Self::write_index(&mid_dir, &idx).await?;
 
@@ -505,6 +472,13 @@ impl MemoryStore {
                 uuid: long_uuid,
                 created_at: Utc::now(),
                 preview,
+                first_message_id: to_promote.iter().find_map(|e| e.first_message_id.clone()),
+                last_message_id: to_promote
+                    .iter()
+                    .rev()
+                    .find_map(|e| e.last_message_id.clone()),
+                message_count: Some(to_promote.iter().filter_map(|e| e.message_count).sum()),
+                status: Some("committed".to_string()),
             }],
         };
         Self::write_index(&long_dir, &new_lt_idx).await?;
@@ -523,6 +497,7 @@ impl MemoryStore {
     /// This also runs `maybe_promote` to age out stale mid-term entries.
     /// Promotion failures are non-fatal.
     pub async fn load_context(&self, thread_id: &str) -> Result<MemoryContext, AgentError> {
+        self.migrate_legacy_raw_archives(thread_id).await?;
         // Attempt promotion first; ignore errors so a failing LLM call
         // does not block the main turn.
         let _ = self.maybe_promote(thread_id).await;
@@ -534,22 +509,104 @@ impl MemoryStore {
         let soul_md = read_optional_file(&self.data_dir.join("Soul.md")).await;
         let long_term = Self::read_index(&self.long_term_dir(thread_id)).await;
         let mid_term = Self::read_index(&self.mid_term_dir(thread_id)).await;
-        let short_term = Self::read_short_term(&self.short_term_path(thread_id)).await;
-        let short_term_tokens = estimate_memory_message_tokens(&short_term);
+        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        // Never create a visibility gap between committed summary coverage and
+        // the raw tail.  "Recent 10" is the normal direct-message window, but
+        // messages which have not yet been covered by any summary must remain
+        // directly visible until a later budget-driven compaction commits.
+        let covered_position = last_covered_position_across_tiers(&ledger, &mid_term, &long_term);
+        let uncovered_start = covered_position.map_or(0, |position| position + 1);
+        let recent_start = recent_complete_start(&ledger, 10);
+        let short_term = ledger[uncovered_start.min(recent_start)..].to_vec();
+        let uncovered_tokens = estimate_memory_message_tokens(&ledger[uncovered_start..]);
         short_term_token_counts()
             .lock()
             .expect("short-term token cache lock poisoned")
-            .insert(self.token_cache_key(thread_id), short_term_tokens);
+            .insert(self.token_cache_key(thread_id), uncovered_tokens);
         let user_state = self.load_user_state(thread_id).await;
 
+        let latest_entry = mid_term.entries.last().or_else(|| long_term.entries.last());
+        let latest_summary = match latest_entry {
+            Some(entry) => {
+                let dir = if mid_term.entries.iter().any(|e| e.uuid == entry.uuid) {
+                    self.mid_term_dir(thread_id)
+                } else {
+                    self.long_term_dir(thread_id)
+                };
+                tokio::fs::read_to_string(dir.join(format!("{}.md", entry.uuid)))
+                    .await
+                    .ok()
+            }
+            None => None,
+        };
         Ok(MemoryContext {
             agent_md,
             soul_md,
             long_term,
             mid_term,
             short_term,
+            latest_summary,
             user_state,
         })
+    }
+
+    async fn migrate_legacy_raw_archives(&self, thread_id: &str) -> Result<(), AgentError> {
+        let thread_dir = self.thread_dir(thread_id);
+        let marker = thread_dir.join(".ledger_migration_v1");
+        if tokio::fs::metadata(&marker).await.is_ok() {
+            return Ok(());
+        }
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
+        let mut raw_files = Vec::new();
+        for root in [
+            self.mid_term_dir(thread_id).join("raw"),
+            self.long_term_dir(thread_id).join("raw"),
+        ] {
+            collect_jsonl_files(root, &mut raw_files).await?;
+        }
+        if raw_files.is_empty() {
+            atomic_write(&marker, b"complete\n").await?;
+            return Ok(());
+        }
+        let short_path = self.short_term_path(thread_id);
+        let mut merged = Self::read_short_term(&short_path).await;
+        let mut ids = merged
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        for path in raw_files {
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let blobs = thread_dir.join("blobs");
+            let text = super::blob::restore_blobs(&text, &blobs).await;
+            for message in text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Message>(line).ok())
+            {
+                if ids.insert(message.id.to_string()) {
+                    merged.push(message);
+                }
+            }
+        }
+        merged.sort_by_key(message_timestamp);
+        Self::write_short_term(&short_path, &merged).await?;
+        let reparsed = Self::read_short_term(&short_path).await;
+        if reparsed.len() != merged.len() {
+            return Err(AgentError::Io(
+                "legacy raw migration verification failed".to_string(),
+            ));
+        }
+        atomic_write(&marker, b"complete\n").await?;
+        for raw in [
+            self.mid_term_dir(thread_id).join("raw"),
+            self.long_term_dir(thread_id).join("raw"),
+        ] {
+            let _ = tokio::fs::remove_dir_all(raw).await;
+        }
+        Ok(())
     }
 
     pub async fn thread_history(&self, thread_id: &str) -> Vec<ThreadHistoryMessage> {
@@ -637,11 +694,15 @@ impl MemoryStore {
     }
 
     pub async fn delete_thread(&self, thread_id: &str) -> Result<(), AgentError> {
-        match tokio::fs::remove_dir_all(self.thread_dir(thread_id)).await {
+        let result = match tokio::fs::remove_dir_all(self.thread_dir(thread_id)).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(AgentError::Io(err.to_string())),
+        };
+        if result.is_ok() {
+            remove_thread_caches(&self.token_cache_key(thread_id));
         }
+        result
     }
 
     pub async fn fork_thread(
@@ -693,7 +754,10 @@ impl MemoryStore {
                     .or_insert(serde_json::Value::String(ts));
             }
         }
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
         let short_path = self.short_term_path(thread_id);
+        Self::append_short_term(&short_path, &new_msgs).await?;
         let new_tokens = estimate_memory_message_tokens(&new_msgs);
         let token_cache_key = self.token_cache_key(thread_id);
         let cached_tokens = short_term_token_counts()
@@ -704,7 +768,6 @@ impl MemoryStore {
         if !self.auto_compress
             || cached_tokens.is_some_and(|tokens| tokens + new_tokens <= self.short_term_tokens)
         {
-            Self::append_short_term(&short_path, &new_msgs).await?;
             if let Some(tokens) = cached_tokens {
                 short_term_token_counts()
                     .lock()
@@ -714,65 +777,62 @@ impl MemoryStore {
             return Ok(());
         }
 
-        let mut all_msgs = Self::read_short_term(&short_path).await;
-        all_msgs.append(&mut new_msgs);
+        let all_msgs = Self::read_short_term(&short_path).await;
+        let mid_idx = Self::read_index(&self.mid_term_dir(thread_id)).await;
+        let long_idx = Self::read_index(&self.long_term_dir(thread_id)).await;
+        let uncovered_start =
+            last_covered_position_across_tiers(&all_msgs, &mid_idx, &long_idx).map_or(0, |i| i + 1);
+        let active = all_msgs[uncovered_start..].to_vec();
+        let mut cached_uncovered_tokens = estimate_memory_message_tokens(&active);
 
-        if self.auto_compress {
-            while estimate_memory_message_tokens(&all_msgs) > self.short_term_tokens
-                && all_msgs.len() > 1
-            {
-                let attempt = self.plan_mid_term_compression(&all_msgs);
-                let event_id = Uuid::new_v4().to_string();
-                emit_compaction_event(
-                    &mut compaction_sink,
-                    &event_id,
-                    thread_id,
-                    ContextCompactionStatus::Started,
-                    attempt.compacted_messages,
-                    attempt.remaining_messages,
-                    None,
-                );
-                match self.compress_to_mid_term(thread_id, all_msgs.clone()).await {
-                    Ok(remaining) => {
-                        emit_compaction_event(
-                            &mut compaction_sink,
-                            &event_id,
-                            thread_id,
-                            ContextCompactionStatus::Completed,
-                            attempt.compacted_messages,
-                            remaining.len(),
-                            None,
-                        );
-                        all_msgs = remaining;
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        emit_compaction_event(
-                            &mut compaction_sink,
-                            &event_id,
-                            thread_id,
-                            ContextCompactionStatus::Failed,
-                            attempt.compacted_messages,
-                            attempt.remaining_messages,
-                            Some(error.clone()),
-                        );
-                        // Compression failed (e.g. LLM unavailable or empty response).
-                        // Fall back to dropping the oldest half so we can still save.
-                        tracing::warn!(
-                            "compress_to_mid_term failed, dropping oldest messages: {error}"
-                        );
-                        let drop_n = (all_msgs.len() / 2).max(1);
-                        all_msgs.drain(..drop_n);
-                    }
+        if self.auto_compress
+            && estimate_memory_message_tokens(&active) > self.short_term_tokens
+            && active.len() > 10
+        {
+            let attempt = self.plan_mid_term_compression(&active);
+            let event_id = Uuid::new_v4().to_string();
+            emit_compaction_event(
+                &mut compaction_sink,
+                &event_id,
+                thread_id,
+                ContextCompactionStatus::Started,
+                attempt.compacted_messages,
+                attempt.remaining_messages,
+                None,
+            );
+            match self.compress_to_mid_term(thread_id, active.clone()).await {
+                Ok(remaining) => {
+                    cached_uncovered_tokens = estimate_memory_message_tokens(&remaining);
+                    emit_compaction_event(
+                        &mut compaction_sink,
+                        &event_id,
+                        thread_id,
+                        ContextCompactionStatus::Completed,
+                        attempt.compacted_messages,
+                        remaining.len(),
+                        None,
+                    );
+                    let _ = remaining;
+                }
+                Err(e) => {
+                    let error = e.to_string();
+                    emit_compaction_event(
+                        &mut compaction_sink,
+                        &event_id,
+                        thread_id,
+                        ContextCompactionStatus::Failed,
+                        attempt.compacted_messages,
+                        attempt.remaining_messages,
+                        Some(error.clone()),
+                    );
+                    tracing::warn!("compress_to_mid_term failed; ledger remains intact: {error}");
                 }
             }
         }
-
-        Self::write_short_term(&short_path, &all_msgs).await?;
         short_term_token_counts()
             .lock()
             .expect("short-term token cache lock poisoned")
-            .insert(token_cache_key, estimate_memory_message_tokens(&all_msgs));
+            .insert(token_cache_key, cached_uncovered_tokens);
         Ok(())
     }
 
@@ -816,25 +876,28 @@ impl MemoryStore {
         }
     }
 
-    /// Immediately compress **all** current short-term messages **and** all
-    /// existing mid-term summaries into one single new mid-term block.
+    /// Force compression of uncovered complete exchanges while retaining the
+    /// latest ten raw ledger messages for direct model context.
     ///
     /// - All existing mid-term `.md` files are read, merged, and re-compressed
     ///   together with the current short-term log.
     /// - The mid-term index is replaced with the single new entry.
-    /// - Short-term is cleared.
-    ///
-    /// Returns the number of short-term messages that were included, or `0`
-    /// if both short-term and mid-term were already empty.
+    /// The append-only ledger is never truncated by this operation.
     pub async fn compact_now(&self, thread_id: &str) -> Result<usize, AgentError> {
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
         let short_path = self.short_term_path(thread_id);
         let mid_dir = self.mid_term_dir(thread_id);
 
-        let short_msgs = Self::read_short_term(&short_path).await;
+        let ledger = Self::read_short_term(&short_path).await;
+        let mid_idx = Self::read_index(&mid_dir).await;
+        let start = last_covered_position(&ledger, &mid_idx).map_or(0, |i| i + 1);
+        let uncovered = &ledger[start..];
+        let keep_start = recent_complete_start(uncovered, 10);
+        let short_msgs = uncovered[..keep_start].to_vec();
         let short_count = short_msgs.len();
 
         // ── Collect existing mid-term summary texts ───────────────────────
-        let mid_idx = Self::read_index(&mid_dir).await;
         let mut combined_text = String::new();
         for entry in &mid_idx.entries {
             let md_path = mid_dir.join(format!("{}.md", entry.uuid));
@@ -846,7 +909,7 @@ impl MemoryStore {
             }
         }
 
-        if short_count == 0 && combined_text.is_empty() {
+        if short_count == 0 {
             return Ok(0);
         }
 
@@ -862,11 +925,6 @@ impl MemoryStore {
 
         let new_uuid = Uuid::new_v4().to_string();
 
-        // ── Archive short-term raw before compressing ─────────────────────
-        if !short_msgs.is_empty() {
-            Self::archive_raw(&mid_dir, &new_uuid, &short_msgs).await?;
-        }
-
         // ── Compress ──────────────────────────────────────────────────────
         let summary = self.compressor.compress(&compress_msgs).await?;
 
@@ -878,13 +936,9 @@ impl MemoryStore {
                 short_msgs.len(),
                 if combined_text.is_empty() { 0 } else { 1 },
             );
-            // Clear short-term (these messages were uncompressible).
-            Self::write_short_term(&short_path, &[]).await?;
-            short_term_token_counts()
-                .lock()
-                .expect("short-term token cache lock poisoned")
-                .insert(self.token_cache_key(thread_id), 0);
-            return Ok(0);
+            return Err(AgentError::other(
+                "compact_now: compressor returned an invalid empty summary",
+            ));
         }
 
         // ── Proceed with normal compression output ───────────────────────
@@ -896,9 +950,7 @@ impl MemoryStore {
             .map_err(|e| AgentError::Io(e.to_string()))?;
         let md_path = mid_dir.join(format!("{new_uuid}.md"));
         let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
-        tokio::fs::write(&md_path, format!("{ts_header}{summary}"))
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
+        atomic_write(&md_path, format!("{ts_header}{summary}").as_bytes()).await?;
 
         // ── Remove old mid-term .md files ─────────────────────────────────
         for entry in &mid_idx.entries {
@@ -911,16 +963,13 @@ impl MemoryStore {
                 uuid: new_uuid,
                 created_at: Utc::now(),
                 preview,
+                first_message_id: short_msgs.first().map(|m| m.id.to_string()),
+                last_message_id: short_msgs.last().map(|m| m.id.to_string()),
+                message_count: Some(short_msgs.len()),
+                status: Some("committed".to_string()),
             }],
         };
         Self::write_index(&mid_dir, &new_idx).await?;
-
-        // ── Clear short-term ──────────────────────────────────────────────
-        Self::write_short_term(&short_path, &[]).await?;
-        short_term_token_counts()
-            .lock()
-            .expect("short-term token cache lock poisoned")
-            .insert(self.token_cache_key(thread_id), 0);
 
         Ok(short_count)
     }
@@ -928,6 +977,8 @@ impl MemoryStore {
     /// Clear conversational history for a thread while preserving tool-managed
     /// `user_state.json` such as todos.
     pub async fn clear_thread(&self, thread_id: &str) -> Result<(), AgentError> {
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
         let short_path = self.short_term_path(thread_id);
         Self::write_short_term(&short_path, &[]).await?;
         short_term_token_counts()
@@ -946,6 +997,11 @@ impl MemoryStore {
                 Err(err) => return Err(AgentError::Io(err.to_string())),
             }
         }
+        THREAD_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("memory thread lock map poisoned")
+            .remove(&self.token_cache_key(thread_id));
         Ok(())
     }
 
@@ -963,6 +1019,15 @@ impl MemoryStore {
             if let Ok(text) = tokio::fs::read_to_string(&path).await {
                 return Ok(Some(text));
             }
+        }
+        if let Some(message) = Self::read_short_term(&self.short_term_path(thread_id))
+            .await
+            .into_iter()
+            .find(|message| message.id.to_string() == uuid)
+        {
+            return serde_json::to_string_pretty(&message)
+                .map(Some)
+                .map_err(|e| AgentError::other(format!("serialize ledger message: {e}")));
         }
         Ok(None)
     }
@@ -1164,10 +1229,117 @@ fn tool_elapsed_ms(message: &Message) -> Option<u64> {
     message.metadata.as_ref()?.get("tool_elapsed_ms")?.as_u64()
 }
 
+fn last_covered_position(messages: &[Message], index: &MemoryIndex) -> Option<usize> {
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.status.as_deref() != Some("legacy"))
+        .filter_map(|entry| entry.last_message_id.as_deref())
+        .filter_map(|id| {
+            messages
+                .iter()
+                .position(|message| message.id.to_string() == id)
+        })
+        .max()
+}
+
+fn last_covered_position_across_tiers(
+    messages: &[Message],
+    mid_term: &MemoryIndex,
+    long_term: &MemoryIndex,
+) -> Option<usize> {
+    last_covered_position(messages, mid_term)
+        .into_iter()
+        .chain(last_covered_position(messages, long_term))
+        .max()
+}
+
+fn remove_thread_caches(key: &str) {
+    short_term_token_counts()
+        .lock()
+        .expect("short-term token cache lock poisoned")
+        .remove(key);
+    THREAD_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("memory thread lock map poisoned")
+        .remove(key);
+}
+
+fn recent_complete_start(messages: &[Message], max_messages: usize) -> usize {
+    if messages.len() <= max_messages {
+        return 0;
+    }
+    let desired = messages.len() - max_messages;
+    (desired..messages.len())
+        .find(|&i| matches!(messages[i].role, Role::User | Role::System))
+        .unwrap_or(desired)
+}
+
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|e| AgentError::Io(e.to_string()))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| AgentError::Io(e.to_string()))?;
+    file.sync_all()
+        .await
+        .map_err(|e| AgentError::Io(e.to_string()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| AgentError::Io(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    Ok(())
+}
+
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 
 async fn read_optional_file(path: &PathBuf) -> Option<String> {
     tokio::fs::read_to_string(path).await.ok()
+}
+
+fn collect_jsonl_files(
+    root: PathBuf,
+    output: &mut Vec<PathBuf>,
+) -> futures::future::BoxFuture<'_, Result<(), AgentError>> {
+    Box::pin(async move {
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(AgentError::Io(err.to_string())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?
+        {
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .await
+                .map_err(|e| AgentError::Io(e.to_string()))?;
+            if kind.is_dir() {
+                collect_jsonl_files(path, output).await?;
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                output.push(path);
+            }
+        }
+        Ok(())
+    })
 }
 
 fn normalize_named_memory_name(name: &str) -> Result<String, AgentError> {
@@ -1440,8 +1612,37 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    #[test]
+    fn coverage_uses_furthest_committed_entry_across_mid_and_long_term() {
+        let messages = vec![
+            Message::user("one"),
+            Message::assistant("two"),
+            Message::user("three"),
+        ];
+        let entry = |last_message_id: String| MemoryEntry {
+            uuid: Uuid::new_v4().to_string(),
+            created_at: Utc::now(),
+            preview: String::new(),
+            first_message_id: None,
+            last_message_id: Some(last_message_id),
+            message_count: None,
+            status: Some("committed".to_string()),
+        };
+        let mid = MemoryIndex {
+            entries: vec![entry(messages[0].id.to_string())],
+        };
+        let long = MemoryIndex {
+            entries: vec![entry(messages[1].id.to_string())],
+        };
+
+        assert_eq!(
+            last_covered_position_across_tiers(&messages, &mid, &long),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
-    async fn save_turn_emits_context_compaction_started_and_completed() {
+    async fn save_turn_keeps_recent_messages_in_append_only_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = test_store(tmp.path().to_path_buf());
         store.auto_compress = true;
@@ -1461,18 +1662,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].status, ContextCompactionStatus::Started);
-        assert_eq!(events[1].status, ContextCompactionStatus::Completed);
-        assert_eq!(events[0].id, events[1].id);
-        assert_eq!(events[0].thread_id, "thread-1");
-        assert_eq!(events[0].compacted_messages, 2);
-        assert_eq!(events[1].remaining_messages, 0);
-        assert!(events[1].error.is_none());
+        assert!(events.is_empty());
+        assert_eq!(store.thread_history("thread-1").await.len(), 2);
     }
 
     #[tokio::test]
-    async fn save_turn_emits_context_compaction_failed_before_fallback_drop() {
+    async fn unavailable_compaction_target_does_not_drop_recent_ledger_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = test_store(tmp.path().to_path_buf());
         store.auto_compress = true;
@@ -1497,15 +1692,84 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].status, ContextCompactionStatus::Started);
-        assert_eq!(events[1].status, ContextCompactionStatus::Failed);
-        assert_eq!(events[0].id, events[1].id);
-        assert!(events[1]
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Not a directory"));
+        assert!(events.is_empty());
+        assert_eq!(store.thread_history("thread-1").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_context_keeps_uncovered_messages_before_recent_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let thread_id = "thread-no-coverage-gap";
+        let messages = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("user-{i}"))
+                } else {
+                    Message::assistant(format!("assistant-{i}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        MemoryStore::append_short_term(&store.short_term_path(thread_id), &messages)
+            .await
+            .unwrap();
+
+        let entry = MemoryEntry {
+            uuid: "summary-1".to_string(),
+            created_at: Utc::now(),
+            preview: "covered first six".to_string(),
+            first_message_id: Some(messages[0].id.to_string()),
+            last_message_id: Some(messages[5].id.to_string()),
+            message_count: Some(6),
+            status: Some("committed".to_string()),
+        };
+        let mid_dir = store.mid_term_dir(thread_id);
+        tokio::fs::create_dir_all(&mid_dir).await.unwrap();
+        tokio::fs::write(mid_dir.join("summary-1.md"), "committed summary")
+            .await
+            .unwrap();
+        MemoryStore::write_index(
+            &mid_dir,
+            &MemoryIndex {
+                entries: vec![entry],
+            },
+        )
+        .await
+        .unwrap();
+
+        let context = store.load_context(thread_id).await.unwrap();
+        assert_eq!(context.short_term.len(), 14);
+        assert_eq!(context.short_term[0].id, messages[6].id);
+        assert_eq!(context.short_term.last().unwrap().id, messages[19].id);
+        assert_eq!(context.latest_summary.as_deref(), Some("committed summary"));
+
+        // A summary boundary may overlap the complete-exchange expansion of
+        // the recent window.  The overlap must not suppress the whole summary,
+        // because it also carries facts from older, non-overlapping messages.
+        let overlapping_entry = MemoryEntry {
+            uuid: "summary-1".to_string(),
+            created_at: Utc::now(),
+            preview: "covered first twelve".to_string(),
+            first_message_id: Some(messages[0].id.to_string()),
+            last_message_id: Some(messages[11].id.to_string()),
+            message_count: Some(12),
+            status: Some("committed".to_string()),
+        };
+        MemoryStore::write_index(
+            &mid_dir,
+            &MemoryIndex {
+                entries: vec![overlapping_entry],
+            },
+        )
+        .await
+        .unwrap();
+        let overlapping = store.load_context(thread_id).await.unwrap();
+        assert_eq!(overlapping.short_term.len(), 10);
+        assert_eq!(overlapping.short_term[0].id, messages[10].id);
+        assert_eq!(
+            overlapping.latest_summary.as_deref(),
+            Some("committed summary")
+        );
     }
 
     #[test]
@@ -1744,6 +2008,10 @@ mod tests {
                     uuid: mid_uuid,
                     created_at: dt("2026-05-02T00:00:00Z"),
                     preview: "mid".to_string(),
+                    first_message_id: None,
+                    last_message_id: None,
+                    message_count: None,
+                    status: None,
                 }],
             },
         )
@@ -1756,6 +2024,10 @@ mod tests {
                     uuid: long_uuid,
                     created_at: dt("2026-05-03T00:00:00Z"),
                     preview: "long".to_string(),
+                    first_message_id: None,
+                    last_message_id: None,
+                    message_count: None,
+                    status: None,
                 }],
             },
         )

@@ -174,8 +174,13 @@ impl<S: SkillStore + 'static> Tool for SearchTool<S> {
             {
                 results.push(json!({
                     "scope": "skills",
+                    "id": skill.id,
                     "name": skill.name,
                     "description": skill.description,
+                    "parent_id": skill.parent_id,
+                    "source": skill.source,
+                    "skill_file_path": skill.skill_file_path,
+                    "resource_root_path": skill.resource_root_path,
                 }));
             }
         }

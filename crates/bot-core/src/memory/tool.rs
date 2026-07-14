@@ -50,6 +50,10 @@ impl Tool for MemoryGetDetailTool {
                     "type": "string",
                     "description": "The UUID of the memory block to retrieve"
                 },
+                "message_id": {
+                    "type": "string",
+                    "description": "Optional ledger message ID to retrieve"
+                },
                 "name": {
                     "type": "string",
                     "description": "Optional named memory file name to retrieve instead of a UUID"
@@ -73,7 +77,11 @@ impl Tool for MemoryGetDetailTool {
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
-        let uuid = args["uuid"].as_str().unwrap_or("").to_string();
+        let uuid = args["message_id"]
+            .as_str()
+            .or_else(|| args["uuid"].as_str())
+            .unwrap_or("")
+            .to_string();
         let name = args["name"].as_str().unwrap_or("").to_string();
         let thread_id = memory_thread_id_from_args_or_context(
             &args,
@@ -221,6 +229,10 @@ impl Tool for MemoryRecallTool {
                 "query": {
                     "type": "string",
                     "description": "Keyword query to search for"
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Optional exact ledger message ID; use with query for compatibility"
                 },
                 "limit": {
                     "type": "integer",

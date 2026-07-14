@@ -3,18 +3,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 use crate::search_query::tokenize_search_query;
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const PRIMARY_SOURCE: &str = ".remi-cat/skills";
 const COMPAT_SOURCE: &str = ".agents/skills";
+const MAX_SKILL_DEPTH: usize = 6;
+const MAX_SCANNED_DIRS: usize = 2000;
+const MAX_SKILL_FILE_SIZE: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
+    pub id: String,
     pub name: String,
     pub description: String,
+    pub parent_id: Option<String>,
+    pub has_children: bool,
     pub source: String,
+    pub skill_file_path: Option<String>,
+    pub resource_root_path: Option<String>,
     #[serde(default)]
     pub pin: bool,
 }
@@ -36,6 +45,7 @@ pub struct SkillLoadDiagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDocument {
+    pub id: String,
     pub name: String,
     pub description: String,
     pub pin: bool,
@@ -44,6 +54,8 @@ pub struct SkillDocument {
     pub root: Option<PathBuf>,
     pub skill_file_path: Option<String>,
     pub resource_root_path: Option<String>,
+    pub parent_id: Option<String>,
+    pub children: Vec<SkillSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +78,7 @@ impl BuiltinSkill {
     fn document(&self) -> Result<SkillDocument, AgentError> {
         let parsed = parse_skill_markdown(self.name, &self.content)?;
         Ok(SkillDocument {
+            id: parsed.name.clone(),
             name: parsed.name,
             description: parsed.description,
             pin: parsed.pin,
@@ -74,6 +87,8 @@ impl BuiltinSkill {
             root: None,
             skill_file_path: None,
             resource_root_path: None,
+            parent_id: None,
+            children: Vec::new(),
         })
     }
 }
@@ -84,6 +99,7 @@ pub trait SkillStore: Send + Sync + 'static {
     async fn search(&self, query: &str) -> Result<Vec<SkillSummary>, AgentError>;
     async fn read_resource(&self, skill: &str, path: &str) -> Result<SkillResource, AgentError>;
     fn featured_summaries(&self) -> Vec<SkillSummary>;
+    fn all_summaries(&self) -> Vec<SkillSummary>;
     fn load_diagnostics(&self) -> Vec<SkillLoadDiagnostic>;
 }
 
@@ -109,9 +125,14 @@ impl<S> BuiltinSkillStore<S> {
         self.builtins
             .values()
             .map(|skill| SkillSummary {
+                id: skill.name.to_string(),
                 name: skill.name.to_string(),
                 description: skill.description.to_string(),
+                parent_id: None,
+                has_children: false,
                 source: "builtin".to_string(),
+                skill_file_path: None,
+                resource_root_path: None,
                 pin: false,
             })
             .collect()
@@ -131,11 +152,11 @@ impl<S: SkillStore> SkillStore for BuiltinSkillStore<S> {
         let mut results = rank_summaries(self.builtin_summaries(), &keywords);
         let mut seen: HashSet<String> = results
             .iter()
-            .map(|entry| canonical_name(&entry.name))
+            .map(|entry| canonical_name(&entry.id))
             .collect();
 
         for entry in self.inner.search(query).await? {
-            if seen.insert(canonical_name(&entry.name)) {
+            if seen.insert(canonical_name(&entry.id)) {
                 results.push(entry);
             }
         }
@@ -157,16 +178,27 @@ impl<S: SkillStore> SkillStore for BuiltinSkillStore<S> {
         let mut featured = self.builtin_summaries();
         let mut seen: HashSet<String> = featured
             .iter()
-            .map(|entry| canonical_name(&entry.name))
+            .map(|entry| canonical_name(&entry.id))
             .collect();
 
         for summary in self.inner.featured_summaries() {
-            if seen.insert(canonical_name(&summary.name)) {
+            if seen.insert(canonical_name(&summary.id)) {
                 featured.push(summary);
             }
         }
 
         featured
+    }
+
+    fn all_summaries(&self) -> Vec<SkillSummary> {
+        let mut all = self.builtin_summaries();
+        let mut seen: HashSet<String> = all.iter().map(|entry| canonical_id(&entry.id)).collect();
+        for summary in self.inner.all_summaries() {
+            if seen.insert(canonical_id(&summary.id)) {
+                all.push(summary);
+            }
+        }
+        all
     }
 
     fn load_diagnostics(&self) -> Vec<SkillLoadDiagnostic> {
@@ -193,6 +225,7 @@ pub struct FileSkillStore {
     roots: Vec<SkillRoot>,
     entries: RwLock<BTreeMap<String, SkillEntry>>,
     diagnostics: RwLock<Vec<SkillLoadDiagnostic>>,
+    metadata_cache: RwLock<BTreeMap<PathBuf, CachedSkillMetadata>>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,16 +277,19 @@ impl FileSkillStore {
 
     fn with_skill_roots(roots: impl IntoIterator<Item = SkillRoot>) -> Self {
         let roots = roots.into_iter().collect::<Vec<_>>();
-        let scan = scan_skill_roots(&roots);
+        let mut metadata_cache = BTreeMap::new();
+        let scan = scan_skill_roots(&roots, &mut metadata_cache);
         Self {
             roots,
             entries: RwLock::new(scan.entries),
             diagnostics: RwLock::new(scan.diagnostics),
+            metadata_cache: RwLock::new(metadata_cache),
         }
     }
 
     fn reload(&self) {
-        let scan = scan_skill_roots(&self.roots);
+        let mut metadata_cache = self.metadata_cache.write().unwrap();
+        let scan = scan_skill_roots(&self.roots, &mut metadata_cache);
         *self.entries.write().unwrap() = scan.entries;
         *self.diagnostics.write().unwrap() = scan.diagnostics;
     }
@@ -284,7 +320,7 @@ impl SkillStore for FileSkillStore {
         self.reload();
         let entry = {
             let entries = self.entries.read().unwrap();
-            entries.get(&canonical_name(name)).cloned()
+            resolve_entry(&entries, name)?
         };
         let Some(entry) = entry else {
             return Ok(None);
@@ -302,6 +338,7 @@ impl SkillStore for FileSkillStore {
             &content,
         )?;
         Ok(Some(SkillDocument {
+            id: entry.summary.id.clone(),
             name: parsed.name,
             description: parsed.description,
             pin: parsed.pin,
@@ -310,6 +347,15 @@ impl SkillStore for FileSkillStore {
             root: Some(entry.root),
             skill_file_path: entry.skill_file_path,
             resource_root_path: entry.resource_root_path,
+            parent_id: entry.summary.parent_id.clone(),
+            children: self
+                .entries
+                .read()
+                .unwrap()
+                .values()
+                .filter(|child| child.summary.parent_id.as_deref() == Some(&entry.summary.id))
+                .map(|child| child.summary.clone())
+                .collect(),
         }))
     }
 
@@ -329,7 +375,7 @@ impl SkillStore for FileSkillStore {
         self.reload();
         let entry = {
             let entries = self.entries.read().unwrap();
-            entries.get(&canonical_name(skill)).cloned()
+            resolve_entry(&entries, skill)?
         }
         .ok_or_else(|| AgentError::tool("skill_resource", "skill not found"))?;
         let resource_path = resolve_resource_path(&entry.root, path)?;
@@ -348,14 +394,14 @@ impl SkillStore for FileSkillStore {
         let size = bytes.len() as u64;
         match String::from_utf8(bytes) {
             Ok(content) => Ok(SkillResource {
-                skill: entry.summary.name,
+                skill: entry.summary.id.clone(),
                 path: path.to_string(),
                 content: Some(content),
                 size,
                 binary: false,
             }),
             Err(_) => Ok(SkillResource {
-                skill: entry.summary.name,
+                skill: entry.summary.id.clone(),
                 path: path.to_string(),
                 content: None,
                 size,
@@ -365,6 +411,17 @@ impl SkillStore for FileSkillStore {
     }
 
     fn featured_summaries(&self) -> Vec<SkillSummary> {
+        self.reload();
+        self.entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.summary.parent_id.is_none() || entry.summary.pin)
+            .map(|entry| entry.summary.clone())
+            .collect()
+    }
+
+    fn all_summaries(&self) -> Vec<SkillSummary> {
         self.reload();
         self.entries
             .read()
@@ -388,101 +445,245 @@ struct ParsedSkill {
     warnings: Vec<String>,
 }
 
-fn scan_skill_roots(roots: &[SkillRoot]) -> SkillScan {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillFileSignature {
+    modified: Option<SystemTime>,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSkillMetadata {
+    signature: SkillFileSignature,
+    parsed: ParsedSkill,
+}
+
+fn scan_skill_roots(
+    roots: &[SkillRoot],
+    metadata_cache: &mut BTreeMap<PathBuf, CachedSkillMetadata>,
+) -> SkillScan {
     let mut scan = SkillScan::default();
+    let mut seen_files = HashSet::new();
     for root_spec in roots {
-        let root = &root_spec.dir;
-        let Ok(read_dir) = std::fs::read_dir(root) else {
-            continue;
-        };
-        for entry in read_dir.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let skill_dir = entry.path();
-            let skill_file = skill_dir.join(SKILL_FILE_NAME);
-            if !skill_file.is_file() {
-                continue;
-            }
-            let dir_name = skill_dir
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_string();
-            match std::fs::read_to_string(&skill_file)
-                .map_err(|e| AgentError::Io(e.to_string()))
-                .and_then(|content| parse_skill_markdown(&dir_name, &content))
-            {
-                Ok(parsed) => {
-                    let key = canonical_name(&parsed.name);
-                    let skill_file_path =
-                        root_spec
-                            .workspace_root
-                            .as_ref()
-                            .and_then(|workspace_root| {
-                                sandbox_relative_path(workspace_root, &skill_file)
-                            });
-                    let resource_root_path =
-                        root_spec
-                            .workspace_root
-                            .as_ref()
-                            .and_then(|workspace_root| {
-                                sandbox_relative_path(workspace_root, &skill_dir)
-                            });
-                    if root_spec.workspace_root.is_some() && skill_file_path.is_none() {
-                        scan.diagnostics.push(SkillLoadDiagnostic {
-                            skill: Some(parsed.name.clone()),
-                            path: skill_file.display().to_string(),
-                            severity: SkillLoadDiagnosticSeverity::Warning,
-                            message: "skill is outside the workspace root; resources cannot be read via fs_read".to_string(),
-                        });
-                    }
-                    for warning in parsed.warnings {
-                        scan.diagnostics.push(SkillLoadDiagnostic {
-                            skill: Some(parsed.name.clone()),
-                            path: skill_file.display().to_string(),
-                            severity: SkillLoadDiagnosticSeverity::Warning,
-                            message: warning,
-                        });
-                    }
-                    scan.entries.entry(key).or_insert_with(|| SkillEntry {
-                        summary: SkillSummary {
-                            name: parsed.name,
-                            description: parsed.description,
-                            source: root_spec.source.clone(),
-                            pin: parsed.pin,
-                        },
-                        path: skill_file,
-                        root: skill_dir,
-                        skill_file_path,
-                        resource_root_path,
-                    });
-                }
-                Err(error) => {
-                    scan.diagnostics.push(SkillLoadDiagnostic {
-                        skill: normalize_skill_name(&dir_name),
-                        path: skill_file.display().to_string(),
-                        severity: SkillLoadDiagnosticSeverity::Error,
-                        message: error.to_string(),
-                    });
-                    tracing::warn!(
-                        path = %skill_file.display(),
-                        error = %error,
-                        "skipping invalid skill"
-                    );
-                }
-            }
-        }
+        let mut dirs_seen = 0;
+        scan_container(
+            root_spec,
+            &root_spec.dir,
+            None,
+            0,
+            &mut dirs_seen,
+            &mut scan,
+            metadata_cache,
+            &mut seen_files,
+        );
+    }
+    metadata_cache.retain(|path, _| seen_files.contains(path));
+    let parent_ids: HashSet<String> = scan
+        .entries
+        .values()
+        .filter_map(|entry| entry.summary.parent_id.clone())
+        .collect();
+    for entry in scan.entries.values_mut() {
+        entry.summary.has_children = parent_ids.contains(&entry.summary.id);
     }
     scan
 }
 
+fn scan_container(
+    root_spec: &SkillRoot,
+    container: &Path,
+    parent_id: Option<&str>,
+    depth: usize,
+    dirs_seen: &mut usize,
+    scan: &mut SkillScan,
+    metadata_cache: &mut BTreeMap<PathBuf, CachedSkillMetadata>,
+    seen_files: &mut HashSet<PathBuf>,
+) {
+    let Ok(read_dir) = std::fs::read_dir(container) else {
+        return;
+    };
+    let mut dirs = read_dir
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|entry| entry.path());
+    for dir in dirs {
+        *dirs_seen += 1;
+        if *dirs_seen > MAX_SCANNED_DIRS {
+            scan.diagnostics.push(SkillLoadDiagnostic {
+                skill: parent_id.map(str::to_string),
+                path: container.display().to_string(),
+                severity: SkillLoadDiagnosticSeverity::Error,
+                message: format!("skill scan exceeded {MAX_SCANNED_DIRS} directories"),
+            });
+            return;
+        }
+        let skill_dir = dir.path();
+        if std::fs::symlink_metadata(&skill_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let skill_file = skill_dir.join(SKILL_FILE_NAME);
+        let Ok(file_metadata) = std::fs::metadata(&skill_file) else {
+            continue;
+        };
+        if !file_metadata.is_file() {
+            continue;
+        }
+        seen_files.insert(skill_file.clone());
+        if depth > MAX_SKILL_DEPTH {
+            scan.diagnostics.push(SkillLoadDiagnostic {
+                skill: parent_id.map(str::to_string),
+                path: skill_file.display().to_string(),
+                severity: SkillLoadDiagnosticSeverity::Error,
+                message: format!("maximum child skill depth {MAX_SKILL_DEPTH} exceeded"),
+            });
+            continue;
+        }
+        let dir_name = skill_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let size = file_metadata.len();
+        let signature = SkillFileSignature {
+            modified: file_metadata.modified().ok(),
+            size,
+        };
+        let parsed = if size > MAX_SKILL_FILE_SIZE {
+            Err(AgentError::other(format!(
+                "SKILL.md exceeds {MAX_SKILL_FILE_SIZE} byte limit"
+            )))
+        } else if let Some(cached) = metadata_cache
+            .get(&skill_file)
+            .filter(|cached| cached.signature == signature)
+        {
+            Ok(cached.parsed.clone())
+        } else {
+            std::fs::read_to_string(&skill_file)
+                .map_err(|e| AgentError::Io(e.to_string()))
+                .and_then(|content| parse_skill_markdown(&dir_name, &content))
+                .inspect(|parsed| {
+                    metadata_cache.insert(
+                        skill_file.clone(),
+                        CachedSkillMetadata {
+                            signature: signature.clone(),
+                            parsed: parsed.clone(),
+                        },
+                    );
+                })
+        };
+        match parsed {
+            Ok(parsed) => {
+                let id = parent_id
+                    .map(|p| format!("{p}/{}", parsed.name))
+                    .unwrap_or_else(|| parsed.name.clone());
+                let skill_file_path = root_spec
+                    .workspace_root
+                    .as_ref()
+                    .and_then(|root| safe_workspace_relative_path(root, &skill_file));
+                let resource_root_path = root_spec
+                    .workspace_root
+                    .as_ref()
+                    .and_then(|root| safe_workspace_relative_path(root, &skill_dir));
+                for warning in parsed.warnings {
+                    scan.diagnostics.push(SkillLoadDiagnostic {
+                        skill: Some(id.clone()),
+                        path: skill_file.display().to_string(),
+                        severity: SkillLoadDiagnosticSeverity::Warning,
+                        message: warning,
+                    });
+                }
+                let candidate = SkillEntry {
+                    summary: SkillSummary {
+                        id: id.clone(),
+                        name: parsed.name,
+                        description: parsed.description,
+                        parent_id: parent_id.map(str::to_string),
+                        has_children: false,
+                        source: root_spec.source.clone(),
+                        skill_file_path: skill_file_path.clone(),
+                        resource_root_path: resource_root_path.clone(),
+                        pin: parsed.pin,
+                    },
+                    path: skill_file,
+                    root: skill_dir.clone(),
+                    skill_file_path,
+                    resource_root_path,
+                };
+                let key = canonical_id(&id);
+                if let Some(existing) = scan.entries.get(&key) {
+                    scan.diagnostics.push(SkillLoadDiagnostic {
+                        skill: Some(id.clone()),
+                        path: candidate.path.display().to_string(),
+                        severity: SkillLoadDiagnosticSeverity::Warning,
+                        message: format!(
+                            "shadowed by {} from {}",
+                            existing.path.display(),
+                            existing.summary.source
+                        ),
+                    });
+                } else {
+                    scan.entries.insert(key, candidate);
+                }
+                scan_container(
+                    root_spec,
+                    &skill_dir.join("skills"),
+                    Some(&id),
+                    depth + 1,
+                    dirs_seen,
+                    scan,
+                    metadata_cache,
+                    seen_files,
+                );
+            }
+            Err(error) => scan.diagnostics.push(SkillLoadDiagnostic {
+                skill: normalize_skill_name(&dir_name),
+                path: skill_file.display().to_string(),
+                severity: SkillLoadDiagnosticSeverity::Error,
+                message: error.to_string(),
+            }),
+        }
+    }
+}
+
+fn resolve_entry(
+    entries: &BTreeMap<String, SkillEntry>,
+    locator: &str,
+) -> Result<Option<SkillEntry>, AgentError> {
+    if locator.contains('/') {
+        return Ok(entries.get(&canonical_id(locator)).cloned());
+    }
+    let needle = canonical_name(locator);
+    let matches = entries
+        .values()
+        .filter(|entry| canonical_name(&entry.summary.name) == needle)
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(entry.clone())),
+        many => Err(AgentError::tool(
+            "skill",
+            format!(
+                "skill name '{locator}' is ambiguous; use one of: {}",
+                many.iter()
+                    .map(|e| e.summary.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+fn canonical_id(id: &str) -> String {
+    id.split('/')
+        .map(canonical_name)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, AgentError> {
     let mut warnings = Vec::new();
-    let (frontmatter, body) = match split_frontmatter(content) {
+    let (frontmatter, _body) = match split_frontmatter(content) {
         Some(parts) => parts,
         None => {
             warnings.push(
@@ -517,23 +718,18 @@ fn parse_skill_markdown(dir_name: &str, content: &str) -> Result<ParsedSkill, Ag
             raw_name.unwrap_or_default()
         ));
     }
+    if canonical_name(dir_name) != canonical_name(&name) {
+        warnings.push(format!(
+            "frontmatter name `{name}` does not match leaf directory `{dir_name}`"
+        ));
+    }
 
     let mut description = mapping
         .and_then(|map| yaml_field(map, "description"))
         .and_then(yaml_scalarish_string)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| derive_description(body, dir_name));
-    if description.is_none() {
-        description = Some(format!("Local skill from {dir_name}"));
-        warnings.push("missing description; using a generated fallback".to_string());
-    } else if mapping
-        .and_then(|map| yaml_field(map, "description"))
-        .is_none()
-    {
-        warnings.push("missing description; inferred from skill body".to_string());
-    }
-    let mut description = description.unwrap_or_else(|| format!("Local skill from {dir_name}"));
+        .ok_or_else(|| AgentError::other("skill requires a non-empty frontmatter description"))?;
     if description.chars().count() > 1024 {
         description = truncate_chars(&description, 1024);
         warnings.push("description exceeded 1024 characters; truncated".to_string());
@@ -652,16 +848,6 @@ fn yaml_scalarish_string(value: &serde_yaml::Value) -> Option<String> {
     }
 }
 
-fn derive_description(body: &str, dir_name: &str) -> Option<String> {
-    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let candidate = line.trim_start_matches('#').trim();
-        if !candidate.is_empty() {
-            return Some(truncate_chars(candidate, 1024));
-        }
-    }
-    normalize_skill_name(dir_name).map(|name| format!("Local skill from {name}"))
-}
-
 fn normalize_skill_name(raw: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut last_was_dash = false;
@@ -699,6 +885,26 @@ fn sandbox_relative_path(workspace_root: &Path, path: &Path) -> Option<String> {
         return Some(".".to_string());
     }
     Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn safe_workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<String> {
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return None;
+    }
+    let mut current = canonical_path.as_path();
+    while current != canonical_root {
+        if std::fs::symlink_metadata(current)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return None;
+        }
+        current = current.parent()?;
+    }
+    sandbox_relative_path(&canonical_root, &canonical_path)
 }
 
 fn absolute_lexical_path(path: &Path) -> PathBuf {
@@ -935,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_description_is_inferred_from_body() {
+    async fn missing_description_is_rejected() {
         let primary = temp_dir();
         let compat = temp_dir();
         let dir = primary.join("missing-description");
@@ -951,12 +1157,11 @@ mod tests {
             (compat.clone(), ".agents/skills".to_string()),
         ]);
 
-        let doc = store.get("missing-description").await.unwrap().unwrap();
-        assert_eq!(doc.description, "Body");
+        assert!(store.get("missing-description").await.unwrap().is_none());
         assert!(store
             .load_diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("missing description")));
+            .any(|diagnostic| diagnostic.message.contains("frontmatter description")));
 
         let _ = std::fs::remove_dir_all(primary);
         let _ = std::fs::remove_dir_all(compat);
@@ -1138,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_without_frontmatter_loads_with_inferred_metadata() {
+    async fn markdown_without_frontmatter_is_rejected() {
         let primary = temp_dir();
         let compat = temp_dir();
         let dir = primary.join("Loose Skill");
@@ -1149,13 +1354,10 @@ mod tests {
             (primary.clone(), ".remi-cat/skills".to_string()),
             (compat.clone(), ".agents/skills".to_string()),
         ]);
-        let doc = store.get("loose_skill").await.unwrap().unwrap();
-
-        assert_eq!(doc.name, "loose-skill");
-        assert_eq!(doc.description, "Loose workflow");
+        assert!(store.get("loose_skill").await.unwrap().is_none());
         assert!(store.load_diagnostics().iter().any(|diagnostic| {
-            diagnostic.severity == SkillLoadDiagnosticSeverity::Warning
-                && diagnostic.message.contains("missing YAML frontmatter")
+            diagnostic.severity == SkillLoadDiagnosticSeverity::Error
+                && diagnostic.message.contains("frontmatter description")
         }));
 
         let _ = std::fs::remove_dir_all(primary);
@@ -1225,5 +1427,130 @@ mod tests {
         let results = store.search("docs").await.unwrap();
         assert_eq!(results[0].name, "docs");
         assert_eq!(store.get("docs").await.unwrap().unwrap().source, "builtin");
+    }
+
+    #[tokio::test]
+    async fn discovers_progressive_child_skills_and_exposes_safe_paths() {
+        let workspace = temp_dir();
+        let primary = workspace.join(".remi-cat/skills");
+        write_skill(
+            &primary,
+            "office",
+            "office",
+            "Office workflows",
+            "Choose a child skill.",
+        );
+        let excel_root = primary.join("office/skills");
+        write_skill(
+            &excel_root,
+            "excel",
+            "excel",
+            "Excel workflows",
+            "Work with spreadsheets.",
+        );
+        let formula_root = excel_root.join("excel/skills");
+        write_skill(
+            &formula_root,
+            "formulas",
+            "formulas",
+            "Formula workflows",
+            "Write formulas.",
+        );
+        std::fs::create_dir_all(primary.join("office/references/not-a-skill")).unwrap();
+        write_skill(
+            &primary.join("office/references"),
+            "not-a-skill",
+            "hidden",
+            "Hidden",
+            "Never scan me.",
+        );
+
+        let store = FileSkillStore::new_in_workspace(&primary, &workspace);
+        let featured = store.featured_summaries();
+        assert_eq!(
+            featured.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["office"]
+        );
+        let results = store.search("formula").await.unwrap();
+        assert_eq!(results[0].id, "office/excel/formulas");
+        assert!(!store
+            .search("hidden")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.name == "hidden"));
+
+        let office = store.get("office").await.unwrap().unwrap();
+        assert_eq!(
+            office
+                .children
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["office/excel"]
+        );
+        let excel = store.get("office/excel").await.unwrap().unwrap();
+        assert_eq!(excel.parent_id.as_deref(), Some("office"));
+        assert_eq!(
+            excel.skill_file_path.as_deref(),
+            Some(".remi-cat/skills/office/skills/excel/SKILL.md")
+        );
+        assert_eq!(
+            excel.resource_root_path.as_deref(),
+            Some(".remi-cat/skills/office/skills/excel")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_leaf_name_requires_hierarchical_id() {
+        let root = temp_dir();
+        for parent in ["office", "finance"] {
+            write_skill(&root, parent, parent, parent, "Parent");
+            write_skill(
+                &root.join(parent).join("skills"),
+                "excel",
+                "excel",
+                "Excel",
+                "Child",
+            );
+        }
+        let store = FileSkillStore::with_roots([(root.clone(), "test".to_string())]);
+        let error = store
+            .get("excel")
+            .await
+            .expect_err("leaf alias must be ambiguous");
+        assert!(error.to_string().contains("office/excel"));
+        assert_eq!(
+            store.get("finance/excel").await.unwrap().unwrap().id,
+            "finance/excel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loads_symlinked_skill_markdown() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir().join("outside.md");
+        std::fs::write(
+            &outside,
+            "---\nname: linked\ndescription: Outside instructions\n---\n\nNever load this.",
+        )
+        .unwrap();
+        let skill_dir = root.join("linked");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        symlink(&outside, skill_dir.join("SKILL.md")).unwrap();
+
+        let store = FileSkillStore::with_roots([(root.clone(), "test".to_string())]);
+        let document = store.get("linked").await.unwrap().unwrap();
+        assert_eq!(document.id, "linked");
+        assert!(document.content.contains("Never load this."));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
     }
 }

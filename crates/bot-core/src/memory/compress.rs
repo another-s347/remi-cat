@@ -14,10 +14,26 @@ use remi_agentloop::prelude::{
 use remi_agentloop::types::AgentEvent;
 
 const COMPRESSION_SYSTEM: &str = "\
-You are a memory compression assistant. \
-Compress the following conversation into a concise, information-dense summary in Chinese. \
-Preserve all key facts, decisions, plans, and outcomes. \
-Output only the summary text — no preamble, no commentary.";
+You are a memory compression assistant. Preserve the conversation's primary language. \
+Never translate code, commands, paths, identifiers, exact values, or error text. \
+Resolve knowledge updates chronologically: label older values as superseded and state only the \
+latest confirmed value in Current state. Never collapse distinct old and new exact values into a range. \
+Prefer completeness over brevity. Preserve concrete facts even when mentioned incidentally. Represent \
+facts as losslessly as possible with their entity, attribute, exact value, timestamp, provenance, and \
+state transition when present. Preserve dependencies required to reproduce a stated or implied result, \
+not only the result itself. Do not replace an exact fact with a vague category or omit it merely because \
+it appears unrelated to the latest goal. \
+Return a concise, information-dense summary with exactly these non-empty headings:\n\
+## Goal and latest user intent\n\
+## Constraints and prohibitions\n\
+## Confirmed facts and decisions\n\
+## Completed work with evidence\n\
+## Current state\n\
+## Pending work and next action\n\
+## Failures and uncertainties\n\
+## Exact references\n\
+For tool activity retain the tool name, concise arguments, success status, duration, key result, \
+errors, paths, IDs, and exact values. Output only the summary.";
 
 // ── LlmCompressor ────────────────────────────────────────────────────────────
 
@@ -52,24 +68,41 @@ impl LlmCompressor {
 
     /// Compress a slice of messages into a summary string.
     ///
-    /// Tool-response messages are excluded before compression — they are
-    /// typically large, noisy, and not useful in a long-term summary.
     pub async fn compress(&self, messages: &[Message]) -> Result<String, AgentError> {
         if messages.is_empty() {
             return Ok(String::new());
         }
 
-        // Format messages as plain text, skipping Tool responses.
+        // Tool results are part of the durable evidence. Bound only the input
+        // presented to the compressor; the ledger always retains full content.
         let text: String = messages
             .iter()
-            .filter(|m| format!("{:?}", m.role) != "Tool")
             .map(|m| {
-                let role = format!("{:?}", m.role); // "User" / "Assistant" / "System"
-                let body = m.content.text_content();
+                let role = format!("{:?}", m.role);
+                let raw = m.content.text_content();
+                let body = truncate_tool_body(&role, &raw, 12_000);
                 if body.is_empty() {
                     String::new()
                 } else {
-                    format!("[{role}]\n{body}")
+                    let calls = m.tool_calls.as_ref().map(|calls| {
+                        calls
+                            .iter()
+                            .map(|call| {
+                                format!(
+                                    "{}({}) id={}",
+                                    call.function.name, call.function.arguments, call.id
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    });
+                    format!(
+                        "[{role}] id={}{}\n{body}",
+                        m.id,
+                        calls
+                            .map(|v| format!(" tool_calls={v}"))
+                            .unwrap_or_default()
+                    )
                 }
             })
             .filter(|s| !s.is_empty())
@@ -78,7 +111,7 @@ impl LlmCompressor {
 
         if text.is_empty() {
             tracing::warn!(
-                "LlmCompressor: all {} messages filtered out (tool/empty), nothing to compress",
+                "LlmCompressor: all {} messages empty, nothing to compress",
                 messages.len(),
             );
             return Ok(String::new());
@@ -98,11 +131,49 @@ impl LlmCompressor {
             }
         }
 
-        if result.is_empty() {
+        if result.trim().is_empty() {
             return Err(AgentError::Io(
                 "LlmCompressor: model returned empty summary".to_string(),
             ));
         }
+        validate_summary(&result)?;
         Ok(result)
     }
+}
+
+fn truncate_tool_body(role: &str, text: &str, max_chars: usize) -> String {
+    if role != "Tool" || text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let half = max_chars / 2;
+    let head: String = text.chars().take(half).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n...[tool result elided for summary input only]...\n{tail}")
+}
+
+fn validate_summary(summary: &str) -> Result<(), AgentError> {
+    const HEADINGS: [&str; 8] = [
+        "## Goal and latest user intent",
+        "## Constraints and prohibitions",
+        "## Confirmed facts and decisions",
+        "## Completed work with evidence",
+        "## Current state",
+        "## Pending work and next action",
+        "## Failures and uncertainties",
+        "## Exact references",
+    ];
+    if summary.chars().count() > 40_000 || HEADINGS.iter().any(|heading| !summary.contains(heading))
+    {
+        return Err(AgentError::other(
+            "LlmCompressor: summary failed structure/length validation",
+        ));
+    }
+    Ok(())
 }

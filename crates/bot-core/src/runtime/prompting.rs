@@ -251,9 +251,9 @@ pub(crate) fn apply_skill_injections(user_state: &mut serde_json::Value, skills:
     for skill in skills {
         if !items
             .iter()
-            .any(|item| item.as_str().is_some_and(|value| value == skill.name))
+            .any(|item| item.as_str().is_some_and(|value| value == skill.id))
         {
-            items.push(serde_json::Value::String(skill.name.clone()));
+            items.push(serde_json::Value::String(skill.id.clone()));
         }
     }
 }
@@ -577,15 +577,21 @@ mod tests {
 
     fn skill(name: &str, description: &str, pin: bool) -> SkillSummary {
         SkillSummary {
+            id: name.to_string(),
             name: name.to_string(),
             description: description.to_string(),
+            parent_id: None,
+            has_children: false,
             source: ".remi-cat/skills".to_string(),
+            skill_file_path: None,
+            resource_root_path: None,
             pin,
         }
     }
 
     fn skill_document() -> SkillDocument {
         SkillDocument {
+            id: "docs".to_string(),
             name: "docs".to_string(),
             description: "Docs workflow".to_string(),
             pin: false,
@@ -594,6 +600,8 @@ mod tests {
             root: None,
             skill_file_path: Some(".remi-cat/skills/docs/SKILL.md".to_string()),
             resource_root_path: Some(".remi-cat/skills/docs".to_string()),
+            parent_id: None,
+            children: Vec::new(),
         }
     }
 

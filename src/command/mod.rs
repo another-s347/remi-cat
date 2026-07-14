@@ -270,7 +270,7 @@ fn runtime_command_help() -> String {
         "- `/help` - show this command list",
         "- `/tools` - list tools available to the current agent",
         "- `/tasks` - list background tool tasks for this session",
-        "- `/tasks all|get <task_id>|cancel <task_id>` - inspect or cancel background tasks",
+        "- `/tasks get <task_id>|cancel <task_id>` - inspect or cancel this session's background tasks",
         "- `/skill list` - list available local and builtin skills",
         "- `/skill status` - show skills already read or activated in this session",
         "- `/skill:<name> <task>` - load a skill for the same message and run the task",
@@ -299,38 +299,51 @@ async fn handle_tasks_command(
             let tasks = bot.list_background_tasks(Some(session_id)).await;
             Ok(format_tool_tasks(&tasks))
         }
-        ["/tasks", "all"] => {
-            let tasks = bot.list_background_tasks(None).await;
-            Ok(format_tool_tasks(&tasks))
+        ["/tasks", "all"] => Ok("仅支持查看当前 session 的后台任务；请使用 `/tasks`。".to_string()),
+        ["/tasks", "get", task_id] => {
+            let task = bot
+                .get_background_task(task_id)
+                .await
+                .filter(|task| task_belongs_to_session(task, session_id));
+            Ok(task
+                .map(|task| format_tool_task_detail(&task))
+                .unwrap_or_else(|| format!("background task not found: {task_id}")))
         }
-        ["/tasks", "get", task_id] => Ok(bot
-            .get_background_task(task_id)
-            .await
-            .map(|task| format_tool_task_detail(&task))
-            .unwrap_or_else(|| format!("background task not found: {task_id}"))),
-        ["/tasks", "cancel", task_id] => Ok(bot
-            .cancel_background_task(task_id)
-            .await
-            .map(|task| format!("{} {}", task.task_id, task.status))
-            .unwrap_or_else(|| format!("background task not found: {task_id}"))),
-        _ => Ok("用法：/tasks [list|all|get <task_id>|cancel <task_id>]".to_string()),
+        ["/tasks", "cancel", task_id] => {
+            let owned = bot
+                .get_background_task(task_id)
+                .await
+                .is_some_and(|task| task_belongs_to_session(&task, session_id));
+            let task = if owned {
+                bot.cancel_background_task(task_id).await
+            } else {
+                None
+            };
+            Ok(task
+                .map(|task| format!("{} {}", task.task_id, task.status))
+                .unwrap_or_else(|| format!("background task not found: {task_id}")))
+        }
+        _ => Ok("用法：/tasks [list|get <task_id>|cancel <task_id>]".to_string()),
     }
+}
+
+fn task_belongs_to_session(task: &ToolTaskRecord, session_id: &str) -> bool {
+    task.background && task.thread_id == session_id
 }
 
 fn format_tool_tasks(tasks: &[ToolTaskRecord]) -> String {
     if tasks.is_empty() {
         return "no background tool tasks".to_string();
     }
+    let now = chrono::Utc::now();
     tasks
         .iter()
         .map(|task| {
+            let args = compact_task_args(&task.args, 160);
+            let timing = task_timing_label(task, &now);
             format!(
-                "- `{}` `{}` `{}` `{}` {}ms",
-                task.task_id,
-                task.status,
-                task.thread_id,
-                task.tool_name,
-                task.elapsed_ms.unwrap_or(0)
+                "- `{}` `{}` `{}` args: `{}` · {}",
+                task.status, task.task_id, task.tool_name, args, timing
             )
         })
         .collect::<Vec<_>>()
@@ -343,6 +356,10 @@ fn format_tool_task_detail(task: &ToolTaskRecord) -> String {
         format!("status: {}", task.status),
         format!("thread_id: {}", task.thread_id),
         format!("tool: {}", task.tool_name),
+        format!(
+            "args: {}",
+            serde_json::to_string_pretty(&task.args).unwrap_or_else(|_| task.args.to_string())
+        ),
         format!("elapsed_ms: {}", task.elapsed_ms.unwrap_or(0)),
     ];
     if let Some(message) = task.message.as_deref() {
@@ -355,6 +372,57 @@ fn format_tool_task_detail(task: &ToolTaskRecord) -> String {
         lines.push(format!("result:\n{result}"));
     }
     lines.join("\n")
+}
+
+fn compact_task_args(args: &serde_json::Value, max_chars: usize) -> String {
+    let value = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn task_timing_label(task: &ToolTaskRecord, now: &chrono::DateTime<chrono::Utc>) -> String {
+    let timestamp = if task.status == bot_core::tool_tasks::TOOL_TASK_RUNNING {
+        Some(task.started_at.as_str())
+    } else {
+        task.completed_at.as_deref()
+    };
+    let elapsed = timestamp
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|timestamp| {
+            now.signed_duration_since(timestamp.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                .max(0) as u64
+        });
+    let Some(elapsed) = elapsed else {
+        return "unknown".to_string();
+    };
+    if task.status == bot_core::tool_tasks::TOOL_TASK_RUNNING {
+        format!("运行 {}", format_relative_duration(elapsed))
+    } else {
+        format!("{} 前结束", format_relative_duration(elapsed))
+    }
+}
+
+fn format_relative_duration(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    if seconds == 0 {
+        "<1s".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 pub(crate) async fn handle_agent_command(
@@ -1092,7 +1160,7 @@ async fn handle_skill_command(
         if rest.trim().is_empty() {
             let names = skills
                 .iter()
-                .map(|skill| format!("`{}`", skill.name))
+                .map(|skill| format!("`{}`", skill.id))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Ok(RuntimeCommandResult::Reply(format!(
@@ -1101,7 +1169,7 @@ async fn handle_skill_command(
         }
         let prefix = skills
             .iter()
-            .map(|skill| format!("已加载 skill `{}`。\n", skill.name))
+            .map(|skill| format!("已加载 skill `{}`。\n", skill.id))
             .collect::<String>();
         return Ok(RuntimeCommandResult::Continue {
             text: rest.trim().to_string(),
@@ -1139,8 +1207,8 @@ async fn parse_skill_prefixes(
 }
 
 fn format_skill_list(bot: &CatBot) -> String {
-    let mut skills = bot.skill_summaries();
-    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
+    let mut skills = bot.all_skill_summaries();
+    skills.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.source.cmp(&b.source)));
     let diagnostics = bot.skill_load_diagnostics();
     if skills.is_empty() {
         let mut text = "No skills are available.".to_string();
@@ -1149,9 +1217,13 @@ fn format_skill_list(bot: &CatBot) -> String {
     }
     let mut lines = vec!["**skills**".to_string(), String::new()];
     for skill in skills {
+        let depth = skill.id.matches('/').count();
         lines.push(format!(
-            "- `/skill:{}` - {} ({})",
-            skill.name, skill.description, skill.source
+            "{}- `/skill:{}` - {} ({})",
+            "  ".repeat(depth),
+            skill.id,
+            skill.description,
+            skill.source
         ));
     }
     let mut text = lines.join("\n");
@@ -1602,6 +1674,7 @@ mod tests {
             tool_name: "bash".to_string(),
             args: serde_json::json!({"command": "sleep 60"}),
             status: bot_core::tool_tasks::TOOL_TASK_RUNNING.to_string(),
+            background: true,
             started_at: "2026-07-09T00:00:00Z".to_string(),
             completed_at: None,
             elapsed_ms: None,
@@ -1616,17 +1689,47 @@ mod tests {
 
     #[test]
     fn formats_background_task_list_and_detail() {
-        let task = test_task();
+        let mut task = test_task();
+        task.started_at = "2026-07-09T00:00:00Z".to_string();
 
         let list = format_tool_tasks(std::slice::from_ref(&task));
         assert!(list.contains("task-1"));
         assert!(list.contains("running"));
-        assert!(list.contains("session-1"));
         assert!(list.contains("bash"));
+        assert!(list.contains("args: `{"));
+        assert!(list.contains("运行"));
 
         let detail = format_tool_task_detail(&task);
         assert!(detail.contains("task_id: task-1"));
         assert!(detail.contains("recent_output:\ntail line"));
         assert!(detail.contains("result:\nresult body"));
+        assert!(detail.contains("args:"));
+    }
+
+    #[test]
+    fn task_list_truncates_args_and_formats_relative_time() {
+        let mut task = test_task();
+        task.args = serde_json::json!({"command": "界".repeat(200)});
+        task.started_at = "2026-07-09T00:00:00Z".to_string();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-09T00:02:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(compact_task_args(&task.args, 20).chars().count(), 20);
+        assert!(compact_task_args(&task.args, 20).ends_with('…'));
+        assert_eq!(task_timing_label(&task, &now), "运行 2m");
+
+        task.status = bot_core::tool_tasks::TOOL_TASK_FAILED.to_string();
+        task.completed_at = Some("2026-07-09T00:01:30Z".to_string());
+        assert_eq!(task_timing_label(&task, &now), "30s 前结束");
+    }
+
+    #[test]
+    fn background_task_access_is_scoped_to_session() {
+        let mut task = test_task();
+        assert!(task_belongs_to_session(&task, "session-1"));
+        assert!(!task_belongs_to_session(&task, "session-2"));
+        task.background = false;
+        assert!(!task_belongs_to_session(&task, "session-1"));
     }
 }

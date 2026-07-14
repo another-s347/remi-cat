@@ -14,6 +14,16 @@ pub struct MemoryEntry {
     pub created_at: DateTime<Utc>,
     /// Single-line preview shown in the injected context index message.
     pub preview: String,
+    /// Inclusive message-id range covered by this summary.  Missing values
+    /// identify legacy entries and must never be used to hide ledger rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// The `index.json` file for one memory tier.

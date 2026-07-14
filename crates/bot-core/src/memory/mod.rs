@@ -4,7 +4,7 @@
 //!
 //! | Tier       | Storage               | Context slot              |
 //! |------------|-----------------------|---------------------------|
-//! | Short-term | `short_term.jsonl`    | Raw messages in history   |
+//! | Ledger     | `short_term.jsonl`    | Append-only full history  |
 //! | Mid-term   | `mid_term/<uuid>.md`  | One summarised index msg  |
 //! | Long-term  | `long_term/<uuid>.md` | One summarised index msg  |
 //!
@@ -21,14 +21,7 @@
 //! [User: new message]
 //! ```
 //!
-//! ## Raw archive preservation
-//!
-//! Before any compression or promotion, the original messages are written to:
-//! - `mid_term/raw/<uuid>/<timestamp>.jsonl`
-//! - `long_term/raw/<long_uuid>/<orig_mid_uuid>/<timestamp>.jsonl`
-//!
-//! These files are never loaded into context but are accessible for future
-//! filesystem-mount tools.
+//! Original messages remain in the ledger. New raw archives are not created.
 
 pub mod blob;
 pub mod compress;
@@ -66,6 +59,14 @@ pub fn build_injected_history(ctx: &MemoryContext) -> Vec<Message> {
     }
     if !ctx.mid_term.entries.is_empty() {
         msgs.push(build_tier_msg("MID-TERM", &ctx.mid_term.entries));
+    }
+    if let Some(summary) = &ctx.latest_summary {
+        msgs.push(Message::system(format!(
+            "[LATEST COMPRESSED MEMORY]\n{summary}\n\n\
+             If this summary overlaps raw messages below, treat the newer raw messages as authoritative. \
+             When a question depends on prior facts that are absent or uncertain here, search local memory \
+             before concluding that the information is unavailable."
+        )));
     }
     msgs.extend(ctx.short_term.clone());
     msgs
