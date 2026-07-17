@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use bot_runtime_core::ToolContext;
-use bot_runtime_core::{CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions};
+use bot_runtime_core::{
+    CoreSteerBehavior, CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions,
+};
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
     AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, OpenAIClient,
@@ -172,6 +174,15 @@ pub(crate) fn metadata_flag_enabled(metadata: Option<&serde_json::Value>, key: &
             })
         })
         .unwrap_or(false)
+}
+
+fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn steer_preview(content: &Content) -> String {
@@ -628,6 +639,7 @@ pub struct CatBot {
     tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
     run_locks: ThreadRunLocks,
     active_steers: ActiveSteerQueues,
+    subagent_sessions: Arc<SubagentSessionCoordinator>,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
     environment_context_source: EnvironmentContextSource,
@@ -690,6 +702,37 @@ impl CatBot {
 
     pub fn submit_steer(&self, input: SteerInput) -> SteerSubmitResult {
         self.submit_queued_input(input, CoreSteerSource::User)
+    }
+
+    pub fn submit_subagent_steer(
+        &self,
+        thread_id: &str,
+        mut input: SteerInput,
+    ) -> SteerSubmitResult {
+        let Some(queue) = self.subagent_sessions.active_queue(thread_id) else {
+            return SteerSubmitResult::NotRunning;
+        };
+        input.session_id = thread_id.to_string();
+        let steer_id = uuid::Uuid::new_v4().to_string();
+        let preview = steer_preview(&input.content);
+        let message_metadata = steer_message_metadata(&input);
+        queue.push(CoreSteerInput {
+            id: steer_id.clone(),
+            content: input.content,
+            preview: preview.clone(),
+            message_metadata,
+            user_name: input.sender_username,
+            source: CoreSteerSource::User,
+        });
+        SteerSubmitResult::Queued(SteerQueuedEvent {
+            steer_id,
+            session_id: thread_id.to_string(),
+            preview,
+        })
+    }
+
+    pub fn cancel_subagent(&self, thread_id: &str) -> bool {
+        self.subagent_sessions.cancel(thread_id)
     }
 
     pub fn submit_next_turn(&self, input: SteerInput) -> SteerSubmitResult {
@@ -820,6 +863,27 @@ impl CatBot {
 
     pub fn get_model_profile(&self, id: &str) -> Option<&ModelProfileConfig> {
         self.model_registry.get(id)
+    }
+
+    pub fn validate_runtime_overrides(
+        &self,
+        model_profile_id: Option<&str>,
+        agent_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> anyhow::Result<()> {
+        let agent = match agent_id {
+            Some(id) => self
+                .get_agent_profile(id)
+                .ok_or_else(|| anyhow::anyhow!("unknown agent `{id}`"))?,
+            None => self.default_agent_profile(),
+        };
+        if let Some(id) = model_profile_id {
+            self.get_model_profile(id)
+                .ok_or_else(|| anyhow::anyhow!("unknown model profile `{id}`"))?;
+        }
+        let effective = self.effective_model_profile_for_agent(model_profile_id, agent);
+        apply_reasoning_effort_override(effective, reasoning_effort)?;
+        Ok(())
     }
 
     pub fn effective_model_profile(
@@ -1036,6 +1100,18 @@ impl CatBot {
         &self,
         thread_id: &str,
     ) -> Result<usize, remi_agentloop::prelude::AgentError> {
+        self.compact_memory_with_profile(thread_id, None, None, None)
+            .await
+    }
+
+    /// Compact memory with the same effective model profile as the session.
+    pub async fn compact_memory_with_profile(
+        &self,
+        thread_id: &str,
+        session_model_profile_id: Option<&str>,
+        session_agent_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<usize, remi_agentloop::prelude::AgentError> {
         let run_lock = self.thread_run_lock(thread_id).await;
         let _run_guard = run_lock.try_lock().map_err(|_| {
             remi_agentloop::prelude::AgentError::other(
@@ -1058,7 +1134,35 @@ impl CatBot {
                     .unwrap_or_else(|| "context compaction blocked by hook".to_string()),
             ));
         }
-        let result = self.memory.compact_now(thread_id).await;
+        let agent = self.effective_agent_profile(session_agent_id);
+        let effective = apply_reasoning_effort_override(
+            self.effective_model_profile_for_agent(session_model_profile_id, &agent.profile),
+            reasoning_effort,
+        )
+        .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
+        let profile = effective.profile;
+        let api_key = runtime_api_key_for_profile(&profile);
+        let extra_options = profile
+            .merged_extra_options(None, profile.reasoning_effort)
+            .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
+        let compressor = LlmCompressor::new(
+            api_key,
+            profile.base_url.clone(),
+            profile.model.clone(),
+            profile.context_tokens,
+            profile.max_output_tokens,
+            extra_options,
+        );
+        tracing::info!(
+            thread_id,
+            model_profile = %profile.id,
+            model = %profile.model,
+            "manual memory compression started"
+        );
+        let result = self
+            .memory
+            .compact_now_with_compressor(thread_id, &compressor)
+            .await;
         let payload = match &result {
             Ok(compacted_messages) => serde_json::json!({
                 "trigger": "manual",
@@ -2077,6 +2181,7 @@ impl CatBot {
                         CoreStreamOptions {
                             cancel: cancel.clone(),
                             steer: None,
+                            steer_behavior: CoreSteerBehavior::Continue,
                             async_agent: false,
                         },
                     ));
@@ -2247,7 +2352,7 @@ impl CatBot {
         let thread_id_owned = thread_id.to_string();
         stream! {
                 let run_lock = self.thread_run_lock(&thread_id_owned).await;
-                let _run_guard = run_lock.lock().await;
+                let mut run_guard = Some(run_lock.lock().await);
                 let steer_registration = if opts.supervisor_run {
                     None
                 } else {
@@ -2259,11 +2364,17 @@ impl CatBot {
                 let mut supervisor_round: u32 = 0;
                 let mut continuation_from_supervisor = false;
                 let mut continuation_from_background_task = false;
+                let mut continuation_from_user_next_turn = false;
+                let mut next_steer_metadata: Option<serde_json::Value> = None;
+                let mut next_steer_user_name: Option<String> = None;
                 let mut stop_hook_active = false;
                 let mut interruption_resume_checked = false;
                 let turn_started = Instant::now();
 
                 'workflow_loop: loop {
+                if run_guard.is_none() {
+                    run_guard = Some(run_lock.lock().await);
+                }
                 if !interruption_resume_checked && !opts.supervisor_run {
                     interruption_resume_checked = true;
                     if let Some((report, _instance)) = self
@@ -2387,6 +2498,7 @@ impl CatBot {
 
                 let mut round_opts = opts.clone();
                 let background_task_continuation = continuation_from_background_task;
+                let user_next_turn_continuation = continuation_from_user_next_turn;
                 if continuation_from_supervisor || background_task_continuation {
                     if continuation_from_supervisor {
                         round_opts.sender_username = Some("supervisor".to_string());
@@ -2398,8 +2510,22 @@ impl CatBot {
                     round_opts.message_id = None;
                     round_opts.im_attachments.clear();
                     round_opts.im_documents.clear();
+                    next_steer_metadata = None;
+                    next_steer_user_name = None;
+                } else if user_next_turn_continuation {
+                    round_opts.sender_username = next_steer_user_name.take();
+                    let metadata = next_steer_metadata
+                        .take()
+                        .unwrap_or(serde_json::Value::Null);
+                    round_opts.message_id = metadata_string(&metadata, "message_id");
+                    round_opts.chat_type = metadata_string(&metadata, "chat_type");
+                    round_opts.platform = metadata_string(&metadata, "platform");
+                    round_opts.sender_user_id = metadata_string(&metadata, "sender_user_id");
+                    round_opts.im_attachments.clear();
+                    round_opts.im_documents.clear();
                 }
                 continuation_from_background_task = false;
+                continuation_from_user_next_turn = false;
 
                 apply_skill_injections(&mut ctx.user_state, &round_opts.skill_injections);
                 let requested_user_name = round_opts
@@ -2808,6 +2934,7 @@ impl CatBot {
                     CoreStreamOptions {
                         cancel: round_opts.cancel.clone(),
                         steer: steer_queue.clone(),
+                        steer_behavior: CoreSteerBehavior::Continue,
                         async_agent: round_opts.async_agent,
                     },
                 );
@@ -3125,9 +3252,12 @@ impl CatBot {
                                             preview: batch.preview.clone(),
                                             count: batch.count,
                                         });
+                                        continuation_from_background_task = batch.is_background_only();
+                                        continuation_from_user_next_turn = batch.has_user_next_turn();
+                                        next_steer_metadata = batch.message_metadata.clone();
+                                        next_steer_user_name = batch.user_name.clone();
                                         next_content = batch.content;
                                         continuation_from_supervisor = false;
-                                        continuation_from_background_task = true;
                                         continue 'workflow_loop;
                                     }
                                 }
@@ -3146,6 +3276,11 @@ impl CatBot {
                                             count: background_task_count,
                                         };
                                     }
+                                    // The foreground turn and its persistence are complete.
+                                    // Background tools execute independently; keeping the
+                                    // thread lock here would unnecessarily block /compact and
+                                    // subsequent user turns for the full task duration.
+                                    drop(run_guard.take());
                                     loop {
                                         while let Some(event) = try_recv_background_side_event(
                                             &mut background_side_events,
@@ -3180,9 +3315,12 @@ impl CatBot {
                                                             count: batch.count,
                                                         },
                                                     );
+                                                    continuation_from_background_task = batch.is_background_only();
+                                                    continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                    next_steer_metadata = batch.message_metadata.clone();
+                                                    next_steer_user_name = batch.user_name.clone();
                                                     next_content = batch.content;
                                                     continuation_from_supervisor = false;
-                                                    continuation_from_background_task = true;
                                                     continue 'workflow_loop;
                                                 }
                                             } else {
@@ -3209,9 +3347,12 @@ impl CatBot {
                                                         count: batch.count,
                                                     },
                                                 );
+                                                continuation_from_background_task = batch.is_background_only();
+                                                continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                next_steer_metadata = batch.message_metadata.clone();
+                                                next_steer_user_name = batch.user_name.clone();
                                                 next_content = batch.content;
                                                 continuation_from_supervisor = false;
-                                                continuation_from_background_task = true;
                                                 continue 'workflow_loop;
                                             }
                                         }
@@ -3236,9 +3377,12 @@ impl CatBot {
                                                             count: batch.count,
                                                         },
                                                     );
+                                                    continuation_from_background_task = batch.is_background_only();
+                                                    continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                    next_steer_metadata = batch.message_metadata.clone();
+                                                    next_steer_user_name = batch.user_name.clone();
                                                     next_content = batch.content;
                                                     continuation_from_supervisor = false;
-                                                    continuation_from_background_task = true;
                                                     continue 'workflow_loop;
                                                 }
                                             } else {
@@ -3315,9 +3459,12 @@ impl CatBot {
                                                                         count: batch.count,
                                                                     },
                                                                 );
+                                                                continuation_from_background_task = batch.is_background_only();
+                                                                continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                                next_steer_metadata = batch.message_metadata.clone();
+                                                                next_steer_user_name = batch.user_name.clone();
                                                                 next_content = batch.content;
                                                                 continuation_from_supervisor = false;
-                                                                continuation_from_background_task = true;
                                                                 continue 'workflow_loop;
                                                             }
                                                         } else {
@@ -3343,6 +3490,9 @@ impl CatBot {
                                                 }
                                             }
                                         }
+                                    }
+                                    if run_guard.is_none() {
+                                        run_guard = Some(run_lock.lock().await);
                                     }
                                 }
                                 if !round_opts.supervisor_run
@@ -3440,9 +3590,12 @@ impl CatBot {
                                             preview: batch.preview.clone(),
                                             count: batch.count,
                                         });
+                                        continuation_from_background_task = batch.is_background_only();
+                                        continuation_from_user_next_turn = batch.has_user_next_turn();
+                                        next_steer_metadata = batch.message_metadata.clone();
+                                        next_steer_user_name = batch.user_name.clone();
                                         next_content = batch.content;
                                         continuation_from_supervisor = false;
-                                        continuation_from_background_task = true;
                                         continue 'workflow_loop;
                                     }
                                 }
@@ -3613,6 +3766,7 @@ struct LocalToolDeps {
     user_question_manager: Arc<UserQuestionManager>,
     hook_manager: Arc<HookManager>,
     tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
+    subagent_sessions: Arc<SubagentSessionCoordinator>,
     overflow_bytes: usize,
     acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
 }
@@ -3646,6 +3800,7 @@ impl LocalToolDeps {
             user_question_manager: Arc::clone(&self.user_question_manager),
             hook_manager: Arc::clone(&self.hook_manager),
             tool_tasks: Arc::clone(&self.tool_tasks),
+            subagent_sessions: Arc::clone(&self.subagent_sessions),
             overflow_bytes: self.overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         }
@@ -3678,7 +3833,7 @@ impl LocalToolDeps {
             &self.delegate_ids,
             self.api_key.clone(),
             profile.base_url.clone(),
-            profile.model.clone(),
+            profile.clone(),
             extra_options,
             self.overflow_bytes,
         );
@@ -3986,6 +4141,7 @@ impl CatBotBuilder {
         let hook_manager = HookManager::new(workspace_root.clone(), data_dir.clone());
         let tool_tasks = crate::tool_tasks::ToolTaskManager::load(&data_dir)
             .map_err(|err| AgentError::other(format!("load tool task store: {err:#}")))?;
+        let subagent_sessions = Arc::new(SubagentSessionCoordinator::default());
         let acp_backend = Arc::new(acp::AcpBackend::new(
             data_dir.clone(),
             self.im_bridge.clone(),
@@ -4026,6 +4182,7 @@ impl CatBotBuilder {
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             tool_tasks: Arc::clone(&tool_tasks),
+            subagent_sessions: Arc::clone(&subagent_sessions),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         };
@@ -4038,7 +4195,7 @@ impl CatBotBuilder {
             &self.delegate_ids,
             self.api_key.clone(),
             resolved_base_url.clone(),
-            profile.model.clone(),
+            profile.clone(),
             self.extra_options.clone(),
             overflow_bytes,
         );
@@ -4090,6 +4247,7 @@ impl CatBotBuilder {
             user_question_manager: Arc::clone(&user_question_manager),
             hook_manager: Arc::clone(&hook_manager),
             tool_tasks: Arc::clone(&tool_tasks),
+            subagent_sessions: Arc::clone(&subagent_sessions),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
         };
@@ -4220,6 +4378,7 @@ impl CatBotBuilder {
                 user_question_manager: Arc::clone(&user_question_manager),
                 hook_manager: Arc::clone(&hook_manager),
                 tool_tasks: Arc::clone(&tool_tasks),
+                subagent_sessions: Arc::clone(&subagent_sessions),
                 overflow_bytes,
                 acp_client_tools: self.acp_client_tools.clone(),
             };
@@ -4300,6 +4459,7 @@ impl CatBotBuilder {
             tool_tasks,
             run_locks,
             active_steers,
+            subagent_sessions,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
             environment_context_source,
@@ -4434,6 +4594,7 @@ struct RemiSubAgentTool {
     parameters_schema: serde_json::Value,
     agent_name: String,
     model_name: String,
+    model_profile: ModelProfileConfig,
     base_url: Option<String>,
     api_key: String,
     system_prompt: String,
@@ -4444,8 +4605,90 @@ struct RemiSubAgentTool {
     profile: AgentProfile,
     tool_allowlist: Vec<String>,
     overflow_bytes: usize,
-    persistent_sessions: bool,
-    session_locks: Arc<AsyncMutex<HashMap<String, ThreadRunLock>>>,
+    sessions: Arc<SubagentSessionCoordinator>,
+}
+
+#[derive(Default)]
+struct SubagentSessionCoordinator {
+    locks: AsyncMutex<HashMap<String, ThreadRunLock>>,
+    active: ActiveSteerQueues,
+    cancellations: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl SubagentSessionCoordinator {
+    async fn session_lock(&self, thread_id: &str) -> ThreadRunLock {
+        let mut locks = self.locks.lock().await;
+        locks
+            .entry(thread_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    fn active_queue(&self, thread_id: &str) -> Option<Arc<CoreSteerQueue>> {
+        self.active
+            .lock()
+            .expect("active sub-agent steer queue lock poisoned")
+            .get(thread_id)
+            .cloned()
+    }
+
+    fn register(
+        &self,
+        thread_id: &str,
+        cancel: CancellationToken,
+    ) -> (
+        Arc<CoreSteerQueue>,
+        SteerQueueRegistration,
+        SubagentCancelRegistration,
+    ) {
+        let queue = Arc::new(CoreSteerQueue::new());
+        self.active
+            .lock()
+            .expect("active sub-agent steer queue lock poisoned")
+            .insert(thread_id.to_string(), Arc::clone(&queue));
+        let guard = SteerQueueRegistration {
+            session_id: thread_id.to_string(),
+            queue: Arc::clone(&queue),
+            active: Arc::clone(&self.active),
+            removes_queue_on_drop: true,
+        };
+        self.cancellations
+            .lock()
+            .expect("active sub-agent cancellation lock poisoned")
+            .insert(thread_id.to_string(), cancel);
+        let cancel_guard = SubagentCancelRegistration {
+            thread_id: thread_id.to_string(),
+            cancellations: Arc::clone(&self.cancellations),
+        };
+        (queue, guard, cancel_guard)
+    }
+
+    fn cancel(&self, thread_id: &str) -> bool {
+        let token = self
+            .cancellations
+            .lock()
+            .expect("active sub-agent cancellation lock poisoned")
+            .get(thread_id)
+            .cloned();
+        token.is_some_and(|token| {
+            token.cancel();
+            true
+        })
+    }
+}
+
+struct SubagentCancelRegistration {
+    thread_id: String,
+    cancellations: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl Drop for SubagentCancelRegistration {
+    fn drop(&mut self) {
+        self.cancellations
+            .lock()
+            .expect("active sub-agent cancellation lock poisoned")
+            .remove(&self.thread_id);
+    }
 }
 
 impl RemiSubAgentTool {
@@ -4456,14 +4699,17 @@ impl RemiSubAgentTool {
             .map(ToString::to_string)
     }
 
-    fn named_from_args(arguments: &serde_json::Value) -> Result<Option<String>, AgentError> {
+    fn named_from_args(arguments: &serde_json::Value) -> Result<String, AgentError> {
         let Some(named) = arguments
             .get("named")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            return Ok(None);
+            return Err(AgentError::tool(
+                "sub-agent",
+                "missing required named sub-agent session",
+            ));
         };
         if named.len() > 64 {
             return Err(AgentError::tool(
@@ -4480,15 +4726,7 @@ impl RemiSubAgentTool {
                 "named sub-agent session may only contain ASCII letters, numbers, '-' and '_'",
             ));
         }
-        Ok(Some(named.to_string()))
-    }
-
-    async fn session_lock(&self, thread_id: &str) -> ThreadRunLock {
-        let mut locks = self.session_locks.lock().await;
-        locks
-            .entry(thread_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        Ok(named.to_string())
     }
 }
 
@@ -4521,12 +4759,6 @@ impl Tool for RemiSubAgentTool {
             return Err(AgentError::tool("sub-agent", "missing task"));
         }
         let named = Self::named_from_args(&arguments)?;
-        if named.is_some() && !self.persistent_sessions {
-            return Err(AgentError::tool(
-                "sub-agent",
-                "named sub-agent sessions are not enabled for this agent profile",
-            ));
-        }
 
         let title = Self::title_from_args(&arguments);
         let agent_name = self.agent_name.clone();
@@ -4536,6 +4768,7 @@ impl Tool for RemiSubAgentTool {
         }
         let mut builder = AgentBuilder::new()
             .model(model)
+            .config(AgentConfig::default().with_max_tokens(self.model_profile.max_output_tokens))
             .system(self.system_prompt.clone())
             .max_turns(self.max_turns);
         if !self.extra_options.is_empty() {
@@ -4558,31 +4791,38 @@ impl Tool for RemiSubAgentTool {
             hook_manager: Arc::clone(&self.deps.hook_manager),
             tool_tasks: Arc::clone(&self.deps.tool_tasks),
         };
-        let sub_thread_id = ThreadId(match named.as_deref() {
-            Some(named) => format!("subagent:{}:{named}", self.agent_name),
-            None => format!("subagent:{}", uuid::Uuid::new_v4()),
-        });
+        let sub_thread_id = ThreadId(format!("subagent:{}:{named}", self.agent_name));
         let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
         let sub_thread_id_for_memory = sub_thread_id.0.clone();
+        let subagent_cancel = ctx.runtime().cancellation();
         let metadata = subagent_metadata(ctx, &sub_thread_id_for_memory);
         let memory = Arc::clone(&self.deps.memory);
         let workspace_root = self.deps.workspace_root.clone();
         let environment_context_source = self.deps.environment_context_source.clone();
         let subagent_system_prompt = self.system_prompt.clone();
         let model_name = self.model_name.clone();
+        let model_profile = self.model_profile.clone();
         let hook_manager = Arc::clone(&self.deps.hook_manager);
-        let persistent = named.is_some();
-        let session_lock = if persistent {
-            Some(self.session_lock(&sub_thread_id_for_memory).await)
-        } else {
-            None
-        };
+        let persistent = true;
+        let sessions = Arc::clone(&self.sessions);
+        let session_lock = sessions.session_lock(&sub_thread_id_for_memory).await;
 
         let output: remi_agentloop::tool::BoxedToolStream = Box::pin(stream! {
-            let _session_guard = match session_lock.as_ref() {
-                Some(lock) => Some(lock.lock().await),
-                None => None,
-            };
+            if let Some(active) = sessions.active_queue(&sub_thread_id_for_memory) {
+                active.push(CoreSteerInput {
+                    id: sub_run_id.0.clone(),
+                    content: Content::text(task.clone()),
+                    preview: steer_preview(&Content::text(task.clone())),
+                    message_metadata: None,
+                    user_name: None,
+                    source: CoreSteerSource::UserNextTurn,
+                });
+            }
+            let _session_guard = session_lock.lock().await;
+            let (subagent_steer, _steer_registration, _cancel_registration) = sessions.register(
+                &sub_thread_id_for_memory,
+                subagent_cancel.clone(),
+            );
             let mut sub_task = task.clone();
             let sub_hook_context = HookContext {
                 session_id: sub_thread_id_for_memory.clone(),
@@ -4697,10 +4937,136 @@ impl Tool for RemiSubAgentTool {
                     }
                 }
             }
+            let request_budget = model_request_budget_tokens(
+                &model_profile,
+                auto_compress_context_percent().unwrap_or(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
+            );
+            loop {
+                let request_tool_definitions = agent.tool_definitions_for_input(&input, None);
+                let Some(snapshot) = model_input_snapshot_from_loop_input(
+                    &input,
+                    &request_tool_definitions,
+                    &sub_thread_id_for_memory,
+                    None,
+                    &model_profile.id,
+                    &model_profile.model,
+                ) else {
+                    break;
+                };
+                if snapshot.totals.estimated_tokens <= request_budget {
+                    break;
+                }
+                if !persistent {
+                    let message = format!(
+                        "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; the current ephemeral task cannot be compressed",
+                        snapshot.totals.estimated_tokens, request_budget
+                    );
+                    yield ToolOutput::SubSession(SubSessionEvent::new(
+                        String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
+                        title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
+                    ));
+                    yield ToolOutput::text(format_subagent_tool_result(
+                        &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
+                    ));
+                    return;
+                }
+                if !memory.auto_compress {
+                    let message = format!(
+                        "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; automatic compression is disabled",
+                        snapshot.totals.estimated_tokens, request_budget
+                    );
+                    let _ = memory.append_failed_turn(
+                        &sub_thread_id_for_memory,
+                        vec![Message::user(sub_task.clone())],
+                    ).await;
+                    yield ToolOutput::SubSession(SubSessionEvent::new(
+                        String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
+                        title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
+                    ));
+                    yield ToolOutput::text(format_subagent_tool_result(
+                        &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
+                    ));
+                    return;
+                }
+                match memory.compact_for_request(&sub_thread_id_for_memory).await {
+                    Ok(count) if count > 0 => {}
+                    Ok(_) => {
+                        let message = format!(
+                            "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; no complete older exchange is eligible for compression",
+                            snapshot.totals.estimated_tokens, request_budget
+                        );
+                        let _ = memory.append_failed_turn(
+                            &sub_thread_id_for_memory,
+                            vec![Message::user(sub_task.clone())],
+                        ).await;
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
+                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
+                        ));
+                        yield ToolOutput::text(format_subagent_tool_result(
+                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
+                        ));
+                        return;
+                    }
+                    Err(err) => {
+                        let message = format!(
+                            "pre-request sub-agent memory compression failed while reducing {} estimated tokens to the {} token limit: {err}",
+                            snapshot.totals.estimated_tokens, request_budget
+                        );
+                        let _ = memory.append_failed_turn(
+                            &sub_thread_id_for_memory,
+                            vec![Message::user(sub_task.clone())],
+                        ).await;
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
+                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
+                        ));
+                        yield ToolOutput::text(format_subagent_tool_result(
+                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
+                        ));
+                        return;
+                    }
+                }
+                let mut ctx = match memory.load_context(&sub_thread_id_for_memory).await {
+                    Ok(ctx) => ctx,
+                    Err(err) => {
+                        let message = format!("reload sub-agent memory after pre-request compression: {err}");
+                        yield ToolOutput::SubSession(SubSessionEvent::new(
+                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
+                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
+                        ));
+                        yield ToolOutput::text(format_subagent_tool_result(
+                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
+                        ));
+                        return;
+                    }
+                };
+                let environment_context = ensure_environment_context(
+                    &mut ctx.user_state,
+                    &environment_context_source,
+                );
+                let mut history = build_injected_history(&ctx);
+                history.insert(0, Message::system(subagent_system_prompt.clone()));
+                insert_environment_context_prompt(&mut history, 1, environment_context.prompt);
+                skip_count = history.len();
+                input = LoopInput::start(&sub_task)
+                    .history(history)
+                    .metadata(metadata.clone())
+                    .user_state(std::mem::take(&mut ctx.user_state));
+            }
             let mut raw_history: Option<Vec<Message>> = None;
             let mut raw_user_state: Option<serde_json::Value> = None;
             let mut subagent_stop_hook_active = false;
-            let mut inner_stream = Box::pin(agent.stream_with_input(input));
+            let mut handed_off = false;
+            let mut inner_stream = Box::pin(agent.stream_with_input_and_options(
+                input,
+                CoreStreamOptions {
+                    cancel: Some(subagent_cancel.clone()),
+                    steer: Some(Arc::clone(&subagent_steer)),
+                    steer_behavior: CoreSteerBehavior::Handoff,
+                    async_agent: false,
+                },
+            ));
             while let Some(event) = inner_stream.next().await {
                 match event {
                     CatEvent::History(messages, user_state) => {
@@ -4854,6 +5220,9 @@ impl Tool for RemiSubAgentTool {
                             .unwrap_or_default(),
                         );
                     }
+                    CatEvent::SteerInjected(_) => {
+                        handed_off = true;
+                    }
                     CatEvent::Done => {
                         if persistent {
                             let _ = persist_turn(
@@ -4865,6 +5234,33 @@ impl Tool for RemiSubAgentTool {
                                 &HashMap::new(),
                             )
                             .await;
+                        }
+                        if handed_off {
+                            yield ToolOutput::SubSession(SubSessionEvent::new(
+                                String::new(),
+                                sub_thread_id.clone(),
+                                sub_run_id.clone(),
+                                agent_name.clone(),
+                                title.clone(),
+                                0,
+                                ProtocolEvent::Custom {
+                                    event_type: "sub_session_handed_off".to_string(),
+                                    extra: serde_json::json!({
+                                        "final_output": &final_output,
+                                        "handed_off": true,
+                                    }),
+                                },
+                            ));
+                            yield ToolOutput::text(format_subagent_tool_result_with_handoff(
+                                &sub_thread_id,
+                                &sub_run_id,
+                                &agent_name,
+                                true,
+                                &final_output,
+                                None,
+                                true,
+                            ));
+                            return;
                         }
                         let stop_hook = hook_manager
                             .run(
@@ -4912,7 +5308,15 @@ impl Tool for RemiSubAgentTool {
                                 continuation_input = continuation_input.history(history);
                             }
                             raw_user_state = None;
-                            inner_stream = Box::pin(agent.stream_with_input(continuation_input));
+                            inner_stream = Box::pin(agent.stream_with_input_and_options(
+                                continuation_input,
+                                CoreStreamOptions {
+                                    cancel: Some(subagent_cancel.clone()),
+                                    steer: Some(Arc::clone(&subagent_steer)),
+                                    steer_behavior: CoreSteerBehavior::Handoff,
+                                    async_agent: false,
+                                },
+                            ));
                             continue;
                         }
                         yield ToolOutput::SubSession(SubSessionEvent::new(
@@ -5010,6 +5414,26 @@ fn format_subagent_tool_result(
     final_output: &str,
     error: Option<&str>,
 ) -> String {
+    format_subagent_tool_result_with_handoff(
+        sub_thread_id,
+        sub_run_id,
+        agent_name,
+        success,
+        final_output,
+        error,
+        false,
+    )
+}
+
+fn format_subagent_tool_result_with_handoff(
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    agent_name: &str,
+    success: bool,
+    final_output: &str,
+    error: Option<&str>,
+    handed_off: bool,
+) -> String {
     let value = serde_json::json!({
         "sub_session_id": &sub_thread_id.0,
         "sub_run_id": &sub_run_id.0,
@@ -5017,6 +5441,7 @@ fn format_subagent_tool_result(
         "success": success,
         "final_output": final_output,
         "error": error,
+        "handed_off": handed_off,
     });
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| final_output.to_string())
 }
@@ -5061,7 +5486,7 @@ fn register_delegate_agent_tools(
     delegate_ids: &[String],
     api_key: String,
     base_url: Option<String>,
-    default_model: String,
+    default_model_profile: ModelProfileConfig,
     extra_options: serde_json::Map<String, serde_json::Value>,
     overflow_bytes: usize,
 ) {
@@ -5101,7 +5526,7 @@ fn register_delegate_agent_tools(
         };
         let tool_name = delegate_tool_name(&profile.id);
         let tool_description = format!(
-            "Delegate a focused task to the `{}` sub-agent. {}",
+            "Delegate a focused task to the `{}` sub-agent. {} Every call must choose a named session. Reuse the same name when prior conversation or memory is useful; choose a new name when the task is unrelated. If that named session is already running, this call safely hands off the prior run and continues afterward.",
             profile.name, profile.description
         );
         let agent_name = profile.id.clone();
@@ -5110,12 +5535,13 @@ fn register_delegate_agent_tools(
         let model_name = profile
             .model
             .clone()
-            .unwrap_or_else(|| default_model.clone());
+            .unwrap_or_else(|| default_model_profile.model.clone());
+        let mut model_profile = default_model_profile.clone();
+        model_profile.model = model_name.clone();
         let tool_base_url = profile.base_url.clone().or_else(|| base_url.clone());
         let max_turns = profile.max_turns.unwrap_or(12);
         let tool_api_key = api_key.clone();
         let tool_extra_options = extra_options.clone();
-        let persistent_sessions = profile.persistent_sessions;
         let mut tool_allowlist = profile.tools.clone();
         expand_skill_discovery_tools(&mut tool_allowlist);
         for delegate in &profile.delegates {
@@ -5124,36 +5550,31 @@ fn register_delegate_agent_tools(
                 tool_allowlist.push(name);
             }
         }
-        let mut parameters_schema = serde_json::json!({
+        let parameters_schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "Complete, self-contained task for the sub-agent. Include all necessary context."
+                    "description": "Task for this turn. For a new named session include all necessary context; when reusing a session, provide the new goal, follow-up, or correction."
+                },
+                "named": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                    "description": "Required sub-agent session name. Reuse an existing name when its conversation and memory are relevant, or choose a new descriptive name for an unrelated task."
                 }
             },
-            "required": ["task"]
+            "required": ["task", "named"],
+            "additionalProperties": false
         });
-        if profile.persistent_sessions {
-            if let Some(properties) = parameters_schema
-                .get_mut("properties")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                properties.insert(
-                    "named".to_string(),
-                    serde_json::json!({
-                        "type": "string",
-                        "description": "Optional named persistent sub-agent session. Calls with the same name reuse the same sub-agent conversation and memory."
-                    }),
-                );
-            }
-        }
         registry.register(RemiSubAgentTool {
             name: tool_name,
             description: tool_description,
             parameters_schema,
             agent_name,
             model_name,
+            model_profile,
             base_url: tool_base_url,
             api_key: tool_api_key,
             system_prompt,
@@ -5164,8 +5585,7 @@ fn register_delegate_agent_tools(
             profile,
             tool_allowlist,
             overflow_bytes,
-            persistent_sessions,
-            session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            sessions: Arc::clone(&deps.subagent_sessions),
         });
     }
 }
@@ -5609,7 +6029,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_delegate_agent_exposes_named_parameter() {
+    fn every_delegate_agent_requires_named_parameter_even_when_legacy_flag_is_false() {
         std::env::set_var("OPENAI_API_KEY", "test");
         let data_dir = tempfile::tempdir().unwrap();
         let skills_dir = data_dir.path().join("skills");
@@ -5625,7 +6045,7 @@ name: Coder
 description: Persistent coder
 tools:
   - search
-persistent_sessions: true
+persistent_sessions: false
 ---
 You are Coder.
 "#,
@@ -5689,18 +6109,21 @@ You are Remi.
                 .is_some_and(|properties| properties.contains_key("named")),
             "persistent delegate schema should expose named"
         );
+        assert!(coder
+            .function
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| required.iter().any(|value| value == "named")));
     }
 
     #[test]
     fn subagent_named_argument_is_validated() {
-        assert_eq!(
-            RemiSubAgentTool::named_from_args(&json!({"task": "work"})).unwrap(),
-            None
-        );
+        assert!(RemiSubAgentTool::named_from_args(&json!({"task": "work"})).is_err());
         assert_eq!(
             RemiSubAgentTool::named_from_args(&json!({"task": "work", "named": "build_1"}))
                 .unwrap(),
-            Some("build_1".to_string())
+            "build_1".to_string()
         );
         assert!(
             RemiSubAgentTool::named_from_args(&json!({"task": "work", "named": "bad name"}))
@@ -5725,6 +6148,7 @@ You are Remi.
         assert_eq!(value["agent"], "explorer");
         assert_eq!(value["success"], true);
         assert_eq!(value["final_output"], "done");
+        assert_eq!(value["handed_off"], false);
     }
 
     #[test]

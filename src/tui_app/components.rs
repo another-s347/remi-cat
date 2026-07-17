@@ -917,15 +917,21 @@ pub(super) fn context_compaction_cell(event: ContextCompactionEvent) -> HistoryC
         ContextCompactionStatus::Completed => ("context compressed", ToolVisualStatus::Success),
         ContextCompactionStatus::Failed => ("context compression failed", ToolVisualStatus::Error),
     };
-    let body = if matches!(event.status, ContextCompactionStatus::Failed) {
-        event
+    let body = match event.status {
+        ContextCompactionStatus::Started => "using the current session model".to_string(),
+        ContextCompactionStatus::Failed => event
             .error
-            .unwrap_or_else(|| "context compression failed".to_string())
-    } else {
-        format!(
-            "compacted {} messages; remaining {} messages",
-            event.compacted_messages, event.remaining_messages
-        )
+            .unwrap_or_else(|| "context compression failed".to_string()),
+        ContextCompactionStatus::Completed => {
+            if event.remaining_messages > 0 {
+                format!(
+                    "compacted {} messages; remaining {} messages",
+                    event.compacted_messages, event.remaining_messages
+                )
+            } else {
+                format!("compacted {} messages", event.compacted_messages)
+            }
+        }
     };
     HistoryCell::context_compaction(event.id, title.to_string(), body, status)
 }
@@ -1119,7 +1125,7 @@ pub(super) fn patch_tool_meta_with_elapsed(elapsed: String, pretty: &PrettyToolC
 }
 
 pub(super) fn tool_body(pretty: &PrettyToolCall) -> String {
-    let summary = if matches!(pretty.tool_name.as_str(), "bash" | "workspace_bash") {
+    let summary = if preserves_multiline_summary(&pretty.tool_name) {
         pretty.summary.trim().to_string()
     } else {
         single_line(&pretty.summary)

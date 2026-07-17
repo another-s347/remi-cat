@@ -48,10 +48,14 @@ pub struct AgentProfile {
     pub delegates: Vec<String>,
     #[serde(default)]
     pub max_turns: Option<usize>,
-    #[serde(default, alias = "persistent")]
+    #[serde(default = "default_persistent_sessions", alias = "persistent")]
     pub persistent_sessions: bool,
     #[serde(skip)]
     pub system_prompt: String,
+}
+
+fn default_persistent_sessions() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +207,22 @@ You are Remi.
         assert_eq!(profile.system_prompt, "You are Remi.");
         assert_eq!(profile.delegates, vec!["coder"]);
         assert!(profile.allows_tool("search"));
+        assert!(profile.persistent_sessions);
+    }
+
+    #[test]
+    fn persistent_sessions_can_be_explicitly_disabled() {
+        let profile = AgentProfile::from_markdown(
+            r#"---
+id: ephemeral
+name: Ephemeral
+persistent_sessions: false
+---
+You are ephemeral.
+"#,
+        )
+        .unwrap();
+        assert!(!profile.persistent_sessions);
     }
 
     #[test]

@@ -10,10 +10,18 @@ use remi_agentloop::prelude::{
 
 use crate::profile::AgentProfile;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CoreSteerBehavior {
+    #[default]
+    Continue,
+    Handoff,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CoreStreamOptions {
     pub cancel: Option<CancellationToken>,
     pub steer: Option<Arc<CoreSteerQueue>>,
+    pub steer_behavior: CoreSteerBehavior,
     pub async_agent: bool,
 }
 
@@ -32,13 +40,18 @@ impl CoreStreamOptions {
         self
     }
 
+    pub fn with_steer_behavior(mut self, behavior: CoreSteerBehavior) -> Self {
+        self.steer_behavior = behavior;
+        self
+    }
+
     pub fn with_async_agent(mut self, enabled: bool) -> Self {
         self.async_agent = enabled;
         self
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreSteerSource {
     User,
     UserNextTurn,
@@ -63,6 +76,23 @@ pub struct CoreSteerBatch {
     pub count: usize,
     pub message_metadata: Option<serde_json::Value>,
     pub user_name: Option<String>,
+    pub sources: Vec<CoreSteerSource>,
+}
+
+impl CoreSteerBatch {
+    pub fn is_background_only(&self) -> bool {
+        !self.sources.is_empty()
+            && self
+                .sources
+                .iter()
+                .all(|source| *source == CoreSteerSource::BackgroundToolCompletion)
+    }
+
+    pub fn has_user_next_turn(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| *source == CoreSteerSource::UserNextTurn)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -129,10 +159,21 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
         }
         Content::parts(parts)
     };
-    let message_metadata = inputs
-        .last()
-        .and_then(|input| input.message_metadata.clone());
-    let user_name = inputs.last().and_then(|input| input.user_name.clone());
+    let user_input = inputs
+        .iter()
+        .rev()
+        .find(|input| input.source == CoreSteerSource::UserNextTurn);
+    let message_metadata = user_input
+        .and_then(|input| input.message_metadata.clone())
+        .or_else(|| {
+            inputs
+                .last()
+                .and_then(|input| input.message_metadata.clone())
+        });
+    let user_name = user_input
+        .and_then(|input| input.user_name.clone())
+        .or_else(|| inputs.last().and_then(|input| input.user_name.clone()));
+    let sources = inputs.iter().map(|input| input.source).collect();
     CoreSteerBatch {
         ids,
         content,
@@ -140,6 +181,7 @@ fn merge_steer_inputs(inputs: Vec<CoreSteerInput>) -> CoreSteerBatch {
         count,
         message_metadata,
         user_name,
+        sources,
     }
 }
 
@@ -488,6 +530,41 @@ You are a markdown agent.
         assert!(text.contains("1. User steer: first"));
         assert!(text.contains("2. User steer: second"));
         assert!(queue.drain_batch().is_none());
+    }
+
+    #[test]
+    fn steer_batch_preserves_user_next_turn_metadata_when_mixed_with_background() {
+        let queue = CoreSteerQueue::new();
+        queue.push(CoreSteerInput {
+            id: "user".to_string(),
+            content: Content::text("next question"),
+            preview: "next question".to_string(),
+            message_metadata: Some(serde_json::json!({"message_id": "message-2"})),
+            user_name: Some("alice".to_string()),
+            source: CoreSteerSource::UserNextTurn,
+        });
+        queue.push(CoreSteerInput {
+            id: "background".to_string(),
+            content: Content::text("tool finished"),
+            preview: "tool finished".to_string(),
+            message_metadata: Some(serde_json::json!({"background_tool_task": true})),
+            user_name: None,
+            source: CoreSteerSource::BackgroundToolCompletion,
+        });
+
+        let batch = queue.drain_batch().expect("batch should be present");
+
+        assert!(batch.has_user_next_turn());
+        assert!(!batch.is_background_only());
+        assert_eq!(batch.user_name.as_deref(), Some("alice"));
+        assert_eq!(
+            batch
+                .message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("message_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("message-2")
+        );
     }
 
     #[tokio::test]

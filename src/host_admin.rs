@@ -9,8 +9,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bot_core::skill::store::SkillStore;
 use bot_core::{
-    remi_skill, AgentProfile, AgentRegistry, BuiltinSkillStore, FileSkillStore, ModelInputSnapshot,
-    ToolApprovalDecision,
+    remi_skill, AgentProfile, AgentRegistry, BuiltinSkillStore, Content, ContentPart,
+    FileSkillStore, ModelInputSnapshot, ReasoningEffort, ToolApprovalDecision,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -21,7 +21,7 @@ use crate::model_input_store::{
 use crate::runtime_config::SetupState;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::{Session, SessionRuntime};
-use crate::web_chat::{WebChatHandle, WEB_CHANNEL, WEB_USER_ID};
+use crate::web_chat::{WebChatHandle, WebRuntimeOptions, WEB_CHANNEL, WEB_USER_ID};
 use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
@@ -75,6 +75,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/chat/sessions/{id}/messages",
             get(web_session_messages),
         )
+        .route("/api/v1/chat/sessions/{id}/events", get(web_session_events))
         .route(
             "/api/v1/chat/sessions/{id}/model-inputs",
             get(list_web_model_inputs),
@@ -503,7 +504,12 @@ async fn list_web_sessions(State(state): State<AdminState>) -> Json<Vec<WebSessi
         .await
         .list()
         .into_iter()
-        .filter(|session| session.channel_binding.platform == WEB_CHANNEL)
+        .filter(|session| {
+            session.channel_binding.platform == WEB_CHANNEL
+                && !session
+                    .metadata
+                    .contains_key("sub_session_parent_session_id")
+        })
         .map(|session| {
             let active_run = active_by_session.get(&session.id).cloned();
             let sort_at = active_run
@@ -572,7 +578,37 @@ async fn delete_web_session(
     State(state): State<AdminState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, AdminError> {
-    require_web_session(&state, &id).await?;
+    let session = require_web_session(&state, &id).await?;
+    let child_session_ids = {
+        let sessions = state.sessions.lock().await;
+        let all_sessions = sessions.list();
+        session
+            .sub_sessions
+            .iter()
+            .filter_map(|sub| sub.channel_binding.as_ref())
+            .filter(|binding| binding.platform == WEB_CHANNEL)
+            .filter(|binding| {
+                !all_sessions.iter().any(|other| {
+                    other.id != session.id
+                        && other.sub_sessions.iter().any(|sub| {
+                            sub.channel_binding.as_ref().is_some_and(|candidate| {
+                                candidate.platform == binding.platform
+                                    && candidate.channel_id == binding.channel_id
+                            })
+                        })
+                })
+            })
+            .filter_map(|binding| {
+                sessions.channel_session_id(&binding.platform, &binding.channel_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for child_id in child_session_ids {
+        let _ = web_handle(&state)?.cancel_session(child_id.clone()).await;
+        web_handle(&state)?.delete_thread(child_id.clone()).await?;
+        delete_web_model_inputs_for_session(&state, &child_id);
+        let _ = state.sessions.lock().await.delete(&child_id)?;
+    }
     web_handle(&state)?.delete_thread(id.clone()).await?;
     delete_web_model_inputs_for_session(&state, &id);
     state.sessions.lock().await.delete(&id)?;
@@ -619,6 +655,25 @@ async fn web_session_messages(
 ) -> Result<Json<Vec<bot_core::ThreadHistoryMessage>>, AdminError> {
     require_web_session(&state, &id).await?;
     Ok(Json(web_handle(&state)?.history(id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionEventsQuery {
+    after_sequence: Option<u64>,
+    #[serde(default)]
+    follow: bool,
+}
+
+async fn web_session_events(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<SessionEventsQuery>,
+) -> Result<Response, AdminError> {
+    require_web_session(&state, &id).await?;
+    let run = web_handle(&state)?
+        .events(id, query.after_sequence, query.follow)
+        .await?;
+    Ok(ndjson_event_response(run))
 }
 
 #[derive(Debug, Serialize)]
@@ -779,7 +834,83 @@ async fn cancel_web_tool_task(
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     run_id: String,
-    text: String,
+    content: WebInputContent,
+    after_sequence: Option<u64>,
+    #[serde(default)]
+    runtime: WebRuntimeOptionsRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebInputContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl WebInputContent {
+    fn into_content(self) -> Result<Content, AdminError> {
+        match self {
+            Self::Text(text) if text.trim().is_empty() => {
+                Err(AdminError::bad_request("message may not be empty".into()))
+            }
+            Self::Text(text) => Ok(Content::text(text)),
+            Self::Parts(parts) if parts.is_empty() => Err(AdminError::bad_request(
+                "content parts may not be empty".into(),
+            )),
+            Self::Parts(parts) => {
+                for part in &parts {
+                    let valid = match part {
+                        ContentPart::Text { .. } => true,
+                        ContentPart::ImageUrl { image_url } => !image_url.url.trim().is_empty(),
+                        ContentPart::ImageBase64 { media_type, data } => {
+                            !media_type.trim().is_empty() && !data.trim().is_empty()
+                        }
+                        ContentPart::Audio { input_audio } => {
+                            !input_audio.format.trim().is_empty()
+                                && !input_audio.data.trim().is_empty()
+                        }
+                        ContentPart::File { file_id, data, .. } => {
+                            file_id
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty())
+                                || data
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                        }
+                    };
+                    if !valid {
+                        return Err(AdminError::bad_request(
+                            "content contains an incomplete media part".into(),
+                        ));
+                    }
+                }
+                let content = Content::parts(parts);
+                if content.text_content().trim().is_empty() && !content.is_multimodal() {
+                    return Err(AdminError::bad_request("message may not be empty".into()));
+                }
+                Ok(content)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WebRuntimeOptionsRequest {
+    model_profile_id: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    agent_id: Option<String>,
+    async_agent: Option<bool>,
+}
+
+impl From<WebRuntimeOptionsRequest> for WebRuntimeOptions {
+    fn from(value: WebRuntimeOptionsRequest) -> Self {
+        Self {
+            model_profile_id: value.model_profile_id,
+            reasoning_effort: value.reasoning_effort,
+            agent_id: value.agent_id,
+            async_agent: value.async_agent,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -805,28 +936,38 @@ async fn start_web_run(
     Json(request): Json<StartRunRequest>,
 ) -> Result<Response, AdminError> {
     require_web_session(&state, &id).await?;
-    if request.text.trim().is_empty() {
+    let content = request.content.into_content()?;
+    let text = content.text_content();
+    if text.trim().is_empty() && !content.is_multimodal() {
         return Err(AdminError::bad_request("message may not be empty".into()));
     }
     uuid::Uuid::parse_str(&request.run_id)
         .map_err(|_| AdminError::bad_request("run_id must be a UUID".into()))?;
-    if !crate::web_chat::is_web_fork_command(request.text.trim()) {
-        state
-            .sessions
-            .lock()
-            .await
-            .set_title_if_empty(&id, &request.text)?;
+    if !crate::web_chat::is_web_fork_command(text.trim()) {
+        state.sessions.lock().await.set_title_if_empty(&id, &text)?;
     }
     let run = web_handle(&state)?
-        .run(id, request.run_id, request.text)
+        .run(
+            id,
+            request.run_id,
+            content,
+            request.runtime.into(),
+            request.after_sequence,
+        )
         .await
         .map_err(|error| {
             if error.to_string().contains("already active") {
                 AdminError::conflict(error.to_string())
+            } else if error.to_string().contains("invalid runtime override") {
+                AdminError::bad_request(error.to_string())
             } else {
                 AdminError::from(error)
             }
         })?;
+    Ok(ndjson_event_response(run))
+}
+
+fn ndjson_event_response(run: crate::web_chat::WebRun) -> Response {
     let stream = futures::stream::unfold(run.events, |mut events| async move {
         let event = events.recv().await?;
         let line = serde_json::to_string(&event).unwrap_or_else(|_| {
@@ -849,7 +990,7 @@ async fn start_web_run(
     response
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
-    Ok(response)
+    response
 }
 
 async fn steer_web_run(
@@ -858,13 +999,14 @@ async fn steer_web_run(
     Json(request): Json<StartRunRequest>,
 ) -> Result<StatusCode, AdminError> {
     require_web_session(&state, &id).await?;
-    if request.text.trim().is_empty() {
+    let content = request.content.into_content()?;
+    if content.text_content().trim().is_empty() && !content.is_multimodal() {
         return Err(AdminError::bad_request("message may not be empty".into()));
     }
     uuid::Uuid::parse_str(&request.run_id)
         .map_err(|_| AdminError::bad_request("run_id must be a UUID".into()))?;
     web_handle(&state)?
-        .steer(id, request.run_id, request.text)
+        .steer(id, request.run_id, content)
         .await
         .map_err(|error| {
             let message = error.to_string();
@@ -1191,5 +1333,58 @@ impl From<std::io::Error> for AdminError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StartRunRequest;
+    use bot_core::{Content, ContentPart, ReasoningEffort};
+
+    #[test]
+    fn run_request_accepts_all_core_content_parts_and_runtime_overrides() {
+        let request: StartRunRequest = serde_json::from_value(serde_json::json!({
+            "run_id": "7f8707eb-27fd-4bd6-9474-f7a32600f611",
+            "content": [
+                {"type": "text", "text": "inspect "},
+                {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+                {"type": "image_base64", "media_type": "image/png", "data": "YWJj"},
+                {"type": "input_audio", "input_audio": {"format": "wav", "data": "YWJj"}},
+                {"type": "file", "filename": "a.txt", "media_type": "text/plain", "data": "YWJj"}
+            ],
+            "runtime": {
+                "model_profile_id": "mimo",
+                "agent_id": "default",
+                "reasoning_effort": "high",
+                "async_agent": true
+            }
+        }))
+        .expect("request");
+        assert_eq!(
+            request.runtime.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        let content = request.content.into_content().expect("valid content");
+        assert!(matches!(content, Content::Parts(parts) if parts.len() == 5));
+    }
+
+    #[test]
+    fn run_request_rejects_incomplete_media_parts() {
+        let request: StartRunRequest = serde_json::from_value(serde_json::json!({
+            "run_id": "7f8707eb-27fd-4bd6-9474-f7a32600f611",
+            "content": [{"type": "image_base64", "media_type": "image/png", "data": ""}]
+        }))
+        .expect("wire shape");
+        assert!(request.content.into_content().is_err());
+    }
+
+    #[test]
+    fn content_part_wire_format_matches_core_serde() {
+        let part: ContentPart = serde_json::from_value(serde_json::json!({
+            "type": "file",
+            "file_id": "file-1"
+        }))
+        .expect("file part");
+        assert!(matches!(part, ContentPart::File { file_id: Some(id), .. } if id == "file-1"));
     }
 }

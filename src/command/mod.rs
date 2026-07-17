@@ -236,7 +236,22 @@ pub(crate) async fn handle_runtime_command(
         return Ok(Some(RuntimeCommandResult::Reply(reply)));
     }
     if command == "/compact" {
-        let n = runtime.bot.compact_memory(session_id).await?;
+        let (model_profile, reasoning_effort) =
+            session_model_and_reasoning(runtime, session_id).await?;
+        let agent_id = runtime
+            .sessions
+            .lock()
+            .await
+            .metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY);
+        let n = runtime
+            .bot
+            .compact_memory_with_profile(
+                session_id,
+                model_profile.as_deref(),
+                agent_id.as_deref(),
+                reasoning_effort,
+            )
+            .await?;
         return Ok(Some(RuntimeCommandResult::Reply(format!(
             "compacted {n} short-term message(s)."
         ))));
@@ -962,7 +977,7 @@ async fn switch_model_profile(
     ))
 }
 
-async fn session_model_and_reasoning(
+pub(crate) async fn session_model_and_reasoning(
     runtime: &Runtime,
     session_id: &str,
 ) -> anyhow::Result<(Option<String>, Option<ReasoningEffort>)> {

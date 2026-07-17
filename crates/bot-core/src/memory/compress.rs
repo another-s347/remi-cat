@@ -31,6 +31,7 @@ errors, paths, IDs, and exact values. Output only the summary.";
 
 // ── LlmCompressor ────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct LlmCompressor {
     api_key: String,
     base_url: Option<String>,

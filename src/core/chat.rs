@@ -52,6 +52,9 @@ pub(crate) struct ChatRequest {
     pub(crate) command_preprocess: bool,
     pub(crate) sub_session_routing: bool,
     pub(crate) async_agent: bool,
+    pub(crate) model_profile_id: Option<String>,
+    pub(crate) reasoning_effort: Option<bot_core::ReasoningEffort>,
+    pub(crate) agent_id: Option<String>,
 }
 
 impl ChatRequest {
@@ -75,11 +78,30 @@ impl ChatRequest {
             command_preprocess: true,
             sub_session_routing: true,
             async_agent: false,
+            model_profile_id: None,
+            reasoning_effort: None,
+            agent_id: None,
         }
     }
 
     pub(crate) fn with_content(mut self, content: Content) -> Self {
         self.content = content;
+        self
+    }
+
+    pub(crate) fn with_runtime_overrides(
+        mut self,
+        model_profile_id: Option<String>,
+        reasoning_effort: Option<bot_core::ReasoningEffort>,
+        agent_id: Option<String>,
+        async_agent: Option<bool>,
+    ) -> Self {
+        self.model_profile_id = model_profile_id;
+        self.reasoning_effort = reasoning_effort;
+        self.agent_id = agent_id;
+        if let Some(async_agent) = async_agent {
+            self.async_agent = async_agent;
+        }
         self
     }
 
@@ -320,7 +342,7 @@ impl Runtime {
                 None => {}
             }
 
-            let (model_profile_id, reasoning_effort, agent_id) = {
+            let (stored_model_profile_id, stored_reasoning_effort, stored_agent_id) = {
                 let sessions = self.sessions.lock().await;
                 (
                     sessions.metadata_string(&request.session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
@@ -330,6 +352,9 @@ impl Runtime {
                     sessions.metadata_string(&request.session_id, SESSION_AGENT_ID_METADATA_KEY),
                 )
             };
+            let model_profile_id = request.model_profile_id.clone().or(stored_model_profile_id);
+            let reasoning_effort = request.reasoning_effort.or(stored_reasoning_effort);
+            let agent_id = request.agent_id.clone().or(stored_agent_id);
             let platform = request.platform();
             let opts = StreamOptions {
                 model_profile_id,
@@ -395,6 +420,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::{ChatChannel, ChatRequest};
+    use bot_core::ReasoningEffort;
 
     #[test]
     fn text_request_enables_user_turn_preprocessing_and_sub_session_routing() {
@@ -405,6 +431,21 @@ mod tests {
         assert!(request.command_preprocess);
         assert!(request.sub_session_routing);
         assert_eq!(request.platform(), Some("tui".to_string()));
+    }
+
+    #[test]
+    fn runtime_overrides_are_carried_per_request() {
+        let request = ChatRequest::text("thread", ChatChannel::Web, "hello")
+            .with_runtime_overrides(
+                Some("model-a".to_string()),
+                Some(ReasoningEffort::High),
+                Some("agent-a".to_string()),
+                Some(true),
+            );
+        assert_eq!(request.model_profile_id.as_deref(), Some("model-a"));
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(request.agent_id.as_deref(), Some("agent-a"));
+        assert!(request.async_agent);
     }
 
     #[test]

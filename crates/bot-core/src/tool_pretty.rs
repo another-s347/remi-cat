@@ -76,6 +76,25 @@ impl PrettyToolCall {
 
 pub fn tool_success(result: &str) -> bool {
     let trimmed = result.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if value.get("success").and_then(Value::as_bool) == Some(false) {
+            return false;
+        }
+        if value
+            .get("error")
+            .is_some_and(|error| !error.is_null() && error.as_str() != Some(""))
+        {
+            return false;
+        }
+        if value
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+            && !json_collection_has_items(&value)
+        {
+            return false;
+        }
+    }
     !(trimmed.eq_ignore_ascii_case("interrupted")
         || trimmed.starts_with("error:")
         || trimmed.starts_with("Error:")
@@ -100,6 +119,10 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
         "fs_create" => {
             let path = string_arg(args, "path").unwrap_or("文件");
             (format!("创建 {path}"), describe_content_bytes(args))
+        }
+        "fs_mkdir" => {
+            let path = string_arg(args, "path").unwrap_or("目录");
+            (format!("创建目录 {path}"), "准备创建工作区目录".to_string())
         }
         "apply_patch" => {
             let patch = string_arg(args, "patch").unwrap_or("");
@@ -134,9 +157,12 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             let path = string_arg(args, "path").unwrap_or("文件");
             (format!("上传 {path}"), "发送文件到当前会话".to_string())
         }
-        "search" | "exa_search" => {
+        "search" | "exa_search" | "web_search" => {
             let query = string_arg(args, "query").unwrap_or("内容");
-            (format!("搜索 {query}"), "查询外部或本地资料".to_string())
+            let scope = string_arg(args, "scope")
+                .map(|scope| format!("，范围 {scope}"))
+                .unwrap_or_default();
+            (format!("搜索 {query}"), format!("查询资料{scope}"))
         }
         "workspace_bash" | "bash" => ("执行 bash".to_string(), bash_command_preview(args)),
         "ssh" => ("执行 ssh".to_string(), ssh_command_preview(args)),
@@ -149,7 +175,47 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
                 "执行 remi-cat 管理命令".to_string(),
             )
         }
-        value if value.starts_with("memory__") => ("检索/更新记忆".to_string(), value.to_string()),
+        "skill__get" => {
+            let name = string_arg(args, "name").unwrap_or("skill");
+            (
+                format!("读取 skill {name}"),
+                "加载 skill 指令与资源信息".to_string(),
+            )
+        }
+        "skill__search" => {
+            let query = string_arg(args, "query").unwrap_or("全部 skill");
+            (
+                format!("搜索 skill {query}"),
+                "查询本地 skill catalog".to_string(),
+            )
+        }
+        "memory__get_detail" => {
+            let target = string_arg(args, "name")
+                .or_else(|| string_arg(args, "message_id"))
+                .or_else(|| string_arg(args, "uuid"))
+                .unwrap_or("记忆");
+            (format!("读取记忆 {target}"), "加载完整记忆内容".to_string())
+        }
+        "memory__upsert_named" => {
+            let name = string_arg(args, "name").unwrap_or("命名记忆");
+            (format!("更新记忆 {name}"), describe_content_bytes(args))
+        }
+        "memory__recall" => {
+            let query = string_arg(args, "query").unwrap_or("记忆");
+            (
+                format!("召回记忆 {query}"),
+                "搜索当前会话与命名记忆".to_string(),
+            )
+        }
+        value if value.starts_with("todo__") => describe_todo(value, args),
+        "tool_tasks" => describe_tool_tasks(args),
+        "ask_user_question" => {
+            let question = string_arg(args, "question").unwrap_or("需要用户确认");
+            (
+                format!("询问用户 {}", first_sentence(question, 80)),
+                "等待用户回答".to_string(),
+            )
+        }
         "codex" => (
             "调用 Codex 子会话".to_string(),
             "等待 Codex 回复".to_string(),
@@ -161,7 +227,7 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
         value if value.starts_with("acp__") => {
             (format!("调用 {value}"), "执行 ACP 工具".to_string())
         }
-        _ => (format!("调用 {name}"), "执行工具".to_string()),
+        _ => describe_generic_started(name, args),
     }
 }
 
@@ -183,7 +249,9 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
 
     let summary = match name {
         "fs_read" => read_summary(args, result).unwrap_or(started),
-        "fs_write" | "fs_create" => first_line(result).unwrap_or(&started).to_string(),
+        "fs_write" | "fs_create" | "fs_mkdir" | "fs_remove" | "im_upload" => {
+            structured_result_summary(result).unwrap_or(started)
+        }
         "apply_patch" => apply_patch_summary(args, result).unwrap_or(started),
         "fs_ls" => {
             let count = result
@@ -204,12 +272,31 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
             }
         }
         "fetch" => fetch_summary(result).unwrap_or(started),
+        "search" | "exa_search" | "web_search" | "skill__search" | "memory__recall" => {
+            collection_result_summary(result).unwrap_or(started)
+        }
+        "skill__get" => format!("已读取 {}", string_arg(args, "name").unwrap_or("skill")),
+        "memory__get_detail" => format!(
+            "已读取 {}",
+            string_arg(args, "name")
+                .or_else(|| string_arg(args, "message_id"))
+                .or_else(|| string_arg(args, "uuid"))
+                .unwrap_or("记忆")
+        ),
+        "memory__upsert_named" => structured_result_summary(result)
+            .unwrap_or_else(|| format!("已更新记忆 {}", string_arg(args, "name").unwrap_or(""))),
+        value if value.starts_with("todo__") || value == "tool_tasks" => {
+            structured_result_summary(result).unwrap_or(started)
+        }
+        "ask_user_question" => {
+            structured_result_summary(result).unwrap_or_else(|| "用户已回答".to_string())
+        }
         "workspace_bash" | "bash" => bash_summary(args, result),
         "ssh" => ssh_summary(args, result),
         "manage_yourself" => remi_command_summary(args, result),
         "codex" => acp_chat_summary(result).unwrap_or_else(|| "Codex 子会话已完成".to_string()),
         value if value.starts_with("agent__") => "子会话已完成".to_string(),
-        _ => first_line(result).unwrap_or(&started).to_string(),
+        _ => structured_result_summary(result).unwrap_or(started),
     };
     (title, summary)
 }
@@ -219,6 +306,155 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+pub fn preserves_multiline_summary(name: &str) -> bool {
+    matches!(name, "bash" | "workspace_bash" | "ssh")
+}
+
+fn describe_todo(name: &str, args: &Value) -> (String, String) {
+    let id = args.get("id").and_then(Value::as_u64);
+    match name {
+        "todo__add" => {
+            let title = string_arg(args, "title").unwrap_or("Todo");
+            let count = args
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            (
+                format!("添加 Todo {title}"),
+                format!("创建 {count} 个待办项"),
+            )
+        }
+        "todo__list" => ("查看 Todo".to_string(), "列出当前待办事项".to_string()),
+        "todo__complete" => (
+            format!(
+                "完成 Todo #{}",
+                id.map_or("?".to_string(), |id| id.to_string())
+            ),
+            "标记待办为已完成".to_string(),
+        ),
+        "todo__update" => (
+            format!(
+                "更新 Todo #{}",
+                id.map_or("?".to_string(), |id| id.to_string())
+            ),
+            string_arg(args, "content")
+                .map(|content| first_sentence(content, 80))
+                .unwrap_or_else(|| "更新待办内容".to_string()),
+        ),
+        "todo__remove" => (
+            format!(
+                "删除 Todo #{}",
+                id.map_or("?".to_string(), |id| id.to_string())
+            ),
+            "移除待办事项".to_string(),
+        ),
+        _ => ("管理 Todo".to_string(), name.to_string()),
+    }
+}
+
+fn describe_tool_tasks(args: &Value) -> (String, String) {
+    let action = string_arg(args, "action").unwrap_or("list");
+    let task_id = string_arg(args, "task_id").unwrap_or("任务");
+    match action {
+        "get" => (
+            format!("查看后台任务 {task_id}"),
+            "读取任务状态与最近输出".to_string(),
+        ),
+        "cancel" => (
+            format!("取消后台任务 {task_id}"),
+            "请求停止后台任务".to_string(),
+        ),
+        _ => (
+            "查看后台任务".to_string(),
+            "列出当前 session 的后台任务".to_string(),
+        ),
+    }
+}
+
+fn describe_generic_started(name: &str, args: &Value) -> (String, String) {
+    let action = string_arg(args, "action").unwrap_or("执行");
+    let target = ["path", "query", "name", "task_id", "id"]
+        .into_iter()
+        .find_map(|key| {
+            string_arg(args, key).map(ToOwned::to_owned).or_else(|| {
+                args.get(key)
+                    .and_then(Value::as_u64)
+                    .map(|value| value.to_string())
+            })
+        });
+    let title = target
+        .map(|target| format!("{action} {name}: {}", first_sentence(&target, 80)))
+        .unwrap_or_else(|| format!("{action} {name}"));
+    (title, "执行动态工具".to_string())
+}
+
+fn json_collection_has_items(value: &Value) -> bool {
+    ["results", "items", "tasks", "todos", "matches"]
+        .into_iter()
+        .any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+}
+
+fn collection_result_summary(result: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(result.trim()).ok()?;
+    for key in ["results", "items", "tasks", "todos", "matches"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            let errors = value
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            return Some(if errors == 0 {
+                format!("找到 {} 项", items.len())
+            } else {
+                format!("找到 {} 项，{} 个来源失败", items.len(), errors)
+            });
+        }
+    }
+    value
+        .as_array()
+        .map(|items| format!("找到 {} 项", items.len()))
+}
+
+fn structured_result_summary(result: &str) -> Option<String> {
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return Some("完成，无输出".to_string());
+    }
+    if let Some(summary) = collection_result_summary(trimmed) {
+        return Some(summary);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        for key in ["error", "message", "status", "summary", "name", "path"] {
+            if let Some(text) = value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                return Some(first_sentence(text, 120));
+            }
+        }
+        for key in ["count", "total", "bytes"] {
+            if let Some(count) = value.get(key).and_then(Value::as_u64) {
+                return Some(format!("完成，{key}={count}"));
+            }
+        }
+        if value.is_object() {
+            return Some("执行完成".to_string());
+        }
+        if let Some(items) = value.as_array() {
+            return Some(format!("返回 {} 项", items.len()));
+        }
+    }
+    first_line(trimmed).map(|line| first_sentence(line, 120))
 }
 
 fn describe_content_bytes(args: &Value) -> String {
@@ -707,6 +943,85 @@ mod tests {
     #[test]
     fn detects_error_result() {
         assert!(!tool_success("error: failed"));
+        assert!(!tool_success(r#"{"success":false,"message":"failed"}"#));
+        assert!(!tool_success(r#"{"error":"permission denied"}"#));
         assert!(tool_success("ok"));
+    }
+
+    #[test]
+    fn every_builtin_tool_has_a_semantic_title() {
+        let cases = [
+            ("fs_read", json!({"path":"src/lib.rs"})),
+            ("fs_write", json!({"path":"out.txt","content":"x"})),
+            (
+                "apply_patch",
+                json!({"patch":"*** Begin Patch\n*** End Patch"}),
+            ),
+            ("fs_mkdir", json!({"path":"tmp"})),
+            ("fs_remove", json!({"path":"tmp"})),
+            ("fs_ls", json!({"path":"."})),
+            ("rg", json!({"args":["needle"]})),
+            ("web_search", json!({"query":"Rust"})),
+            ("bash", json!({"command":"true"})),
+            ("ssh", json!({"host":"example.com","command":"true"})),
+            ("manage_yourself", json!({"command":"agent list"})),
+            ("now", json!({})),
+            ("sleep", json!({"seconds":1})),
+            ("fetch", json!({"url":"https://example.com"})),
+            ("im_upload", json!({"path":"report.txt"})),
+            ("search", json!({"query":"needle","scope":"skills"})),
+            ("tool_tasks", json!({"action":"list"})),
+            ("ask_user_question", json!({"question":"Continue?"})),
+            (
+                "todo__add",
+                json!({"title":"Release","items":[{"title":"Test"}]}),
+            ),
+            ("todo__list", json!({})),
+            ("todo__complete", json!({"id":1})),
+            ("todo__update", json!({"id":1,"content":"Ship"})),
+            ("todo__remove", json!({"id":1})),
+            ("skill__get", json!({"name":"office/excel"})),
+            ("skill__search", json!({"query":"excel"})),
+            ("memory__get_detail", json!({"uuid":"memory-1"})),
+            (
+                "memory__upsert_named",
+                json!({"name":"preferences","content":"dark"}),
+            ),
+            ("memory__recall", json!({"query":"preferences"})),
+        ];
+
+        for (name, args) in cases {
+            let pretty = PrettyToolCall::started("call", name, &args);
+            assert_ne!(
+                pretty.title,
+                format!("调用 {name}"),
+                "missing formatter for {name}"
+            );
+            assert_ne!(pretty.summary, "执行工具", "missing summary for {name}");
+        }
+    }
+
+    #[test]
+    fn structured_collections_and_unknown_json_are_summarized() {
+        let search = PrettyToolCall::completed(
+            "1",
+            "search",
+            &json!({"query":"rust"}),
+            r#"{"results":[{"name":"one"},{"name":"two"}],"errors":[]}"#,
+            true,
+            1,
+        );
+        assert_eq!(search.summary, "找到 2 项");
+
+        let unknown = PrettyToolCall::completed(
+            "2",
+            "plugin_tool",
+            &json!({"action":"inspect","path":"src"}),
+            r#"{"status":"ready"}"#,
+            true,
+            1,
+        );
+        assert_eq!(unknown.title, "inspect plugin_tool: src");
+        assert_eq!(unknown.summary, "ready");
     }
 }

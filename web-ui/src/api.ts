@@ -40,9 +40,11 @@ export type ChatEvent = {
 export type ActiveRun = {
   session_id: string;
   run_id: string;
-  text: string;
+  content: WebContent;
   started_at: string;
 };
+
+export type WebContent = string | Array<Record<string, unknown>>;
 
 export type TodoItem = {
   id: number;
@@ -292,7 +294,7 @@ export const api = {
       const response = await fetch(`/api/v1/chat/sessions/${sessionId}/steers`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ run_id: runId, text }),
+        body: JSON.stringify({ run_id: runId, content: text }),
       });
       if (response.ok) return;
       if (response.status === 409 && attempt < 7) {
@@ -346,11 +348,11 @@ export const api = {
 export async function* streamRun(
   sessionId: string,
   runId: string,
-  text: string,
+  content: WebContent,
   signal: AbortSignal,
   onOpen?: () => void,
 ): AsyncGenerator<ChatEvent> {
-  const response = await postRun(sessionId, runId, text, signal);
+  const response = await postRun(sessionId, runId, content, signal);
   if (!response.ok || !response.body) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.error ?? `run failed: ${response.status}`);
@@ -372,11 +374,11 @@ export async function* streamRun(
   if (buffer.trim()) yield JSON.parse(buffer) as ChatEvent;
 }
 
-function postRun(sessionId: string, runId: string, text: string, signal: AbortSignal) {
+function postRun(sessionId: string, runId: string, content: WebContent, signal: AbortSignal) {
   return fetch(`/api/v1/chat/sessions/${sessionId}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ run_id: runId, text }),
+    body: JSON.stringify({ run_id: runId, content }),
     signal,
   });
 }

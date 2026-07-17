@@ -99,11 +99,14 @@ impl TuiApp {
             owners.push(("supervisor".to_string(), phase));
         }
 
-        if owners.is_empty() {
+        if owners.is_empty() && !self.compressing_memory {
             return "idle".to_string();
         }
 
         let mut labels = Vec::new();
+        if self.compressing_memory {
+            labels.push("Compressing memory".to_string());
+        }
         for phase in ["running", "thinking", "cancelling", "paused", "error"] {
             let names: Vec<&str> = owners
                 .iter()

@@ -20,6 +20,7 @@ import {
   type TodoItem,
   type UserQuestionRequest,
   type UserQuestionResponse,
+  type WebContent,
 } from "./api";
 
 const TOOL_TICK_MS = 500;
@@ -28,6 +29,14 @@ function contentText(content: AppendMessage["content"]) {
   return content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
     .map((part) => part.text)
+    .join("");
+}
+
+function webContentText(content: WebContent) {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => String(part.text))
     .join("");
 }
 
@@ -355,9 +364,10 @@ function applySupervisorReport(
 }
 
 function subSessionKey(data: Record<string, unknown>, fallback: string) {
+  const sessionId = String(data.session_id ?? "");
   const threadId = String(data.sub_thread_id ?? data.thread_id ?? "");
   const runId = String(data.sub_run_id ?? data.run_id ?? "");
-  return threadId || runId ? `${threadId}:${runId}` : fallback;
+  return sessionId || (threadId || runId ? `${threadId}:${runId}` : fallback);
 }
 
 function appendSubSessionEvent(
@@ -388,6 +398,9 @@ function appendSubSessionEvent(
       toolCallId,
       toolName: "__remi_sub_session",
       args: {
+        sessionId: data.session_id,
+        status: data.status,
+        parentCallId: data.parent_call_id,
         agentName: data.agent_name,
         title: data.title,
         threadId: data.sub_thread_id ?? data.thread_id,
@@ -401,6 +414,9 @@ function appendSubSessionEvent(
   const part = parts[index];
   if (part?.type !== "tool-call") return;
   const args = part.args as {
+    sessionId?: unknown;
+    status?: unknown;
+    parentCallId?: unknown;
     agentName?: unknown;
     title?: unknown;
     threadId?: unknown;
@@ -413,13 +429,21 @@ function appendSubSessionEvent(
   parts[index] = {
     ...part,
     args: {
+      sessionId: displayData.session_id ?? args.sessionId,
+      status: displayData.status ?? args.status,
+      parentCallId: displayData.parent_call_id ?? args.parentCallId,
       agentName: displayData.agent_name ?? args.agentName,
       title: displayData.title ?? args.title,
       threadId: displayData.sub_thread_id ?? displayData.thread_id ?? args.threadId,
       runId: displayData.sub_run_id ?? displayData.run_id ?? args.runId,
       events,
     } as never,
-    result: subType === "done" || subType === "error" ? displayData : part.result,
+    result:
+      subType === "done" ||
+      subType === "error" ||
+      ["completed", "cancelled", "error", "handed_off"].includes(String(displayData.status ?? ""))
+        ? displayData
+        : part.result,
   };
 }
 
@@ -558,7 +582,7 @@ export function RemiRuntimeProvider({
       {
         id: crypto.randomUUID(),
         role: "user",
-        content: [{ type: "text", text: activeRun.text }],
+        content: [{ type: "text", text: webContentText(activeRun.content) }],
         createdAt: new Date(),
       },
       {
@@ -607,7 +631,7 @@ export function RemiRuntimeProvider({
         for await (const event of streamRun(
           sessionId,
           runId,
-          activeRun.text,
+          activeRun.content,
           controller.signal,
           () => {
             runState.ready = true;
@@ -636,7 +660,8 @@ export function RemiRuntimeProvider({
               }
               break;
             }
-            case "tool_started": {
+            case "tool_call_started":
+            case "tool_call": {
               const toolName = String(data.tool_name ?? "tool");
               if (toolName.startsWith("todo__")) break;
               const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
@@ -677,7 +702,7 @@ export function RemiRuntimeProvider({
               });
               break;
             }
-            case "tool_completed": {
+            case "tool_call_result": {
               const toolName = String(data.tool_name ?? "tool");
               if (toolName.startsWith("todo__")) break;
               const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
@@ -934,7 +959,8 @@ export function RemiRuntimeProvider({
               }
               break;
             }
-            case "tool_started": {
+            case "tool_call_started":
+            case "tool_call": {
               const toolName = String(data.tool_name ?? "tool");
               if (toolName.startsWith("todo__")) break;
               const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);
@@ -975,7 +1001,7 @@ export function RemiRuntimeProvider({
               });
               break;
             }
-            case "tool_completed": {
+            case "tool_call_result": {
               const toolName = String(data.tool_name ?? "tool");
               if (toolName.startsWith("todo__")) break;
               const toolCallId = String(data.call_id ?? `${runId}-${event.sequence}`);

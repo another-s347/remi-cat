@@ -920,7 +920,12 @@ fn sub_session_header(event: &SubSessionEvent) -> String {
 fn sub_session_tool_status(event: &ProtocolEvent) -> ToolCallStatus {
     match event {
         ProtocolEvent::Done => ToolCallStatus::Completed,
-        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+        ProtocolEvent::Custom { event_type, .. }
+            if matches!(
+                event_type.as_str(),
+                "sub_session_done" | "sub_session_handed_off"
+            ) =>
+        {
             ToolCallStatus::Completed
         }
         ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => ToolCallStatus::Failed,
@@ -957,13 +962,25 @@ fn sub_session_event_line(event: &SubSessionEvent) -> Option<String> {
             format!("Tool `{name}` result ({id}):\n{result}")
         }
         ProtocolEvent::Done => "Done.".to_string(),
-        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
-            .get("final_output")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("Done:\n{value}"))
-            .unwrap_or_else(|| "Done.".to_string()),
+        ProtocolEvent::Custom { event_type, extra }
+            if matches!(
+                event_type.as_str(),
+                "sub_session_done" | "sub_session_handed_off"
+            ) =>
+        {
+            let label = if event_type == "sub_session_handed_off" {
+                "Handed off"
+            } else {
+                "Done"
+            };
+            extra
+                .get("final_output")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{label}:\n{value}"))
+                .unwrap_or_else(|| format!("{label}."))
+        }
         ProtocolEvent::Error { message, .. } => format!("Error: {message}"),
         ProtocolEvent::Cancelled => "Error: cancelled".to_string(),
         other => format!("{other:?}"),

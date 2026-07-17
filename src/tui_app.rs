@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use base64::Engine as _;
 use bot_core::{
-    model_profile_key_status, tool_success, CatEvent, Content, ContentPart, ContextCompactionEvent,
-    ContextCompactionStatus, Message, ModelProfileConfig, PrettyToolCall, PrettyToolStatus,
-    ReasoningEffort, SteerSubmitResult, SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage,
-    ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
-    UserQuestionStatus, WorkflowReport, WorkflowStatus,
+    model_profile_key_status, preserves_multiline_summary, tool_success, CatEvent, Content,
+    ContentPart, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, Message,
+    ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, SteerSubmitResult,
+    SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
+    ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
+    WorkflowReport, WorkflowStatus,
 };
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -49,7 +50,8 @@ use components::*;
 use composer::*;
 
 use crate::command::{
-    model_reasoning_effort_label, process_runtime_commands, RuntimeCommandPipelineResult,
+    model_reasoning_effort_label, process_runtime_commands, session_model_and_reasoning,
+    RuntimeCommandPipelineResult,
 };
 use crate::session::{ChannelBinding, Session, SubSessionKind};
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
@@ -735,6 +737,7 @@ struct TuiApp {
     show_shortcuts: bool,
     quit_hint_until: Option<Instant>,
     running: bool,
+    compressing_memory: bool,
     awaiting_background_tasks: bool,
     background_task_count: usize,
     run_started_at: Option<Instant>,
@@ -852,6 +855,7 @@ impl TuiApp {
             show_shortcuts: false,
             quit_hint_until: None,
             running: false,
+            compressing_memory: false,
             awaiting_background_tasks: false,
             background_task_count: 0,
             run_started_at: None,
@@ -1313,6 +1317,10 @@ impl TuiApp {
             self.start_new_command();
             return Ok(false);
         }
+        if text == "/compact" {
+            self.start_compact_command(display_text);
+            return Ok(false);
+        }
         if self.running && text.trim_start().starts_with('/') {
             match process_runtime_commands(&self.runtime, &self.session_id, text.trim()).await {
                 Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
@@ -1395,6 +1403,68 @@ impl TuiApp {
             content,
         });
         Ok(false)
+    }
+
+    fn start_compact_command(&mut self, display_text: String) {
+        self.cells.push(HistoryCell::user(display_text));
+        if self.compressing_memory {
+            self.cells.push(HistoryCell::system(
+                "memory compression is already running".to_string(),
+            ));
+            return;
+        }
+
+        self.compressing_memory = true;
+        let id = uuid::Uuid::new_v4().to_string();
+        let started = ContextCompactionEvent {
+            id: id.clone(),
+            thread_id: self.session_id.clone(),
+            status: ContextCompactionStatus::Started,
+            source: ContextCompactionSource::Manual,
+            compacted_messages: 0,
+            remaining_messages: 0,
+            error: None,
+        };
+        upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(started));
+
+        let runtime = Rc::clone(&self.runtime);
+        let session_id = self.session_id.clone();
+        let tx = self.bot_tx.clone();
+        tokio::task::spawn_local(async move {
+            let result = async {
+                let (model_profile, reasoning_effort) =
+                    session_model_and_reasoning(&runtime, &session_id).await?;
+                let agent_id = runtime
+                    .sessions
+                    .lock()
+                    .await
+                    .metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY);
+                runtime
+                    .bot
+                    .compact_memory_with_profile(
+                        &session_id,
+                        model_profile.as_deref(),
+                        agent_id.as_deref(),
+                        reasoning_effort,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            .await;
+            let (status, compacted_messages, error) = match result {
+                Ok(count) => (ContextCompactionStatus::Completed, count, None),
+                Err(err) => (ContextCompactionStatus::Failed, 0, Some(format!("{err:#}"))),
+            };
+            let _ = tx.send(BotEvent::ContextCompaction(ContextCompactionEvent {
+                id,
+                thread_id: session_id,
+                status,
+                source: ContextCompactionSource::Manual,
+                compacted_messages,
+                remaining_messages: 0,
+                error,
+            }));
+        });
     }
 
     fn start_fork_command(&mut self) {
@@ -1872,6 +1942,7 @@ impl TuiApp {
             BotEvent::SupervisorReport(report) => self.upsert_supervisor_report(report),
             BotEvent::SubSession(event) => self.upsert_sub_session(event).await,
             BotEvent::ContextCompaction(event) => {
+                self.compressing_memory = matches!(event.status, ContextCompactionStatus::Started);
                 upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(event));
             }
             BotEvent::TodoState {
@@ -2008,8 +2079,9 @@ impl TuiApp {
                 self.has_activity = true;
                 self.background_task_count = self.background_task_count.saturating_sub(1);
                 self.awaiting_background_tasks = self.background_task_count > 0;
-                let status = tool_task_visual_status(&task);
-                let body = tool_task_result_body(&task);
+                let pretty = pretty_background_tool_task(&task);
+                let status = ToolVisualStatus::from_pretty(&pretty.status);
+                let body = tool_body(&pretty);
                 let meta = format!(
                     "background · {}",
                     format_elapsed(task.elapsed_ms.unwrap_or(0))
@@ -2020,14 +2092,14 @@ impl TuiApp {
                     .rev()
                     .find(|cell| cell.tool_id().is_some_and(|id| id == task.tool_call_id))
                 {
-                    cell.title = format!("调用 {}", task.tool_name);
+                    cell.title = pretty.title.clone();
                     cell.body = body;
                     cell.meta = preserve_token_meta(meta, &cell.meta);
                     cell.status = status;
                 } else {
                     self.cells.push(HistoryCell::tool(
                         task.tool_call_id,
-                        format!("调用 {}", task.tool_name),
+                        pretty.title,
                         body,
                         meta,
                         status,
@@ -2396,7 +2468,31 @@ impl TuiApp {
 
     fn request_cancel_current_run(&mut self) {
         if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
-            self.status.state = "cancelling".to_string();
+            if let Some(handle) = self.run_handle.take() {
+                handle.abort();
+            }
+            promote_pending_steers_to_queued_inputs(
+                &mut self.pending_steers,
+                &mut self.queued_inputs,
+            );
+            self.running = false;
+            self.awaiting_background_tasks = false;
+            self.background_task_count = 0;
+            self.interrupt_requested = false;
+            self.cancel = None;
+            self.sub_tool_args.clear();
+            self.sub_tool_names.clear();
+            self.sub_sessions.clear();
+            self.supervisors.clear();
+            self.pending_approval = None;
+            self.pending_user_question = None;
+            self.active_supervisor_id = None;
+            self.status.state = "idle".to_string();
+            self.cells.push(HistoryCell::system(
+                "run force-aborted after cancellation did not finish".to_string(),
+            ));
+            set_terminal_title(&self.workspace_dir, "idle");
+            self.refresh_command_catalog();
             return;
         }
         if let Some(cancel) = &self.cancel {
@@ -3030,7 +3126,12 @@ impl TuiApp {
                 state.done = true;
                 state.final_output = None;
             }
-            ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
+            ProtocolEvent::Custom { event_type, .. }
+                if matches!(
+                    event_type.as_str(),
+                    "sub_session_done" | "sub_session_handed_off"
+                ) =>
+            {
                 state.done = true;
                 state.final_output = None;
             }
@@ -3290,7 +3391,12 @@ impl TuiApp {
             ProtocolEvent::Done => {
                 self.status.state = "idle".to_string();
             }
-            ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => {
+            ProtocolEvent::Custom { event_type, extra }
+                if matches!(
+                    event_type.as_str(),
+                    "sub_session_done" | "sub_session_handed_off"
+                ) =>
+            {
                 if let Some(output) = extra
                     .get("final_output")
                     .and_then(|value| value.as_str())
@@ -4152,23 +4258,22 @@ fn supervisor_visual_status(status: &WorkflowStatus) -> ToolVisualStatus {
     }
 }
 
-fn tool_task_visual_status(task: &bot_core::ToolTaskRecord) -> ToolVisualStatus {
-    match task.success {
-        Some(true) => ToolVisualStatus::Success,
-        Some(false) => ToolVisualStatus::Error,
-        None if task.status == "completed" => ToolVisualStatus::Success,
-        None if task.status == "failed" || task.status == "cancelled" => ToolVisualStatus::Error,
-        None => ToolVisualStatus::Running,
-    }
-}
-
-fn tool_task_result_body(task: &bot_core::ToolTaskRecord) -> String {
-    task.result_preview
+fn pretty_background_tool_task(task: &bot_core::ToolTaskRecord) -> PrettyToolCall {
+    let result = task
+        .result_preview
         .as_deref()
         .or_else(|| task.recent_output.last().map(String::as_str))
         .or(task.message.as_deref())
-        .map(|text| truncate_chars(&single_line(text), MAX_TOOL_BODY_CHARS))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let success = task.success.unwrap_or(task.status == "completed");
+    PrettyToolCall::completed(
+        &task.tool_call_id,
+        &task.tool_name,
+        &task.args,
+        result,
+        success,
+        task.elapsed_ms.unwrap_or(0),
+    )
 }
 
 fn push_or_update_current_supervisor_stream_cell(
@@ -6010,6 +6115,47 @@ mod tests {
 
         assert!(body.contains("$ cargo test\n输出 4 行:\none\ntwo\nthree"));
         assert!(!body.contains("four"));
+    }
+
+    #[test]
+    fn tool_body_preserves_ssh_summary_lines() {
+        let pretty = PrettyToolCall::completed(
+            "call-1",
+            "ssh",
+            &serde_json::json!({"host":"example.com","command":"uptime"}),
+            "up 10 days\nload 0.1\n",
+            true,
+            10,
+        );
+        let body = tool_body(&pretty);
+        assert!(body.contains("ssh example.com $ uptime\n输出 2 行:\nup 10 days"));
+    }
+
+    #[test]
+    fn background_tasks_use_the_same_semantic_formatter() {
+        let task = bot_core::ToolTaskRecord {
+            task_id: "task-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "fs_read".to_string(),
+            args: serde_json::json!({"path":"src/lib.rs"}),
+            status: "completed".to_string(),
+            background: true,
+            started_at: "2026-07-15T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-15T00:00:01Z".to_string()),
+            elapsed_ms: Some(1_000),
+            success: Some(true),
+            result_preview: Some("content".to_string()),
+            recent_output: Vec::new(),
+            message: None,
+            notify_on_finish: false,
+            notification_delivered: true,
+        };
+
+        let pretty = pretty_background_tool_task(&task);
+        assert_eq!(pretty.title, "查看 src/lib.rs");
+        assert!(pretty.summary.contains("已读取 src/lib.rs"));
     }
 
     #[test]

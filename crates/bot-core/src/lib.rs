@@ -85,7 +85,9 @@ pub use supervisor_workflow::{
 pub use token_usage::{
     context_budget_tokens, estimate_model_input_tokens, ContextMetrics, TokenUsage,
 };
-pub use tool_pretty::{tool_success, PrettyToolCall, PrettyToolStatus};
+pub use tool_pretty::{
+    preserves_multiline_summary, tool_success, PrettyToolCall, PrettyToolStatus,
+};
 pub use tool_tasks::{ToolTaskManager, ToolTaskRecord};
 pub use tools::SharedRedactor;
 pub use user_question::{

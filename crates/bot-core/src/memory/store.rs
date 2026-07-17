@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::token_usage::estimate_memory_message_tokens;
 use crate::tool_pretty::{tool_success, PrettyToolCall};
-use crate::{ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus};
+use crate::ContextCompactionEvent;
 
 use super::compress::LlmCompressor;
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
@@ -110,34 +110,6 @@ pub struct MemoryRecallResult {
 }
 
 pub type ContextCompactionSink<'a> = &'a mut dyn FnMut(ContextCompactionEvent);
-
-struct PlannedCompaction {
-    compacted_messages: usize,
-    remaining_messages: usize,
-}
-
-fn emit_compaction_event(
-    sink: &mut Option<ContextCompactionSink<'_>>,
-    id: &str,
-    thread_id: &str,
-    status: ContextCompactionStatus,
-    compacted_messages: usize,
-    remaining_messages: usize,
-    error: Option<String>,
-) {
-    let Some(sink) = sink.as_mut() else {
-        return;
-    };
-    (*sink)(ContextCompactionEvent {
-        id: id.to_string(),
-        thread_id: thread_id.to_string(),
-        status,
-        source: ContextCompactionSource::Auto,
-        compacted_messages,
-        remaining_messages,
-        error,
-    });
-}
 
 const MEMORY_RECALL_SNIPPET_CHARS: usize = 2_000;
 static SHORT_TERM_TOKEN_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -731,9 +703,8 @@ impl MemoryStore {
 
     /// Append new messages from a turn to short-term storage.
     ///
-    /// If the total token estimate exceeds `short_term_tokens`, the oldest
-    /// chunk is compressed into a new mid-term block.  If compression fails,
-    /// the oldest messages are simply dropped so the save never aborts.
+    /// Saving is append-only and never performs network I/O. Automatic
+    /// compression is exclusively a pre-request operation.
     pub async fn save_turn(
         &self,
         thread_id: &str,
@@ -760,7 +731,7 @@ impl MemoryStore {
         &self,
         thread_id: &str,
         mut new_msgs: Vec<Message>,
-        mut compaction_sink: Option<ContextCompactionSink<'_>>,
+        _compaction_sink: Option<ContextCompactionSink<'_>>,
     ) -> Result<(), AgentError> {
         // Attach turn timestamp to the first user message's metadata.
         let ts = Utc::now().to_rfc3339();
@@ -777,94 +748,8 @@ impl MemoryStore {
         let _guard = lock.lock().await;
         let short_path = self.short_term_path(thread_id);
         Self::append_short_term(&short_path, &new_msgs).await?;
-        let new_tokens = estimate_memory_message_tokens(&new_msgs);
-        let token_cache_key = self.token_cache_key(thread_id);
-        let cached_tokens = short_term_token_counts()
-            .lock()
-            .expect("short-term token cache lock poisoned")
-            .get(&token_cache_key)
-            .copied();
-        if !self.auto_compress
-            || cached_tokens.is_some_and(|tokens| tokens + new_tokens <= self.short_term_tokens)
-        {
-            if let Some(tokens) = cached_tokens {
-                short_term_token_counts()
-                    .lock()
-                    .expect("short-term token cache lock poisoned")
-                    .insert(token_cache_key, tokens + new_tokens);
-            }
-            return Ok(());
-        }
-
-        let all_msgs = Self::read_short_term(&short_path).await;
-        let mid_idx = Self::read_index(&self.mid_term_dir(thread_id)).await;
-        let long_idx = Self::read_index(&self.long_term_dir(thread_id)).await;
-        let uncovered_start =
-            last_covered_position_across_tiers(&all_msgs, &mid_idx, &long_idx).map_or(0, |i| i + 1);
-        let active = all_msgs[uncovered_start..].to_vec();
-        let mut cached_uncovered_tokens = estimate_memory_message_tokens(&active);
-
-        if self.auto_compress
-            && estimate_memory_message_tokens(&active) > self.short_term_tokens
-            && active.len() > 10
-        {
-            let attempt = self.plan_mid_term_compression(&active);
-            let event_id = Uuid::new_v4().to_string();
-            emit_compaction_event(
-                &mut compaction_sink,
-                &event_id,
-                thread_id,
-                ContextCompactionStatus::Started,
-                attempt.compacted_messages,
-                attempt.remaining_messages,
-                None,
-            );
-            match self
-                .compress_to_mid_term(thread_id, active.clone(), None)
-                .await
-            {
-                Ok(remaining) => {
-                    cached_uncovered_tokens = estimate_memory_message_tokens(&remaining);
-                    emit_compaction_event(
-                        &mut compaction_sink,
-                        &event_id,
-                        thread_id,
-                        ContextCompactionStatus::Completed,
-                        attempt.compacted_messages,
-                        remaining.len(),
-                        None,
-                    );
-                    let _ = remaining;
-                }
-                Err(e) => {
-                    let error = e.to_string();
-                    emit_compaction_event(
-                        &mut compaction_sink,
-                        &event_id,
-                        thread_id,
-                        ContextCompactionStatus::Failed,
-                        attempt.compacted_messages,
-                        attempt.remaining_messages,
-                        Some(error.clone()),
-                    );
-                    tracing::warn!("compress_to_mid_term failed; ledger remains intact: {error}");
-                }
-            }
-        }
-        short_term_token_counts()
-            .lock()
-            .expect("short-term token cache lock poisoned")
-            .insert(token_cache_key, cached_uncovered_tokens);
+        remove_thread_caches(&self.token_cache_key(thread_id));
         Ok(())
-    }
-
-    fn plan_mid_term_compression(&self, msgs: &[Message]) -> PlannedCompaction {
-        let desired = (msgs.len() / 2).max(1);
-        let split = safe_split_point(msgs, desired);
-        PlannedCompaction {
-            compacted_messages: split,
-            remaining_messages: msgs.len().saturating_sub(split),
-        }
     }
 
     /// Compact the oldest uncovered complete exchanges for request preflight.
@@ -950,6 +835,17 @@ impl MemoryStore {
     /// - The mid-term index is replaced with the single new entry.
     /// The append-only ledger is never truncated by this operation.
     pub async fn compact_now(&self, thread_id: &str) -> Result<usize, AgentError> {
+        self.compact_now_with_compressor(thread_id, &self.compressor)
+            .await
+    }
+
+    /// Compact using the model selected for the active session rather than
+    /// the process-wide default compressor.
+    pub async fn compact_now_with_compressor(
+        &self,
+        thread_id: &str,
+        compressor: &LlmCompressor,
+    ) -> Result<usize, AgentError> {
         let lock = thread_lock(self.token_cache_key(thread_id));
         let _guard = lock.lock().await;
         let short_path = self.short_term_path(thread_id);
@@ -992,7 +888,7 @@ impl MemoryStore {
         let new_uuid = Uuid::new_v4().to_string();
 
         // ── Compress ──────────────────────────────────────────────────────
-        let summary = self.compressor.compress(&compress_msgs).await?;
+        let summary = compressor.compress(&compress_msgs).await?;
 
         // ── Skip empty compression results ───────────────────────────────
         if summary.trim().is_empty() {
@@ -1831,6 +1727,39 @@ mod tests {
 
         assert!(events.is_empty());
         assert_eq!(store.thread_history("thread-1").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_turn_never_runs_post_turn_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = test_store(tmp.path().to_path_buf());
+        store.auto_compress = true;
+        store.short_term_tokens = 1;
+        let messages = (0..20)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!("user-{index} {}", "large ".repeat(100)))
+                } else {
+                    Message::assistant(format!("assistant-{index} {}", "large ".repeat(100)))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            store.save_turn("append-only-save", messages),
+        )
+        .await
+        .expect("save_turn must not wait for the compressor")
+        .unwrap();
+
+        assert_eq!(store.thread_history("append-only-save").await.len(), 20);
+        assert!(
+            MemoryStore::read_index(&store.mid_term_dir("append-only-save"))
+                .await
+                .entries
+                .is_empty()
+        );
     }
 
     #[tokio::test]

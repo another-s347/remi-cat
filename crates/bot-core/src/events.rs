@@ -101,7 +101,8 @@ impl ModelInputSnapshot {
 
 // ── Skill events ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum SkillEvent {
     Saved { name: String, path: String },
     Deleted { name: String },
@@ -109,7 +110,8 @@ pub enum SkillEvent {
 
 // ── Todo events ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum TodoEvent {
     Added { id: u64, content: String },
     Completed { id: u64 },

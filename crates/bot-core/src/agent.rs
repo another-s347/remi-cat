@@ -22,7 +22,7 @@ use bot_runtime_core::ToolContext;
 use bot_runtime_core::{
     build_tool_definition_ctx, chat_ctx_from_input, inject_extra_tools,
     tool_ctx_from_state_with_cancel, CoreAgentLoop, CoreCancelKind, CoreDriveConfig,
-    CoreDriveEvent, CoreSteerBatch, CoreStreamOptions, CoreUsageStats,
+    CoreDriveEvent, CoreSteerBatch, CoreSteerBehavior, CoreStreamOptions, CoreUsageStats,
 };
 use remi_agentloop::prelude::{
     AgentError, AgentState, CancellationToken, Content, ContentPart, LoopInput, Message,
@@ -338,6 +338,7 @@ where
 
             loop {
                 let run_input = inject_extra_tools(current, extra_defs.clone());
+                let handoff_fallback = handoff_history_from_input(&run_input);
                 let run_ctx = chat_ctx_from_input(&run_input, cancel_signal.clone());
                 let inner_stream = match self.inner.chat(run_ctx, run_input).await {
                     Ok(s) => s,
@@ -359,7 +360,38 @@ where
                 let mut last_checkpoint_state: Option<remi_agentloop::prelude::AgentState> = None;
 
                 loop {
-                    let ev = inner_stream.next().await;
+                    let ev = if options.steer_behavior == CoreSteerBehavior::Handoff {
+                        if let Some(steer) = options.steer.as_ref() {
+                            tokio::select! {
+                                ev = inner_stream.next() => ev,
+                                _ = steer.notified() => {
+                                    if let Some(batch) = steer.drain_batch() {
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
+                                            steer_ids: batch.ids.clone(),
+                                            session_id: log_thread_id.clone(),
+                                            preview: batch.preview.clone(),
+                                            count: batch.count,
+                                        });
+                                        let (messages, user_state) = last_checkpoint_state
+                                            .take()
+                                            .map(|mut state| {
+                                                complete_pending_tool_calls_in_state(&mut state);
+                                                (state.messages, state.user_state)
+                                            })
+                                            .unwrap_or_else(|| handoff_fallback.clone());
+                                        yield CatEvent::History(messages, user_state);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            inner_stream.next().await
+                        }
+                    } else {
+                        inner_stream.next().await
+                    };
                     let Some(ev) = ev else {
                         break;
                     };
@@ -376,6 +408,13 @@ where
                                         preview: batch.preview.clone(),
                                         count: batch.count,
                                     });
+                                    if options.steer_behavior == CoreSteerBehavior::Handoff {
+                                        let mut state = state;
+                                        complete_pending_tool_calls_in_state(&mut state);
+                                        yield CatEvent::History(state.messages, state.user_state);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
                                     next_input = Some(steer_start_input(state, batch));
                                     break;
                                 }
@@ -1375,6 +1414,13 @@ where
                                         preview: batch.preview.clone(),
                                         count: batch.count,
                                     });
+                                    if options.steer_behavior == CoreSteerBehavior::Handoff {
+                                        append_tool_results_to_history(&mut state.messages, all_outcomes);
+                                        complete_pending_tool_calls_in_state(&mut state);
+                                        yield CatEvent::History(state.messages, state.user_state);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
                                     next_input =
                                         Some(steer_start_input_after_tool_results(state, all_outcomes, batch));
                                     break;
@@ -1397,6 +1443,13 @@ where
                                         preview: batch.preview.clone(),
                                         count: batch.count,
                                     });
+                                    if options.steer_behavior == CoreSteerBehavior::Handoff {
+                                        let mut state = state;
+                                        complete_pending_tool_calls_in_state(&mut state);
+                                        yield CatEvent::History(state.messages, state.user_state);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
                                     next_input = Some(steer_start_input(state, batch));
                                     break;
                                 }
@@ -1516,6 +1569,29 @@ fn steer_start_input(mut state: AgentState, batch: CoreSteerBatch) -> LoopInput 
         input = input.user_name(user_name);
     }
     input
+}
+
+fn handoff_history_from_input(input: &LoopInput) -> (Vec<Message>, serde_json::Value) {
+    match input {
+        LoopInput::Start {
+            message,
+            history,
+            user_state,
+            ..
+        } => {
+            let mut messages = history.clone();
+            messages.push(message.clone());
+            (
+                messages,
+                user_state.clone().unwrap_or(serde_json::Value::Null),
+            )
+        }
+        LoopInput::Resume { state, .. } => {
+            let mut state = state.clone();
+            complete_pending_tool_calls_in_state(&mut state);
+            (state.messages, state.user_state)
+        }
+    }
 }
 
 fn steer_start_input_after_tool_results(
@@ -2481,7 +2557,8 @@ mod tests {
     use crate::user_question::UserQuestionManager;
     use bot_runtime_core::ToolContext;
     use bot_runtime_core::{
-        CoreSteerBatch, CoreSteerInput, CoreSteerQueue, CoreSteerSource, CoreStreamOptions,
+        CoreSteerBatch, CoreSteerBehavior, CoreSteerInput, CoreSteerQueue, CoreSteerSource,
+        CoreStreamOptions,
     };
     use futures::{stream, Stream, StreamExt};
     use remi_agentloop::prelude::{
@@ -2714,6 +2791,7 @@ mod tests {
             count: 1,
             message_metadata: None,
             user_name: None,
+            sources: vec![CoreSteerSource::User],
         }
     }
 
@@ -4083,6 +4161,7 @@ mod tests {
                     CoreStreamOptions {
                         cancel: Some(cancel.clone()),
                         steer: None,
+                        steer_behavior: CoreSteerBehavior::Continue,
                         async_agent: false,
                     },
                 );
@@ -4185,6 +4264,58 @@ mod tests {
                     "{events:#?}"
                 );
                 assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cat_agent_handoff_steer_stops_before_running_queued_input() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let queue = Arc::new(CoreSteerQueue::new());
+                let mut local_tools = DefaultToolRegistry::new();
+                local_tools.register(SteerPushingTool {
+                    queue: Arc::clone(&queue),
+                });
+                let agent = CatAgent {
+                    inner: SteerDuringToolInnerAgent,
+                    local_tools: Arc::new(local_tools),
+                    model_tools: None,
+                    data_dir: test_root(),
+                    workspace_root: test_root(),
+                    workspace_root_label: "/workspace".to_string(),
+                    allow_host_absolute_paths: true,
+                    overflow_bytes: 8_192,
+                    im_bridge: None,
+                    tool_allowlist: None,
+                    approval_manager: ToolApprovalManager::new(),
+                    approval_reviewer: None,
+                    user_question_manager: UserQuestionManager::new(),
+                    hook_manager: test_hook_manager(),
+                    tool_tasks: test_tool_tasks(),
+                };
+
+                let events = agent
+                    .stream_with_input_and_options(
+                        LoopInput::start("start"),
+                        CoreStreamOptions::new()
+                            .with_steer(queue)
+                            .with_steer_behavior(CoreSteerBehavior::Handoff),
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::SteerInjected(_))));
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::History(_, _))));
+                assert!(events.iter().any(|event| matches!(event, CatEvent::Done)));
+                assert!(!events
                     .iter()
                     .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));
             })
@@ -4383,6 +4514,7 @@ mod tests {
             CoreStreamOptions {
                 cancel: Some(cancel.clone()),
                 steer: None,
+                steer_behavior: CoreSteerBehavior::Continue,
                 async_agent: false,
             },
         );

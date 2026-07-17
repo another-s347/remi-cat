@@ -37,7 +37,7 @@ tools:
 delegates:
   - explorer
 max_turns: 0
-persistent_sessions: false
+persistent_sessions: true
 ---
 You are Remi, a helpful assistant.
 

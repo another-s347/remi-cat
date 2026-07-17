@@ -1,20 +1,24 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
 use bot_core::{
-    todo::TodoItem, CatEvent, ContextMetrics, ModelInputSnapshot, SteerSubmitResult,
-    ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
+    todo::TodoItem, CatEvent, Content, ContextMetrics, ModelInputSnapshot, ReasoningEffort,
+    SteerSubmitResult, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision, ToolApprovalRequest,
     UserQuestionRequest, UserQuestionResponse,
 };
 use futures::StreamExt;
 use remi_agentloop::prelude::CancellationToken;
-use serde::Serialize;
+use remi_agentloop::prelude::ProtocolEvent;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::session::{ChannelBinding, SubSessionKind};
 use crate::{
     command::{process_runtime_commands, RuntimeCommandPipelineResult},
     model_input_store::upsert_model_input_snapshot_json,
@@ -38,21 +42,31 @@ pub struct WebRun {
 pub struct ActiveWebRun {
     pub session_id: String,
     pub run_id: String,
-    pub text: String,
+    pub content: Content,
     pub started_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WebRuntimeOptions {
+    pub model_profile_id: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub agent_id: Option<String>,
+    pub async_agent: Option<bool>,
 }
 
 pub(crate) enum WebChatCommand {
     Run {
         session_id: String,
         run_id: String,
-        text: String,
+        content: Content,
+        runtime: WebRuntimeOptions,
+        after_sequence: Option<u64>,
         response: oneshot::Sender<anyhow::Result<WebRun>>,
     },
     Steer {
         session_id: String,
         run_id: String,
-        text: String,
+        content: Content,
         response: oneshot::Sender<anyhow::Result<()>>,
     },
     Cancel {
@@ -73,6 +87,12 @@ pub(crate) enum WebChatCommand {
     History {
         session_id: String,
         response: oneshot::Sender<Vec<ThreadHistoryMessage>>,
+    },
+    Events {
+        session_id: String,
+        after_sequence: Option<u64>,
+        follow: bool,
+        response: oneshot::Sender<anyhow::Result<WebRun>>,
     },
     Todos {
         session_id: String,
@@ -106,7 +126,7 @@ pub(crate) enum WebChatCommand {
 
 struct ActiveRun {
     session_id: String,
-    text: String,
+    content: Content,
     started_at: String,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
@@ -115,10 +135,10 @@ struct ActiveRun {
     broadcast: broadcast::Sender<ChatEventV1>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEventV1 {
     pub version: u8,
-    pub event: &'static str,
+    pub event: String,
     pub run_id: String,
     pub session_id: String,
     pub sequence: u64,
@@ -129,7 +149,7 @@ pub struct ChatEventV1 {
 
 impl ChatEventV1 {
     fn new(
-        event: &'static str,
+        event: impl Into<String>,
         run_id: &str,
         session_id: &str,
         sequence: u64,
@@ -137,7 +157,7 @@ impl ChatEventV1 {
     ) -> Self {
         Self {
             version: 1,
-            event,
+            event: event.into(),
             run_id: run_id.to_string(),
             session_id: session_id.to_string(),
             sequence,
@@ -157,14 +177,18 @@ impl WebChatHandle {
         &self,
         session_id: String,
         run_id: String,
-        text: String,
+        content: Content,
+        runtime: WebRuntimeOptions,
+        after_sequence: Option<u64>,
     ) -> anyhow::Result<WebRun> {
         let (response, rx) = oneshot::channel();
         self.tx
             .send(WebChatCommand::Run {
                 session_id,
                 run_id,
-                text,
+                content,
+                runtime,
+                after_sequence,
                 response,
             })
             .await
@@ -177,14 +201,14 @@ impl WebChatHandle {
         &self,
         session_id: String,
         run_id: String,
-        text: String,
+        content: Content,
     ) -> anyhow::Result<()> {
         let (response, rx) = oneshot::channel();
         self.tx
             .send(WebChatCommand::Steer {
                 session_id,
                 run_id,
-                text,
+                content,
                 response,
             })
             .await
@@ -248,6 +272,26 @@ impl WebChatHandle {
             .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("web chat runtime dropped history response"))
+    }
+
+    pub async fn events(
+        &self,
+        session_id: String,
+        after_sequence: Option<u64>,
+        follow: bool,
+    ) -> anyhow::Result<WebRun> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::Events {
+                session_id,
+                after_sequence,
+                follow,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped events response"))?
     }
 
     pub async fn todos(&self, session_id: String) -> anyhow::Result<Vec<TodoItem>> {
@@ -349,20 +393,32 @@ impl WebChatHandle {
 
 pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChatCommand>) {
     let active: Rc<RefCell<HashMap<String, ActiveRun>>> = Rc::new(RefCell::new(HashMap::new()));
+    let event_store = Rc::new(SessionEventStore::new(&runtime.data_dir));
 
     while let Some(command) = rx.recv().await {
         match command {
             WebChatCommand::Run {
                 session_id,
                 run_id,
-                text,
+                content,
+                runtime: runtime_options,
+                after_sequence,
                 response,
             } => {
+                if let Err(error) = runtime.bot.validate_runtime_overrides(
+                    runtime_options.model_profile_id.as_deref(),
+                    runtime_options.agent_id.as_deref(),
+                    runtime_options.reasoning_effort,
+                ) {
+                    let _ =
+                        response.send(Err(anyhow::anyhow!("invalid runtime override: {error}")));
+                    continue;
+                }
                 if let Some(existing_run_id) =
                     active_run_id_for_session(&active.borrow(), &session_id)
                 {
                     if existing_run_id == run_id {
-                        let run = attach_active_run(&active.borrow(), &run_id);
+                        let run = attach_active_run(&active.borrow(), &run_id, after_sequence);
                         let _ = response.send(run.ok_or_else(|| {
                             anyhow::anyhow!("active run disappeared while attaching")
                         }));
@@ -385,21 +441,25 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 let active_for_task = Rc::clone(&active);
                 let session_id_for_task = session_id.clone();
                 let run_id_for_task = run_id.clone();
-                let text_for_task = text.clone();
+                let content_for_task = content.clone();
+                let runtime_options_for_task = runtime_options.clone();
                 let log_for_task = Rc::clone(&log);
                 let broadcast_for_task = broadcast_tx.clone();
+                let event_store_for_task = Rc::clone(&event_store);
                 let cancel_for_task = cancel.clone();
                 let handle = tokio::task::spawn_local(async move {
                     let sink = WebRunEventSink {
                         direct: events_tx,
                         log: log_for_task,
                         broadcast: broadcast_for_task,
+                        event_store: event_store_for_task,
                     };
                     run_turn(
                         runtime,
                         &session_id_for_task,
                         &run_id_for_task,
-                        text_for_task,
+                        content_for_task,
+                        runtime_options_for_task,
                         cancel_for_task,
                         sink,
                     )
@@ -410,7 +470,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     run_id.clone(),
                     ActiveRun {
                         session_id: session_id.clone(),
-                        text: text.clone(),
+                        content: content.clone(),
                         started_at,
                         cancel: cancel.clone(),
                         handle,
@@ -423,19 +483,29 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
             WebChatCommand::Steer {
                 session_id,
                 run_id,
-                text,
+                content,
                 response,
             } => {
                 let run_matches_session = active
                     .borrow()
                     .get(&run_id)
                     .is_some_and(|run| run.session_id == session_id);
-                if !run_matches_session {
+                let child_thread_id = if run_matches_session {
+                    None
+                } else {
+                    runtime
+                        .sessions
+                        .lock()
+                        .await
+                        .metadata_string(&session_id, "sub_session_thread_id")
+                };
+                if !run_matches_session && child_thread_id.is_none() {
                     let _ = response.send(Err(anyhow::anyhow!(
                         "no matching active run for this session"
                     )));
                     continue;
                 }
+                let text = content.text_content();
                 if text.trim_start().starts_with('/') {
                     match process_runtime_commands(&runtime, &session_id, text.trim()).await {
                         Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
@@ -448,9 +518,11 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                                     sequence,
                                     Some(serde_json::json!({"text": reply})),
                                 );
-                                run.log.borrow_mut().push(web_event.clone());
-                                let _ = run.broadcast.send(web_event.clone());
-                                let _ = run.direct.try_send(web_event);
+                                if let Ok(web_event) = event_store.append(web_event) {
+                                    run.log.borrow_mut().push(web_event.clone());
+                                    let _ = run.broadcast.send(web_event.clone());
+                                    let _ = run.direct.try_send(web_event);
+                                }
                             }
                             let _ = response.send(Ok(()));
                         }
@@ -466,11 +538,19 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     }
                     continue;
                 }
-                let request = ChatRequest::text(session_id.clone(), ChatChannel::Web, text.clone())
+                let request = ChatRequest::text(session_id.clone(), ChatChannel::Web, "")
+                    .with_content(content)
                     .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
                     .with_message(format!("web-steer-{}", uuid::Uuid::new_v4()), "p2p")
                     .with_platform(Some(WEB_CHANNEL.to_string()));
-                match runtime.submit_steer(request) {
+                let result = if let Some(thread_id) = child_thread_id.as_deref() {
+                    runtime
+                        .bot
+                        .submit_subagent_steer(&thread_id, request.into())
+                } else {
+                    runtime.submit_steer(request)
+                };
+                match result {
                     SteerSubmitResult::Queued(event) => {
                         if let Some(run) = active.borrow().get(&run_id) {
                             let sequence = run.log.borrow().len() as u64;
@@ -483,9 +563,22 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                                     serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
                                 ),
                             );
-                            run.log.borrow_mut().push(web_event.clone());
-                            let _ = run.broadcast.send(web_event.clone());
-                            let _ = run.direct.try_send(web_event);
+                            if let Ok(web_event) = event_store.append(web_event) {
+                                run.log.borrow_mut().push(web_event.clone());
+                                let _ = run.broadcast.send(web_event.clone());
+                                let _ = run.direct.try_send(web_event);
+                            }
+                        } else {
+                            let web_event = ChatEventV1::new(
+                                "steer_queued",
+                                &run_id,
+                                &session_id,
+                                0,
+                                Some(
+                                    serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+                                ),
+                            );
+                            let _ = event_store.append(web_event);
                         }
                         let _ = response.send(Ok(()));
                     }
@@ -499,6 +592,28 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
             WebChatCommand::Cancel { run_id, response } => {
                 let cancelled = active.borrow_mut().remove(&run_id).map(|run| {
                     run.cancel.cancel();
+                    let cancelled_event = ChatEventV1::new(
+                        "cancelled",
+                        &run_id,
+                        &run.session_id,
+                        0,
+                        Some(serde_json::json!({})),
+                    );
+                    if let Ok(event) = event_store.append(cancelled_event) {
+                        let _ = run.broadcast.send(event.clone());
+                        let _ = run.direct.try_send(event);
+                    }
+                    let event = ChatEventV1::new(
+                        "run_finished",
+                        &run_id,
+                        &run.session_id,
+                        0,
+                        Some(serde_json::json!({"status": "cancelled"})),
+                    );
+                    if let Ok(event) = event_store.append(event) {
+                        let _ = run.broadcast.send(event.clone());
+                        let _ = run.direct.try_send(event);
+                    }
                     let runtime = Rc::clone(&runtime);
                     let session_id = run.session_id.clone();
                     tokio::task::spawn_local(async move {
@@ -523,6 +638,28 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 for run_id in run_ids {
                     if let Some(run) = active.borrow_mut().remove(&run_id) {
                         run.cancel.cancel();
+                        let cancelled_event = ChatEventV1::new(
+                            "cancelled",
+                            &run_id,
+                            &run.session_id,
+                            0,
+                            Some(serde_json::json!({})),
+                        );
+                        if let Ok(event) = event_store.append(cancelled_event) {
+                            let _ = run.broadcast.send(event.clone());
+                            let _ = run.direct.try_send(event);
+                        }
+                        let event = ChatEventV1::new(
+                            "run_finished",
+                            &run_id,
+                            &run.session_id,
+                            0,
+                            Some(serde_json::json!({"status": "cancelled"})),
+                        );
+                        if let Ok(event) = event_store.append(event) {
+                            let _ = run.broadcast.send(event.clone());
+                            let _ = run.direct.try_send(event);
+                        }
                         let runtime = Rc::clone(&runtime);
                         let session_id = run.session_id.clone();
                         tokio::task::spawn_local(async move {
@@ -533,7 +670,38 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     }
                 }
                 if !cancelled {
-                    let _ = runtime.bot.cancel_background_tasks(&session_id).await;
+                    let child_thread_id = runtime
+                        .sessions
+                        .lock()
+                        .await
+                        .metadata_string(&session_id, "sub_session_thread_id");
+                    if let Some(thread_id) = child_thread_id {
+                        cancelled = runtime.bot.cancel_subagent(&thread_id);
+                        let _ = runtime.bot.cancel_background_tasks(&thread_id).await;
+                        if cancelled {
+                            let child_run_id = event_store
+                                .read(&session_id)
+                                .ok()
+                                .and_then(|events| events.last().map(|event| event.run_id.clone()))
+                                .unwrap_or_default();
+                            let _ = event_store.append(ChatEventV1::new(
+                                "cancelled",
+                                &child_run_id,
+                                &session_id,
+                                0,
+                                Some(serde_json::json!({})),
+                            ));
+                            let _ = event_store.append(ChatEventV1::new(
+                                "run_finished",
+                                &child_run_id,
+                                &session_id,
+                                0,
+                                Some(serde_json::json!({"status": "cancelled"})),
+                            ));
+                        }
+                    } else {
+                        let _ = runtime.bot.cancel_background_tasks(&session_id).await;
+                    }
                 }
                 let _ = response.send(cancelled);
             }
@@ -548,7 +716,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     .map(|(run_id, run)| ActiveWebRun {
                         session_id: run.session_id.clone(),
                         run_id: run_id.clone(),
-                        text: run.text.clone(),
+                        content: run.content.clone(),
                         started_at: run.started_at.clone(),
                     });
                 let _ = response.send(active_run);
@@ -560,7 +728,7 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     .map(|(run_id, run)| ActiveWebRun {
                         session_id: run.session_id.clone(),
                         run_id: run_id.clone(),
-                        text: run.text.clone(),
+                        content: run.content.clone(),
                         started_at: run.started_at.clone(),
                     })
                     .collect();
@@ -570,11 +738,28 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                 session_id,
                 response,
             } => {
-                let mut history = runtime.bot.thread_history(&session_id).await;
-                if let Some(instance) = runtime.bot.workflow_status(&session_id).await {
+                let thread_id = runtime
+                    .sessions
+                    .lock()
+                    .await
+                    .metadata_string(&session_id, "sub_session_thread_id")
+                    .unwrap_or_else(|| session_id.clone());
+                let mut history = runtime.bot.thread_history(&thread_id).await;
+                for message in &mut history {
+                    message.pretty = None;
+                }
+                if let Some(instance) = runtime.bot.workflow_status(&thread_id).await {
                     append_supervisor_history(&mut history, &session_id, &instance);
                 }
                 let _ = response.send(history);
+            }
+            WebChatCommand::Events {
+                session_id,
+                after_sequence,
+                follow,
+                response,
+            } => {
+                let _ = response.send(event_store.stream(&session_id, after_sequence, follow));
             }
             WebChatCommand::Todos {
                 session_id,
@@ -603,11 +788,18 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                         run.handle.abort();
                     }
                 }
+                let thread_id = runtime
+                    .sessions
+                    .lock()
+                    .await
+                    .metadata_string(&session_id, "sub_session_thread_id")
+                    .unwrap_or_else(|| session_id.clone());
                 let result = runtime
                     .bot
-                    .delete_thread_data(&session_id, Some(WEB_USER_ID))
+                    .delete_thread_data(&thread_id, Some(WEB_USER_ID))
                     .await
                     .map_err(anyhow::Error::from);
+                let result = result.and_then(|_| event_store.delete(&session_id));
                 let _ = response.send(result);
             }
             WebChatCommand::ForkThread {
@@ -677,11 +869,22 @@ fn active_run_id_for_session(
         .map(|(run_id, _)| run_id.clone())
 }
 
-fn attach_active_run(active: &HashMap<String, ActiveRun>, run_id: &str) -> Option<WebRun> {
+fn attach_active_run(
+    active: &HashMap<String, ActiveRun>,
+    run_id: &str,
+    after_sequence: Option<u64>,
+) -> Option<WebRun> {
     let run = active.get(run_id)?;
     let (tx, rx) = mpsc::channel(128);
     let mut broadcast_rx = run.broadcast.subscribe();
-    let replay = run.log.borrow().clone();
+    let replay = run
+        .log
+        .borrow()
+        .iter()
+        .filter(|event| after_sequence.is_none_or(|sequence| event.sequence > sequence))
+        .cloned()
+        .collect::<Vec<_>>();
+    let replay_last = replay.last().map(|event| event.sequence).or(after_sequence);
     tokio::task::spawn_local(async move {
         for event in replay {
             if tx.send(event).await.is_err() {
@@ -690,11 +893,12 @@ fn attach_active_run(active: &HashMap<String, ActiveRun>, run_id: &str) -> Optio
         }
         loop {
             match broadcast_rx.recv().await {
-                Ok(event) => {
+                Ok(event) if replay_last.is_none_or(|sequence| event.sequence > sequence) => {
                     if tx.send(event).await.is_err() {
                         return;
                     }
                 }
+                Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -777,12 +981,159 @@ struct WebRunEventSink {
     direct: mpsc::Sender<ChatEventV1>,
     log: Rc<RefCell<Vec<ChatEventV1>>>,
     broadcast: broadcast::Sender<ChatEventV1>,
+    event_store: Rc<SessionEventStore>,
 }
 
 async fn send_event(sink: &WebRunEventSink, event: ChatEventV1) {
+    let event = match sink.event_store.append(event.clone()) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::error!(%error, "failed to persist web session event");
+            event
+        }
+    };
     sink.log.borrow_mut().push(event.clone());
     let _ = sink.broadcast.send(event.clone());
     let _ = sink.direct.send(event).await;
+}
+
+struct SessionEventStore {
+    root: PathBuf,
+    next_sequences: RefCell<HashMap<String, u64>>,
+    broadcasts: RefCell<HashMap<String, broadcast::Sender<ChatEventV1>>>,
+    files: RefCell<HashMap<String, std::fs::File>>,
+}
+
+impl SessionEventStore {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            root: data_dir.join("session-events"),
+            next_sequences: RefCell::new(HashMap::new()),
+            broadcasts: RefCell::new(HashMap::new()),
+            files: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn path(&self, session_id: &str) -> PathBuf {
+        self.root.join(format!("{session_id}.jsonl"))
+    }
+
+    fn read(&self, session_id: &str) -> anyhow::Result<Vec<ChatEventV1>> {
+        let path = self.path(session_id);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut events = Vec::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str(&line) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    tracing::warn!(session_id, %error, "ignoring incomplete session event tail");
+                    break;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn sender(&self, session_id: &str) -> broadcast::Sender<ChatEventV1> {
+        self.broadcasts
+            .borrow_mut()
+            .entry(session_id.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .clone()
+    }
+
+    fn append(&self, mut event: ChatEventV1) -> anyhow::Result<ChatEventV1> {
+        std::fs::create_dir_all(&self.root)?;
+        let next = if let Some(next) = self.next_sequences.borrow().get(&event.session_id).copied()
+        {
+            next
+        } else {
+            self.read(&event.session_id)?
+                .last()
+                .map(|event| event.sequence.saturating_add(1))
+                .unwrap_or(0)
+        };
+        event.sequence = next;
+        let mut files = self.files.borrow_mut();
+        if !files.contains_key(&event.session_id) {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.path(&event.session_id))?;
+            files.insert(event.session_id.clone(), file);
+        }
+        let file = files
+            .get_mut(&event.session_id)
+            .expect("event file inserted above");
+        serde_json::to_writer(&mut *file, &event)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        if event.event == "run_finished" {
+            file.sync_data()?;
+        }
+        self.next_sequences
+            .borrow_mut()
+            .insert(event.session_id.clone(), next.saturating_add(1));
+        let _ = self.sender(&event.session_id).send(event.clone());
+        Ok(event)
+    }
+
+    fn stream(
+        &self,
+        session_id: &str,
+        after_sequence: Option<u64>,
+        follow: bool,
+    ) -> anyhow::Result<WebRun> {
+        let mut live = self.sender(session_id).subscribe();
+        let replay = self
+            .read(session_id)?
+            .into_iter()
+            .filter(|event| after_sequence.is_none_or(|sequence| event.sequence > sequence))
+            .collect::<Vec<_>>();
+        let last_replayed = replay.last().map(|event| event.sequence).or(after_sequence);
+        let (tx, rx) = mpsc::channel(128);
+        tokio::task::spawn_local(async move {
+            for event in replay {
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            if !follow {
+                return;
+            }
+            loop {
+                match live.recv().await {
+                    Ok(event) if last_replayed.is_none_or(|sequence| event.sequence > sequence) => {
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(WebRun { events: rx })
+    }
+
+    fn delete(&self, session_id: &str) -> anyhow::Result<()> {
+        self.next_sequences.borrow_mut().remove(session_id);
+        self.broadcasts.borrow_mut().remove(session_id);
+        self.files.borrow_mut().remove(session_id);
+        match std::fs::remove_file(self.path(session_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 fn persist_model_input_snapshot(
@@ -817,6 +1168,148 @@ fn persist_model_input_snapshot(
     }
 }
 
+async fn ensure_web_sub_session(
+    runtime: &Runtime,
+    parent_session_id: &str,
+    event: &remi_agentloop::prelude::SubSessionEvent,
+) -> anyhow::Result<String> {
+    let kind = if event.agent_name == "acp" {
+        SubSessionKind::Acp
+    } else {
+        SubSessionKind::Agent
+    };
+    let status = sub_session_status(event.event.as_ref());
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        sessions.upsert_sub_session(
+            parent_session_id,
+            &event.sub_thread_id.0,
+            kind,
+            &event.agent_name,
+            event.title.clone(),
+            status,
+        )?;
+    }
+    let channel_id = format!("sub-session:{}", event.sub_thread_id.0);
+    let child = runtime.sessions.lock().await.create_channel(
+        WEB_CHANNEL,
+        &channel_id,
+        &runtime.root_agent_id,
+        event.title.clone(),
+    )?;
+    let mut sessions = runtime.sessions.lock().await;
+    sessions.bind_sub_session_channel(
+        parent_session_id,
+        &event.sub_thread_id.0,
+        ChannelBinding {
+            platform: WEB_CHANNEL.to_string(),
+            channel_id,
+        },
+    )?;
+    sessions.set_metadata_values(
+        &child.id,
+        [
+            (
+                "sub_session_parent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.to_string()),
+            ),
+            (
+                "sub_session_thread_id".to_string(),
+                serde_json::Value::String(event.sub_thread_id.0.clone()),
+            ),
+            (
+                "sub_session_agent".to_string(),
+                serde_json::Value::String(event.agent_name.clone()),
+            ),
+            (
+                SESSION_AGENT_ID_METADATA_KEY.to_string(),
+                serde_json::Value::String(event.agent_name.clone()),
+            ),
+        ],
+    )?;
+    Ok(child.id)
+}
+
+fn persist_sub_session_event(
+    store: &SessionEventStore,
+    session_id: &str,
+    event: &remi_agentloop::prelude::SubSessionEvent,
+) {
+    let (kind, data) = protocol_event_payload(event.event.as_ref());
+    let web_event = ChatEventV1::new(kind, &event.sub_run_id.0, session_id, 0, Some(data));
+    if let Err(error) = store.append(web_event) {
+        tracing::warn!(session_id, %error, "failed to persist sub-session event");
+    }
+}
+
+fn protocol_event_payload(event: &ProtocolEvent) -> (&'static str, serde_json::Value) {
+    match event {
+        ProtocolEvent::RunStart { .. } => (
+            "run_started",
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        ProtocolEvent::Delta { content, role } => (
+            "text_delta",
+            serde_json::json!({"text": content, "role": role}),
+        ),
+        ProtocolEvent::ThinkingStart => ("thinking_started", serde_json::json!({})),
+        ProtocolEvent::ThinkingDelta { content } => {
+            ("thinking_delta", serde_json::json!({"text": content}))
+        }
+        ProtocolEvent::ThinkingEnd { content } => {
+            ("thinking_finished", serde_json::json!({"text": content}))
+        }
+        ProtocolEvent::ToolCallStart { id, name } => (
+            "tool_call_started",
+            serde_json::json!({"call_id": id, "tool_name": name}),
+        ),
+        ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta,
+        } => (
+            "tool_call_arguments_delta",
+            serde_json::json!({"call_id": id, "delta": arguments_delta}),
+        ),
+        ProtocolEvent::ToolDelta { id, name, delta } => (
+            "tool_delta",
+            serde_json::json!({"call_id": id, "tool_name": name, "delta": delta}),
+        ),
+        ProtocolEvent::ToolResult { id, name, result } => (
+            "tool_call_result",
+            serde_json::json!({
+                "call_id": id,
+                "tool_name": name,
+                "result": result,
+                "success": bot_core::tool_success(result),
+            }),
+        ),
+        ProtocolEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+        } => (
+            "stats",
+            serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }),
+        ),
+        ProtocolEvent::Error { message, code } => (
+            "error",
+            serde_json::json!({"message": message, "code": code}),
+        ),
+        ProtocolEvent::Done => ("run_finished", serde_json::json!({"status": "completed"})),
+        ProtocolEvent::Cancelled => ("run_finished", serde_json::json!({"status": "cancelled"})),
+        ProtocolEvent::Custom { event_type, extra } => (
+            "custom",
+            serde_json::json!({"event_type": event_type, "data": extra}),
+        ),
+        _ => (
+            "protocol_event",
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+    }
+}
+
 fn stats_payload(
     usage: TokenUsage,
     context_tokens: u32,
@@ -840,8 +1333,21 @@ fn stats_payload(
 
 enum WebEventMap {
     Emit(&'static str, serde_json::Value),
-    Done,
+    Finish(&'static str),
     Skip,
+}
+
+fn sub_session_status(event: &ProtocolEvent) -> &'static str {
+    match event {
+        ProtocolEvent::Done => "completed",
+        ProtocolEvent::Cancelled => "cancelled",
+        ProtocolEvent::Error { .. } => "error",
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => "completed",
+        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_handed_off" => {
+            "handed_off"
+        }
+        _ => "running",
+    }
 }
 
 struct WebCoreEventMapper {
@@ -853,7 +1359,7 @@ struct WebCoreEventMapper {
     max_prompt_tokens: u32,
     model_elapsed_ms: u64,
     model_input_snapshot: Option<ModelInputSnapshot>,
-    streaming_tools: HashMap<String, StreamingToolCall>,
+    terminal_status: &'static str,
 }
 
 impl WebCoreEventMapper {
@@ -867,7 +1373,7 @@ impl WebCoreEventMapper {
             max_prompt_tokens: 0,
             model_elapsed_ms: 0,
             model_input_snapshot: None,
-            streaming_tools: HashMap::new(),
+            terminal_status: "completed",
         }
     }
 
@@ -901,7 +1407,7 @@ impl WebCoreEventMapper {
                 self.mark_first_response();
                 WebEventMap::Emit("text_delta", serde_json::json!({"text": text}))
             }
-            CoreChatEvent::Done => WebEventMap::Done,
+            CoreChatEvent::Done => WebEventMap::Finish(self.terminal_status),
             CoreChatEvent::Bot(event) => self.map_cat_event(runtime, session_id, event),
         }
     }
@@ -923,64 +1429,26 @@ impl WebCoreEventMapper {
             }
             CatEvent::ToolCallStart { id, name } => {
                 self.mark_first_response();
-                self.streaming_tools.insert(
-                    id.clone(),
-                    StreamingToolCall {
-                        name: name.clone(),
-                        arguments: String::new(),
-                        last_emit: Instant::now(),
-                    },
-                );
-                let args = serde_json::Value::Object(serde_json::Map::new());
-                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
                 WebEventMap::Emit(
-                    "tool_started",
+                    "tool_call_started",
                     serde_json::json!({
                         "call_id": id,
                         "tool_name": name,
-                        "args": args,
-                        "pretty": pretty,
-                        "partial": true,
                     }),
                 )
             }
-            CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                if let Some(call) = self.streaming_tools.get_mut(&id) {
-                    call.arguments.push_str(&delta);
-                    if call.last_emit.elapsed() < Duration::from_millis(500) {
-                        WebEventMap::Skip
-                    } else {
-                        call.last_emit = Instant::now();
-                        streaming_tool_progress(&id, call)
-                            .map(|pretty| {
-                                WebEventMap::Emit(
-                                    "tool_started",
-                                    serde_json::json!({
-                                        "call_id": id,
-                                        "tool_name": call.name.clone(),
-                                        "args": {},
-                                        "pretty": pretty,
-                                        "partial": true,
-                                    }),
-                                )
-                            })
-                            .unwrap_or(WebEventMap::Skip)
-                    }
-                } else {
-                    WebEventMap::Skip
-                }
-            }
+            CatEvent::ToolCallArgumentsDelta { id, delta } => WebEventMap::Emit(
+                "tool_call_arguments_delta",
+                serde_json::json!({"call_id": id, "delta": delta}),
+            ),
             CatEvent::ToolCall { id, name, args } => {
                 self.mark_first_response();
-                self.streaming_tools.remove(&id);
-                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
                 WebEventMap::Emit(
-                    "tool_started",
+                    "tool_call",
                     serde_json::json!({
                         "call_id": id,
                         "tool_name": name,
                         "args": args,
-                        "pretty": pretty,
                     }),
                 )
             }
@@ -991,24 +1459,17 @@ impl WebCoreEventMapper {
                 result,
                 success,
                 elapsed_ms,
-            } => {
-                self.streaming_tools.remove(&id);
-                let pretty = bot_core::PrettyToolCall::completed(
-                    &id, &name, &args, &result, success, elapsed_ms,
-                );
-                WebEventMap::Emit(
-                    "tool_completed",
-                    serde_json::json!({
-                        "call_id": id,
-                        "tool_name": name,
-                        "args": args,
-                        "result": result,
-                        "success": success,
-                        "elapsed_ms": elapsed_ms,
-                        "pretty": pretty,
-                    }),
-                )
-            }
+            } => WebEventMap::Emit(
+                "tool_call_result",
+                serde_json::json!({
+                    "call_id": id,
+                    "tool_name": name,
+                    "args": args,
+                    "result": result,
+                    "success": success,
+                    "elapsed_ms": elapsed_ms,
+                }),
+            ),
             CatEvent::ToolApprovalRequested(request) => WebEventMap::Emit(
                 "approval_requested",
                 serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
@@ -1039,20 +1500,9 @@ impl WebCoreEventMapper {
                     "response": response,
                 }),
             ),
-            CatEvent::SubSession(event) => WebEventMap::Emit("sub_session", {
-                let mut value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-                if let serde_json::Value::Object(map) = &mut value {
-                    map.insert(
-                        "thread_id".to_string(),
-                        serde_json::Value::String(event.sub_thread_id.0.clone()),
-                    );
-                    map.insert(
-                        "run_id".to_string(),
-                        serde_json::Value::String(event.sub_run_id.0.clone()),
-                    );
-                }
-                value
-            }),
+            // Registered asynchronously by `run_turn`, which mirrors the full
+            // event into the child session and emits only the child link here.
+            CatEvent::SubSession(_) => WebEventMap::Skip,
             CatEvent::SupervisorProgress(progress) => WebEventMap::Emit(
                 "supervisor_progress",
                 serde_json::to_value(progress).unwrap_or(serde_json::Value::Null),
@@ -1104,11 +1554,36 @@ impl WebCoreEventMapper {
                 max_prompt_tokens,
                 elapsed_ms,
             ),
+            CatEvent::BackgroundTasksWaiting { count } => WebEventMap::Emit(
+                "background_tasks_waiting",
+                serde_json::json!({"count": count}),
+            ),
+            CatEvent::ToolTaskCompleted(task) => WebEventMap::Emit(
+                "tool_task_completed",
+                serde_json::to_value(task).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::Skill(event) => WebEventMap::Emit(
+                "skill_changed",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::Todo(event) => WebEventMap::Emit(
+                "todo_changed",
+                serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            ),
+            CatEvent::Cancelled => {
+                self.terminal_status = "cancelled";
+                WebEventMap::Emit("cancelled", serde_json::json!({}))
+            }
+            CatEvent::UserInterrupted { reason } => {
+                self.terminal_status = "interrupted";
+                WebEventMap::Emit("user_interrupted", serde_json::json!({"reason": reason}))
+            }
             CatEvent::Error(error) => {
+                self.terminal_status = "error";
                 WebEventMap::Emit("error", serde_json::json!({"message": error.to_string()}))
             }
-            CatEvent::Done => WebEventMap::Done,
-            _ => WebEventMap::Skip,
+            CatEvent::Done => WebEventMap::Finish(self.terminal_status),
+            CatEvent::History(_, _) => WebEventMap::Skip,
         }
     }
 
@@ -1158,7 +1633,8 @@ async fn run_turn(
     runtime: Rc<Runtime>,
     session_id: &str,
     run_id: &str,
-    text: String,
+    content: Content,
+    runtime_options: WebRuntimeOptions,
     cancel: CancellationToken,
     sink: WebRunEventSink,
 ) {
@@ -1171,6 +1647,7 @@ async fn run_turn(
     .await;
     sequence += 1;
 
+    let text = content.text_content();
     if is_web_fork_command(text.trim()) {
         match fork_web_session_command(&runtime, session_id, text.trim()).await {
             Ok(fork) => {
@@ -1206,7 +1683,13 @@ async fn run_turn(
                 sequence += 1;
                 send_event(
                     &sink,
-                    ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+                    ChatEventV1::new(
+                        "run_finished",
+                        run_id,
+                        session_id,
+                        sequence,
+                        Some(serde_json::json!({"status": "completed"})),
+                    ),
                 )
                 .await;
             }
@@ -1225,7 +1708,13 @@ async fn run_turn(
                 sequence += 1;
                 send_event(
                     &sink,
-                    ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+                    ChatEventV1::new(
+                        "run_finished",
+                        run_id,
+                        session_id,
+                        sequence,
+                        Some(serde_json::json!({"status": "error"})),
+                    ),
                 )
                 .await;
             }
@@ -1240,10 +1729,21 @@ async fn run_turn(
             sessions.metadata_string(session_id, SESSION_AGENT_ID_METADATA_KEY),
         )
     };
-    let context_tokens = runtime
-        .bot
-        .model_context_tokens_for_agent(model_profile_id.as_deref(), agent_id.as_deref());
-    let request = ChatRequest::text(session_id.to_string(), ChatChannel::Web, text)
+    let context_tokens = runtime.bot.model_context_tokens_for_agent(
+        runtime_options
+            .model_profile_id
+            .as_deref()
+            .or(model_profile_id.as_deref()),
+        runtime_options.agent_id.as_deref().or(agent_id.as_deref()),
+    );
+    let request = ChatRequest::text(session_id.to_string(), ChatChannel::Web, "")
+        .with_content(content)
+        .with_runtime_overrides(
+            runtime_options.model_profile_id,
+            runtime_options.reasoning_effort,
+            runtime_options.agent_id,
+            runtime_options.async_agent,
+        )
         .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
         .with_message(run_id.to_string(), "p2p")
         .with_platform(Some(WEB_CHANNEL.to_string()))
@@ -1252,6 +1752,8 @@ async fn run_turn(
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
     let mut event_mapper = WebCoreEventMapper::new(context_tokens, run_started_at);
+    let mut final_status = "completed";
+    let mut sub_sessions = HashMap::<String, (String, String)>::new();
 
     loop {
         let event = tokio::select! {
@@ -1262,10 +1764,54 @@ async fn run_turn(
                     Some(serde_json::json!({"message": "reply timed out"})),
                 )).await;
                 sequence += 1;
+                final_status = "error";
                 None
             }
         };
         let Some(event) = event else { break };
+        if let CoreChatEvent::Bot(CatEvent::SubSession(sub_event)) = &event {
+            let thread_id = sub_event.sub_thread_id.0.clone();
+            let status = sub_session_status(sub_event.event.as_ref()).to_string();
+            let previous = sub_sessions.get(&thread_id).cloned();
+            let needs_update = previous
+                .as_ref()
+                .is_none_or(|(_, previous_status)| previous_status != &status);
+            let child = if needs_update {
+                ensure_web_sub_session(&runtime, session_id, sub_event)
+                    .await
+                    .map(|child_id| {
+                        sub_sessions.insert(thread_id, (child_id.clone(), status.clone()));
+                        child_id
+                    })
+            } else {
+                Ok(previous.expect("checked above").0)
+            };
+            match child {
+                Ok(child_session_id) => {
+                    persist_sub_session_event(&sink.event_store, &child_session_id, sub_event);
+                    if needs_update {
+                        send_event(
+                            &sink,
+                            ChatEventV1::new(
+                                "sub_session",
+                                run_id,
+                                session_id,
+                                sequence,
+                                Some(serde_json::json!({
+                                    "session_id": child_session_id,
+                                    "status": status,
+                                    "parent_call_id": sub_event.parent_tool_call_id,
+                                })),
+                            ),
+                        )
+                        .await;
+                        sequence += 1;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to register web sub-session"),
+            }
+            continue;
+        }
         match event_mapper.map(&runtime, session_id, event) {
             WebEventMap::Emit(kind, data) => {
                 send_event(
@@ -1275,9 +1821,15 @@ async fn run_turn(
                 .await;
                 sequence += 1;
             }
-            WebEventMap::Done => break,
+            WebEventMap::Finish(status) => {
+                final_status = status;
+                break;
+            }
             WebEventMap::Skip => {}
         }
+    }
+    if final_status != "error" {
+        final_status = event_mapper.terminal_status;
     }
 
     send_event(
@@ -1294,7 +1846,13 @@ async fn run_turn(
     sequence += 1;
     send_event(
         &sink,
-        ChatEventV1::new("run_finished", run_id, session_id, sequence, None),
+        ChatEventV1::new(
+            "run_finished",
+            run_id,
+            session_id,
+            sequence,
+            Some(serde_json::json!({"status": final_status})),
+        ),
     )
     .await;
 }
@@ -1334,153 +1892,13 @@ async fn fork_web_session_command(
     Ok(fork)
 }
 
-struct StreamingToolCall {
-    name: String,
-    arguments: String,
-    last_emit: Instant,
-}
-
-fn streaming_tool_progress(id: &str, call: &StreamingToolCall) -> Option<bot_core::PrettyToolCall> {
-    match call.name.as_str() {
-        "fs_write" | "fs_create" => {
-            let path = partial_json_string(&call.arguments, "path", 160)
-                .map(|value| value.value)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "文件".to_string());
-            let content_bytes = partial_json_string(&call.arguments, "content", 0)
-                .map(|value| value.unescaped_bytes)
-                .unwrap_or(0);
-            let verb = if call.name == "fs_create" {
-                "创建"
-            } else {
-                "写入"
-            };
-            Some(bot_core::PrettyToolCall {
-                id: id.to_string(),
-                tool_name: call.name.clone(),
-                title: format!("{verb} {path}"),
-                summary: if content_bytes == 0 {
-                    "正在生成写入内容".to_string()
-                } else {
-                    format!("已生成 {} 内容", format_bytes(content_bytes))
-                },
-                status: bot_core::PrettyToolStatus::Running,
-                elapsed_ms: None,
-                request: serde_json::Value::Object(serde_json::Map::new()),
-                response: None,
-            })
-        }
-        _ => None,
-    }
-}
-
-struct PartialJsonString {
-    value: String,
-    unescaped_bytes: usize,
-}
-
-fn partial_json_string(input: &str, key: &str, value_limit: usize) -> Option<PartialJsonString> {
-    let needle = format!("\"{key}\"");
-    let start = input.find(&needle)? + needle.len();
-    let bytes = input.as_bytes();
-    let mut index = start;
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if bytes.get(index) != Some(&b':') {
-        return None;
-    }
-    index += 1;
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if bytes.get(index) != Some(&b'"') {
-        return None;
-    }
-    index += 1;
-
-    let mut value = String::new();
-    let mut unescaped_bytes = 0usize;
-    let mut escaped = false;
-    let mut unicode_remaining = 0usize;
-    while index < input.len() {
-        let ch = input[index..].chars().next()?;
-        index += ch.len_utf8();
-        if unicode_remaining > 0 {
-            unicode_remaining -= 1;
-            if unicode_remaining == 0 {
-                unescaped_bytes += 1;
-                if value.len() < value_limit {
-                    value.push('?');
-                }
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            match ch {
-                '"' | '\\' | '/' => {
-                    unescaped_bytes += ch.len_utf8();
-                    if value.len() < value_limit {
-                        value.push(ch);
-                    }
-                }
-                'b' | 'f' | 'n' | 'r' | 't' => {
-                    unescaped_bytes += 1;
-                    if value.len() < value_limit {
-                        value.push(match ch {
-                            'n' => '\n',
-                            'r' => '\r',
-                            't' => '\t',
-                            _ => ' ',
-                        });
-                    }
-                }
-                'u' => {
-                    unicode_remaining = 4;
-                }
-                _ => {
-                    unescaped_bytes += ch.len_utf8();
-                    if value.len() < value_limit {
-                        value.push(ch);
-                    }
-                }
-            }
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => break,
-            _ => {
-                unescaped_bytes += ch.len_utf8();
-                if value.len() < value_limit {
-                    value.push(ch);
-                }
-            }
-        }
-    }
-    Some(PartialJsonString {
-        value,
-        unescaped_bytes,
-    })
-}
-
-fn format_bytes(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} 字节")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        stats_payload, streaming_tool_progress, StreamingToolCall, WebCoreEventMapper, WebEventMap,
+        protocol_event_payload, stats_payload, ChatEventV1, SessionEventStore, WebCoreEventMapper,
+        WebEventMap,
     };
     use bot_core::TokenUsage;
 
@@ -1509,22 +1927,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_tool_progress_extracts_partial_write_summary() {
-        let call = StreamingToolCall {
-            name: "fs_write".to_string(),
-            arguments: r#"{"path":"src/lib.rs","content":"hello world"}"#.to_string(),
-            last_emit: Instant::now(),
-        };
-
-        let pretty = streaming_tool_progress("call-1", &call).expect("progress");
-
-        assert_eq!(pretty.id, "call-1");
-        assert_eq!(pretty.tool_name, "fs_write");
-        assert_eq!(pretty.title, "写入 src/lib.rs");
-        assert_eq!(pretty.summary, "已生成 11 字节 内容");
-    }
-
-    #[test]
     fn web_mapper_tracks_stats_for_final_payload() {
         let mut mapper = WebCoreEventMapper::new(1000, Instant::now());
 
@@ -1544,5 +1946,57 @@ mod tests {
         let final_payload = mapper.stats_payload();
         assert_eq!(final_payload["prompt_tokens"], 100);
         assert_eq!(final_payload["completion_tokens"], 25);
+    }
+
+    #[test]
+    fn session_event_store_persists_monotonic_sequences() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionEventStore::new(data_dir.path());
+        let first = store
+            .append(ChatEventV1::new(
+                "text_delta",
+                "run-1",
+                "session-1",
+                99,
+                None,
+            ))
+            .expect("first event");
+        let second = store
+            .append(ChatEventV1::new(
+                "run_finished",
+                "run-1",
+                "session-1",
+                0,
+                None,
+            ))
+            .expect("second event");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 1);
+
+        let reloaded = SessionEventStore::new(data_dir.path());
+        let third = reloaded
+            .append(ChatEventV1::new(
+                "run_started",
+                "run-2",
+                "session-1",
+                0,
+                None,
+            ))
+            .expect("third event");
+        assert_eq!(third.sequence, 2);
+        assert_eq!(reloaded.read("session-1").expect("read").len(), 3);
+    }
+
+    #[test]
+    fn sub_session_protocol_events_use_raw_web_shapes() {
+        let event = remi_agentloop::prelude::ProtocolEvent::ToolCallDelta {
+            id: "call-1".to_string(),
+            arguments_delta: "{\"path\":".to_string(),
+        };
+        let (kind, payload) = protocol_event_payload(&event);
+        assert_eq!(kind, "tool_call_arguments_delta");
+        assert_eq!(payload["call_id"], "call-1");
+        assert_eq!(payload["delta"], "{\"path\":");
+        assert!(payload.get("pretty").is_none());
     }
 }
