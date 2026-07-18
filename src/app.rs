@@ -472,11 +472,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     if cli.tui {
         let workspace = std::env::current_dir().context("resolving TUI workspace")?;
+        let (credentials, application_secret_store) = {
+            let store = secret_store.lock().await;
+            (store.entries()?, store.clone())
+        };
         let mut builder = crate::application::ApplicationBuilder::new(data_dir.clone())
             .app_id("remi-cat")
             .workspace(workspace)
-            .credentials(secret_store.lock().await.entries()?)
-            .secret_store(secret_store.lock().await.clone())
+            .credentials(credentials)
+            .secret_store(application_secret_store)
             .default_agent(root_agent_id.clone());
         if telemetry_enabled {
             if let Some(dsn) = crate::telemetry::builtin_dsn() {
