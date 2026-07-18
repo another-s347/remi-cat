@@ -1,19 +1,30 @@
 use std::collections::HashMap;
+use std::io::{Read as _, Seek as _};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Context;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-use crate::cli::{FeedbackCommand, GitHubIssueCreateRequest, GitHubIssueCreateResponse};
+use crate::cli::FeedbackCommand;
 use crate::command::sandbox_doctor_report;
 use crate::config::{detect_setup_state, SetupState};
 use crate::instance_profile::InstanceProfile;
 use crate::secret_store::{redaction_entries, SecretStore};
 
-const DEFAULT_FEEDBACK_REPO: &str = "another-s347/remi-cat";
-const GITHUB_API_VERSION: &str = "2026-03-10";
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_BODY_CHARS: usize = 16_000;
+const MAX_LABELS: usize = 10;
+const MAX_LABEL_CHARS: usize = 64;
+const MAX_LOG_BYTES_PER_FILE: u64 = 64 * 1024;
+const FEEDBACK_PER_HOUR: usize = 3;
+const FEEDBACK_PER_DAY: usize = 10;
+const HOUR_SECS: u64 = 60 * 60;
+const DAY_SECS: u64 = 24 * HOUR_SECS;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct FeedbackRateState {
+    submitted_at: Vec<u64>,
+}
 
 pub(crate) async fn run_feedback_command(
     store: Arc<Mutex<SecretStore>>,
@@ -21,69 +32,97 @@ pub(crate) async fn run_feedback_command(
     data_dir: &Path,
     command: FeedbackCommand,
 ) -> anyhow::Result<()> {
-    let repo = feedback_repo(command.repo.as_deref())?;
+    validate_feedback(&command)?;
     let secret_entries = store.lock().await.entries()?;
     let redactions = redaction_entries(&secret_entries);
-    let body = build_feedback_issue_body(
-        &command.body,
-        profile,
-        data_dir,
-        command.include_logs,
-        &redactions,
+    let body = truncate_chars_owned(
+        build_feedback_issue_body(
+            &command.body,
+            profile,
+            data_dir,
+            command.include_logs,
+            &redactions,
+        ),
+        MAX_BODY_CHARS,
     );
-    let payload = GitHubIssueCreateRequest {
-        title: command.title,
-        body,
-        labels: command.labels,
-    };
-
     if command.dry_run {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        println!("repo: {repo}");
-        return Ok(());
-    }
-
-    let Some(token) = github_issue_token(&secret_entries) else {
-        let url = github_new_issue_url(&repo, &payload);
-        println!("GitHub token not found; open this URL to create the issue:");
-        println!("{url}");
         println!(
-            "To submit directly, set GITHUB_TOKEN, GH_TOKEN, or REMI_GITHUB_TOKEN with Issues: write permission."
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "title": command.title,
+                "body": body,
+                "labels": command.labels,
+            }))?
         );
         return Ok(());
-    };
-
-    let response = create_github_issue(&repo, &token, &payload).await?;
-    println!(
-        "Created GitHub issue #{}: {}",
-        response.number, response.html_url
-    );
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock is before the Unix epoch"))?
+        .as_secs();
+    reserve_feedback_slot(data_dir, now)?;
+    let event_id = crate::telemetry::capture_feedback(
+        &command.title,
+        &body,
+        &command.labels,
+        profile.label(),
+    )?;
+    println!("Submitted feedback to Sentry: {event_id}");
     Ok(())
 }
 
-pub(crate) fn feedback_repo(override_repo: Option<&str>) -> anyhow::Result<String> {
-    let repo = override_repo
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("REMI_FEEDBACK_REPO").ok())
-        .unwrap_or_else(|| DEFAULT_FEEDBACK_REPO.to_string());
-    let repo = repo.trim().trim_start_matches('/').trim_end_matches('/');
-    let parts = repo.split('/').collect::<Vec<_>>();
-    if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
-        anyhow::bail!("invalid GitHub repo `{repo}`; expected owner/repo");
+fn validate_feedback(command: &FeedbackCommand) -> anyhow::Result<()> {
+    let title_len = command.title.chars().count();
+    let body_len = command.body.chars().count();
+    anyhow::ensure!(
+        title_len <= MAX_TITLE_CHARS,
+        "feedback title is too long ({title_len}/{MAX_TITLE_CHARS} characters)"
+    );
+    anyhow::ensure!(
+        body_len <= MAX_BODY_CHARS,
+        "feedback body is too long ({body_len}/{MAX_BODY_CHARS} characters)"
+    );
+    anyhow::ensure!(
+        command.labels.len() <= MAX_LABELS,
+        "too many feedback labels ({}/{MAX_LABELS})",
+        command.labels.len()
+    );
+    for label in &command.labels {
+        let len = label.chars().count();
+        anyhow::ensure!(
+            len <= MAX_LABEL_CHARS,
+            "feedback label is too long ({len}/{MAX_LABEL_CHARS} characters)"
+        );
     }
-    Ok(repo.to_string())
+    Ok(())
 }
 
-fn github_issue_token(secrets: &std::collections::BTreeMap<String, String>) -> Option<String> {
-    ["GITHUB_TOKEN", "GH_TOKEN", "REMI_GITHUB_TOKEN"]
+fn reserve_feedback_slot(data_dir: &Path, now: u64) -> anyhow::Result<()> {
+    let state_dir = data_dir.join("telemetry");
+    let state_path = state_dir.join("feedback-rate.json");
+    let mut state = match std::fs::read(&state_path) {
+        Ok(bytes) => serde_json::from_slice::<FeedbackRateState>(&bytes).unwrap_or_default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FeedbackRateState::default(),
+        Err(error) => return Err(error.into()),
+    };
+    state
+        .submitted_at
+        .retain(|timestamp| now.saturating_sub(*timestamp) < DAY_SECS);
+    let hourly = state
+        .submitted_at
         .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .or_else(|| secrets.get(*key).cloned())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+        .filter(|timestamp| now.saturating_sub(**timestamp) < HOUR_SECS)
+        .count();
+    anyhow::ensure!(
+        hourly < FEEDBACK_PER_HOUR && state.submitted_at.len() < FEEDBACK_PER_DAY,
+        "feedback rate limit reached; try again later"
+    );
+    state.submitted_at.push(now);
+    std::fs::create_dir_all(&state_dir)?;
+    let temporary = state_dir.join(format!("feedback-rate-{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(&state)?)?;
+    std::fs::rename(temporary, state_path)?;
+    Ok(())
 }
 
 fn build_feedback_issue_body(
@@ -133,7 +172,7 @@ fn collect_feedback_logs(
 ) -> String {
     let mut sections = Vec::new();
     for path in [profile.log_file(), profile.log_dir().join("tui.log")] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = read_log_tail(&path) {
             let redacted = redact_known_secrets(&text, redactions);
             sections.push(format!(
                 "== {} ==\n{}",
@@ -143,6 +182,24 @@ fn collect_feedback_logs(
         }
     }
     sections.join("\n\n")
+}
+
+fn read_log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > MAX_LOG_BYTES_PER_FILE {
+        file.seek(std::io::SeekFrom::Start(len - MAX_LOG_BYTES_PER_FILE))?;
+    }
+    let mut bytes = Vec::with_capacity(len.min(MAX_LOG_BYTES_PER_FILE) as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn truncate_chars_owned(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    value.chars().take(max_chars).collect()
 }
 
 pub(crate) fn redact_known_secrets(text: &str, redactions: &HashMap<String, String>) -> String {
@@ -161,60 +218,41 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-async fn create_github_issue(
-    repo: &str,
-    token: &str,
-    payload: &GitHubIssueCreateRequest,
-) -> anyhow::Result<GitHubIssueCreateResponse> {
-    let url = format!("https://api.github.com/repos/{repo}/issues");
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .header(reqwest::header::USER_AGENT, "remi-cat")
-        .bearer_auth(token)
-        .json(payload)
-        .send()
-        .await
-        .with_context(|| format!("failed to create GitHub issue at {url}"))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub issue creation failed with HTTP {status}: {body}");
-    }
-
-    response
-        .json::<GitHubIssueCreateResponse>()
-        .await
-        .context("failed to parse GitHub issue response")
-}
-
-pub(crate) fn github_new_issue_url(repo: &str, payload: &GitHubIssueCreateRequest) -> String {
-    let mut url = format!(
-        "https://github.com/{repo}/issues/new?title={}&body={}",
-        percent_encode_query(&payload.title),
-        percent_encode_query(&payload.body)
-    );
-    if !payload.labels.is_empty() {
-        url.push_str("&labels=");
-        url.push_str(&percent_encode_query(&payload.labels.join(",")));
-    }
-    url
-}
-
-pub(crate) fn percent_encode_query(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            b' ' => out.push('+'),
-            byte => out.push_str(&format!("%{byte:02X}")),
+    #[test]
+    fn feedback_rate_limit_has_hourly_and_daily_caps() {
+        let directory = tempfile::tempdir().unwrap();
+        for second in 0..FEEDBACK_PER_HOUR {
+            reserve_feedback_slot(directory.path(), second as u64).unwrap();
         }
+        assert!(reserve_feedback_slot(directory.path(), 10).is_err());
+
+        for hour in 1..=(FEEDBACK_PER_DAY - FEEDBACK_PER_HOUR) {
+            reserve_feedback_slot(directory.path(), hour as u64 * HOUR_SECS).unwrap();
+        }
+        assert!(reserve_feedback_slot(directory.path(), 23 * HOUR_SECS).is_err());
     }
-    out
+
+    #[test]
+    fn feedback_payload_is_bounded() {
+        let command = FeedbackCommand {
+            title: "x".repeat(MAX_TITLE_CHARS + 1),
+            body: "body".into(),
+            labels: Vec::new(),
+            include_logs: false,
+            dry_run: false,
+        };
+        assert!(validate_feedback(&command).is_err());
+
+        let oversized = format!("prefix{}", "x".repeat(MAX_BODY_CHARS * 2));
+        assert_eq!(
+            truncate_chars_owned(oversized, MAX_BODY_CHARS)
+                .chars()
+                .count(),
+            MAX_BODY_CHARS
+        );
+    }
 }

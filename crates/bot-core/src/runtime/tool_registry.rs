@@ -109,5 +109,8 @@ pub(super) fn build_subagent_tools(
     skill::register_skill_tools(&mut local_tools, Arc::clone(&deps.skill_store));
     todo::register_todo_tools(&mut local_tools, Arc::clone(&deps.todo_backend));
     register_runtime_tools(&mut local_tools, deps, &profile.id, true);
+    for tool in &deps.host_tools {
+        local_tools.register(tool.clone());
+    }
     local_tools
 }

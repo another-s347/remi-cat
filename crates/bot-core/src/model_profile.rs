@@ -693,6 +693,21 @@ pub fn api_key_from_env(profile: &ModelProfileConfig) -> Result<String> {
     bail!("{} must be set", keys.join(" or "))
 }
 
+pub fn api_key_from_values(
+    profile: &ModelProfileConfig,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let keys = api_key_env_keys_for_profile(profile);
+    for key in &keys {
+        if let Some(value) = values.get(key).map(|value| value.trim()) {
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    bail!("{} must be set", keys.join(" or "))
+}
+
 pub async fn validate_model_profile_api_key(profile: &ModelProfileConfig) -> Result<()> {
     let api_key = api_key_from_env(profile)?;
     let endpoint = format!(
@@ -1465,5 +1480,18 @@ auto_compress: true
             std::env::set_var("OPENAI_API_KEY", "openai-key");
         }
         assert_eq!(api_key_from_env(&profile).unwrap(), "openai-key");
+    }
+
+    #[test]
+    fn explicit_api_key_values_do_not_read_process_environment() {
+        let profile = test_profile(Some("openai"), "gpt-4o", Some("https://api.openai.com/v1"));
+        let values = std::collections::BTreeMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "application-key".to_string(),
+        )]);
+        assert_eq!(
+            api_key_from_values(&profile, &values).unwrap(),
+            "application-key"
+        );
     }
 }

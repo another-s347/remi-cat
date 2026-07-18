@@ -24,6 +24,7 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 - For profile deletion, require `--force` only when the user clearly requested deletion.
 - For background instances, use `profile status <name>` before `profile stop`, `profile restart`, or `profile delete`.
 - Use `manage_yourself` for Remi CLI commands. It only supports one argument shape: `{"command":"profile list"}`.
+- Telemetry for the active profile can be inspected or changed with `{"command":"telemetry status"}`, `telemetry enable`, and `telemetry disable`.
 - Use help through `manage_yourself` when unsure about syntax, for example `{"command":"help"}` or `{"command":"profile agent --help"}`.
 - Current-session runtime settings use slash commands in chat. To change reasoning strength for the active session, tell the user or runtime to run `/model reasoning set <auto|none|minimal|low|medium|high|xhigh|max>`; use `/model reasoning reset` to return to the model profile default.
 - Use `{"command":"tools --json"}` before adding tools to an agent profile. It lists all runtime-known tools, ignores the active allowlist, and includes configuration warnings/errors.

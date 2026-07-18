@@ -162,31 +162,20 @@ impl TuiApp {
     }
 
     fn status_context_parts(&self) -> Vec<String> {
-        let (model_profile_id, agent_id) = self
-            .runtime
-            .sessions
-            .try_lock()
-            .ok()
-            .map(|sessions| {
-                (
-                    sessions.metadata_string(&self.session_id, SESSION_MODEL_PROFILE_METADATA_KEY),
-                    sessions.metadata_string(&self.session_id, SESSION_AGENT_ID_METADATA_KEY),
-                )
-            })
-            .unwrap_or((None, None));
-        let effective_agent = self
-            .runtime
-            .bot
-            .effective_agent_profile(agent_id.as_deref());
-        let effective_model = self.runtime.bot.effective_model_profile_for_agent(
-            model_profile_id.as_deref(),
-            &effective_agent.profile,
-        );
+        let agent_id = self
+            .catalog
+            .agents
+            .first()
+            .map(|profile| profile.id.as_str())
+            .unwrap_or("default");
+        let model_id = self
+            .catalog
+            .models
+            .first()
+            .map(|profile| profile.id.as_str())
+            .unwrap_or("default");
         let mut parts = vec![
-            format!(
-                "model {}/{}",
-                effective_agent.profile.id, effective_model.profile.id
-            ),
+            format!("model {agent_id}/{model_id}"),
             self.git_status
                 .as_ref()
                 .map(|status| format!("git {status}"))
@@ -200,7 +189,11 @@ impl TuiApp {
             self.status.prompt_tokens,
             self.status.completion_tokens,
             self.status.max_prompt_tokens,
-            effective_model.profile.context_tokens,
+            self.catalog
+                .models
+                .first()
+                .map(|profile| profile.context_tokens)
+                .unwrap_or(0),
         ) {
             parts.insert(1, format!("ctx {pct}%"));
         }

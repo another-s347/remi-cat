@@ -78,12 +78,25 @@ jobs:
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Require embedded Sentry DSN
+        shell: bash
+        env:
+          REMI_SENTRY_DSN: ${{ secrets.REMI_SENTRY_DSN }}
+          REMI_SENTRY_FEEDBACK_DSN: ${{ secrets.REMI_SENTRY_FEEDBACK_DSN }}
+        run: test -n "$REMI_SENTRY_DSN" && test -n "$REMI_SENTRY_FEEDBACK_DSN"
+
       - name: Build release binary
         if: runner.os != 'Linux'
+        env:
+          REMI_SENTRY_DSN: ${{ secrets.REMI_SENTRY_DSN }}
+          REMI_SENTRY_FEEDBACK_DSN: ${{ secrets.REMI_SENTRY_FEEDBACK_DSN }}
         run: cargo build --release --target ${{ matrix.target }} -p remi-cat
 
       - name: Build release binary (Linux musl, no keyring)
         if: runner.os == 'Linux'
+        env:
+          REMI_SENTRY_DSN: ${{ secrets.REMI_SENTRY_DSN }}
+          REMI_SENTRY_FEEDBACK_DSN: ${{ secrets.REMI_SENTRY_FEEDBACK_DSN }}
         run: >
           cargo build --release --target ${{ matrix.target }} -p remi-cat --no-default-features
 

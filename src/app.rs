@@ -21,13 +21,11 @@ pub(crate) use crate::cli::{
 #[cfg(test)]
 pub(crate) use crate::cli::{parse_command, parse_global_args};
 #[cfg(test)]
-pub(crate) use crate::cli::{
-    CodexCommand, FeedbackCommand, GitHubIssueCreateRequest, HooksCommand,
-};
+pub(crate) use crate::cli::{CodexCommand, FeedbackCommand, HooksCommand, TelemetryCommand};
 #[cfg(test)]
 pub(crate) use crate::command::{
-    build_cargo_install_args, feedback_repo, github_new_issue_url, normalize_release_tag,
-    parse_release_version, percent_encode_query, redact_known_secrets, update_available,
+    build_cargo_install_args, normalize_release_tag, parse_release_version, redact_known_secrets,
+    update_available,
 };
 #[cfg(test)]
 pub(crate) use crate::command::{
@@ -117,6 +115,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     };
     let _ = dotenvy::dotenv();
     let tool_output_overflow_bytes = parsed.tool_output_overflow_bytes;
+    let no_telemetry = parsed.no_telemetry;
     let command = parsed.command;
     let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
     let acp_agent_mode = matches!(&command, AppCommand::Acp(AcpCommand::Agent));
@@ -137,6 +136,32 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         ensure_builtin_diagnostic_profile()?;
     }
     let mut data_dir = selected_profile.data_dir.clone();
+    let profile_telemetry_enabled = match detect_setup_state(&data_dir) {
+        SetupState::Initialized { config, .. } => config.telemetry.enabled,
+        _ => true,
+    };
+    let explicit_feedback = matches!(&command, AppCommand::Feedback(command) if !command.dry_run);
+    let telemetry_enabled = effective_telemetry_enabled(
+        profile_telemetry_enabled,
+        no_telemetry,
+        crate::telemetry::builtin_dsn().is_some(),
+        explicit_feedback,
+    );
+    let surface = command_surface(&command);
+    let _observability_guard = init_observability(
+        matches!(
+            &command,
+            AppCommand::Run(cli) if cli.tui
+        ),
+        acp_agent_mode,
+        &data_dir,
+        telemetry_enabled
+            .then(crate::telemetry::builtin_dsn)
+            .flatten(),
+        selected_profile.label(),
+        surface,
+    )?;
+    let result: anyhow::Result<()> = async {
     std::fs::create_dir_all(&data_dir)?;
     let secret_store = Arc::new(Mutex::new(if tui_mode || acp_agent_mode {
         SecretStore::from_env_with_default_dotenv_path(data_dir.join(".env"))
@@ -146,14 +171,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let secret_backend_label = secret_store.lock().await.backend_label();
     let startup_secrets = secret_store.lock().await.entries()?;
     apply_entries_to_env(&startup_secrets);
-    let _observability_guard = init_observability(
-        matches!(
-            &command,
-            AppCommand::Run(cli) if cli.tui
-        ),
-        acp_agent_mode,
-        &data_dir,
-    )?;
     tracing::info!(backend = secret_backend_label, "secret store initialized");
     tracing::info!(
         tui_mode,
@@ -211,6 +228,44 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .map(|entry| prefix_short_config_entry("sandbox", entry))
                 .collect::<Vec<_>>();
             apply_runtime_config_entries(&selected_profile, &data_dir, &entries, false).await?;
+            return Ok(());
+        }
+        AppCommand::Telemetry(command) => {
+            match command {
+                crate::cli::TelemetryCommand::Status => {
+                    println!("profile: {}", selected_profile.label());
+                    println!("configured: {profile_telemetry_enabled}");
+                    println!("process_override_disabled: {no_telemetry}");
+                    println!(
+                        "embedded_dsn: {}",
+                        crate::telemetry::builtin_dsn().is_some()
+                    );
+                    println!(
+                        "effective: {}",
+                        profile_telemetry_enabled
+                            && !no_telemetry
+                            && crate::telemetry::builtin_dsn().is_some()
+                    );
+                }
+                crate::cli::TelemetryCommand::Enable => {
+                    apply_runtime_config_entries(
+                        &selected_profile,
+                        &data_dir,
+                        &["telemetry.enabled=true".to_string()],
+                        false,
+                    )
+                    .await?;
+                }
+                crate::cli::TelemetryCommand::Disable => {
+                    apply_runtime_config_entries(
+                        &selected_profile,
+                        &data_dir,
+                        &["telemetry.enabled=false".to_string()],
+                        false,
+                    )
+                    .await?;
+                }
+            }
             return Ok(());
         }
         AppCommand::Profile(_) => unreachable!(),
@@ -415,6 +470,25 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.tui {
+        let workspace = std::env::current_dir().context("resolving TUI workspace")?;
+        let mut builder = crate::application::ApplicationBuilder::new(data_dir.clone())
+            .app_id("remi-cat")
+            .workspace(workspace)
+            .credentials(secret_store.lock().await.entries()?)
+            .secret_store(secret_store.lock().await.clone())
+            .default_agent(root_agent_id.clone());
+        if telemetry_enabled {
+            if let Some(dsn) = crate::telemetry::builtin_dsn() {
+                builder = builder.sentry_dsn(dsn);
+            }
+        }
+        let application = builder.spawn().await?;
+        return crate::channel::tui::TuiChannel::new(cli)
+            .run_once(application)
+            .await;
+    }
+
     let im_disabled = matches!(im_mode_from_env(), ImMode::Disabled);
     let gateway = if im_disabled || cli.enabled || cli.tui || cli.once.is_some() {
         None
@@ -479,11 +553,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     local_set
         .run_until(async move {
             tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
-            if cli.tui {
-                return crate::channel::tui::TuiChannel::new(cli)
-                    .run_once(runtime)
-                    .await;
-            }
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
                     process_prompt_message(Rc::clone(&runtime), &cli, message).await?;
@@ -511,6 +580,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
         })
         .await
+    }
+    .await;
+    if let Err(error) = &result {
+        crate::telemetry::capture_anyhow_if_system(error, "cli.top-level");
+    }
+    result
 }
 
 fn resolve_instance_profile(
@@ -685,21 +760,23 @@ fn init_observability(
     tui_enabled: bool,
     stdio_json: bool,
     data_dir: &Path,
-) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    let _sentry_guard = sentry::init((
-        std::env::var("SENTRY_DSN").unwrap_or_default(),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            ..Default::default()
-        },
-    ));
+    sentry_dsn: Option<&str>,
+    profile: &str,
+    surface: &str,
+) -> anyhow::Result<ObservabilityGuard> {
+    let sentry = sentry_dsn
+        .map(|dsn| crate::telemetry::CliTelemetryGuard::init(dsn, profile, surface))
+        .transpose()?;
     use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "remi_cat=info,bot_core=info,im_feishu=info".into());
 
     if tui_enabled || stdio_json {
         let log_dir = data_dir.join("logs");
-        std::fs::create_dir_all(&log_dir)?;
+        if let Err(error) = std::fs::create_dir_all(&log_dir) {
+            crate::telemetry::capture_system_error(error.to_string(), "observability.log-dir");
+            return Err(error.into());
+        }
         let file_name = if stdio_json { "acp.log" } else { "tui.log" };
         let file_appender = tracing_appender::rolling::never(log_dir, file_name);
         let (writer, guard) = tracing_appender::non_blocking(file_appender);
@@ -710,32 +787,81 @@ fn init_observability(
                     .with_writer(writer)
                     .with_filter(filter),
             )
-            .with(sentry::integrations::tracing::layer())
+            .with(
+                sentry::integrations::tracing::layer().event_filter(|metadata| {
+                    if *metadata.level() == tracing::Level::ERROR {
+                        sentry::integrations::tracing::EventFilter::Event
+                    } else {
+                        sentry::integrations::tracing::EventFilter::Ignore
+                    }
+                }),
+            )
             .init();
-        Ok(Some(guard))
+        Ok(ObservabilityGuard {
+            _sentry: sentry,
+            _log_writer: Some(guard),
+        })
     } else {
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_filter(filter))
-            .with(sentry::integrations::tracing::layer())
+            .with(
+                sentry::integrations::tracing::layer().event_filter(|metadata| {
+                    if *metadata.level() == tracing::Level::ERROR {
+                        sentry::integrations::tracing::EventFilter::Event
+                    } else {
+                        sentry::integrations::tracing::EventFilter::Ignore
+                    }
+                }),
+            )
             .init();
-        Ok(None)
+        Ok(ObservabilityGuard {
+            _sentry: sentry,
+            _log_writer: None,
+        })
     }
+}
+
+struct ObservabilityGuard {
+    // Both guards must live until the command exits: dropping ClientInitGuard
+    // disables Sentry and flushes pending events.
+    _sentry: Option<crate::telemetry::CliTelemetryGuard>,
+    _log_writer: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+fn command_surface(command: &AppCommand) -> &'static str {
+    match command {
+        AppCommand::Run(cli) if cli.tui => "tui",
+        AppCommand::Run(_) => "cli",
+        AppCommand::Acp(_) | AppCommand::AcpAdapter(_) => "acp",
+        AppCommand::Feishu(_) => "feishu",
+        AppCommand::Feedback(_) => "feedback",
+        _ => "cli-command",
+    }
+}
+
+fn effective_telemetry_enabled(
+    profile_enabled: bool,
+    process_disabled: bool,
+    dsn_available: bool,
+    explicit_feedback: bool,
+) -> bool {
+    dsn_available && (explicit_feedback || (profile_enabled && !process_disabled))
 }
 
 #[cfg(test)]
 mod cli_tests {
     use super::{
         build_cargo_install_args, extract_first_url, extract_lark_cli_config_from_json,
-        feedback_repo, feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
+        feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
         first_available_port, format_context_compaction_line, format_feishu_tool_line,
-        github_new_issue_url, is_goal_set_command, normalize_release_tag, parse_cli_args,
-        parse_command, parse_global_args, parse_goal_max_rounds, parse_release_version,
-        parse_workflow_start_options, percent_encode_query, prefix_short_config_entry,
-        redact_known_secrets, run_streaming_command, run_streaming_command_with_stdin,
+        is_goal_set_command, normalize_release_tag, parse_cli_args, parse_command,
+        parse_global_args, parse_goal_max_rounds, parse_release_version,
+        parse_workflow_start_options, prefix_short_config_entry, redact_known_secrets,
+        run_streaming_command, run_streaming_command_with_stdin,
         should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
         AcpAdapterCommand, AcpCommand, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, GitHubIssueCreateRequest, HooksCommand,
-        ProfileCommand, UpdateCommand,
+        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, HooksCommand, ProfileCommand,
+        TelemetryCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
     use crate::profile_command::{
@@ -1555,22 +1681,42 @@ mod cli_tests {
     }
 
     #[test]
-    fn issue_create_command_reuses_feedback_flow() {
+    fn telemetry_commands_and_process_override_are_recognized() {
         assert!(matches!(
-            parse_command(&args(&[
-                "issue",
-                "create",
-                "--title=Install fails",
-                "--repo",
-                "owner/project",
-                "--no-default-label",
-            ]))
-            .unwrap(),
-            AppCommand::Feedback(FeedbackCommand { title, repo, labels, .. })
-                if title == "Install fails"
-                    && repo.as_deref() == Some("owner/project")
-                    && labels.is_empty()
+            parse_command(&args(&["telemetry", "disable"])).unwrap(),
+            AppCommand::Telemetry(TelemetryCommand::Disable)
         ));
+        assert!(matches!(
+            parse_command(&args(&["telemetry", "enable"])).unwrap(),
+            AppCommand::Telemetry(TelemetryCommand::Enable)
+        ));
+        let parsed = parse_cli_args(&args(&["--no-telemetry", "telemetry", "status"])).unwrap();
+        assert!(parsed.no_telemetry);
+        assert!(matches!(
+            parsed.command,
+            AppCommand::Telemetry(TelemetryCommand::Status)
+        ));
+    }
+
+    #[test]
+    fn telemetry_precedence_allows_explicit_feedback_only() {
+        assert!(!super::effective_telemetry_enabled(true, true, true, false));
+        assert!(!super::effective_telemetry_enabled(
+            false, false, true, false
+        ));
+        assert!(!super::effective_telemetry_enabled(
+            true, false, false, false
+        ));
+        assert!(super::effective_telemetry_enabled(false, true, true, true));
+        assert!(!super::effective_telemetry_enabled(
+            false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn legacy_github_feedback_flags_and_issue_alias_are_rejected() {
+        assert!(parse_command(&args(&["feedback", "--title", "bug", "--repo", "o/r"])).is_err());
+        assert!(parse_command(&args(&["issue", "create", "--title", "bug"])).is_err());
     }
 
     #[test]
@@ -1580,30 +1726,6 @@ mod cli_tests {
             AppCommand::Feedback(FeedbackCommand { title, body, .. })
                 if title == "short message" && body == "short message"
         ));
-    }
-
-    #[test]
-    fn github_issue_url_is_prefilled_and_encoded() {
-        let payload = GitHubIssueCreateRequest {
-            title: "A bug & a fix".to_string(),
-            body: "line 1\nline 2".to_string(),
-            labels: args(&["feedback", "bug"]),
-        };
-
-        let url = github_new_issue_url("owner/repo", &payload);
-
-        assert!(url.starts_with("https://github.com/owner/repo/issues/new?"));
-        assert!(url.contains("title=A+bug+%26+a+fix"));
-        assert!(url.contains("body=line+1%0Aline+2"));
-        assert!(url.contains("labels=feedback%2Cbug"));
-        assert_eq!(percent_encode_query("你好"), "%E4%BD%A0%E5%A5%BD");
-    }
-
-    #[test]
-    fn feedback_repo_validates_owner_repo() {
-        assert_eq!(feedback_repo(Some("owner/repo")).unwrap(), "owner/repo");
-        assert!(feedback_repo(Some("owner")).is_err());
-        assert!(feedback_repo(Some("owner/repo/extra")).is_err());
     }
 
     #[test]

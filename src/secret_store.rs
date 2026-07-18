@@ -25,6 +25,12 @@ pub struct SecretStore {
 }
 
 impl SecretStore {
+    pub(crate) fn dotenv(path: impl Into<PathBuf>) -> Self {
+        Self {
+            backend: SecretBackend::Dotenv { path: path.into() },
+        }
+    }
+
     pub fn from_env() -> Self {
         Self::from_env_with_default_dotenv_path(PathBuf::from(".env"))
     }

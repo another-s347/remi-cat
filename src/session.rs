@@ -58,6 +58,29 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    pub fn patch(
+        &mut self,
+        session_id: &str,
+        root_agent_id: Option<&str>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+        remove_metadata: &[String],
+    ) -> Result<Option<Session>> {
+        let Some(session) = self.store.sessions.get_mut(session_id) else {
+            return Ok(None);
+        };
+        if let Some(root_agent_id) = root_agent_id {
+            session.root_agent_id = root_agent_id.to_string();
+        }
+        for key in remove_metadata {
+            session.metadata.remove(key);
+        }
+        session.metadata.extend(metadata);
+        session.updated_at = Utc::now().to_rfc3339();
+        let result = session.clone();
+        self.save()?;
+        Ok(Some(result))
+    }
+
     pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let path = data_dir.into().join("sessions.json");
         let store = match std::fs::read_to_string(&path) {
@@ -782,6 +805,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn separate_data_directories_isolate_session_stores() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let mut left_store = SessionRuntime::load(left.path()).unwrap();
+        let mut right_store = SessionRuntime::load(right.path()).unwrap();
+        let left_id = left_store
+            .resolve_channel("tui", "same", "default")
+            .unwrap();
+        let right_id = right_store
+            .resolve_channel("tui", "same", "default")
+            .unwrap();
+        assert_ne!(left_id, right_id);
+        assert!(left_store.get(&right_id).is_none());
+        assert!(right_store.get(&left_id).is_none());
     }
 
     #[test]

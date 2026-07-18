@@ -50,20 +50,25 @@ pub use approval::{
     ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
     ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
-pub use bot_runtime_core::{Content, ContentPart, Message};
+pub use bot_runtime_core::{AgentError, Content, ContentPart, Message, ToolOutput, ToolResult};
+pub use bot_runtime_core::{DynamicTool, DynamicToolRisk};
 pub use events::{
     CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
     ModelInputSegment, ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillEvent,
     SteerInjectedEvent, SteerQueuedEvent, TodoEvent,
 };
 pub use goal::{GoalMaxRounds, GoalState, GoalStatus, SupervisorDecision};
-pub use hooks::{HookEventName, HookManager, HookOutcome, HookPermissionDecision, HookStatus};
+pub use hooks::{
+    HookEventName, HookManager, HookOutcome, HookPermissionDecision, HookSource, HookStatus,
+    HookTextFormat,
+};
 pub use im_tools::{ImAttachment, ImDocument, ImFileBridge};
 pub use memory::{MemoryStore, ThreadHistoryMessage};
 pub use model_profile::{
-    api_key_from_env, install_embedded_model_profiles, model_profile_key_status,
-    resolve_model_profile_from_env, validate_model_profile_api_key, ModelProfileConfig,
-    ModelProfileKeyStatus, ModelProfileRegistry, ModelProfileSource, ReasoningEffort, ThinkingMode,
+    api_key_from_env, api_key_from_values, install_embedded_model_profiles,
+    model_profile_key_status, resolve_model_profile_from_env, validate_model_profile_api_key,
+    ModelProfileConfig, ModelProfileKeyStatus, ModelProfileRegistry, ModelProfileSource,
+    ReasoningEffort, ThinkingMode,
 };
 pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{
@@ -74,7 +79,7 @@ pub use runtime::{
     CatBot, CatBotBuilder, EffectiveModelProfile, EffectiveModelSource, RegisteredToolStatus,
     SteerInput, SteerSubmitResult, StreamOptions,
 };
-pub use skill::store::{BuiltinSkillStore, FileSkillStore};
+pub use skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};
 pub use skill::store::{
     SkillDocument, SkillLoadDiagnostic, SkillLoadDiagnosticSeverity, SkillSummary,
 };

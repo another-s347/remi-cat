@@ -15,7 +15,7 @@ use remi_agentloop::prelude::{
     ProtocolEvent, ResumePayload, Role, RunId, SubSessionEvent, ThreadId, Tool, ToolOutput,
     ToolResult,
 };
-use remi_agentloop::tool::registry::DefaultToolRegistry;
+use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::approval::ModelApprovalReviewer;
@@ -216,6 +216,12 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
             serde_json::Value::String(value.to_string()),
         );
     }
+    if let Some(value) = input.app_id.as_deref() {
+        map.insert(
+            "app_id".into(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
     if let Some(value) = input.sender_user_id.as_deref() {
         map.insert(
             "sender_user_id".into(),
@@ -400,6 +406,8 @@ fn async_agent_enabled_from_env() -> bool {
 /// Per-turn options for [`CatBot::stream_with_options`].
 #[derive(Debug, Default, Clone)]
 pub struct StreamOptions {
+    /// Embedding application identifier. Internal context only; never sent as an HTTP header.
+    pub app_id: Option<String>,
     /// Optional session-persisted model profile override.
     pub model_profile_id: Option<String>,
     /// Optional session-persisted reasoning effort override for the current model.
@@ -456,6 +464,7 @@ pub struct SteerInput {
     pub message_id: Option<String>,
     pub chat_type: Option<String>,
     pub platform: Option<String>,
+    pub app_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -642,6 +651,7 @@ pub struct CatBot {
     subagent_sessions: Arc<SubagentSessionCoordinator>,
     model_profile: ModelProfileConfig,
     model_registry: Arc<ModelProfileRegistry>,
+    api_keys: Option<Arc<std::collections::BTreeMap<String, String>>>,
     environment_context_source: EnvironmentContextSource,
     /// Shared secret redactor — updated via `update_secret_redactor`.
     redactor: SharedRedactor,
@@ -675,6 +685,14 @@ pub enum EffectiveAgentSource {
 }
 
 impl CatBot {
+    pub fn tool_task_manager(&self) -> Arc<crate::tool_tasks::ToolTaskManager> {
+        Arc::clone(&self.tool_tasks)
+    }
+
+    pub async fn todo_card(&self, thread_id: &str) -> Option<String> {
+        let state = self.memory.load_user_state(thread_id).await;
+        todo::current_todo_card_markdown(&state)
+    }
     fn register_steer_queue(
         &self,
         session_id: &str,
@@ -1021,7 +1039,10 @@ impl CatBot {
     }
 
     pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
-        let api_key = api_key_from_env(&self.model_profile)?;
+        let api_key = match self.api_keys.as_deref() {
+            Some(values) => crate::model_profile::api_key_from_values(&self.model_profile, values)?,
+            None => api_key_from_env(&self.model_profile)?,
+        };
         model_usage::query_account_usage(&self.model_profile, &api_key).await
     }
 
@@ -1030,7 +1051,10 @@ impl CatBot {
         session_model_profile_id: Option<&str>,
     ) -> anyhow::Result<AccountUsage> {
         let effective = self.effective_model_profile(session_model_profile_id);
-        let api_key = api_key_from_env(&effective.profile)?;
+        let api_key = match self.api_keys.as_deref() {
+            Some(values) => crate::model_profile::api_key_from_values(&effective.profile, values)?,
+            None => api_key_from_env(&effective.profile)?,
+        };
         model_usage::query_account_usage(&effective.profile, &api_key).await
     }
 
@@ -1061,9 +1085,11 @@ impl CatBot {
         thread_id: &str,
         model: Option<String>,
         turn_id: Option<String>,
+        app_id: Option<String>,
     ) -> HookContext {
         HookContext {
             session_id: thread_id.to_string(),
+            app_id,
             transcript_path: None,
             cwd: self.inner.workspace_root.clone(),
             model,
@@ -1104,6 +1130,16 @@ impl CatBot {
             .await
     }
 
+    /// Compact memory while identifying the embedding application to hooks.
+    pub async fn compact_memory_for_app(
+        &self,
+        thread_id: &str,
+        app_id: &str,
+    ) -> Result<usize, remi_agentloop::prelude::AgentError> {
+        self.compact_memory_with_profile_and_app(thread_id, None, None, None, Some(app_id))
+            .await
+    }
+
     /// Compact memory with the same effective model profile as the session.
     pub async fn compact_memory_with_profile(
         &self,
@@ -1112,13 +1148,36 @@ impl CatBot {
         session_agent_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<usize, remi_agentloop::prelude::AgentError> {
+        self.compact_memory_with_profile_and_app(
+            thread_id,
+            session_model_profile_id,
+            session_agent_id,
+            reasoning_effort,
+            None,
+        )
+        .await
+    }
+
+    async fn compact_memory_with_profile_and_app(
+        &self,
+        thread_id: &str,
+        session_model_profile_id: Option<&str>,
+        session_agent_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        app_id: Option<&str>,
+    ) -> Result<usize, remi_agentloop::prelude::AgentError> {
         let run_lock = self.thread_run_lock(thread_id).await;
         let _run_guard = run_lock.try_lock().map_err(|_| {
             remi_agentloop::prelude::AgentError::other(
                 "cannot compact memory while this session is running; wait for the current model/tool turn to finish or cancel it first",
             )
         })?;
-        let context = self.hook_context(thread_id, Some(self.model_profile.model.clone()), None);
+        let context = self.hook_context(
+            thread_id,
+            Some(self.model_profile.model.clone()),
+            None,
+            app_id.map(str::to_string),
+        );
         let pre = self
             .hook_manager
             .run(
@@ -1141,7 +1200,7 @@ impl CatBot {
         )
         .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
         let profile = effective.profile;
-        let api_key = runtime_api_key_for_profile(&profile);
+        let api_key = runtime_api_key_for_profile(&profile, self.api_keys.as_deref());
         let extra_options = profile
             .merged_extra_options(None, profile.reasoning_effort)
             .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
@@ -2520,6 +2579,7 @@ impl CatBot {
                     round_opts.message_id = metadata_string(&metadata, "message_id");
                     round_opts.chat_type = metadata_string(&metadata, "chat_type");
                     round_opts.platform = metadata_string(&metadata, "platform");
+                    round_opts.app_id = metadata_string(&metadata, "app_id");
                     round_opts.sender_user_id = metadata_string(&metadata, "sender_user_id");
                     round_opts.im_attachments.clear();
                     round_opts.im_documents.clear();
@@ -2594,6 +2654,9 @@ impl CatBot {
                 // 3. Build request-level metadata (thread_id for tools);
                 //    build per-message metadata (sender identity + message id).
                 let mut meta = serde_json::json!({ "thread_id": &thread_id_owned });
+                if let Some(ref app_id) = round_opts.app_id {
+                    meta["app_id"] = serde_json::Value::String(app_id.clone());
+                }
                 if let Some(ref ct) = round_opts.chat_type {
                     meta["chat_type"] = serde_json::Value::String(ct.clone());
                 }
@@ -2605,6 +2668,9 @@ impl CatBot {
                 }
 
                 let mut msg_meta = serde_json::Map::new();
+                if let Some(ref app_id) = round_opts.app_id {
+                    msg_meta.insert("app_id".into(), serde_json::Value::String(app_id.clone()));
+                }
                 if round_opts.internal_supervisor_message {
                     msg_meta.insert(
                         "internal_supervisor_message".into(),
@@ -2667,6 +2733,7 @@ impl CatBot {
                     &thread_id_owned,
                     Some(effective_model.profile.model.clone()),
                     round_opts.message_id.clone(),
+                    round_opts.app_id.clone(),
                 );
                 if supervisor_round == 0 && !continuation_from_supervisor {
                     let session_hook = self
@@ -3769,9 +3836,42 @@ struct LocalToolDeps {
     subagent_sessions: Arc<SubagentSessionCoordinator>,
     overflow_bytes: usize,
     acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
+    host_tools: Vec<bot_runtime_core::DynamicTool>,
 }
 
 impl LocalToolDeps {
+    fn validate_host_tools(&self, include_acp: bool) -> anyhow::Result<()> {
+        let mut registered = DefaultToolRegistry::new();
+        skill::register_skill_tools(&mut registered, Arc::clone(&self.skill_store));
+        todo::register_todo_tools(&mut registered, Arc::clone(&self.todo_backend));
+        if include_acp {
+            acp::register_acp_tools(
+                &mut registered,
+                Arc::clone(&self.acp_backend),
+                Arc::clone(&self.approval_manager),
+            );
+        }
+        register_runtime_tools(&mut registered, self, &self.active_agent_id, true);
+        for tool in &self.host_tools {
+            let name = tool.name();
+            let reserved_builtin = builtin_tool_catalog()
+                .iter()
+                .any(|(builtin, _)| *builtin == name)
+                || name.starts_with("agent__")
+                || name.starts_with("acp__")
+                || name.starts_with("im__");
+            let conflicts_with_delegate = self
+                .delegate_ids
+                .iter()
+                .any(|delegate| delegate_tool_name(delegate) == name);
+            if reserved_builtin || registered.contains(name) || conflicts_with_delegate {
+                anyhow::bail!("custom tool `{name}` conflicts with an existing tool");
+            }
+            registered.register(tool.clone());
+        }
+        Ok(())
+    }
+
     fn with_api_key(&self, api_key: String) -> Self {
         let mut deps = self.clone_for_subagent();
         deps.api_key = api_key;
@@ -3803,6 +3903,7 @@ impl LocalToolDeps {
             subagent_sessions: Arc::clone(&self.subagent_sessions),
             overflow_bytes: self.overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
+            host_tools: self.host_tools.clone(),
         }
     }
 
@@ -3818,6 +3919,9 @@ impl LocalToolDeps {
             );
         }
         register_runtime_tools(&mut local_tools, self, &self.active_agent_id, true);
+        for tool in &self.host_tools {
+            local_tools.register(tool.clone());
+        }
         local_tools
     }
 
@@ -3868,6 +3972,13 @@ pub struct CatBotBuilder {
     max_turns: Option<usize>,
     model_registry: Arc<ModelProfileRegistry>,
     acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
+    host_tools: Vec<bot_runtime_core::DynamicTool>,
+    builtin_skills: Vec<crate::skill::BuiltinSkill>,
+    include_default_skills: bool,
+    file_skills: bool,
+    include_default_agents: bool,
+    hook_manager: Option<Arc<HookManager>>,
+    api_keys: Option<Arc<std::collections::BTreeMap<String, String>>>,
 }
 
 impl CatBotBuilder {
@@ -3923,6 +4034,13 @@ impl CatBotBuilder {
             max_turns: None,
             model_registry,
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
+            api_keys: None,
         };
         let agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| DEFAULT_AGENT_ID.into());
         let agents_dir = std::env::var("REMI_AGENTS_DIR")
@@ -3938,6 +4056,84 @@ impl CatBotBuilder {
         Ok(builder)
     }
 
+    /// Build an embedded runtime whose mutable data is separate from the model registry.
+    pub fn from_model_source(
+        data_dir: impl Into<PathBuf>,
+        model_source: impl Into<PathBuf>,
+        selected_model: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::from_model_source_with_keys(data_dir, model_source, selected_model, None)
+    }
+
+    pub fn from_model_source_with_api_keys(
+        data_dir: impl Into<PathBuf>,
+        model_source: impl Into<PathBuf>,
+        selected_model: Option<&str>,
+        api_keys: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        Self::from_model_source_with_keys(data_dir, model_source, selected_model, Some(api_keys))
+    }
+
+    fn from_model_source_with_keys(
+        data_dir: impl Into<PathBuf>,
+        model_source: impl Into<PathBuf>,
+        selected_model: Option<&str>,
+        api_keys: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> anyhow::Result<Self> {
+        let data_dir = data_dir.into();
+        let model_source = model_source.into();
+        let models_dir = model_source.join("models");
+        let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
+        let model_profile = if let Some(id) = selected_model {
+            model_registry.get(id).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "model profile `{id}` was not found in {}",
+                    models_dir.display()
+                )
+            })?
+        } else {
+            model_registry.default_profile().cloned().ok_or_else(|| {
+                anyhow::anyhow!("no default model profile found in {}", models_dir.display())
+            })?
+        };
+        let api_key = match api_keys {
+            Some(values) => crate::model_profile::api_key_from_values(&model_profile, values)?,
+            None => api_key_from_env(&model_profile)?,
+        };
+        let extra_options = model_profile.merged_extra_options(None, None)?;
+        let sandbox_config = SandboxConfig::from_env(data_dir.clone(), BashMode::Local);
+        Ok(Self {
+            api_key,
+            model_profile,
+            runtime_model_locked: selected_model.is_some(),
+            system: default_system_prompt(),
+            skills_dir: data_dir.join("skills"),
+            data_dir: data_dir.clone(),
+            agent_md_path: None,
+            overflow_bytes: tool_output_overflow_bytes_from_env()?,
+            memory_days: 7,
+            sandbox_config,
+            im_bridge: None,
+            extra_options,
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir: data_dir.join("agents"),
+            max_turns: None,
+            model_registry,
+            acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
+            api_keys: api_keys.map(|values| Arc::new(values.clone())),
+        })
+    }
+
     pub fn system(mut self, s: impl Into<String>) -> Self {
         self.system = s.into();
         self
@@ -3950,6 +4146,11 @@ impl CatBotBuilder {
 
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = dir.into();
+        self
+    }
+
+    pub fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.sandbox_config = self.sandbox_config.with_host_dir(workspace.into());
         self
     }
 
@@ -3977,6 +4178,36 @@ impl CatBotBuilder {
         support: acp::AcpClientToolSupport,
     ) -> Self {
         self.acp_client_tools = Some((provider, support));
+        self
+    }
+
+    pub fn tool(mut self, tool: bot_runtime_core::DynamicTool) -> Self {
+        self.host_tools.push(tool);
+        self
+    }
+
+    pub fn builtin_skill(mut self, skill: crate::skill::BuiltinSkill) -> Self {
+        self.builtin_skills.push(skill);
+        self
+    }
+
+    pub fn include_default_skills(mut self, include: bool) -> Self {
+        self.include_default_skills = include;
+        self
+    }
+
+    pub fn file_skills(mut self, include: bool) -> Self {
+        self.file_skills = include;
+        self
+    }
+
+    pub fn include_default_agents(mut self, include: bool) -> Self {
+        self.include_default_agents = include;
+        self
+    }
+
+    pub fn hook_manager(mut self, manager: Arc<HookManager>) -> Self {
+        self.hook_manager = Some(manager);
         self
     }
 
@@ -4021,6 +4252,10 @@ impl CatBotBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<CatBot> {
+        validate_host_tool_names(
+            self.host_tools.iter().map(|tool| tool.name()),
+            &self.delegate_ids,
+        )?;
         let profile = self.model_profile.clone();
         let auto_compress_context_percent = auto_compress_context_percent()?;
         let system_prompt = system_prompt_with_agent_md_notice_for_current_dir(self.system.clone());
@@ -4041,7 +4276,10 @@ impl CatBotBuilder {
         } else {
             profile.clone()
         };
-        let approval_api_key = api_key_from_env(&approval_profile)?;
+        let approval_api_key = match self.api_keys.as_deref() {
+            Some(values) => crate::model_profile::api_key_from_values(&approval_profile, values)?,
+            None => api_key_from_env(&approval_profile)?,
+        };
         let approval_reviewer = Arc::new(ModelApprovalReviewer::new(
             approval_profile.clone(),
             approval_api_key,
@@ -4121,10 +4359,16 @@ impl CatBotBuilder {
         let workspace_root = self.sandbox_config.host_dir().to_path_buf();
         let environment_context_source =
             EnvironmentContextSource::from_sandbox_config(&self.sandbox_config);
-        let skill_store = Arc::new(BuiltinSkillStore::new(
-            FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone()),
-            [remi_skill::builtin_remi_skill()],
-        ));
+        let file_skill_store = if self.file_skills {
+            FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone())
+        } else {
+            FileSkillStore::with_roots([])
+        };
+        let mut builtin_skills = self.builtin_skills;
+        if self.include_default_skills {
+            builtin_skills.push(remi_skill::builtin_remi_skill());
+        }
+        let skill_store = Arc::new(BuiltinSkillStore::new(file_skill_store, builtin_skills));
         let pinned_skill_summaries = skill_store
             .featured_summaries()
             .into_iter()
@@ -4133,12 +4377,16 @@ impl CatBotBuilder {
         let data_dir = memory.data_dir.clone();
         let sandbox = self.sandbox_config.build()?;
         let agents_dir = self.agents_dir.clone();
-        install_embedded_agent_profiles(&agents_dir)?;
+        if self.include_default_agents {
+            install_embedded_agent_profiles(&agents_dir)?;
+        }
         let active_agent_id = self.active_agent_id.clone();
         let todo_backend = Arc::new(todo::HybridTodoBackend::new(data_dir.clone()));
         let approval_manager = ToolApprovalManager::new();
         let user_question_manager = UserQuestionManager::new();
-        let hook_manager = HookManager::new(workspace_root.clone(), data_dir.clone());
+        let hook_manager = self
+            .hook_manager
+            .unwrap_or_else(|| HookManager::new(workspace_root.clone(), data_dir.clone()));
         let tool_tasks = crate::tool_tasks::ToolTaskManager::load(&data_dir)
             .map_err(|err| AgentError::other(format!("load tool task store: {err:#}")))?;
         let subagent_sessions = Arc::new(SubagentSessionCoordinator::default());
@@ -4185,6 +4433,7 @@ impl CatBotBuilder {
             subagent_sessions: Arc::clone(&subagent_sessions),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
+            host_tools: self.host_tools.clone(),
         };
         let mut acp_local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
@@ -4250,7 +4499,19 @@ impl CatBotBuilder {
             subagent_sessions: Arc::clone(&subagent_sessions),
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
+            host_tools: self.host_tools.clone(),
         };
+        tool_deps.validate_host_tools(true)?;
+        for tool in &self.host_tools {
+            if let Some(risk) = tool.declared_risk() {
+                let risk = match risk {
+                    bot_runtime_core::DynamicToolRisk::Low => crate::ToolRiskLevel::Low,
+                    bot_runtime_core::DynamicToolRisk::Medium => crate::ToolRiskLevel::Medium,
+                    bot_runtime_core::DynamicToolRisk::High => crate::ToolRiskLevel::High,
+                };
+                approval_manager.register_custom_tool_risk(tool.name(), risk)?;
+            }
+        }
         let local_tools = Arc::new(tool_deps.build_static_tools(true));
         let model_tools = tool_deps.build_model_tools(&profile, self.extra_options.clone());
         let mut model_agents = HashMap::new();
@@ -4259,7 +4520,8 @@ impl CatBotBuilder {
                 if model_profile.id == profile.id && variant.key == model_profile.id {
                     continue;
                 }
-                let model_api_key = runtime_api_key_for_profile(&variant.profile);
+                let model_api_key =
+                    runtime_api_key_for_profile(&variant.profile, self.api_keys.as_deref());
                 let model_inner = build_inner_agent(
                     &model_api_key,
                     &variant.profile,
@@ -4381,12 +4643,15 @@ impl CatBotBuilder {
                 subagent_sessions: Arc::clone(&subagent_sessions),
                 overflow_bytes,
                 acp_client_tools: self.acp_client_tools.clone(),
+                host_tools: self.host_tools.clone(),
             };
+            agent_tool_deps.validate_host_tools(true)?;
             let agent_static_tools = Arc::new(agent_tool_deps.build_static_tools(true));
             let mut by_model = HashMap::new();
             for model_profile in self.model_registry.list() {
                 for variant in model_runtime_variants(model_profile)? {
-                    let model_api_key = runtime_api_key_for_profile(&variant.profile);
+                    let model_api_key =
+                        runtime_api_key_for_profile(&variant.profile, self.api_keys.as_deref());
                     let model_inner = build_inner_agent(
                         &model_api_key,
                         &variant.profile,
@@ -4462,14 +4727,47 @@ impl CatBotBuilder {
             subagent_sessions,
             model_profile: profile,
             model_registry: Arc::clone(&self.model_registry),
+            api_keys: self.api_keys.clone(),
             environment_context_source,
             redactor,
         })
     }
 }
 
-fn runtime_api_key_for_profile(profile: &ModelProfileConfig) -> String {
-    match api_key_from_env(profile) {
+fn validate_host_tool_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    delegate_ids: &[String],
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            anyhow::bail!("custom tool `{name}` is registered more than once");
+        }
+        let reserved = builtin_tool_catalog()
+            .iter()
+            .any(|(builtin, _)| *builtin == name)
+            || name.starts_with("agent__")
+            || name.starts_with("acp__")
+            || name.starts_with("im__")
+            || delegate_ids
+                .iter()
+                .any(|delegate| delegate_tool_name(delegate) == name);
+        if reserved {
+            anyhow::bail!("custom tool `{name}` conflicts with an existing tool");
+        }
+    }
+    Ok(())
+}
+
+fn runtime_api_key_for_profile(
+    profile: &ModelProfileConfig,
+    api_keys: Option<&std::collections::BTreeMap<String, String>>,
+) -> String {
+    let result = match api_keys {
+        Some(values) => crate::model_profile::api_key_from_values(profile, values),
+        None => api_key_from_env(profile),
+    };
+    match result {
         Ok(api_key) => api_key,
         Err(err) => {
             tracing::warn!(
@@ -4826,6 +5124,7 @@ impl Tool for RemiSubAgentTool {
             let mut sub_task = task.clone();
             let sub_hook_context = HookContext {
                 session_id: sub_thread_id_for_memory.clone(),
+                app_id: metadata.get("app_id").and_then(serde_json::Value::as_str).map(str::to_string),
                 transcript_path: None,
                 cwd: workspace_root.clone(),
                 model: Some(model_name.clone()),
@@ -5600,10 +5899,10 @@ mod tests {
         model_input_snapshot_from_loop_input, model_request_budget_tokens,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
-        try_recv_completed_tool_task, AgentModelBindings, CatBotBuilder, CatEvent, Content,
-        ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
-        PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent,
-        ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
+        try_recv_completed_tool_task, validate_host_tool_names, AgentModelBindings, CatBotBuilder,
+        CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
+        ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
+        SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
         ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
@@ -5624,6 +5923,14 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
+
+    #[test]
+    fn custom_tool_names_reject_duplicates_and_runtime_collisions() {
+        assert!(validate_host_tool_names(["host_lookup", "host_lookup"], &[]).is_err());
+        assert!(validate_host_tool_names(["search"], &[]).is_err());
+        assert!(validate_host_tool_names(["agent__worker"], &["worker".to_string()]).is_err());
+        assert!(validate_host_tool_names(["host_lookup"], &[]).is_ok());
+    }
     use uuid::Uuid;
 
     static LARGE_STACK_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -5762,6 +6069,7 @@ mod tests {
             task_id: "task-1".to_string(),
             thread_id: "thread-1".to_string(),
             run_id: "run-1".to_string(),
+            app_id: None,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             args: json!({"command": "sleep 60"}),
@@ -5806,6 +6114,7 @@ mod tests {
             task_id: "task-1".to_string(),
             thread_id: "thread-1".to_string(),
             run_id: "run-1".to_string(),
+            app_id: None,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             args: json!({"command": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}),
@@ -5924,6 +6233,7 @@ mod tests {
         install_embedded_model_profiles(&models_dir).unwrap();
 
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -5947,6 +6257,12 @@ mod tests {
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -5976,6 +6292,7 @@ mod tests {
 
         let build_bot = || {
             CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile: test_model_profile(),
                 runtime_model_locked: false,
@@ -5999,6 +6316,12 @@ mod tests {
                 max_turns: Some(2),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir.clone()).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap()
@@ -6066,6 +6389,7 @@ You are Remi.
         .unwrap();
 
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6089,6 +6413,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .agent_profile(root_profile)
         .unwrap()
@@ -6190,6 +6520,7 @@ You are Remi.
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6213,6 +6544,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -6266,6 +6603,7 @@ You are Remi.
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6289,6 +6627,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -6352,6 +6696,7 @@ You are Remi.
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6375,6 +6720,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -6465,6 +6816,7 @@ You are Remi.
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6488,6 +6840,12 @@ You are Remi.
             max_turns: Some(4),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -6661,6 +7019,7 @@ You are Remi.
         )
         .unwrap();
         let builder = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6684,6 +7043,12 @@ You are Remi.
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .agent_profile(profile)
         .unwrap();
@@ -6708,6 +7073,7 @@ You are Remi.
         )
         .unwrap();
         let builder = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile: ModelProfileConfig {
                 id: "deepseek-v4-flash".to_string(),
@@ -6747,6 +7113,12 @@ You are Remi.
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .agent_profile(profile)
         .unwrap();
@@ -6765,6 +7137,7 @@ You are Remi.
         let agents_dir = data_dir.join("agents");
         let models_dir = data_dir.join("models");
         let builder = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6788,6 +7161,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         };
 
         let bot = builder.build().unwrap();
@@ -7021,6 +7400,7 @@ You are Remi.
             model_profile.base_url = Some(base_url);
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7044,6 +7424,12 @@ You are Remi.
                 max_turns: Some(8),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap();
@@ -7100,6 +7486,7 @@ You are Remi.
             model_profile.base_url = Some(base_url);
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7123,6 +7510,12 @@ You are Remi.
                 max_turns: Some(8),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap();
@@ -7229,6 +7622,7 @@ You are Remi.
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
+            api_keys: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7252,6 +7646,12 @@ You are Remi.
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
         }
         .build()
         .unwrap();
@@ -7348,6 +7748,7 @@ You are Remi.
             model_profile.base_url = Some(base_url);
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7371,6 +7772,12 @@ You are Remi.
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap();
@@ -7484,6 +7891,7 @@ You are Remi.
             profile.context_tokens = 128_000;
             profile.max_output_tokens = 4_096;
             let bot = CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,
@@ -7507,6 +7915,12 @@ You are Remi.
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap();
@@ -7558,6 +7972,7 @@ You are Remi.
             profile.context_tokens = 40_000;
             profile.max_output_tokens = 4_096;
             let bot = CatBotBuilder {
+                api_keys: None,
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,
@@ -7581,6 +7996,12 @@ You are Remi.
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
                 acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
             }
             .build()
             .unwrap();

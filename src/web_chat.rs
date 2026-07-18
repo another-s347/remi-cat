@@ -1579,6 +1579,7 @@ impl WebCoreEventMapper {
                 WebEventMap::Emit("user_interrupted", serde_json::json!({"reason": reason}))
             }
             CatEvent::Error(error) => {
+                crate::telemetry::capture_agent_error(&error, "web.chat");
                 self.terminal_status = "error";
                 WebEventMap::Emit("error", serde_json::json!({"message": error.to_string()}))
             }

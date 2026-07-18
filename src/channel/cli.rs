@@ -105,7 +105,10 @@ pub(crate) async fn process_prompt_message(
                         io::stdout().flush()?;
                         output.push_str(&delta);
                     }
-                    CoreChatEvent::Bot(CatEvent::Error(err)) => anyhow::bail!(err.to_string()),
+                    CoreChatEvent::Bot(CatEvent::Error(err)) => {
+                        crate::telemetry::capture_agent_error(&err, "cli.chat");
+                        anyhow::bail!(err.to_string())
+                    }
                     CoreChatEvent::Bot(CatEvent::Done) | CoreChatEvent::Done => break,
                     _ => {}
                 }

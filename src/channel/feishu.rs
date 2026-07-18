@@ -583,6 +583,7 @@ impl FeishuEventForwarder<'_, '_> {
                 }
             }
             CatEvent::Error(err) => {
+                crate::telemetry::capture_agent_error(&err, "feishu.chat");
                 let chunk = format!(
                     "\n\n---\n**调试信息**\n\n**Error**\n{}",
                     fenced_block("text", &err.to_string())

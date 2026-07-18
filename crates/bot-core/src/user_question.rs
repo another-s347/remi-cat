@@ -21,6 +21,8 @@ pub struct UserQuestionRequest {
     pub id: String,
     pub session_id: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
     pub tool_call_id: String,
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +103,7 @@ impl UserQuestionManager {
         let _ = pending.tx.send(response.clone());
         tracing::info!(
             question_id,
+            app_id = pending.request.app_id.as_deref().unwrap_or(""),
             session_id = %pending.request.session_id,
             status = ?response.status,
             source = response.source.as_deref().unwrap_or(""),
@@ -258,6 +261,11 @@ impl Tool for AskUserQuestionTool {
                 id: format!("uq-{}", uuid::Uuid::new_v4()),
                 session_id: session_id.clone(),
                 run_id: run_id_value,
+                app_id: metadata
+                    .as_ref()
+                    .and_then(|value| value.get("app_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 tool_call_id: String::new(),
                 question,
                 reason: args
@@ -357,6 +365,7 @@ mod tests {
             id: "q1".to_string(),
             session_id: "s1".to_string(),
             run_id: "r1".to_string(),
+            app_id: None,
             tool_call_id: "call1".to_string(),
             question: "Pick one?".to_string(),
             reason: None,

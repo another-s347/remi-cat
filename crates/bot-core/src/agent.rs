@@ -523,6 +523,7 @@ where
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
+                                        &self.approval_manager,
                                         approval_reviewer.as_deref(),
                                     )
                                     .await;
@@ -765,6 +766,7 @@ where
                                     Arc::clone(&self.tool_tasks),
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
+                                    metadata_string(state.config.metadata.as_ref(), "app_id"),
                                     tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
@@ -968,6 +970,7 @@ where
                                         &state.thread_id.0,
                                         &state.run_id.0,
                                         state.config.metadata.as_ref(),
+                                        &self.approval_manager,
                                         approval_reviewer.as_deref(),
                                     )
                                     .await;
@@ -1205,6 +1208,7 @@ where
                                     Arc::clone(&self.tool_tasks),
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
+                                    metadata_string(state.config.metadata.as_ref(), "app_id"),
                                     tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
@@ -1863,6 +1867,13 @@ fn hook_context_from_state(state: &remi_agentloop::prelude::AgentState, cwd: &Pa
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&state.thread_id.0)
             .to_string(),
+        app_id: state
+            .config
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("app_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         transcript_path: None,
         cwd: cwd.to_path_buf(),
         model: None,
@@ -1894,7 +1905,7 @@ fn approval_request_for_tool(
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(session_id);
-    ToolApprovalRequest {
+    let mut request = ToolApprovalRequest {
         id: uuid::Uuid::new_v4().to_string(),
         session_id: approval_session_id.to_string(),
         run_id: run_id.to_string(),
@@ -1908,8 +1919,14 @@ fn approval_request_for_tool(
             .and_then(|value| value.get("platform"))
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        app_id: None,
         review: None,
-    }
+    };
+    request.app_id = metadata
+        .and_then(|value| value.get("app_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    request
 }
 
 fn outer_thread_id_from_metadata(
@@ -1925,11 +1942,19 @@ fn outer_thread_id_from_metadata(
         .to_string()
 }
 
+fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    metadata
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 async fn prepare_approval_request_for_tool(
     tc: &ParsedToolCall,
     session_id: &str,
     run_id: &str,
     metadata: Option<&serde_json::Value>,
+    approval_manager: &ToolApprovalManager,
     reviewer: Option<&ModelApprovalReviewer>,
 ) -> ToolApprovalRequest {
     let mut request = approval_request_for_tool(tc, session_id, run_id, metadata);
@@ -1942,7 +1967,11 @@ async fn prepare_approval_request_for_tool(
         ));
         return request;
     }
-    match classify_tool_risk_assessment(&tc.name, &tc.arguments) {
+    let assessment = approval_manager
+        .custom_tool_risk(&tc.name)
+        .map(ToolRiskAssessment::Known)
+        .unwrap_or_else(|| classify_tool_risk_assessment(&tc.name, &tc.arguments));
+    match assessment {
         ToolRiskAssessment::Known(risk) => {
             request.risk = risk;
             request.review = Some(review_tool_risk(
@@ -2168,6 +2197,7 @@ fn collect_tool_result_futures_with_timeout(
     tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
     thread_id: String,
     run_id: String,
+    app_id: Option<String>,
     foreground_timeout: std::time::Duration,
     async_agent: bool,
 ) -> FuturesUnordered<LocalBoxFuture<'static, ForegroundToolOutcome>> {
@@ -2189,6 +2219,7 @@ fn collect_tool_result_futures_with_timeout(
             let tool_tasks = Arc::clone(&tool_tasks);
             let thread_id = thread_id.clone();
             let run_id = run_id.clone();
+            let app_id = app_id.clone();
             async move {
                 let collect_call_id = call_id.clone();
                 let collect_tool_name = tool_name.clone();
@@ -2206,13 +2237,14 @@ fn collect_tool_result_futures_with_timeout(
                 };
                 let cancel = CancellationToken::new();
                 let task_id = tool_tasks
-                    .start(
+                    .start_with_app_id(
                         thread_id,
                         run_id,
                         call_id.clone(),
                         tool_name.clone(),
                         args,
                         cancel,
+                        app_id,
                     )
                     .await
                     .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
@@ -2623,12 +2655,14 @@ mod tests {
             "run-1",
             Some(&serde_json::json!({
                 "thread_id": "tui-session-1",
-                "platform": "tui"
+                "platform": "tui",
+                "app_id": "embedded-host"
             })),
         );
 
         assert_eq!(request.session_id, "tui-session-1");
         assert_eq!(request.platform.as_deref(), Some("tui"));
+        assert_eq!(request.app_id.as_deref(), Some("embedded-host"));
     }
 
     #[test]
@@ -3836,6 +3870,7 @@ mod tests {
                     Arc::clone(&tool_tasks),
                     "thread-1".to_string(),
                     "run-1".to_string(),
+                    Some("embedded-host".to_string()),
                     Duration::from_millis(5),
                     true,
                 );
@@ -3857,6 +3892,7 @@ mod tests {
                 assert_eq!(completed.task_id, task_id);
                 assert_eq!(completed.tool_name, "lazy_wait");
                 assert_eq!(completed.status.as_str(), "completed");
+                assert_eq!(completed.app_id.as_deref(), Some("embedded-host"));
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
             })
@@ -3892,6 +3928,7 @@ mod tests {
                     Arc::clone(&tool_tasks),
                     "thread-1".to_string(),
                     "run-1".to_string(),
+                    None,
                     Duration::from_millis(5),
                     false,
                 );
@@ -3945,6 +3982,7 @@ mod tests {
                     Arc::clone(&tool_tasks),
                     "thread-1".to_string(),
                     "run-1".to_string(),
+                    None,
                     Duration::from_millis(200),
                     true,
                 );
@@ -4012,6 +4050,7 @@ mod tests {
                     Arc::clone(&tool_tasks),
                     "thread-1".to_string(),
                     "run-1".to_string(),
+                    None,
                     Duration::from_millis(5),
                     true,
                 );
@@ -4080,6 +4119,7 @@ mod tests {
                             command_key: Some("bash:sleep 60".to_string()),
                             model_review_reason: None,
                             platform: Some("tui".to_string()),
+                            app_id: None,
                             review: None,
                         },
                     );
@@ -4096,6 +4136,7 @@ mod tests {
                     Arc::clone(&tool_tasks),
                     "thread-1".to_string(),
                     "run-1".to_string(),
+                    None,
                     Duration::from_millis(5),
                     true,
                 );

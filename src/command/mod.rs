@@ -12,11 +12,9 @@ pub(crate) use doctor::{
     command_doctor_report, print_registered_tools, run_acp_command, run_codex_command, run_doctor,
     sandbox_doctor_report,
 };
-pub(crate) use feedback::run_feedback_command;
 #[cfg(test)]
-pub(crate) use feedback::{
-    feedback_repo, github_new_issue_url, percent_encode_query, redact_known_secrets,
-};
+pub(crate) use feedback::redact_known_secrets;
+pub(crate) use feedback::run_feedback_command;
 #[cfg(test)]
 pub(crate) use feishu::{
     extract_first_url, extract_lark_cli_config_from_json, feishu_doctor_message,
@@ -1702,6 +1700,7 @@ mod tests {
             task_id: "task-1".to_string(),
             thread_id: "session-1".to_string(),
             run_id: "run-1".to_string(),
+            app_id: None,
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),
             args: serde_json::json!({"command": "sleep 60"}),

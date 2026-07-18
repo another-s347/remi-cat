@@ -46,6 +46,7 @@ pub(crate) struct ChatRequest {
     pub(crate) message_id: Option<String>,
     pub(crate) chat_type: Option<String>,
     pub(crate) platform: Option<String>,
+    pub(crate) app_id: Option<String>,
     pub(crate) im_attachments: Vec<ImAttachment>,
     pub(crate) im_documents: Vec<ImDocument>,
     pub(crate) cancel: Option<CancellationToken>,
@@ -72,6 +73,7 @@ impl ChatRequest {
             message_id: None,
             chat_type: None,
             platform: None,
+            app_id: None,
             im_attachments: Vec::new(),
             im_documents: Vec::new(),
             cancel: None,
@@ -86,6 +88,11 @@ impl ChatRequest {
 
     pub(crate) fn with_content(mut self, content: Content) -> Self {
         self.content = content;
+        self
+    }
+
+    pub(crate) fn with_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 
@@ -169,6 +176,7 @@ impl From<ChatRequest> for SteerInput {
             message_id: request.message_id,
             chat_type: request.chat_type,
             platform: request.platform.or_else(|| request.channel.as_platform()),
+            app_id: request.app_id,
         }
     }
 }
@@ -288,6 +296,7 @@ impl Runtime {
                                 )
                             };
                             let opts = StreamOptions {
+                                app_id: request.app_id.clone(),
                                 model_profile_id,
                                 reasoning_effort,
                                 agent_id,
@@ -357,6 +366,7 @@ impl Runtime {
             let agent_id = request.agent_id.clone().or(stored_agent_id);
             let platform = request.platform();
             let opts = StreamOptions {
+                app_id: request.app_id.clone(),
                 model_profile_id,
                 reasoning_effort,
                 agent_id,

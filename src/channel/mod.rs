@@ -3,8 +3,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use bot_core::{ImAttachment, ImDocument, ToolApprovalDecision, ToolApprovalRequest};
-
 use crate::core::Runtime;
 
 pub(crate) mod cli;
@@ -30,59 +28,6 @@ impl ChannelKind {
             Self::Web => "web",
             Self::Acp => "acp",
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ChannelMessage {
-    pub(crate) kind: ChannelKind,
-    pub(crate) message_id: String,
-    pub(crate) channel_id: String,
-    pub(crate) user_id: String,
-    pub(crate) username: Option<String>,
-    pub(crate) text: String,
-    pub(crate) chat_type: Option<String>,
-    pub(crate) thread_id: Option<String>,
-    pub(crate) attachments: Vec<ImAttachment>,
-    pub(crate) documents: Vec<ImDocument>,
-}
-
-impl ChannelMessage {
-    pub(crate) fn platform(&self) -> &'static str {
-        self.kind.as_platform()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChannelReplyKind {
-    Text,
-    Thinking,
-    Tool,
-    Supervisor,
-    Stats,
-    Error,
-}
-
-pub(crate) trait ChannelSink {
-    fn send<'a>(
-        &'a mut self,
-        kind: ChannelReplyKind,
-        text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
-
-    fn tool_approval_requested<'a>(
-        &'a mut self,
-        _request: &'a ToolApprovalRequest,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn tool_approval_resolved<'a>(
-        &'a mut self,
-        _request: &'a ToolApprovalRequest,
-        _decision: ToolApprovalDecision,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(async { Ok(()) })
     }
 }
 

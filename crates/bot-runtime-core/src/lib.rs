@@ -10,7 +10,7 @@ pub use agent::{
     tool_definition_ctx_from_state, CoreSteerBatch, CoreSteerBehavior, CoreSteerInput,
     CoreSteerQueue, CoreSteerSource, CoreStreamOptions,
 };
-pub use dynamic_tool::{register_dynamic_tool_definitions, DynamicTool};
+pub use dynamic_tool::{register_dynamic_tool_definitions, DynamicTool, DynamicToolRisk};
 pub use loop_driver::{
     CoreAgentLoop, CoreCancelKind, CoreDriveConfig, CoreDriveEvent, CoreToolDispatch,
     CoreUsageStats,

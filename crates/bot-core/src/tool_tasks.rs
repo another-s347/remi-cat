@@ -29,6 +29,8 @@ pub struct ToolTaskRecord {
     pub task_id: String,
     pub thread_id: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub args: serde_json::Value,
@@ -88,12 +90,14 @@ impl PerThreadManager {
         tool_name: String,
         args: serde_json::Value,
         cancel: CancellationToken,
+        app_id: Option<String>,
     ) -> String {
         let task_id = uuid::Uuid::new_v4().to_string();
         let record = ToolTaskRecord {
             task_id: task_id.clone(),
             thread_id: self.thread_id.clone(),
             run_id,
+            app_id,
             tool_call_id,
             tool_name,
             args,
@@ -474,7 +478,28 @@ impl ToolTaskManager {
     ) -> Result<String> {
         let mgr = self.get_thread(&thread_id).await?;
         let task_id = mgr
-            .start_inner(run_id, tool_call_id, tool_name, args, cancel)
+            .start_inner(run_id, tool_call_id, tool_name, args, cancel, None)
+            .await;
+        self.task_thread_map
+            .lock()
+            .await
+            .insert(task_id.clone(), thread_id);
+        Ok(task_id)
+    }
+
+    pub async fn start_with_app_id(
+        &self,
+        thread_id: String,
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        cancel: CancellationToken,
+        app_id: Option<String>,
+    ) -> Result<String> {
+        let mgr = self.get_thread(&thread_id).await?;
+        let task_id = mgr
+            .start_inner(run_id, tool_call_id, tool_name, args, cancel, app_id)
             .await;
         self.task_thread_map
             .lock()
@@ -805,6 +830,7 @@ mod tests {
             task_id: task_id.to_string(),
             thread_id: thread_id.to_string(),
             run_id: "run-a".to_string(),
+            app_id: None,
             tool_call_id: format!("call-{task_id}"),
             tool_name: "bash".to_string(),
             args: serde_json::json!({}),

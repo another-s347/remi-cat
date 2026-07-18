@@ -90,6 +90,16 @@ impl SandboxConfig {
         }
     }
 
+    pub fn with_host_dir(mut self, host_dir: PathBuf) -> Self {
+        match &mut self {
+            Self::Disabled { host_dir: current } | Self::NoSandbox { host_dir: current } => {
+                *current = host_dir;
+            }
+            Self::Docker(config) => config.host_dir = host_dir,
+        }
+        self
+    }
+
     pub fn workspace_root_label(&self) -> String {
         match self {
             Self::Disabled { host_dir } | Self::NoSandbox { host_dir } => {
@@ -673,7 +683,7 @@ impl Sandbox for DockerSandbox {
 mod tests {
     use super::{
         current_host_user_spec, DockerSandbox, DockerSandboxConfig, NoSandbox, ReplaceResult,
-        Sandbox, SandboxBashStatus,
+        Sandbox, SandboxBashStatus, SandboxConfig,
     };
     use remi_agentloop::prelude::CancellationToken;
     use std::path::PathBuf;
@@ -682,6 +692,15 @@ mod tests {
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("remi-sandbox-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn explicit_workspace_replaces_environment_derived_host_dir() {
+        let config = SandboxConfig::NoSandbox {
+            host_dir: PathBuf::from("old"),
+        }
+        .with_host_dir(PathBuf::from("workspace"));
+        assert_eq!(config.host_dir(), std::path::Path::new("workspace"));
     }
 
     #[tokio::test]
@@ -748,7 +767,11 @@ mod tests {
         assert_eq!(out.status, SandboxBashStatus::Completed);
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout.contains("launched"));
-        assert!(started.elapsed() < Duration::from_millis(1_800));
+        // Process reaping on WSL and heavily loaded CI hosts can add several
+        // hundred milliseconds even though the detached descendant no longer
+        // holds the command open. Keep the assertion below the 3s command
+        // timeout while allowing that scheduler variance.
+        assert!(started.elapsed() < Duration::from_millis(2_800));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

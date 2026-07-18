@@ -4,7 +4,6 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -35,10 +34,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use remi_agentloop::prelude::{CancellationToken, ProtocolEvent, SubSessionEvent};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use remi_agentloop::prelude::{ProtocolEvent, SubSessionEvent};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -49,11 +48,10 @@ mod render;
 use components::*;
 use composer::*;
 
-use crate::command::{
-    model_reasoning_effort_label, process_runtime_commands, session_model_and_reasoning,
-    RuntimeCommandPipelineResult,
-};
-use crate::session::{ChannelBinding, Session, SubSessionKind};
+use crate::command::model_reasoning_effort_label;
+#[cfg(test)]
+use crate::session::ChannelBinding;
+use crate::session::{Session, SubSessionKind};
 use crate::tui_markdown::{render_markdown_lines, MarkdownTheme};
 #[cfg(test)]
 use crate::tui_text::contains_tui_control;
@@ -62,8 +60,9 @@ use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
 use crate::{
-    ChatChannel, ChatRequest, CliConfig, CoreChatEvent, Runtime, SESSION_AGENT_ID_METADATA_KEY,
-    SESSION_INPUT_HISTORY_METADATA_KEY, SESSION_MODEL_PROFILE_METADATA_KEY,
+    Application, ApplicationCatalog, ApplicationEvent, ChannelConfig, ChannelHandle, CliConfig,
+    CommandPreprocessResult, RunControl, RunOptions, RunRequest, SessionPatch,
+    SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
 };
 
 const TUI_CHANNEL: &str = "tui";
@@ -94,14 +93,19 @@ struct CachedHistoryCell {
     lines: Vec<Line<'static>>,
 }
 
-pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Result<()> {
+pub(crate) async fn run_tui(application: Application, cli: CliConfig) -> anyhow::Result<()> {
+    let channel = application.handle().channel(
+        ChannelConfig::new(TUI_CHANNEL)
+            .sender(cli.user_id.clone(), cli.username.clone())
+            .chat_type("p2p"),
+    );
     let current_workspace_dir = current_tui_workspace_dir()?;
     let mut terminal = TerminalGuard::enter()?;
     let session_id = if cli.resume {
         if let Some(selector) = cli.resume_session_id.as_deref() {
-            let session_id = resolve_resume_session_id(&runtime, selector).await?;
+            let session_id = resolve_resume_session_id(&channel, selector).await?;
             confirm_resume_workspace_if_mismatched(
-                &runtime,
+                &channel,
                 &mut terminal.terminal,
                 &session_id,
                 &current_workspace_dir,
@@ -109,32 +113,28 @@ pub(crate) async fn run_tui(runtime: Rc<Runtime>, cli: CliConfig) -> anyhow::Res
             .await?;
             session_id
         } else {
-            select_resume_session_id(&runtime, &mut terminal.terminal, &current_workspace_dir)
+            select_resume_session_id(&channel, &mut terminal.terminal, &current_workspace_dir)
                 .await?
         }
     } else {
         let session_channel = tui_start_channel_id(&cli.channel_id);
-        let session_id = runtime
-            .sessions
-            .lock()
-            .await
-            .create_channel(TUI_CHANNEL, &session_channel, &runtime.root_agent_id, None)?
-            .id;
-        ensure_tui_session_workspace_binding(&runtime, &session_id, &current_workspace_dir).await?;
+        let session_id = channel.resolve_session(session_channel).await?.id;
+        ensure_tui_session_workspace_binding(&channel, &session_id, &current_workspace_dir).await?;
         session_id
     };
 
-    let mut app = TuiApp::new(runtime, cli.clone(), session_id.clone()).await;
+    let mut app = TuiApp::new(channel.clone(), cli.clone(), session_id.clone()).await;
     let result = app.run(&mut terminal.terminal).await;
     terminal.restore()?;
     if should_cleanup_session_on_exit(app.has_activity, cli.resume) {
-        let _ = app.runtime.sessions.lock().await.delete(&session_id);
+        let _ = channel.delete_session(&session_id).await;
     } else {
         let exe = std::env::current_exe()?;
         let resume_args = tui_resume_command_args(&exe, &session_id, &cli);
         let resume_command = shell_join_command(&resume_args);
         eprintln!("\nYou can resume this session using: {resume_command}");
     }
+    application.shutdown().await?;
     result
 }
 
@@ -156,20 +156,23 @@ fn workspace_metadata_value(workspace_dir: &Path) -> String {
 }
 
 async fn ensure_tui_session_workspace_binding(
-    runtime: &Rc<Runtime>,
+    channel: &ChannelHandle,
     session_id: &str,
     current_workspace_dir: &Path,
 ) -> anyhow::Result<()> {
-    let mut sessions = runtime.sessions.lock().await;
-    if sessions
-        .metadata_string(session_id, TUI_WORKSPACE_DIR_METADATA_KEY)
-        .is_none()
+    let Some(session) = channel.session(session_id).await? else {
+        return Ok(());
+    };
+    if !session
+        .metadata
+        .contains_key(TUI_WORKSPACE_DIR_METADATA_KEY)
     {
-        sessions.set_metadata_string(
-            session_id,
-            TUI_WORKSPACE_DIR_METADATA_KEY,
-            &workspace_metadata_value(current_workspace_dir),
-        )?;
+        let mut patch = SessionPatch::default();
+        patch.metadata.insert(
+            TUI_WORKSPACE_DIR_METADATA_KEY.into(),
+            serde_json::Value::String(workspace_metadata_value(current_workspace_dir)),
+        );
+        channel.patch_session(session_id, patch).await?;
     }
     Ok(())
 }
@@ -229,16 +232,14 @@ fn resume_workspace_mismatch(session: &Session, current_workspace_dir: &Path) ->
 }
 
 async fn confirm_resume_workspace_if_mismatched(
-    runtime: &Rc<Runtime>,
+    channel: &ChannelHandle,
     terminal: &mut CrosstermTerminal,
     session_id: &str,
     current_workspace_dir: &Path,
 ) -> anyhow::Result<()> {
-    let session = runtime
-        .sessions
-        .lock()
-        .await
-        .get(session_id)
+    let session = channel
+        .session(session_id)
+        .await?
         .with_context(|| format!("session `{session_id}` disappeared before resume"))?;
     let Some(session_workspace) = resume_workspace_mismatch(&session, current_workspace_dir) else {
         return Ok(());
@@ -320,12 +321,11 @@ fn render_resume_workspace_mismatch_warning(
 }
 
 async fn select_resume_session_id(
-    runtime: &Rc<Runtime>,
+    channel: &ChannelHandle,
     terminal: &mut CrosstermTerminal,
     current_workspace_dir: &Path,
 ) -> anyhow::Result<String> {
-    let sessions =
-        resume_sessions_for_workspace(runtime.sessions.lock().await.list(), current_workspace_dir);
+    let sessions = resume_sessions_for_workspace(channel.sessions().await?, current_workspace_dir);
     if sessions.is_empty() {
         anyhow::bail!(
             "no TUI sessions available to resume for current directory `{}`",
@@ -502,7 +502,7 @@ fn short_session_id(id: &str) -> String {
 }
 
 async fn resolve_resume_session_id(
-    runtime: &Rc<Runtime>,
+    channel: &ChannelHandle,
     selector: &str,
 ) -> anyhow::Result<String> {
     let selector = selector.trim();
@@ -510,13 +510,12 @@ async fn resolve_resume_session_id(
         anyhow::bail!("--resume requires a session id, unique prefix, title, or channel id");
     }
 
-    let sessions = runtime.sessions.lock().await;
-    if let Some(session) = sessions.get(selector) {
-        return Ok(session.id);
+    let sessions = channel.sessions().await?;
+    if let Some(session) = sessions.iter().find(|session| session.id == selector) {
+        return Ok(session.id.clone());
     }
 
     let mut matches = sessions
-        .list()
         .into_iter()
         .filter(|session| {
             session.id.starts_with(selector)
@@ -620,13 +619,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn current_workspace_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
-    std::env::var_os("REMI_SANDBOX_HOST_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| data_dir.to_path_buf())
-}
-
 fn current_workspace_root_label(workspace_dir: &std::path::Path) -> String {
     let kind = std::env::var("REMI_SANDBOX_KIND")
         .ok()
@@ -708,7 +700,8 @@ fn git_event_affects_head(event: &notify::Event) -> bool {
 }
 
 struct TuiApp {
-    runtime: Rc<Runtime>,
+    channel: ChannelHandle,
+    catalog: ApplicationCatalog,
     cli: CliConfig,
     session_id: String,
     cells: Vec<HistoryCell>,
@@ -743,8 +736,7 @@ struct TuiApp {
     run_started_at: Option<Instant>,
     interrupt_requested: bool,
     exit_after_run: bool,
-    cancel: Option<CancellationToken>,
-    run_handle: Option<JoinHandle<()>>,
+    run_control: Option<RunControl>,
     queued_inputs: VecDeque<SubmittedInput>,
     pending_steers: VecDeque<PendingSteer>,
     input_history: Vec<String>,
@@ -762,7 +754,6 @@ struct TuiApp {
     sub_tool_args: std::collections::HashMap<String, String>,
     sub_tool_names: std::collections::HashMap<String, String>,
     sub_sessions: std::collections::HashMap<String, SubSessionUiState>,
-    sub_session_event_log_writers: std::collections::HashMap<String, tokio::fs::File>,
     supervisors: std::collections::HashMap<String, SupervisorUiState>,
     pending_approval: Option<ToolApprovalRequest>,
     approval_selected: usize,
@@ -776,7 +767,6 @@ struct TuiApp {
     loaded_thread_history_len: usize,
     sub_session_event_log_lines: usize,
     sub_session_event_log_offset: u64,
-    sub_session_event_log_remainder: String,
     has_activity: bool,
     bot_tx: mpsc::UnboundedSender<BotEvent>,
     bot_rx: UnboundedReceiverStream<BotEvent>,
@@ -807,9 +797,10 @@ fn set_terminal_title(workspace: &Path, status: &str) {
 }
 
 impl TuiApp {
-    async fn new(runtime: Rc<Runtime>, cli: CliConfig, session_id: String) -> Self {
+    async fn new(channel: ChannelHandle, cli: CliConfig, session_id: String) -> Self {
+        let catalog = channel.catalog().await.unwrap_or_default();
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
-        let workspace_dir = current_workspace_dir(&runtime.data_dir);
+        let workspace_dir = current_tui_workspace_dir().unwrap_or_else(|_| PathBuf::from("."));
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
         let git_status_workspace = workspace_dir.clone();
         let git_status =
@@ -817,12 +808,12 @@ impl TuiApp {
                 .await
                 .ok()
                 .flatten();
-        let is_sub_session_view = runtime
-            .sessions
-            .lock()
+        let is_sub_session_view = channel
+            .session(&session_id)
             .await
-            .metadata_string(&session_id, "sub_session_thread_id")
-            .is_some();
+            .ok()
+            .flatten()
+            .is_some_and(|session| session.metadata.contains_key("sub_session_thread_id"));
         let (git_watcher, git_change_rx) = watch_git_metadata(&workspace_dir)
             .map(|(watcher, rx)| (Some(watcher), rx))
             .unwrap_or_else(|| {
@@ -831,7 +822,8 @@ impl TuiApp {
             });
         let (git_status_tx, git_status_rx) = mpsc::unbounded_channel();
         let mut app = Self {
-            runtime,
+            channel,
+            catalog,
             cli,
             session_id,
             cells: Vec::new(),
@@ -861,8 +853,7 @@ impl TuiApp {
             run_started_at: None,
             interrupt_requested: false,
             exit_after_run: false,
-            cancel: None,
-            run_handle: None,
+            run_control: None,
             queued_inputs: VecDeque::new(),
             pending_steers: VecDeque::new(),
             input_history: Vec::new(),
@@ -880,7 +871,6 @@ impl TuiApp {
             sub_tool_args: std::collections::HashMap::new(),
             sub_tool_names: std::collections::HashMap::new(),
             sub_sessions: std::collections::HashMap::new(),
-            sub_session_event_log_writers: std::collections::HashMap::new(),
             supervisors: std::collections::HashMap::new(),
             pending_approval: None,
             approval_selected: 0,
@@ -894,7 +884,6 @@ impl TuiApp {
             loaded_thread_history_len: 0,
             sub_session_event_log_lines: 0,
             sub_session_event_log_offset: 0,
-            sub_session_event_log_remainder: String::new(),
             has_activity: false,
             bot_tx,
             bot_rx: UnboundedReceiverStream::new(bot_rx),
@@ -1322,17 +1311,20 @@ impl TuiApp {
             return Ok(false);
         }
         if self.running && text.trim_start().starts_with('/') {
-            match process_runtime_commands(&self.runtime, &self.session_id, text.trim()).await {
-                Ok(RuntimeCommandPipelineResult::Reply(reply)) => {
+            match self
+                .channel
+                .preprocess_command(&self.session_id, text.trim())
+                .await
+            {
+                Ok(CommandPreprocessResult::Reply(reply)) => {
                     self.cells.push(HistoryCell::user(display_text));
                     self.cells.push(HistoryCell::system(reply));
                 }
-                Ok(RuntimeCommandPipelineResult::StartWorkflow { .. })
-                | Ok(RuntimeCommandPipelineResult::Continue { .. }) => {
+                Ok(CommandPreprocessResult::Continue) => {
                     self.queued_inputs.push_back(SubmittedInput {
                         display_text,
                         content,
-                    });
+                    })
                 }
                 Err(error) => {
                     self.cells.push(HistoryCell::user(display_text));
@@ -1348,12 +1340,8 @@ impl TuiApp {
         // workflow, but new user input belongs to the next turn rather than
         // that internal continuation.
         if should_queue_for_next_turn(self.running, self.awaiting_background_tasks) {
-            let request = ChatRequest::text(self.session_id.clone(), ChatChannel::Tui, text)
-                .with_content(content.clone())
-                .with_sender(self.cli.user_id.clone(), Some(self.cli.username.clone()))
-                .with_message(format!("tui-next-{}", uuid::Uuid::new_v4()), "p2p")
-                .with_platform(Some(TUI_CHANNEL.to_string()));
-            match self.runtime.submit_next_turn(request) {
+            let request = RunRequest::new(self.session_id.clone(), content.clone());
+            match self.channel.next_turn(request).await? {
                 SteerSubmitResult::Queued(event) => {
                     self.has_activity = true;
                     self.pending_steers.push_back(PendingSteer {
@@ -1373,12 +1361,8 @@ impl TuiApp {
             return Ok(false);
         }
         if self.running {
-            let request = ChatRequest::text(self.session_id.clone(), ChatChannel::Tui, text)
-                .with_content(content.clone())
-                .with_sender(self.cli.user_id.clone(), Some(self.cli.username.clone()))
-                .with_message(format!("tui-steer-{}", uuid::Uuid::new_v4()), "p2p")
-                .with_platform(Some(TUI_CHANNEL.to_string()));
-            match self.runtime.submit_steer(request) {
+            let request = RunRequest::new(self.session_id.clone(), content.clone());
+            match self.channel.steer(request).await? {
                 SteerSubmitResult::Queued(event) => {
                     self.has_activity = true;
                     self.pending_steers.push_back(PendingSteer {
@@ -1427,30 +1411,11 @@ impl TuiApp {
         };
         upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(started));
 
-        let runtime = Rc::clone(&self.runtime);
+        let channel = self.channel.clone();
         let session_id = self.session_id.clone();
         let tx = self.bot_tx.clone();
         tokio::task::spawn_local(async move {
-            let result = async {
-                let (model_profile, reasoning_effort) =
-                    session_model_and_reasoning(&runtime, &session_id).await?;
-                let agent_id = runtime
-                    .sessions
-                    .lock()
-                    .await
-                    .metadata_string(&session_id, SESSION_AGENT_ID_METADATA_KEY);
-                runtime
-                    .bot
-                    .compact_memory_with_profile(
-                        &session_id,
-                        model_profile.as_deref(),
-                        agent_id.as_deref(),
-                        reasoning_effort,
-                    )
-                    .await
-                    .map_err(anyhow::Error::from)
-            }
-            .await;
+            let result = async { channel.compact(&session_id).await }.await;
             let (status, compacted_messages, error) = match result {
                 Ok(count) => (ContextCompactionStatus::Completed, count, None),
                 Err(err) => (ContextCompactionStatus::Failed, 0, Some(format!("{err:#}"))),
@@ -1477,12 +1442,12 @@ impl TuiApp {
         }
         self.cells
             .push(HistoryCell::system("fork: 准备复制当前 session..."));
-        let runtime = Rc::clone(&self.runtime);
+        let channel = self.channel.clone();
         let session_id = self.session_id.clone();
         let cli = self.cli.clone();
         let tx = self.bot_tx.clone();
         tokio::task::spawn_local(async move {
-            run_tui_fork_command(runtime, session_id, cli, tx).await;
+            run_tui_fork_command(channel, session_id, cli, tx).await;
         });
     }
 
@@ -1496,11 +1461,11 @@ impl TuiApp {
         }
         self.cells
             .push(HistoryCell::system("new: 正在创建空 session..."));
-        let runtime = Rc::clone(&self.runtime);
+        let channel = self.channel.clone();
         let cli = self.cli.clone();
         let tx = self.bot_tx.clone();
         tokio::task::spawn_local(async move {
-            run_tui_new_command(runtime, cli, tx).await;
+            run_tui_new_command(channel, cli, tx).await;
         });
     }
 
@@ -1511,34 +1476,33 @@ impl TuiApp {
             ));
             return Ok(());
         }
-        let mut agents = self.runtime.bot.agent_profiles();
+        let mut agents = self.channel.catalog().await?.agents;
         agents.sort_by(|a, b| a.id.cmp(&b.id));
         if agents.is_empty() {
             self.cells.push(HistoryCell::system("没有可切换的 agent。"));
             return Ok(());
         }
-        let current = self
-            .runtime
-            .sessions
-            .lock()
-            .await
-            .metadata_string(&self.session_id, SESSION_AGENT_ID_METADATA_KEY);
-        let effective = self
-            .runtime
-            .bot
-            .effective_agent_profile(current.as_deref())
-            .profile
-            .id;
+        let session = self
+            .channel
+            .session(&self.session_id)
+            .await?
+            .context("current session disappeared")?;
+        let current = session
+            .metadata
+            .get(SESSION_AGENT_ID_METADATA_KEY)
+            .and_then(serde_json::Value::as_str);
+        let effective = current.unwrap_or(&session.root_agent_id).to_string();
         let current_index = agents
             .iter()
             .position(|agent| agent.id == effective)
             .unwrap_or(0);
         let next = agents[(current_index + 1) % agents.len()].id.clone();
-        self.runtime.sessions.lock().await.set_metadata_string(
-            &self.session_id,
-            SESSION_AGENT_ID_METADATA_KEY,
-            &next,
-        )?;
+        let mut patch = SessionPatch::default();
+        patch.metadata.insert(
+            SESSION_AGENT_ID_METADATA_KEY.into(),
+            serde_json::Value::String(next.clone()),
+        );
+        self.channel.patch_session(&self.session_id, patch).await?;
         self.cells.push(HistoryCell::system(format!(
             "已切换当前 session agent 为 `{next}`。"
         )));
@@ -1550,12 +1514,12 @@ impl TuiApp {
         let old_had_activity = self.has_activity;
         self.session_id = session_id;
         self.is_sub_session_view = self
-            .runtime
-            .sessions
-            .lock()
+            .channel
+            .session(&self.session_id)
             .await
-            .metadata_string(&self.session_id, "sub_session_thread_id")
-            .is_some();
+            .ok()
+            .flatten()
+            .is_some_and(|session| session.metadata.contains_key("sub_session_thread_id"));
         self.has_activity = false;
         self.cells.clear();
         self.history_line_cache.clear();
@@ -1596,7 +1560,7 @@ impl TuiApp {
         )));
         self.load_thread_history().await;
         if should_cleanup_old_session_on_switch(old_had_activity) {
-            let _ = self.runtime.sessions.lock().await.delete(&old_session_id);
+            let _ = self.channel.delete_session(&old_session_id).await;
         }
     }
 
@@ -1607,8 +1571,6 @@ impl TuiApp {
             self.cells.remove(0);
         }
 
-        let cancel = CancellationToken::new();
-        self.cancel = Some(cancel.clone());
         self.running = true;
         self.awaiting_background_tasks = false;
         self.background_task_count = 0;
@@ -1623,29 +1585,29 @@ impl TuiApp {
         self.last_token_cell_index = None;
         self.active_supervisor_id = Some(format!("supervisor-{}", uuid::Uuid::new_v4()));
 
-        let runtime = Rc::clone(&self.runtime);
+        let channel = self.channel.clone();
         let session_id = self.session_id.clone();
         let sender_user_id = self.cli.user_id.clone();
         let sender_username = self.cli.username.clone();
         let async_agent = self.cli.async_agent;
         let tx = self.bot_tx.clone();
-        self.run_handle = Some(tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             run_bot_turn(
-                runtime,
+                channel,
                 session_id,
                 input.content,
                 sender_user_id,
                 sender_username,
                 async_agent,
-                cancel,
                 tx,
             )
             .await;
-        }));
+        });
     }
 
     async fn handle_bot_event(&mut self, event: BotEvent) {
         match event {
+            BotEvent::RunStarted(control) => self.run_control = Some(control),
             BotEvent::BackgroundTasksWaiting { count } => {
                 self.awaiting_background_tasks = count > 0;
                 self.background_task_count = count;
@@ -2149,8 +2111,7 @@ impl TuiApp {
                 self.awaiting_background_tasks = false;
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
-                self.cancel = None;
-                self.run_handle = None;
+                self.run_control = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2169,8 +2130,7 @@ impl TuiApp {
                 self.awaiting_background_tasks = false;
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
-                self.cancel = None;
-                self.run_handle = None;
+                self.run_control = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2186,8 +2146,7 @@ impl TuiApp {
                 self.awaiting_background_tasks = false;
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
-                self.cancel = None;
-                self.run_handle = None;
+                self.run_control = None;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2468,8 +2427,10 @@ impl TuiApp {
 
     fn request_cancel_current_run(&mut self) {
         if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
-            if let Some(handle) = self.run_handle.take() {
-                handle.abort();
+            if let Some(control) = self.run_control.take() {
+                tokio::spawn(async move {
+                    let _ = control.terminate().await;
+                });
             }
             promote_pending_steers_to_queued_inputs(
                 &mut self.pending_steers,
@@ -2479,7 +2440,6 @@ impl TuiApp {
             self.awaiting_background_tasks = false;
             self.background_task_count = 0;
             self.interrupt_requested = false;
-            self.cancel = None;
             self.sub_tool_args.clear();
             self.sub_tool_names.clear();
             self.sub_sessions.clear();
@@ -2495,8 +2455,10 @@ impl TuiApp {
             self.refresh_command_catalog();
             return;
         }
-        if let Some(cancel) = &self.cancel {
-            cancel.cancel();
+        if let Some(control) = self.run_control.clone() {
+            tokio::spawn(async move {
+                let _ = control.cancel().await;
+            });
         }
         self.status.state = "cancelling".to_string();
         set_terminal_title(&self.workspace_dir, "cancelling");
@@ -2520,11 +2482,17 @@ impl TuiApp {
 
     async fn load_input_history(&mut self) {
         let history = self
-            .runtime
-            .sessions
-            .lock()
+            .channel
+            .session(&self.session_id)
             .await
-            .metadata_value(&self.session_id, SESSION_INPUT_HISTORY_METADATA_KEY)
+            .ok()
+            .flatten()
+            .and_then(|session| {
+                session
+                    .metadata
+                    .get(SESSION_INPUT_HISTORY_METADATA_KEY)
+                    .cloned()
+            })
             .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             .unwrap_or_default();
         self.input_history = normalize_input_history(history);
@@ -2534,11 +2502,11 @@ impl TuiApp {
         self.input_history.push(text);
         self.input_history = normalize_input_history(std::mem::take(&mut self.input_history));
         let value = serde_json::json!(normalize_input_history(self.input_history.clone()));
-        let _ = self.runtime.sessions.lock().await.set_metadata_value(
-            &self.session_id,
-            SESSION_INPUT_HISTORY_METADATA_KEY,
-            value,
-        );
+        let mut patch = SessionPatch::default();
+        patch
+            .metadata
+            .insert(SESSION_INPUT_HISTORY_METADATA_KEY.into(), value);
+        let _ = self.channel.patch_session(&self.session_id, patch).await;
     }
 
     fn recall_history(&mut self, direction: isize) {
@@ -2565,7 +2533,8 @@ impl TuiApp {
 
     fn refresh_command_catalog(&mut self) {
         let mut commands = static_commands();
-        if let Ok(mut workflows) = self.runtime.bot.workflow_definitions() {
+        {
+            let mut workflows = self.catalog.workflows.clone();
             workflows.sort_by(|a, b| a.id.cmp(&b.id));
             commands.extend(
                 workflows
@@ -2596,7 +2565,7 @@ impl TuiApp {
                     }),
             );
         }
-        let mut skills = self.runtime.bot.skill_summaries();
+        let mut skills = self.catalog.skills.clone();
         skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.source.cmp(&b.source)));
         commands.extend(skills.into_iter().map(|skill| CommandEntry {
             value: format!("/skill:{} ", skill.id),
@@ -2604,11 +2573,11 @@ impl TuiApp {
             accepts_arguments: true,
             searchable: format!("skill {} 技能 {}", skill.name, skill.source),
         }));
-        let mut model_profiles = self.runtime.bot.model_profiles();
+        let mut model_profiles = self.catalog.models.clone();
         model_profiles.sort_by(|a, b| a.id.cmp(&b.id));
         for profile in model_profiles {
-            let reasoning = model_reasoning_effort_label(profile);
-            let key_status = model_profile_key_status(profile);
+            let reasoning = model_reasoning_effort_label(&profile);
+            let key_status = model_profile_key_status(&profile);
             let key_label = if key_status.configured {
                 "key ok".to_string()
             } else {
@@ -2626,7 +2595,7 @@ impl TuiApp {
                     profile.id, profile.name, profile.model, key_label, reasoning
                 ),
             });
-            commands.extend(reasoning_effort_menu_entries(profile).into_iter());
+            commands.extend(reasoning_effort_menu_entries(&profile).into_iter());
             commands.push(CommandEntry {
                 value: format!("/model use {} ", profile.id),
                 description: format!(
@@ -2640,7 +2609,7 @@ impl TuiApp {
                 ),
             });
         }
-        let mut agent_profiles = self.runtime.bot.agent_profiles();
+        let mut agent_profiles = self.catalog.agents.clone();
         agent_profiles.sort_by(|a, b| a.id.cmp(&b.id));
         commands.extend(agent_profiles.into_iter().map(|profile| CommandEntry {
             value: format!("/agent use {} ", profile.id),
@@ -2758,11 +2727,11 @@ impl TuiApp {
             return;
         };
         let decided = self
-            .runtime
-            .bot
-            .approval_manager()
-            .decide(&request.id, decision)
+            .channel
+            .decide_approval(&request.id, decision)
             .await
+            .ok()
+            .flatten()
             .is_some();
         tracing::info!(
             approval_id = %request.id,
@@ -2876,10 +2845,11 @@ impl TuiApp {
             source: Some("tui".to_string()),
         };
         let answered = self
-            .runtime
-            .bot
+            .channel
             .answer_user_question(&request.id, response)
             .await
+            .ok()
+            .flatten()
             .is_some();
         tracing::info!(
             question_id = %request.id,
@@ -3174,88 +3144,23 @@ impl TuiApp {
     }
 
     async fn persist_and_maybe_open_sub_session(&mut self, event: SubSessionEvent) {
-        let kind = sub_session_kind(&event);
-        let status = sub_session_status_label(event.event.as_ref());
-        if let Err(error) = self.runtime.sessions.lock().await.upsert_sub_session(
-            &self.session_id,
-            &event.sub_thread_id.0,
-            kind,
-            &event.agent_name,
-            event.title.clone(),
-            status,
-        ) {
-            self.cells.push(HistoryCell::error(format!(
-                "sub-session 记录失败: {error:#}"
-            )));
-            return;
-        }
-
-        let child_session_id =
-            match ensure_tui_sub_session_channel_session(&self.runtime, &self.session_id, &event)
-                .await
-            {
-                Some(session_id) => session_id,
-                None => return,
-            };
-
-        let messages = sub_session_history_messages(&event);
-        if !messages.is_empty() {
-            if let Err(error) = self
-                .runtime
-                .bot
-                .append_thread_messages(&child_session_id, messages)
-                .await
-            {
-                self.cells.push(HistoryCell::error(format!(
-                    "sub-session 历史写入失败: {error:#}"
-                )));
-            }
-        }
         if let Err(error) = self
-            .append_sub_session_event_log(&child_session_id, &event)
+            .channel
+            .record_sub_session(&self.session_id, event)
             .await
         {
             self.cells.push(HistoryCell::error(format!(
-                "sub-session 事件写入失败: {error:#}"
+                "sub-session 记录失败: {error:#}"
             )));
         }
     }
 
-    async fn append_sub_session_event_log(
-        &mut self,
-        session_id: &str,
-        event: &SubSessionEvent,
-    ) -> anyhow::Result<()> {
-        if !self.sub_session_event_log_writers.contains_key(session_id) {
-            let path = sub_session_event_log_path(&self.runtime.data_dir, session_id);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await?;
-            self.sub_session_event_log_writers
-                .insert(session_id.to_string(), file);
-        }
-
-        let mut line = serde_json::to_vec(event)?;
-        line.push(b'\n');
-        let result = self
-            .sub_session_event_log_writers
-            .get_mut(session_id)
-            .expect("sub-session event writer was just initialized")
-            .write_all(&line)
-            .await;
-        if result.is_err() || sub_session_status_label(event.event.as_ref()) != "running" {
-            self.sub_session_event_log_writers.remove(session_id);
-        }
-        result.map_err(Into::into)
-    }
-
     async fn load_thread_history(&mut self) {
-        let history = self.runtime.bot.thread_history(&self.session_id).await;
+        let history = self
+            .channel
+            .history(&self.session_id)
+            .await
+            .unwrap_or_default();
         self.loaded_thread_history_len = history.len();
         if history.is_empty() {
             self.cells.push(HistoryCell::system("no previous messages"));
@@ -3278,12 +3183,12 @@ impl TuiApp {
             return;
         }
         let is_sub_session = self
-            .runtime
-            .sessions
-            .lock()
+            .channel
+            .session(&self.session_id)
             .await
-            .metadata_string(&self.session_id, "sub_session_thread_id")
-            .is_some();
+            .ok()
+            .flatten()
+            .is_some_and(|session| session.metadata.contains_key("sub_session_thread_id"));
         if !is_sub_session {
             return;
         }
@@ -3294,47 +3199,17 @@ impl TuiApp {
     }
 
     async fn poll_sub_session_event_log(&mut self) {
-        let path = sub_session_event_log_path(&self.runtime.data_dir, &self.session_id);
-        let Ok(mut file) = tokio::fs::File::open(path).await else {
-            return;
-        };
-        let Ok(metadata) = file.metadata().await else {
-            return;
-        };
-        if metadata.len() < self.sub_session_event_log_offset {
-            self.sub_session_event_log_offset = 0;
-            self.sub_session_event_log_lines = 0;
-            self.sub_session_event_log_remainder.clear();
-        }
-        if file
-            .seek(std::io::SeekFrom::Start(self.sub_session_event_log_offset))
+        let Ok(page) = self
+            .channel
+            .sub_session_events(&self.session_id, self.sub_session_event_log_offset, 256)
             .await
-            .is_err()
-        {
-            return;
-        }
-        let mut appended = String::new();
-        let Ok(bytes_read) = file.read_to_string(&mut appended).await else {
+        else {
             return;
         };
-        if bytes_read == 0 {
-            return;
-        }
-        self.sub_session_event_log_offset += bytes_read as u64;
-        self.sub_session_event_log_remainder.push_str(&appended);
-        let Some(last_newline) = self.sub_session_event_log_remainder.rfind('\n') else {
-            return;
-        };
-        let complete = self.sub_session_event_log_remainder[..=last_newline].to_string();
-        self.sub_session_event_log_remainder.drain(..=last_newline);
-        for line in complete.lines().filter(|line| !line.trim().is_empty()) {
+        self.sub_session_event_log_offset = page.next_offset;
+        for event in page.events {
             self.sub_session_event_log_lines += 1;
-            match serde_json::from_str::<SubSessionEvent>(line) {
-                Ok(event) => self.apply_sub_session_event_as_session_view(event),
-                Err(error) => self.cells.push(HistoryCell::error(format!(
-                    "sub-session 事件解析失败: {error:#}"
-                ))),
-            }
+            self.apply_sub_session_event_as_session_view(event);
         }
     }
 
@@ -3656,91 +3531,7 @@ fn promote_pending_steers_to_queued_inputs(
     }
 }
 
-async fn ensure_tui_sub_session_channel_session(
-    runtime: &Rc<Runtime>,
-    parent_session_id: &str,
-    event: &SubSessionEvent,
-) -> Option<String> {
-    let title = event.title.clone().or_else(|| {
-        Some(format!(
-            "{} {}",
-            event.agent_name,
-            event.sub_thread_id.0.trim()
-        ))
-    });
-    let existing_binding = runtime
-        .sessions
-        .lock()
-        .await
-        .sub_session_channel_binding(parent_session_id, &event.sub_thread_id.0);
-    let (session_platform, session_channel_id) = existing_binding
-        .as_ref()
-        .map(|binding| (binding.platform.as_str(), binding.channel_id.as_str()))
-        .unwrap_or((TUI_CHANNEL, event.sub_thread_id.0.as_str()));
-
-    let session = runtime.sessions.lock().await.create_channel(
-        session_platform,
-        session_channel_id,
-        &runtime.root_agent_id,
-        title,
-    );
-    let session = match session {
-        Ok(session) => session,
-        Err(_) => return None,
-    };
-    if session.channel_binding.platform == TUI_CHANNEL {
-        if let Ok(current_workspace_dir) = current_tui_workspace_dir() {
-            let _ =
-                ensure_tui_session_workspace_binding(runtime, &session.id, &current_workspace_dir)
-                    .await;
-        }
-    }
-
-    let mut sessions = runtime.sessions.lock().await;
-    if existing_binding.is_none() {
-        let _ = sessions.bind_sub_session_channel(
-            parent_session_id,
-            &event.sub_thread_id.0,
-            ChannelBinding {
-                platform: TUI_CHANNEL.to_string(),
-                channel_id: event.sub_thread_id.0.clone(),
-            },
-        );
-    }
-    let _ = sessions.set_metadata_values(
-        &session.id,
-        [
-            (
-                "sub_session_parent_session_id".to_string(),
-                serde_json::Value::String(parent_session_id.to_string()),
-            ),
-            (
-                "sub_session_thread_id".to_string(),
-                serde_json::Value::String(event.sub_thread_id.0.clone()),
-            ),
-            (
-                "sub_session_agent".to_string(),
-                serde_json::Value::String(event.agent_name.clone()),
-            ),
-        ],
-    );
-    drop(sessions);
-    if event.agent_name == "acp" {
-        if let Some(acp_session_id) = runtime
-            .bot
-            .acp_session_id_for_sub_session(&event.sub_thread_id.0)
-            .await
-        {
-            let _ = runtime.sessions.lock().await.set_metadata_string(
-                &session.id,
-                "sub_session_acp_session_id",
-                &acp_session_id,
-            );
-        }
-    }
-    Some(session.id)
-}
-
+#[cfg(test)]
 fn sub_session_event_log_path(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir
         .join("tui-subsession-events")
@@ -4036,60 +3827,57 @@ fn percent_decode_path(value: &str) -> String {
 }
 
 async fn run_bot_turn(
-    runtime: Rc<Runtime>,
+    channel: ChannelHandle,
     session_id: String,
     content: Content,
-    sender_user_id: String,
-    sender_username: String,
+    _sender_user_id: String,
+    _sender_username: String,
     async_agent: bool,
-    cancel: CancellationToken,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
-    let text = content.text_content();
-    let is_clear_command = text.trim() == "/clear";
-    let request = ChatRequest::text(session_id.clone(), ChatChannel::Tui, text)
-        .with_content(content)
-        .with_sender(sender_user_id, Some(sender_username))
-        .with_message(format!("tui-msg-{}", uuid::Uuid::new_v4()), "p2p")
-        .with_platform(Some(TUI_CHANNEL.to_string()))
-        .with_async_agent(async_agent)
-        .with_cancel(cancel);
-    // `Runtime::chat` composes the agent and workflow streams into a very
-    // large concrete future. Keep that state on the heap: polling it directly
-    // from the TUI's local task can otherwise exhaust the main thread stack
-    // before the first model event is emitted.
-    let mut stream = Box::pin(Rc::clone(&runtime).chat(request));
-    while let Some(event) = stream.next().await {
-        if forward_core_event_to_tui(event, &tx, is_clear_command) {
+    let is_clear_command = content.text_content().trim() == "/clear";
+    let request = RunRequest::new(session_id, content)
+        .options(RunOptions::default().async_agent(async_agent));
+    let mut handle = match channel.run(request).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = tx.send(BotEvent::Error(format!("{error:#}")));
+            let _ = tx.send(BotEvent::Done);
+            return;
+        }
+    };
+    let _ = tx.send(BotEvent::RunStarted(handle.control()));
+    while let Some(event) = handle.recv().await {
+        if forward_application_event_to_tui(event, &tx, is_clear_command) {
             break;
         }
     }
     let _ = tx.send(BotEvent::Done);
 }
 
-fn forward_core_event_to_tui(
-    event: CoreChatEvent,
+fn forward_application_event_to_tui(
+    event: ApplicationEvent,
     tx: &mpsc::UnboundedSender<BotEvent>,
     clear_on_reply: bool,
 ) -> bool {
     match event {
-        CoreChatEvent::SupervisorStarted => {
+        ApplicationEvent::SupervisorStarted => {
             let _ = tx.send(BotEvent::SupervisorStarted);
             false
         }
-        CoreChatEvent::Prefix(prefix) => {
+        ApplicationEvent::Prefix(prefix) => {
             let _ = tx.send(BotEvent::Prefix(prefix));
             false
         }
-        CoreChatEvent::Reply(reply) => {
+        ApplicationEvent::Reply(reply) => {
             if clear_on_reply {
                 let _ = tx.send(BotEvent::SessionCleared);
             }
             let _ = tx.send(BotEvent::Prefix(reply));
             false
         }
-        CoreChatEvent::Bot(event) => forward_cat_event_to_tui(event, tx),
-        CoreChatEvent::Done => true,
+        ApplicationEvent::Cat(event) => forward_cat_event_to_tui(event, tx),
+        ApplicationEvent::Done => true,
     }
 }
 
@@ -4341,7 +4129,7 @@ fn pretty_supervisor_output(content: &str) -> String {
 }
 
 async fn run_tui_fork_command(
-    runtime: Rc<Runtime>,
+    channel: ChannelHandle,
     source_session_id: String,
     cli: CliConfig,
     tx: mpsc::UnboundedSender<BotEvent>,
@@ -4350,19 +4138,12 @@ async fn run_tui_fork_command(
         let _ = tx.send(BotEvent::ForkProgress(message));
     };
 
-    if runtime.bot.is_thread_running(&source_session_id).await {
-        send_progress("当前 session 正在运行，结束或取消后再 fork。".to_string());
-        return;
-    }
-
     let channel_id = format!("fork:{}", uuid::Uuid::new_v4());
     send_progress("fork: 正在创建新 session...".to_string());
-    let fork = match runtime.sessions.lock().await.fork_session(
-        &source_session_id,
-        TUI_CHANNEL,
-        &channel_id,
-        None,
-    ) {
+    let fork = match channel
+        .fork_session(&source_session_id, &channel_id, None)
+        .await
+    {
         Ok(Some(fork)) => fork,
         Ok(None) => {
             send_progress(format!(
@@ -4381,16 +4162,6 @@ async fn run_tui_fork_command(
         "fork: 已创建新 session。\n新 session: {}\n标题: {}\n正在复制上下文...",
         fork.id, fork_title
     ));
-    if let Err(error) = runtime
-        .bot
-        .fork_thread_data(&source_session_id, &fork.id, Some(&cli.user_id))
-        .await
-    {
-        let _ = runtime.sessions.lock().await.delete(&fork.id);
-        send_progress(format!("fork 失败，已清理新 session。\n错误: {error:#}"));
-        return;
-    }
-
     send_progress("fork: 上下文复制完成，正在打开新 pane...".to_string());
     let fork_id = fork.id.clone();
     match open_tui_session_in_new_pane(&fork_id, &cli) {
@@ -4426,7 +4197,7 @@ async fn run_tui_fork_command(
 }
 
 async fn run_tui_new_command(
-    runtime: Rc<Runtime>,
+    channel: ChannelHandle,
     cli: CliConfig,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
@@ -4436,12 +4207,7 @@ async fn run_tui_new_command(
 
     let channel_id = format!("new:{}", uuid::Uuid::new_v4());
     let title = "新对话".to_string();
-    let session = match runtime.sessions.lock().await.create_channel(
-        TUI_CHANNEL,
-        &channel_id,
-        &runtime.root_agent_id,
-        Some(title.clone()),
-    ) {
+    let session = match channel.resolve_session(&channel_id).await {
         Ok(session) => session,
         Err(error) => {
             send_progress(format!("new 失败: {error:#}"));
@@ -4450,7 +4216,7 @@ async fn run_tui_new_command(
     };
     if let Ok(current_workspace_dir) = current_tui_workspace_dir() {
         if let Err(error) =
-            ensure_tui_session_workspace_binding(&runtime, &session.id, &current_workspace_dir)
+            ensure_tui_session_workspace_binding(&channel, &session.id, &current_workspace_dir)
                 .await
         {
             send_progress(format!("new: session cwd 绑定失败: {error:#}"));
@@ -4496,6 +4262,7 @@ async fn run_tui_new_command(
 
 #[derive(Debug)]
 enum BotEvent {
+    RunStarted(RunControl),
     BackgroundTasksWaiting {
         count: usize,
     },
@@ -5789,6 +5556,7 @@ mod tests {
             id: "approval-1".to_string(),
             session_id: "session-1".to_string(),
             run_id: "run-1".to_string(),
+            app_id: None,
             tool_call_id: "call-1".to_string(),
             tool_name: "fs_remove".to_string(),
             risk: bot_core::ToolRiskLevel::Medium,
@@ -6137,6 +5905,7 @@ mod tests {
             task_id: "task-1".to_string(),
             thread_id: "thread-1".to_string(),
             run_id: "run-1".to_string(),
+            app_id: None,
             tool_call_id: "call-1".to_string(),
             tool_name: "fs_read".to_string(),
             args: serde_json::json!({"path":"src/lib.rs"}),
@@ -6247,6 +6016,31 @@ mod tests {
             sub_session_id(&base("run-1")),
             sub_session_id(&base("run-2"))
         );
+    }
+
+    #[test]
+    fn repeated_named_subagent_runs_get_distinct_cell_ids() {
+        let event = |run_id: &str| {
+            SubSessionEvent::new(
+                "parent-tool-call",
+                remi_agentloop::prelude::ThreadId("subagent:explorer:research".to_string()),
+                remi_agentloop::prelude::RunId(run_id.to_string()),
+                "explorer",
+                Some("Research".to_string()),
+                0,
+                ProtocolEvent::RunStart {
+                    thread_id: "subagent:explorer:research".to_string(),
+                    run_id: run_id.to_string(),
+                    metadata: None,
+                },
+            )
+        };
+
+        let first = sub_session_id(&event("run-1"));
+        let second = sub_session_id(&event("run-2"));
+        assert_ne!(first, second);
+        assert_eq!(first, "subagent:explorer:research::run:run-1");
+        assert_eq!(second, "subagent:explorer:research::run:run-2");
     }
 
     #[test]

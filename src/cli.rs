@@ -23,6 +23,14 @@ pub(crate) enum AppCommand {
     Codex(CodexCommand),
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
+    Telemetry(TelemetryCommand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TelemetryCommand {
+    Status,
+    Enable,
+    Disable,
 }
 
 #[cfg(test)]
@@ -58,6 +66,13 @@ pub(crate) struct CliArgs {
         help = "Override the tool-output overflow threshold in bytes"
     )]
     pub(crate) tool_output_overflow_bytes: Option<usize>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable automatic telemetry for this process"
+    )]
+    pub(crate) no_telemetry: bool,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -163,6 +178,11 @@ enum CliCommand {
     Config(ConfigArgs),
     #[command(about = "Update sandbox runtime config")]
     Sandbox(SandboxArgs),
+    #[command(about = "Show, enable, or disable telemetry for the selected profile")]
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCliCommand,
+    },
     #[command(about = "Manage runtime profiles")]
     Profile {
         #[command(subcommand)]
@@ -198,13 +218,8 @@ enum CliCommand {
         #[command(subcommand)]
         command: UpdateCliCommand,
     },
-    #[command(about = "Create a GitHub feedback issue")]
+    #[command(about = "Send feedback to Sentry")]
     Feedback(FeedbackArgs),
-    #[command(about = "Create a GitHub issue")]
-    Issue {
-        #[command(subcommand)]
-        command: IssueCliCommand,
-    },
     #[command(about = "Start local CLI chat mode")]
     Cli(LocalChatArgs),
     #[command(about = "Start terminal UI mode")]
@@ -500,8 +515,6 @@ struct FeedbackArgs {
     title: Option<String>,
     #[arg(short, long)]
     pub(crate) body: Option<String>,
-    #[arg(long)]
-    pub(crate) repo: Option<String>,
     #[arg(long = "label", visible_alias = "labels", value_delimiter = ',')]
     pub(crate) labels: Vec<String>,
     #[arg(long)]
@@ -515,9 +528,10 @@ struct FeedbackArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum IssueCliCommand {
-    #[command(about = "Create a GitHub issue using the feedback flow")]
-    Create(FeedbackArgs),
+enum TelemetryCliCommand {
+    Status,
+    Enable,
+    Disable,
 }
 
 #[derive(Debug, Args)]
@@ -863,23 +877,9 @@ pub(crate) struct GitHubRelease {
 pub(crate) struct FeedbackCommand {
     pub(crate) title: String,
     pub(crate) body: String,
-    pub(crate) repo: Option<String>,
     pub(crate) labels: Vec<String>,
     pub(crate) include_logs: bool,
     pub(crate) dry_run: bool,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct GitHubIssueCreateRequest {
-    pub(crate) title: String,
-    pub(crate) body: String,
-    pub(crate) labels: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct GitHubIssueCreateResponse {
-    pub(crate) html_url: String,
-    pub(crate) number: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1040,10 +1040,12 @@ pub(crate) fn parse_command(args: &[String]) -> anyhow::Result<AppCommand> {
 pub(crate) fn parse_cli_args(args: &[String]) -> anyhow::Result<GlobalArgsAndCommand> {
     let cli = try_parse_cli_args(args)?;
     let tool_output_overflow_bytes = cli.tool_output_overflow_bytes;
+    let no_telemetry = cli.no_telemetry;
     let command = cli_command_to_app(cli.command, cli.run)?;
     Ok(GlobalArgsAndCommand {
         profile: cli.profile,
         tool_output_overflow_bytes,
+        no_telemetry,
         command,
     })
 }
@@ -1059,6 +1061,7 @@ pub(crate) fn try_parse_cli_args(args: &[String]) -> Result<CliArgs, clap::Error
 pub(crate) struct GlobalArgsAndCommand {
     pub(crate) profile: Option<String>,
     pub(crate) tool_output_overflow_bytes: Option<usize>,
+    pub(crate) no_telemetry: bool,
     pub(crate) command: AppCommand,
 }
 
@@ -1093,6 +1096,11 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Sandbox(args)) => match args.command {
             SandboxCliCommand::Set(entries) => Ok(AppCommand::SandboxSet(entries.entries)),
         },
+        Some(CliCommand::Telemetry { command }) => Ok(AppCommand::Telemetry(match command {
+            TelemetryCliCommand::Status => TelemetryCommand::Status,
+            TelemetryCliCommand::Enable => TelemetryCommand::Enable,
+            TelemetryCliCommand::Disable => TelemetryCommand::Disable,
+        })),
         Some(CliCommand::Profile { command }) => {
             Ok(AppCommand::Profile(profile_cli_to_command(command)?))
         }
@@ -1150,11 +1158,6 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Feedback(args)) => {
             Ok(AppCommand::Feedback(feedback_args_to_command(args)?))
         }
-        Some(CliCommand::Issue { command }) => match command {
-            IssueCliCommand::Create(args) => {
-                Ok(AppCommand::Feedback(feedback_args_to_command(args)?))
-            }
-        },
         Some(CliCommand::Cli(args)) => Ok(AppCommand::Run(local_chat_args_to_config(args))),
         Some(CliCommand::Tui(args)) => Ok(AppCommand::Run(tui_args_to_config(args))),
         Some(CliCommand::Prompt(args)) => Ok(AppCommand::Run(prompt_args_to_config(args))),
@@ -1281,7 +1284,6 @@ fn feedback_args_to_command(args: FeedbackArgs) -> anyhow::Result<FeedbackComman
     Ok(FeedbackCommand {
         title,
         body,
-        repo: args.repo,
         labels,
         include_logs: args.include_logs,
         dry_run: args.dry_run,

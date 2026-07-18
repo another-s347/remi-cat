@@ -10,6 +10,22 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookTextFormat {
+    Json,
+    Toml,
+}
+
+#[derive(Debug, Clone)]
+pub enum HookSource {
+    File(PathBuf),
+    Text {
+        id: String,
+        format: HookTextFormat,
+        text: String,
+    },
+}
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -83,6 +99,8 @@ pub struct HookManager {
     trust_path: PathBuf,
     disabled_path: PathBuf,
     inner: Arc<RwLock<HookState>>,
+    discover_defaults: bool,
+    sources: Vec<HookSource>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +138,7 @@ struct HookHandler {
 #[derive(Debug, Clone)]
 pub struct HookContext {
     pub session_id: String,
+    pub app_id: Option<String>,
     pub transcript_path: Option<PathBuf>,
     pub cwd: PathBuf,
     pub model: Option<String>,
@@ -161,9 +180,74 @@ impl HookManager {
             disabled_path: data_dir.join("hooks").join("disabled.json"),
             data_dir,
             inner: Arc::new(RwLock::new(HookState::default())),
+            discover_defaults: true,
+            sources: Vec::new(),
         });
         manager.reload_blocking();
         manager
+    }
+
+    pub fn with_sources(
+        workspace_root: PathBuf,
+        data_dir: PathBuf,
+        discover_defaults: bool,
+        sources: Vec<HookSource>,
+    ) -> std::io::Result<Arc<Self>> {
+        let manager = Arc::new(Self {
+            workspace_root,
+            trust_path: data_dir.join("hooks").join("trust.json"),
+            disabled_path: data_dir.join("hooks").join("disabled.json"),
+            data_dir,
+            inner: Arc::new(RwLock::new(HookState::default())),
+            discover_defaults,
+            sources,
+        });
+        let hooks = manager.load_all_sources()?;
+        if let Ok(mut state) = manager.inner.try_write() {
+            state.hooks = hooks;
+            state.trusted = read_hash_set(&manager.trust_path);
+            state.disabled = read_hash_set(&manager.disabled_path);
+        }
+        Ok(manager)
+    }
+
+    fn load_all_sources(&self) -> std::io::Result<Vec<LoadedHook>> {
+        let mut hooks = if self.discover_defaults {
+            discover_hooks(&self.workspace_root, &self.data_dir)
+        } else {
+            Vec::new()
+        };
+        for source in &self.sources {
+            let (label, value) = match source {
+                HookSource::File(path) => {
+                    let path = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        self.workspace_root.join(path)
+                    };
+                    let text = std::fs::read_to_string(&path)?;
+                    let format = match path.extension().and_then(|v| v.to_str()) {
+                        Some("json") => HookTextFormat::Json,
+                        Some("toml") => HookTextFormat::Toml,
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("unknown hook file format: {}", path.display()),
+                            ))
+                        }
+                    };
+                    (path, parse_hook_text(format, &text)?)
+                }
+                HookSource::Text { id, format, text } => (
+                    PathBuf::from(format!("application:text:{id}")),
+                    parse_hook_text(*format, text)?,
+                ),
+            };
+            hooks.extend(parse_hooks_value(&label, &value));
+        }
+        let mut hashes = HashSet::new();
+        hooks.retain(|hook| hashes.insert(hook.hash.clone()));
+        Ok(hooks)
     }
 
     fn reload_blocking(&self) {
@@ -178,6 +262,19 @@ impl HookManager {
         if let Ok(mut guard) = self.inner.try_write() {
             *guard = state;
         }
+    }
+
+    /// Re-read hook definitions and persisted trust/enable state.
+    pub async fn reload(&self) -> std::io::Result<()> {
+        let hooks = self.load_all_sources()?;
+        let trusted = read_hash_set(&self.trust_path);
+        let disabled = read_hash_set(&self.disabled_path);
+        *self.inner.write().await = HookState {
+            hooks,
+            trusted,
+            disabled,
+        };
+        Ok(())
     }
 
     pub async fn statuses(&self) -> Vec<HookStatus> {
@@ -204,6 +301,20 @@ impl HookManager {
         let found = state.hooks.iter().any(|hook| hook.hash == hash);
         if found {
             state.trusted.insert(hash.to_string());
+            write_hash_set(&self.trust_path, &state.trusted)?;
+        }
+        Ok(found)
+    }
+
+    pub async fn set_trusted(&self, hash: &str, trusted: bool) -> std::io::Result<bool> {
+        let mut state = self.inner.write().await;
+        let found = state.hooks.iter().any(|hook| hook.hash == hash);
+        if found {
+            if trusted {
+                state.trusted.insert(hash.to_string());
+            } else {
+                state.trusted.remove(hash);
+            }
             write_hash_set(&self.trust_path, &state.trusted)?;
         }
         Ok(found)
@@ -363,9 +474,11 @@ async fn run_hook(hook: LoadedHook, context: HookContext, event_payload: Value) 
     let Some(command) = hook.effective_command() else {
         return HookOutcome::default();
     };
+    debug!(hook_hash = %hook.hash, app_id = context.app_id.as_deref().unwrap_or(""), session_id = %context.session_id, "running hook");
 
     let mut stdin = json!({
         "session_id": context.session_id,
+        "app_id": context.app_id,
         "transcript_path": context.transcript_path.as_ref().map(|p| p.display().to_string()),
         "cwd": context.cwd.display().to_string(),
         "hook_event_name": hook.event.as_str(),
@@ -418,19 +531,39 @@ async fn run_hook(hook: LoadedHook, context: HookContext, event_payload: Value) 
         }
     };
 
-    parse_hook_output(
-        hook.event,
-        output.status.code().unwrap_or_default(),
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    )
+    let exit_code = output.status.code().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        warn!(
+            hook_hash = %hook.hash,
+            event = hook.event.as_str(),
+            command = %command,
+            exit_code,
+            stderr = %stderr.trim(),
+            "hook command exited unsuccessfully"
+        );
+    } else if !stderr.trim().is_empty() {
+        debug!(
+            hook_hash = %hook.hash,
+            event = hook.event.as_str(),
+            stderr = %stderr.trim(),
+            "hook command wrote to stderr"
+        );
+    }
+
+    parse_hook_output(hook.event, exit_code, stdout.trim(), stderr.trim())
 }
 
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
         let mut cmd = Command::new("cmd.exe");
-        cmd.arg("/C").arg(command);
+        // `/S /C` strips exactly one outer quote pair. Supplying that pair here
+        // preserves the inner quotes around an executable path (including paths
+        // with spaces) instead of making them part of the command name.
+        cmd.arg("/D").arg("/S").arg("/C");
+        cmd.raw_arg(format!(" \"{command}\""));
         cmd
     }
     #[cfg(not(windows))]
@@ -443,13 +576,23 @@ fn shell_command(command: &str) -> Command {
 
 fn parse_hook_output(event: HookEventName, code: i32, stdout: &str, stderr: &str) -> HookOutcome {
     let mut outcome = HookOutcome::default();
+    if code != 0 {
+        outcome.failed = true;
+        outcome.reason = Some(if stderr.is_empty() {
+            format!("hook command exited with status {code}")
+        } else {
+            format!("hook command exited with status {code}: {stderr}")
+        });
+    }
     if code == 2 {
         outcome.blocked = true;
         outcome.permission_decision = match event {
             HookEventName::PermissionRequest => Some(HookPermissionDecision::Deny),
             _ => outcome.permission_decision,
         };
-        outcome.reason = (!stderr.is_empty()).then(|| stderr.to_string());
+        if !stderr.is_empty() {
+            outcome.reason = Some(stderr.to_string());
+        }
     }
     if !stdout.is_empty() {
         if let Ok(value) = serde_json::from_str::<Value>(stdout) {
@@ -668,6 +811,19 @@ fn read_config_value(path: &Path) -> Option<Value> {
     }
 }
 
+fn parse_hook_text(format: HookTextFormat, text: &str) -> std::io::Result<Value> {
+    match format {
+        HookTextFormat::Json => serde_json::from_str(text)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        HookTextFormat::Toml => {
+            let value: toml::Value = toml::from_str(text)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            serde_json::to_value(value.get("hooks").unwrap_or(&value))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
+    }
+}
+
 fn parse_hooks_value(source: &Path, value: &Value) -> Vec<LoadedHook> {
     if value.get("hooks").is_some() {
         return parse_hooks_value(source, value.get("hooks").unwrap());
@@ -857,6 +1013,138 @@ mod tests {
     use std::sync::Mutex;
 
     static HOOK_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn nonzero_hook_exit_is_reported_as_failure() {
+        let outcome = parse_hook_output(HookEventName::Stop, 1, "", "command failed");
+        assert!(outcome.failed);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("hook command exited with status 1: command failed")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_runs_a_quoted_command_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("hook command.cmd");
+        std::fs::write(&script, "@echo hook-ok\r\n").unwrap();
+        let output = shell_command(&format!("\"{}\"", script.display()))
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hook-ok");
+    }
+
+    #[tokio::test]
+    async fn explicit_text_sources_are_deduplicated_and_survive_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = r#"{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo ok"}]}]}"#;
+        let manager = HookManager::with_sources(
+            temp.path().to_path_buf(),
+            temp.path().join("data"),
+            false,
+            vec![
+                HookSource::Text {
+                    id: "one".into(),
+                    format: HookTextFormat::Json,
+                    text: text.into(),
+                },
+                HookSource::Text {
+                    id: "two".into(),
+                    format: HookTextFormat::Json,
+                    text: text.into(),
+                },
+            ],
+        )
+        .unwrap();
+        let statuses = manager.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, "application:text:one");
+        manager.reload().await.unwrap();
+        assert_eq!(manager.statuses().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_file_reload_keeps_previous_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.json");
+        std::fs::write(
+            &path,
+            r#"{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}"#,
+        )
+        .unwrap();
+        let manager = HookManager::with_sources(
+            temp.path().to_path_buf(),
+            temp.path().join("data"),
+            false,
+            vec![HookSource::File(path.clone())],
+        )
+        .unwrap();
+        let before = manager.statuses().await;
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(manager.reload().await.is_err());
+        assert_eq!(manager.statuses().await[0].hash, before[0].hash);
+    }
+
+    #[tokio::test]
+    async fn hook_stdin_contains_application_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("payload.json");
+        let handler_value =
+            json!({"type":"command","command": format!("cat > {}", output.display())});
+        let hook = LoadedHook {
+            event: HookEventName::SessionStart,
+            matcher: None,
+            handler: serde_json::from_value(handler_value).unwrap(),
+            source: PathBuf::from("test.json"),
+            hash: "test".into(),
+            warning: None,
+        };
+        let context = HookContext {
+            session_id: "session".into(),
+            app_id: Some("embedded-host".into()),
+            transcript_path: None,
+            cwd: temp.path().to_path_buf(),
+            model: None,
+            turn_id: None,
+            permission_mode: None,
+        };
+        let outcome = run_hook(hook, context, json!({})).await;
+        assert!(!outcome.failed);
+        let payload: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(payload["app_id"], "embedded-host");
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_trust_persists_across_manager_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let source = HookSource::Text {
+            id: "trusted".into(),
+            format: HookTextFormat::Json,
+            text: r#"{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}"#.into(),
+        };
+        let first = HookManager::with_sources(
+            temp.path().into(),
+            data.clone(),
+            false,
+            vec![source.clone()],
+        )
+        .unwrap();
+        let hash = first.statuses().await[0].hash.clone();
+        assert!(first.set_trusted(&hash, true).await.unwrap());
+        drop(first);
+        let second =
+            HookManager::with_sources(temp.path().into(), data, false, vec![source]).unwrap();
+        assert!(second.statuses().await[0].trusted);
+    }
 
     fn without_codex_hook_import<T>(f: impl FnOnce() -> T) -> T {
         let _guard = HOOK_ENV_LOCK
@@ -1097,9 +1385,15 @@ import_codex_hooks = true
             .unwrap();
 
             let hooks = discover_hooks(&workspace, &data_dir);
-            assert_eq!(hooks.len(), 1);
-            assert_eq!(hooks[0].source, codex_dir.join("hooks.json"));
-            assert_eq!(hooks[0].handler.command.as_deref(), Some("echo codex"));
+            let workspace_hooks = hooks
+                .iter()
+                .filter(|hook| hook.source == codex_dir.join("hooks.json"))
+                .collect::<Vec<_>>();
+            assert_eq!(workspace_hooks.len(), 1);
+            assert_eq!(
+                workspace_hooks[0].handler.command.as_deref(),
+                Some("echo codex")
+            );
         });
     }
 

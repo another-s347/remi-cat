@@ -178,6 +178,7 @@ pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> 
                             .unwrap_or_else(|| "10000".to_string())
                     );
                     println!("async_agent: {}", config.tool_output.async_agent);
+                    println!("telemetry_enabled: {}", config.telemetry.enabled);
                     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
                     println!("sandbox_container: {}", config.sandbox.container_name);
                     println!("im_mode: {}", config.im.mode.as_env_value());
@@ -906,6 +907,9 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "admin_enabled" | "admin.enabled" => config.admin.enabled = parse_bool(value)?,
         "admin_host" | "admin.host" => config.admin.host = value.to_string(),
         "admin_port" | "admin.port" => config.admin.port = parse_port(value)?,
+        "telemetry_enabled" | "telemetry.enabled" | "telemetry" => {
+            config.telemetry.enabled = parse_bool(value)?
+        }
         "sandbox_kind" | "sandbox.kind" => config.sandbox.kind = parse_sandbox_kind(value)?,
         "sandbox_host_dir" | "sandbox.host_dir" => config.sandbox.host_dir = value.to_string(),
         "sandbox_container_dir" | "sandbox.container_dir" => {

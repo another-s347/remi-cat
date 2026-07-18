@@ -19,9 +19,18 @@ type DynamicToolHandler = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicToolRisk {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone)]
 pub struct DynamicTool {
     definition: ToolDefinition,
     handler: DynamicToolHandler,
+    risk: Option<DynamicToolRisk>,
 }
 
 impl DynamicTool {
@@ -39,6 +48,7 @@ impl DynamicTool {
         Self {
             definition,
             handler,
+            risk: None,
         }
     }
 
@@ -65,6 +75,17 @@ impl DynamicTool {
             },
             handler,
         )
+    }
+
+    /// Declare the approval risk used for every invocation of this host tool.
+    /// Undeclared tools continue through the runtime's normal risk classifier.
+    pub fn risk(mut self, risk: DynamicToolRisk) -> Self {
+        self.risk = Some(risk);
+        self
+    }
+
+    pub fn declared_risk(&self) -> Option<DynamicToolRisk> {
+        self.risk
     }
 }
 

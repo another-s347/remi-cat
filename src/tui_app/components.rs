@@ -1255,7 +1255,16 @@ pub(super) fn format_sub_session_prefix(event: &SubSessionEvent) -> String {
 }
 
 pub(super) fn sub_session_id(event: &SubSessionEvent) -> String {
-    event.sub_thread_id.0.clone()
+    // Named sub-agents deliberately reuse their thread so later invocations can
+    // continue the same conversation. A TUI cell represents one invocation,
+    // though, and therefore needs the run id as part of its identity. ACP is
+    // different: repeated status polls are views of the same remote session and
+    // should continue updating one cell.
+    if event.agent_name == "acp" {
+        event.sub_thread_id.0.clone()
+    } else {
+        format!("{}::run:{}", event.sub_thread_id.0, event.sub_run_id.0)
+    }
 }
 
 pub(super) fn sub_session_kind(event: &SubSessionEvent) -> SubSessionKind {

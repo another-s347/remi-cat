@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 const RUNTIME_FILE_NAME: &str = "runtime.yaml";
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub data_dir: String,
@@ -27,6 +31,20 @@ pub struct RuntimeConfig {
     pub shell: ShellConfig,
     #[serde(default)]
     pub acp: AcpConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +73,7 @@ impl RuntimeConfig {
             im: ImConfig::default(),
             shell: ShellConfig::default(),
             acp: AcpConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 
@@ -843,6 +862,7 @@ mod tests {
             im: Default::default(),
             shell: Default::default(),
             acp: Default::default(),
+            telemetry: Default::default(),
         };
         cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
         write_runtime_config(&dir, &cfg).unwrap();
@@ -862,6 +882,7 @@ model_profile: default
 
         assert_eq!(cfg.tool_output.overflow_bytes, None);
         assert_eq!(cfg.tool_output.foreground_timeout_ms, None);
+        assert!(cfg.telemetry.enabled);
     }
 
     #[test]

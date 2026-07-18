@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +55,8 @@ pub struct ToolApprovalRequest {
     pub model_review_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ToolRiskReview>,
 }
@@ -126,6 +128,32 @@ struct ApprovalState {
 #[derive(Debug, Default)]
 pub struct ToolApprovalManager {
     state: Mutex<ApprovalState>,
+    custom_tool_risks: RwLock<HashMap<String, ToolRiskLevel>>,
+}
+
+impl ToolApprovalManager {
+    pub fn register_custom_tool_risk(
+        &self,
+        tool_name: impl Into<String>,
+        risk: ToolRiskLevel,
+    ) -> anyhow::Result<()> {
+        let tool_name = tool_name.into();
+        let mut risks = self
+            .custom_tool_risks
+            .write()
+            .map_err(|_| anyhow::anyhow!("custom tool risk registry is poisoned"))?;
+        if risks.insert(tool_name.clone(), risk).is_some() {
+            anyhow::bail!("custom tool risk for `{tool_name}` is already registered");
+        }
+        Ok(())
+    }
+
+    pub fn custom_tool_risk(&self, tool_name: &str) -> Option<ToolRiskLevel> {
+        self.custom_tool_risks
+            .read()
+            .ok()
+            .and_then(|risks| risks.get(tool_name).copied())
+    }
 }
 
 impl ToolApprovalManager {
@@ -146,6 +174,7 @@ impl ToolApprovalManager {
         let _ = pending.tx.send(decision);
         tracing::info!(
             approval_id,
+            app_id = request.app_id.as_deref().unwrap_or(""),
             decision = ?decision,
             session_id = %request.session_id,
             tool_name = %request.tool_name,
@@ -1189,6 +1218,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_tool_risk_registration_round_trips_and_rejects_duplicates() {
+        let manager = ToolApprovalManager::default();
+        manager
+            .register_custom_tool_risk("host_read", ToolRiskLevel::Low)
+            .unwrap();
+        assert_eq!(
+            manager.custom_tool_risk("host_read"),
+            Some(ToolRiskLevel::Low)
+        );
+        assert!(manager
+            .register_custom_tool_risk("host_read", ToolRiskLevel::High)
+            .is_err());
+        assert_eq!(manager.custom_tool_risk("unknown"), None);
+    }
+
+    #[test]
     fn risk_policy_marks_readonly_low_writes_medium_and_only_dangerous_deletes_high() {
         assert_eq!(
             classify_tool_risk("fs_read", &serde_json::json!({})),
@@ -1482,6 +1527,7 @@ mod tests {
             )),
             model_review_reason: None,
             platform: Some("test".to_string()),
+            app_id: None,
             review: None,
         };
 
@@ -1509,6 +1555,7 @@ mod tests {
             )),
             model_review_reason: None,
             platform: Some("test".to_string()),
+            app_id: None,
             review: None,
         };
 
@@ -1566,6 +1613,7 @@ mod tests {
             command_key: Some("fetch:{}:one".into()),
             model_review_reason: None,
             platform: None,
+            app_id: None,
             review: None,
         };
         let (wait, _) = manager.start_request(first.clone()).await;
@@ -1622,6 +1670,7 @@ mod tests {
             command_key: Some("bash:cargo-test:first".into()),
             model_review_reason: None,
             platform: None,
+            app_id: None,
             review: Some(ToolRiskReview {
                 risk: ToolRiskLevel::Medium,
                 reason: "Reviewed as medium.".into(),
@@ -1694,6 +1743,7 @@ mod tests {
                 command_key: Some("fs_write:{}:one".into()),
                 model_review_reason: None,
                 platform: None,
+                app_id: None,
                 review: None,
             })
             .await;
@@ -1723,6 +1773,7 @@ mod tests {
                 command_key: Some("bash:{}:one".into()),
                 model_review_reason: None,
                 platform: None,
+                app_id: None,
                 review: None,
             })
             .await;
@@ -1741,6 +1792,7 @@ mod tests {
                 command_key: Some("bash:{}:high".into()),
                 model_review_reason: None,
                 platform: None,
+                app_id: None,
                 review: None,
             })
             .await;
