@@ -21,7 +21,9 @@ use tracing::Instrument as _;
 use crate::channel::feishu::LocalImFileBridge;
 use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
 use crate::secret_store::SecretStore;
-use crate::session::{ChannelBinding, Session, SessionRuntime, SubSessionKind};
+#[cfg(test)]
+use crate::session::ChannelBinding;
+use crate::session::{Session, SessionRuntime, SubSessionKind};
 use bot_core::tool_tasks::TOOL_TASK_RUNNING;
 use bot_core::{CatBotBuilder, ImFileBridge};
 use user_store::UserStore;
@@ -2018,54 +2020,81 @@ async fn record_sub_session(
     };
     let status = match event.event.as_ref() {
         ProtocolEvent::Done => "done",
-        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => "done",
+        ProtocolEvent::Custom { event_type, .. }
+            if matches!(
+                event_type.as_str(),
+                "sub_session_done" | "sub_session_handed_off"
+            ) =>
+        {
+            "done"
+        }
         ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled => "error",
         _ => "running",
     };
+    let persists_session_state = match event.event.as_ref() {
+        ProtocolEvent::RunStart { .. }
+        | ProtocolEvent::Done
+        | ProtocolEvent::Error { .. }
+        | ProtocolEvent::Cancelled => true,
+        ProtocolEvent::Custom { event_type, .. } => {
+            matches!(
+                event_type.as_str(),
+                "sub_session_done" | "sub_session_handed_off"
+            )
+        }
+        _ => false,
+    };
+    let acp_session_id = if persists_session_state && event.agent_name == "acp" {
+        runtime.bot.acp_session_id_for_sub_session(thread_id).await
+    } else {
+        None
+    };
+    let mut child_metadata = vec![
+        (
+            "sub_session_parent_session_id".into(),
+            serde_json::Value::String(parent_id.into()),
+        ),
+        (
+            "sub_session_thread_id".into(),
+            serde_json::Value::String(thread_id.into()),
+        ),
+        (
+            "sub_session_agent".into(),
+            serde_json::Value::String(event.agent_name.clone()),
+        ),
+        (
+            SESSION_APP_ID_METADATA_KEY.into(),
+            serde_json::Value::String(app_id.to_string()),
+        ),
+    ];
+    if let Some(acp_session_id) = acp_session_id {
+        child_metadata.push((
+            "sub_session_acp_session_id".into(),
+            serde_json::Value::String(acp_session_id),
+        ));
+    }
     let mut sessions = runtime.sessions.lock().await;
-    sessions.upsert_sub_session(
-        parent_id,
-        thread_id,
-        kind,
-        &event.agent_name,
-        event.title.clone(),
-        &status,
-    )?;
-    let child = sessions.create_channel(
-        &config.id,
-        thread_id,
-        &runtime.root_agent_id,
-        event.title.clone(),
-    )?;
-    sessions.bind_sub_session_channel(
-        parent_id,
-        thread_id,
-        ChannelBinding {
-            platform: config.id.clone(),
-            channel_id: thread_id.into(),
-        },
-    )?;
-    sessions.set_metadata_values(
-        &child.id,
-        [
-            (
-                "sub_session_parent_session_id".into(),
-                serde_json::Value::String(parent_id.into()),
-            ),
-            (
-                "sub_session_thread_id".into(),
-                serde_json::Value::String(thread_id.into()),
-            ),
-            (
-                "sub_session_agent".into(),
-                serde_json::Value::String(event.agent_name.clone()),
-            ),
-            (
-                SESSION_APP_ID_METADATA_KEY.into(),
-                serde_json::Value::String(app_id.to_string()),
-            ),
-        ],
-    )?;
+    let child =
+        if persists_session_state || sessions.channel_session_id(&config.id, thread_id).is_none() {
+            sessions.upsert_sub_session_channel(
+                parent_id,
+                thread_id,
+                kind,
+                &event.agent_name,
+                event.title.clone(),
+                status,
+                &config.id,
+                &runtime.root_agent_id,
+                child_metadata,
+            )?
+        } else {
+            let child_id = sessions
+                .channel_session_id(&config.id, thread_id)
+                .context("sub-session channel disappeared")?;
+            sessions
+                .get(&child_id)
+                .context("sub-session channel references a missing session")?
+        };
     drop(sessions);
     let messages = match event.event.as_ref() {
         ProtocolEvent::RunStart { .. } => {
@@ -2095,15 +2124,6 @@ async fn record_sub_session(
             .await
             .map_err(anyhow::Error::from)?;
     }
-    if event.agent_name == "acp" {
-        if let Some(acp_id) = runtime.bot.acp_session_id_for_sub_session(thread_id).await {
-            runtime.sessions.lock().await.set_metadata_string(
-                &child.id,
-                "sub_session_acp_session_id",
-                &acp_id,
-            )?;
-        }
-    }
     let path = runtime
         .data_dir
         .join("tui-subsession-events")
@@ -2124,11 +2144,15 @@ async fn record_sub_session(
         .open(path)
         .await?;
     file.write_all(&bytes).await?;
-    tokio::fs::write(
-        metadata_path,
-        serde_json::to_vec_pretty(&serde_json::json!({"app_id": app_id, "session_id": &child.id}))?,
-    )
-    .await?;
+    if persists_session_state || !tokio::fs::try_exists(&metadata_path).await? {
+        tokio::fs::write(
+            metadata_path,
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"app_id": app_id, "session_id": &child.id}),
+            )?,
+        )
+        .await?;
+    }
     Ok(child.id)
 }
 
@@ -2359,6 +2383,45 @@ mod tests {
         let child = channel.session(child_id).await.unwrap().unwrap();
         assert_eq!(child.channel_binding.platform, "host-channel");
         assert_eq!(child.metadata[SESSION_APP_ID_METADATA_KEY], "embedded-host");
+        let data_dir = application.handle().info().data_dir;
+        let sessions_before_delta = std::fs::read(data_dir.join("sessions.json"))
+            .expect("read session store before streaming event");
+        let delta = SubSessionEvent::new(
+            "parent-tool",
+            remi_agentloop::prelude::ThreadId("child-thread".into()),
+            remi_agentloop::prelude::RunId("child-run".into()),
+            "coder",
+            Some("child".into()),
+            2,
+            ProtocolEvent::ThinkingEnd {
+                content: "streaming".into(),
+            },
+        );
+        channel
+            .record_sub_session(&session.id, delta)
+            .await
+            .unwrap();
+        let sessions_after_delta = std::fs::read(data_dir.join("sessions.json"))
+            .expect("read session store after streaming event");
+        assert_eq!(sessions_after_delta, sessions_before_delta);
+        let handed_off = SubSessionEvent::new(
+            "parent-tool",
+            remi_agentloop::prelude::ThreadId("child-thread".into()),
+            remi_agentloop::prelude::RunId("child-run".into()),
+            "coder",
+            Some("child".into()),
+            3,
+            ProtocolEvent::Custom {
+                event_type: "sub_session_handed_off".into(),
+                extra: serde_json::json!({}),
+            },
+        );
+        channel
+            .record_sub_session(&session.id, handed_off)
+            .await
+            .unwrap();
+        let parent = channel.session(&session.id).await.unwrap().unwrap();
+        assert_eq!(parent.sub_sessions[0].status, "done");
         application.shutdown().await.unwrap();
     }
 

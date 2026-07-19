@@ -162,20 +162,11 @@ impl TuiApp {
     }
 
     fn status_context_parts(&self) -> Vec<String> {
-        let agent_id = self
-            .catalog
-            .agents
-            .first()
-            .map(|profile| profile.id.as_str())
-            .unwrap_or("default");
-        let model_id = self
-            .catalog
-            .models
-            .first()
-            .map(|profile| profile.id.as_str())
-            .unwrap_or("default");
         let mut parts = vec![
-            format!("model {agent_id}/{model_id}"),
+            format!(
+                "model {}/{}",
+                self.effective_agent_id, self.effective_model_profile_id
+            ),
             self.git_status
                 .as_ref()
                 .map(|status| format!("git {status}"))
@@ -189,11 +180,7 @@ impl TuiApp {
             self.status.prompt_tokens,
             self.status.completion_tokens,
             self.status.max_prompt_tokens,
-            self.catalog
-                .models
-                .first()
-                .map(|profile| profile.context_tokens)
-                .unwrap_or(0),
+            self.effective_model_context_tokens,
         ) {
             parts.insert(1, format!("ctx {pct}%"));
         }

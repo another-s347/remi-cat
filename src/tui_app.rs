@@ -16,6 +16,8 @@ use bot_core::{
     ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
     WorkflowReport, WorkflowStatus,
 };
+#[cfg(test)]
+use bot_core::{AgentModelBindings, AgentProfile};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -63,6 +65,7 @@ use crate::{
     Application, ApplicationCatalog, ApplicationEvent, ChannelConfig, ChannelHandle, CliConfig,
     CommandPreprocessResult, RunControl, RunOptions, RunRequest, SessionPatch,
     SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
+    SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 
 const TUI_CHANNEL: &str = "tui";
@@ -669,6 +672,48 @@ fn current_git_status(workspace_dir: &std::path::Path) -> Option<String> {
     Some(branch)
 }
 
+fn effective_tui_model_status(
+    catalog: &ApplicationCatalog,
+    session: Option<&Session>,
+) -> (String, String, u32) {
+    let agent_id = session
+        .and_then(|session| {
+            session
+                .metadata
+                .get(SESSION_AGENT_ID_METADATA_KEY)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .or_else(|| Some(session.root_agent_id.as_str()))
+        })
+        .unwrap_or("default")
+        .to_string();
+    let agent = catalog.agents.iter().find(|agent| agent.id == agent_id);
+    let session_model_id = session.and_then(|session| {
+        session
+            .metadata
+            .get(SESSION_MODEL_PROFILE_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    });
+    let model = session_model_id
+        .and_then(|id| catalog.models.iter().find(|model| model.id == id))
+        .or_else(|| {
+            session_model_id.is_none().then(|| {
+                agent
+                    .and_then(|agent| agent.models.primary.as_deref())
+                    .and_then(|id| catalog.models.iter().find(|model| model.id == id))
+            })?
+        })
+        .or_else(|| catalog.models.first());
+    let model_id = model
+        .map(|model| model.id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let context_tokens = model.map(|model| model.context_tokens).unwrap_or(0);
+    (agent_id, model_id, context_tokens)
+}
+
 fn watch_git_metadata(
     workspace_dir: &std::path::Path,
 ) -> Option<(RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
@@ -704,6 +749,9 @@ struct TuiApp {
     catalog: ApplicationCatalog,
     cli: CliConfig,
     session_id: String,
+    effective_agent_id: String,
+    effective_model_profile_id: String,
+    effective_model_context_tokens: u32,
     cells: Vec<HistoryCell>,
     composer: ComposerInput,
     scroll: u16,
@@ -799,6 +847,9 @@ fn set_terminal_title(workspace: &Path, status: &str) {
 impl TuiApp {
     async fn new(channel: ChannelHandle, cli: CliConfig, session_id: String) -> Self {
         let catalog = channel.catalog().await.unwrap_or_default();
+        let session = channel.session(&session_id).await.ok().flatten();
+        let (effective_agent_id, effective_model_profile_id, effective_model_context_tokens) =
+            effective_tui_model_status(&catalog, session.as_ref());
         let (bot_tx, bot_rx) = mpsc::unbounded_channel();
         let workspace_dir = current_tui_workspace_dir().unwrap_or_else(|_| PathBuf::from("."));
         let workspace_root_label = current_workspace_root_label(&workspace_dir);
@@ -826,6 +877,9 @@ impl TuiApp {
             catalog,
             cli,
             session_id,
+            effective_agent_id,
+            effective_model_profile_id,
+            effective_model_context_tokens,
             cells: Vec::new(),
             composer: ComposerInput::default(),
             scroll: 0,
@@ -1319,6 +1373,7 @@ impl TuiApp {
                 Ok(CommandPreprocessResult::Reply(reply)) => {
                     self.cells.push(HistoryCell::user(display_text));
                     self.cells.push(HistoryCell::system(reply));
+                    self.refresh_effective_model_status().await;
                 }
                 Ok(CommandPreprocessResult::Continue) => {
                     self.queued_inputs.push_back(SubmittedInput {
@@ -1503,6 +1558,7 @@ impl TuiApp {
             serde_json::Value::String(next.clone()),
         );
         self.channel.patch_session(&self.session_id, patch).await?;
+        self.refresh_effective_model_status().await;
         self.cells.push(HistoryCell::system(format!(
             "已切换当前 session agent 为 `{next}`。"
         )));
@@ -1513,6 +1569,7 @@ impl TuiApp {
         let old_session_id = self.session_id.clone();
         let old_had_activity = self.has_activity;
         self.session_id = session_id;
+        self.refresh_effective_model_status().await;
         self.is_sub_session_view = self
             .channel
             .session(&self.session_id)
@@ -1562,6 +1619,15 @@ impl TuiApp {
         if should_cleanup_old_session_on_switch(old_had_activity) {
             let _ = self.channel.delete_session(&old_session_id).await;
         }
+    }
+
+    async fn refresh_effective_model_status(&mut self) {
+        let session = self.channel.session(&self.session_id).await.ok().flatten();
+        let (agent_id, model_profile_id, context_tokens) =
+            effective_tui_model_status(&self.catalog, session.as_ref());
+        self.effective_agent_id = agent_id;
+        self.effective_model_profile_id = model_profile_id;
+        self.effective_model_context_tokens = context_tokens;
     }
 
     fn start_turn(&mut self, input: SubmittedInput) {
@@ -2119,6 +2185,7 @@ impl TuiApp {
                 self.pending_user_question = None;
                 self.status.state = "error".to_string();
                 set_terminal_title(&self.workspace_dir, "error");
+                self.refresh_effective_model_status().await;
             }
             BotEvent::Cancelled => {
                 self.has_activity = true;
@@ -2139,6 +2206,7 @@ impl TuiApp {
                 self.status.state = "idle".to_string();
                 set_terminal_title(&self.workspace_dir, "idle");
                 self.refresh_command_catalog();
+                self.refresh_effective_model_status().await;
             }
             BotEvent::Done => {
                 self.has_activity = true;
@@ -2157,6 +2225,7 @@ impl TuiApp {
                 self.status.state = "idle".to_string();
                 set_terminal_title(&self.workspace_dir, "idle");
                 self.refresh_command_catalog();
+                self.refresh_effective_model_status().await;
                 if self.exit_after_run {
                     self.queued_inputs.clear();
                     self.pending_steers.clear();
@@ -6420,6 +6489,94 @@ mod tests {
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
         }
+    }
+
+    fn test_model(id: &str, context_tokens: u32) -> ModelProfileConfig {
+        ModelProfileConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            model: id.to_string(),
+            base_url: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_output_tokens: 1024,
+            context_tokens,
+            supports_images: false,
+            legacy_short_term_tokens: None,
+            overflow_bytes: 1024,
+            auto_compress: true,
+            description: None,
+            provider: None,
+            extra_options: serde_json::Map::new(),
+        }
+    }
+
+    fn test_agent(id: &str, primary_model: Option<&str>) -> AgentProfile {
+        AgentProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            model: None,
+            base_url: None,
+            models: AgentModelBindings {
+                primary: primary_model.map(str::to_string),
+                helper: None,
+                vision: None,
+            },
+            tools: Vec::new(),
+            delegates: Vec::new(),
+            max_turns: None,
+            persistent_sessions: true,
+            system_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn tui_status_uses_session_agent_and_model_overrides() {
+        let catalog = ApplicationCatalog {
+            models: vec![
+                test_model("deepseek", 64_000),
+                test_model("mimo", 1_000_000),
+            ],
+            agents: vec![
+                test_agent("coder", Some("deepseek")),
+                test_agent("default", None),
+            ],
+            ..ApplicationCatalog::default()
+        };
+        let mut session = test_session("session", TUI_CHANNEL, "tui:1", "now", None);
+        session.metadata.insert(
+            SESSION_AGENT_ID_METADATA_KEY.to_string(),
+            serde_json::json!("default"),
+        );
+        session.metadata.insert(
+            SESSION_MODEL_PROFILE_METADATA_KEY.to_string(),
+            serde_json::json!("mimo"),
+        );
+
+        assert_eq!(
+            effective_tui_model_status(&catalog, Some(&session)),
+            ("default".to_string(), "mimo".to_string(), 1_000_000)
+        );
+    }
+
+    #[test]
+    fn tui_status_uses_agent_primary_model_without_session_override() {
+        let catalog = ApplicationCatalog {
+            models: vec![
+                test_model("default-model", 64_000),
+                test_model("coder-model", 128_000),
+            ],
+            agents: vec![test_agent("coder", Some("coder-model"))],
+            ..ApplicationCatalog::default()
+        };
+        let mut session = test_session("session", TUI_CHANNEL, "tui:1", "now", None);
+        session.root_agent_id = "coder".to_string();
+
+        assert_eq!(
+            effective_tui_model_status(&catalog, Some(&session)),
+            ("coder".to_string(), "coder-model".to_string(), 128_000)
+        );
     }
 
     #[test]

@@ -139,6 +139,101 @@ impl SessionRuntime {
             .cloned()
     }
 
+    /// Creates or updates the persisted parent/child relationship for a
+    /// sub-session and flushes the store once. Streaming sub-session events
+    /// must not compose the individual mutators above because each of them
+    /// persists the complete session store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_sub_session_channel(
+        &mut self,
+        parent_session_id: &str,
+        sub_session_id: &str,
+        kind: SubSessionKind,
+        target: &str,
+        title: Option<String>,
+        status: &str,
+        platform: &str,
+        root_agent_id: &str,
+        metadata: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> Result<Session> {
+        let now = Utc::now().to_rfc3339();
+        let binding = ChannelBinding {
+            platform: platform.to_string(),
+            channel_id: sub_session_id.to_string(),
+        };
+        let key = channel_key(platform, sub_session_id);
+        let child_id = if let Some(id) = self.store.channel_index.get(&key) {
+            id.clone()
+        } else {
+            let id = Uuid::new_v4().to_string();
+            self.store.channel_index.insert(key, id.clone());
+            self.store.sessions.insert(
+                id.clone(),
+                Session {
+                    id: id.clone(),
+                    channel_binding: binding.clone(),
+                    root_agent_id: root_agent_id.to_string(),
+                    title: None,
+                    metadata: serde_json::Map::new(),
+                    sub_sessions: Vec::new(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            );
+            id
+        };
+
+        if let Some(parent) = self.store.sessions.get_mut(parent_session_id) {
+            parent.updated_at = now.clone();
+            if let Some(sub) = parent
+                .sub_sessions
+                .iter_mut()
+                .find(|sub| sub.id == sub_session_id)
+            {
+                sub.kind = kind;
+                sub.target = target.to_string();
+                if title.is_some() {
+                    sub.title = title.clone();
+                }
+                // Events are persisted by independent async tasks. A delayed
+                // RunStart must not regress a terminal state written by a
+                // Done/Error/Cancelled event that completed first.
+                if !is_terminal_sub_session_status(&sub.status) || status != "running" {
+                    sub.status = status.to_string();
+                }
+                sub.channel_binding = Some(binding.clone());
+                sub.updated_at = now.clone();
+            } else {
+                parent.sub_sessions.push(SubSession {
+                    id: sub_session_id.to_string(),
+                    parent_session_id: parent_session_id.to_string(),
+                    kind,
+                    target: target.to_string(),
+                    title: title.clone(),
+                    status: status.to_string(),
+                    channel_binding: Some(binding.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+            }
+        }
+
+        let child = self
+            .store
+            .sessions
+            .get_mut(&child_id)
+            .context("sub-session channel index references a missing session")?;
+        child.channel_binding = binding;
+        if title.is_some() {
+            child.title = normalize_title(title.as_deref());
+        }
+        child.metadata.extend(metadata);
+        child.updated_at = now;
+        let child = child.clone();
+        self.save()?;
+        Ok(child)
+    }
+
     #[allow(dead_code)]
     pub fn list(&self) -> Vec<Session> {
         self.store.sessions.values().cloned().collect()
@@ -486,6 +581,10 @@ fn channel_key(platform: &str, channel_id: &str) -> String {
     format!("{}:{}", platform.trim(), channel_id.trim())
 }
 
+fn is_terminal_sub_session_status(status: &str) -> bool {
+    matches!(status, "done" | "error" | "cancelled" | "handed_off")
+}
+
 fn normalize_title(title: Option<&str>) -> Option<String> {
     let title = title?.split_whitespace().collect::<Vec<_>>().join(" ");
     if title.is_empty() {
@@ -673,6 +772,49 @@ mod tests {
         assert_eq!(session.sub_sessions[0].status, "done");
         assert_eq!(session.sub_sessions[0].title.as_deref(), Some("fix bug"));
         assert_eq!(session.sub_sessions[0].channel_binding, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batched_sub_session_update_does_not_regress_terminal_status() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let parent = runtime.resolve_channel("tui", "parent", "default").unwrap();
+        let metadata = || {
+            [(
+                "sub_session_thread_id".to_string(),
+                serde_json::Value::String("sub-1".to_string()),
+            )]
+        };
+        runtime
+            .upsert_sub_session_channel(
+                &parent,
+                "sub-1",
+                SubSessionKind::Agent,
+                "worker",
+                Some("task".to_string()),
+                "done",
+                "tui",
+                "default",
+                metadata(),
+            )
+            .unwrap();
+        runtime
+            .upsert_sub_session_channel(
+                &parent,
+                "sub-1",
+                SubSessionKind::Agent,
+                "worker",
+                Some("task".to_string()),
+                "running",
+                "tui",
+                "default",
+                metadata(),
+            )
+            .unwrap();
+
+        let parent = runtime.get(&parent).unwrap();
+        assert_eq!(parent.sub_sessions[0].status, "done");
         let _ = std::fs::remove_dir_all(dir);
     }
 
