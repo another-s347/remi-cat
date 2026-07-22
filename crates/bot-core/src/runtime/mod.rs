@@ -3864,7 +3864,10 @@ impl LocalToolDeps {
                 .delegate_ids
                 .iter()
                 .any(|delegate| delegate_tool_name(delegate) == name);
-            if reserved_builtin || registered.contains(name) || conflicts_with_delegate {
+            if (reserved_builtin && !tool.allows_builtin_override())
+                || (registered.contains(name) && !tool.allows_builtin_override())
+                || conflicts_with_delegate
+            {
                 anyhow::bail!("custom tool `{name}` conflicts with an existing tool");
             }
             registered.register(tool.clone());
@@ -4252,10 +4255,7 @@ impl CatBotBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<CatBot> {
-        validate_host_tool_names(
-            self.host_tools.iter().map(|tool| tool.name()),
-            &self.delegate_ids,
-        )?;
+        validate_host_tools(&self.host_tools, &self.delegate_ids)?;
         let profile = self.model_profile.clone();
         let auto_compress_context_percent = auto_compress_context_percent()?;
         let system_prompt = system_prompt_with_agent_md_notice_for_current_dir(self.system.clone());
@@ -4734,12 +4734,13 @@ impl CatBotBuilder {
     }
 }
 
-fn validate_host_tool_names<'a>(
-    names: impl IntoIterator<Item = &'a str>,
+fn validate_host_tools(
+    tools: &[bot_runtime_core::DynamicTool],
     delegate_ids: &[String],
 ) -> anyhow::Result<()> {
     let mut seen = std::collections::HashSet::new();
-    for name in names {
+    for tool in tools {
+        let name = tool.name();
         if !seen.insert(name) {
             anyhow::bail!("custom tool `{name}` is registered more than once");
         }
@@ -4752,7 +4753,33 @@ fn validate_host_tool_names<'a>(
             || delegate_ids
                 .iter()
                 .any(|delegate| delegate_tool_name(delegate) == name);
-        if reserved {
+        if reserved && !tool.allows_builtin_override() {
+            anyhow::bail!("custom tool `{name}` conflicts with an existing tool");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_host_tool_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    delegate_ids: &[String],
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            anyhow::bail!("custom tool `{name}` is registered more than once");
+        }
+        if builtin_tool_catalog()
+            .iter()
+            .any(|(builtin, _)| *builtin == name)
+            || name.starts_with("agent__")
+            || name.starts_with("acp__")
+            || name.starts_with("im__")
+            || delegate_ids
+                .iter()
+                .any(|delegate| delegate_tool_name(delegate) == name)
+        {
             anyhow::bail!("custom tool `{name}` conflicts with an existing tool");
         }
     }
@@ -5930,6 +5957,23 @@ mod tests {
         assert!(validate_host_tool_names(["search"], &[]).is_err());
         assert!(validate_host_tool_names(["agent__worker"], &["worker".to_string()]).is_err());
         assert!(validate_host_tool_names(["host_lookup"], &[]).is_ok());
+    }
+
+    #[test]
+    fn explicit_host_override_allows_builtin_name() {
+        let tool = bot_runtime_core::DynamicTool::from_parts(
+            "search",
+            "Product search",
+            json!({"type": "object"}),
+            |_args, _resume, _ctx| async move {
+                Ok::<_, remi_agentloop::prelude::AgentError>(
+                    remi_agentloop::prelude::ToolResult::Output(futures::stream::empty()),
+                )
+            },
+        )
+        .override_builtin();
+
+        assert!(super::validate_host_tools(&[tool], &[]).is_ok());
     }
     use uuid::Uuid;
 

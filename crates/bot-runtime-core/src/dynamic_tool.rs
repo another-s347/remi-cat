@@ -31,6 +31,7 @@ pub struct DynamicTool {
     definition: ToolDefinition,
     handler: DynamicToolHandler,
     risk: Option<DynamicToolRisk>,
+    override_builtin: bool,
 }
 
 impl DynamicTool {
@@ -49,6 +50,7 @@ impl DynamicTool {
             definition,
             handler,
             risk: None,
+            override_builtin: false,
         }
     }
 
@@ -86,6 +88,17 @@ impl DynamicTool {
 
     pub fn declared_risk(&self) -> Option<DynamicToolRisk> {
         self.risk
+    }
+
+    /// Explicitly allow this host tool to replace a built-in tool with the
+    /// same name. Without this opt-in, name collisions remain an error.
+    pub fn override_builtin(mut self) -> Self {
+        self.override_builtin = true;
+        self
+    }
+
+    pub fn allows_builtin_override(&self) -> bool {
+        self.override_builtin
     }
 }
 

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use remi_agentloop::prelude::Tool;
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 
 use crate::im_tools::register_fetch_tool;
@@ -21,24 +22,48 @@ pub(super) fn register_runtime_tools(
     agent_id: &str,
     include_user_question: bool,
 ) {
-    local_tools.register(MemoryGetDetailTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: agent_id.to_string(),
-    });
-    local_tools.register(MemoryUpsertNamedTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: agent_id.to_string(),
-        workspace_root: deps.workspace_root.clone(),
-    });
-    local_tools.register(MemoryRecallTool {
-        store: Arc::clone(&deps.memory),
-        agent_id: agent_id.to_string(),
-    });
-    local_tools.register(SearchTool {
-        skill_store: Arc::clone(&deps.skill_store),
-        memory_store: Arc::clone(&deps.memory),
-        agent_id: agent_id.to_string(),
-    });
+    macro_rules! register_builtin {
+        ($name:literal, $tool:expr) => {
+            if !deps
+                .host_tools
+                .iter()
+                .any(|tool| tool.name() == $name && tool.allows_builtin_override())
+            {
+                local_tools.register($tool);
+            }
+        };
+    }
+
+    register_builtin!(
+        "memory__get_detail",
+        MemoryGetDetailTool {
+            store: Arc::clone(&deps.memory),
+            agent_id: agent_id.to_string(),
+        }
+    );
+    register_builtin!(
+        "memory__upsert_named",
+        MemoryUpsertNamedTool {
+            store: Arc::clone(&deps.memory),
+            agent_id: agent_id.to_string(),
+            workspace_root: deps.workspace_root.clone(),
+        }
+    );
+    register_builtin!(
+        "memory__recall",
+        MemoryRecallTool {
+            store: Arc::clone(&deps.memory),
+            agent_id: agent_id.to_string(),
+        }
+    );
+    register_builtin!(
+        "search",
+        SearchTool {
+            skill_store: Arc::clone(&deps.skill_store),
+            memory_store: Arc::clone(&deps.memory),
+            agent_id: agent_id.to_string(),
+        }
+    );
     local_tools.register(ToolTasksTool::new(Arc::clone(&deps.tool_tasks)));
     let acp_support = deps
         .acp_client_tools
