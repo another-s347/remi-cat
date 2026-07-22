@@ -5,7 +5,15 @@ use anyhow::{Context, Result};
 
 use crate::runtime_config::{load_dotenv_pairs, write_dotenv_pairs};
 
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 const KEYRING_SERVICE: &str = "remi-cat";
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 const KEYRING_INDEX_USER: &str = "__remi_cat_secret_index";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +21,10 @@ pub enum SecretBackend {
     Dotenv {
         path: PathBuf,
     },
-    #[cfg(feature = "secure-storage")]
+    #[cfg(all(
+        feature = "secure-storage",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     Keyring {
         service: String,
     },
@@ -41,7 +52,10 @@ impl SecretStore {
             .trim()
             .to_ascii_lowercase();
         match backend.as_str() {
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             "keyring" | "system" | "system_keyring" => Self {
                 backend: SecretBackend::Keyring {
                     service: std::env::var("REMI_SECRET_KEYRING_SERVICE")
@@ -63,7 +77,10 @@ impl SecretStore {
     pub fn backend_label(&self) -> String {
         match &self.backend {
             SecretBackend::Dotenv { path } => format!("dotenv:{}", path.display()),
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             SecretBackend::Keyring { service } => format!("keyring:{service}"),
         }
     }
@@ -71,7 +88,10 @@ impl SecretStore {
     pub fn entries(&self) -> Result<BTreeMap<String, String>> {
         match &self.backend {
             SecretBackend::Dotenv { path } => load_dotenv_pairs(path),
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             SecretBackend::Keyring { service } => keyring_entries(service),
         }
     }
@@ -83,7 +103,10 @@ impl SecretStore {
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         match &self.backend {
             SecretBackend::Dotenv { .. } => Ok(self.entries()?.remove(key)),
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             SecretBackend::Keyring { service } => keyring_get(service, key),
         }
     }
@@ -99,7 +122,10 @@ impl SecretStore {
                 pairs.insert(key.to_string(), value.to_string());
                 write_dotenv_pairs(path, &pairs)
             }
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             SecretBackend::Keyring { service } => keyring_set(service, key, value),
         }
     }
@@ -112,7 +138,10 @@ impl SecretStore {
                 pairs.remove(key);
                 write_dotenv_pairs(path, &pairs)
             }
-            #[cfg(feature = "secure-storage")]
+            #[cfg(all(
+                feature = "secure-storage",
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
             SecretBackend::Keyring { service } => keyring_delete(service, key),
         }
     }
@@ -155,12 +184,18 @@ fn is_secret_like_key(key: &str) -> bool {
         .any(|marker| key.contains(marker))
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_entry(service: &str, key: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(service, key).context("opening system keyring entry")
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_get(service: &str, key: &str) -> Result<Option<String>> {
     match keyring_entry(service, key)?.get_password() {
         Ok(value) => Ok(Some(value)),
@@ -169,7 +204,10 @@ fn keyring_get(service: &str, key: &str) -> Result<Option<String>> {
     }
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_set(service: &str, key: &str, value: &str) -> Result<()> {
     keyring_entry(service, key)?
         .set_password(value)
@@ -183,7 +221,10 @@ fn keyring_set(service: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_delete(service: &str, key: &str) -> Result<()> {
     match keyring_entry(service, key)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -194,7 +235,10 @@ fn keyring_delete(service: &str, key: &str) -> Result<()> {
     write_keyring_index(service, &keys)
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_entries(service: &str) -> Result<BTreeMap<String, String>> {
     let mut entries = BTreeMap::new();
     for key in keyring_index(service)? {
@@ -205,7 +249,10 @@ fn keyring_entries(service: &str) -> Result<BTreeMap<String, String>> {
     Ok(entries)
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn keyring_index(service: &str) -> Result<Vec<String>> {
     let Some(raw) = keyring_get(service, KEYRING_INDEX_USER)? else {
         return Ok(Vec::new());
@@ -213,7 +260,10 @@ fn keyring_index(service: &str) -> Result<Vec<String>> {
     serde_json::from_str(&raw).context("parsing system keyring secret index")
 }
 
-#[cfg(feature = "secure-storage")]
+#[cfg(all(
+    feature = "secure-storage",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn write_keyring_index(service: &str, keys: &[String]) -> Result<()> {
     keyring_entry(service, KEYRING_INDEX_USER)?
         .set_password(&serde_json::to_string(keys)?)
