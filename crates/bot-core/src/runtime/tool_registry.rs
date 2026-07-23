@@ -108,13 +108,19 @@ pub(super) fn register_runtime_tools(
         sandbox: Arc::clone(&deps.sandbox),
         redactor: Arc::clone(&deps.redactor),
     });
-    register_fetch_tool(
-        local_tools,
-        deps.workspace_root.clone(),
-        deps.sandbox.workspace_root_label(),
-        deps.sandbox.kind() != "docker",
-        deps.im_bridge.clone(),
-    );
+    if !deps
+        .host_tools
+        .iter()
+        .any(|tool| tool.name() == "fetch" && tool.allows_builtin_override())
+    {
+        register_fetch_tool(
+            local_tools,
+            deps.workspace_root.clone(),
+            deps.sandbox.workspace_root_label(),
+            deps.sandbox.kind() != "docker",
+            deps.im_bridge.clone(),
+        );
+    }
     local_tools.register(ExaSearchTool::new());
     local_tools.register(NowTool);
     local_tools.register(SleepTool);
