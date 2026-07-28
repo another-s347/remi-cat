@@ -11,6 +11,7 @@ tools:
   - memory__get_detail
   - memory__recall
   - memory__upsert_named
+  - tool_tasks
   - bash
   - fs_read
   - fs_write

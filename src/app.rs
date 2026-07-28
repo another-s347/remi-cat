@@ -1618,13 +1618,32 @@ mod cli_tests {
                 "--force",
             ]))
             .unwrap(),
-            AppCommand::Update(UpdateCommand::SelfUpdate { version, force: true, dry_run: true })
+            AppCommand::Update(UpdateCommand::SelfUpdate {
+                version,
+                force: true,
+                dry_run: true,
+                binary: false,
+            })
                 if version.as_deref() == Some("v0.2.1")
         ));
         assert!(matches!(
             parse_command(&args(&["update", "self", "--version=0.2.1"])).unwrap(),
-            AppCommand::Update(UpdateCommand::SelfUpdate { version, force: false, dry_run: false })
+            AppCommand::Update(UpdateCommand::SelfUpdate {
+                version,
+                force: false,
+                dry_run: false,
+                binary: false,
+            })
                 if version.as_deref() == Some("0.2.1")
+        ));
+        assert!(matches!(
+            parse_command(&args(&["update", "self", "--binary", "--force"])).unwrap(),
+            AppCommand::Update(UpdateCommand::SelfUpdate {
+                version: None,
+                force: true,
+                dry_run: false,
+                binary: true,
+            })
         ));
     }
 

@@ -294,6 +294,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -864,6 +873,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1010,6 +1028,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1165,6 +1194,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1187,6 +1226,17 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+ "zlib-rs",
+]
 
 [[package]]
 name = "fnv"
@@ -2223,6 +2273,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -2976,7 +3027,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "remi-agentloop"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "chrono",
@@ -2996,12 +3047,13 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-core"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "base64",
  "chrono",
  "futures",
+ "futures-timer",
  "pin-project-lite",
  "remi-agentloop-macros",
  "reqwest 0.12.28",
@@ -3019,7 +3071,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-deepagent"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "futures",
@@ -3039,7 +3091,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-eval"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-trait",
  "futures",
@@ -3052,7 +3104,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-macros"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3063,7 +3115,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-model"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "futures",
@@ -3078,7 +3130,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-tool"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "futures",
@@ -3092,7 +3144,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-transport"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5#c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=a2350dde763eb25459a5c4165858ed275384b036#a2350dde763eb25459a5c4165858ed275384b036"
 dependencies = [
  "async-stream",
  "futures",
@@ -3107,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -3120,6 +3172,7 @@ dependencies = [
  "crossterm 0.29.0",
  "dotenvy",
  "figment",
+ "flate2",
  "futures",
  "git2",
  "im-feishu",
@@ -3134,6 +3187,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "tar",
  "tempfile",
  "textwrap",
  "tokio",
@@ -3144,6 +3199,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "user-store",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -3847,6 +3903,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "simd_cesu8"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4033,6 +4095,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -5076,6 +5149,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "xml5ever"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5204,7 +5287,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "zopfli",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
+
+[[package]]
 name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]

@@ -2085,7 +2085,7 @@ enum ForegroundToolOutcome {
 
 fn background_task_tool_result(task_id: &str, tool_name: &str) -> CollectedToolResult {
     CollectedToolResult::text(format!(
-        "Tool `{tool_name}` is still running in the background.\n\
+        "Tool `{tool_name}` exceeded the foreground wait threshold and has been moved to background execution.\n\
          task_id: {task_id}\n\
          Do not call the same tool again just to wait for this result, and do not continuously poll it. \
          The system will automatically send you the completed result and continue the session when it finishes. \
@@ -2712,12 +2712,14 @@ mod tests {
     #[test]
     fn background_task_tool_result_only_reports_existing_task() {
         let result = background_task_tool_result("task-1", "bash").preview;
-        assert!(result.contains("Tool `bash` is still running in the background."));
+        assert!(result.contains(
+            "Tool `bash` exceeded the foreground wait threshold and has been moved to background execution."
+        ));
         assert!(result.contains("task_id: task-1"));
         assert!(result.contains("Do not call the same tool again"));
         assert!(result.contains("automatically send you the completed result"));
         assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains(
-            "You are free to process other user request, any other tasks or patiently waiting by doing nothing."
+            "When a tool call exceeds the foreground wait threshold, it is moved to background execution and returns a `task_id`."
         ));
         assert!(crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("automatically send"));
         assert!(!crate::runtime::ASYNC_TOOL_SYSTEM_PROMPT.contains("Background sub-agent"));

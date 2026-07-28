@@ -239,4 +239,13 @@ You are ephemeral.
         assert!(profile.system_prompt.contains("relevant skills and memory"));
         assert!(profile.allows_tool("tool_tasks"));
     }
+
+    #[test]
+    fn embedded_diagnostics_profile_can_inspect_background_tool_tasks() {
+        let profile = embedded_agent_profile("remi_diagnostics")
+            .unwrap()
+            .expect("diagnostics profile should exist");
+        assert!(profile.allows_tool("bash"));
+        assert!(profile.allows_tool("tool_tasks"));
+    }
 }

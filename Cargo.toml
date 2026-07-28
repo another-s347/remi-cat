@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.29"
+version = "0.2.30"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -35,7 +35,7 @@ bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
 user-store = { path = "crates/user-store" }
 agent-client-protocol = { version = "1.0.1", features = ["unstable_elicitation"] }
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "c1c20c664bbfaba06bb4eaf653cfdb1e6e1099b5", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "a2350dde763eb25459a5c4165858ed275384b036", features = [
     "tracing-langsmith",
 ] }
 
@@ -47,6 +47,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dotenvy = "0.15"
 figment = { version = "0.10", features = ["yaml"] }
+flate2 = "1"
 futures = "0.3"
 git2 = "0.21"
 notify = "8.2"
@@ -57,6 +58,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 semver = "1"
+sha2 = "0.10"
 sentry = { version = "0.47", default-features = false, features = [
     "backtrace",
     "contexts",
@@ -71,6 +73,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 textwrap = "0.16"
+tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
@@ -78,6 +81,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

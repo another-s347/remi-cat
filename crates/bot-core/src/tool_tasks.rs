@@ -816,6 +816,35 @@ impl Tool for ToolTasksTool {
 mod tests {
     use super::*;
 
+    fn tool_context(thread_id: &str) -> ToolContext {
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!(thread_id))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            bot_runtime_core::ChatCtxState::default(),
+        )
+    }
+
+    async fn get_with_tool(tool: &ToolTasksTool, thread_id: &str, task_id: &str) -> ToolTaskRecord {
+        let result = tool
+            .execute(
+                serde_json::json!({"action": "get", "task_id": task_id}),
+                None,
+                tool_context(thread_id),
+            )
+            .await
+            .expect("tool_tasks get should succeed");
+        let ToolResult::Output(mut stream) = result else {
+            panic!("expected tool output");
+        };
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+        serde_json::from_str(&output).expect("tool output should contain a task record")
+    }
+
     fn temp_data_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "remi-cat-tool-tasks-{name}-{}",
@@ -906,6 +935,41 @@ mod tests {
         assert_eq!(cancelled[0].status, TOOL_TASK_CANCELLED);
         assert!(second_cancel.is_cancelled());
         assert!(!manager.is_thread_running("thread-b").await);
+    }
+
+    #[tokio::test]
+    async fn tool_get_returns_background_task_while_running_and_after_completion() {
+        let manager = Arc::new(ToolTaskManager::load(temp_data_dir("tool-get")).unwrap());
+        let tool = ToolTasksTool::new(Arc::clone(&manager));
+        let task_id = manager
+            .start(
+                "thread-a".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({"command": "echo start; sleep 25; echo end"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.promote_to_background(&task_id, true).await.unwrap();
+        manager.append_output(&task_id, "start").await;
+
+        let running = get_with_tool(&tool, "thread-a", &task_id).await;
+        assert_eq!(running.status, TOOL_TASK_RUNNING);
+        assert_eq!(running.recent_output, vec!["start"]);
+
+        manager.append_output(&task_id, "end").await;
+        manager
+            .finish(&task_id, true, 25_000, "start\nend".to_string())
+            .await
+            .unwrap();
+
+        let completed = get_with_tool(&tool, "thread-a", &task_id).await;
+        assert_eq!(completed.status, TOOL_TASK_COMPLETED);
+        assert_eq!(completed.success, Some(true));
+        assert_eq!(completed.result_preview.as_deref(), Some("start\nend"));
+        assert_eq!(completed.recent_output, vec!["start", "end"]);
     }
 
     #[tokio::test]

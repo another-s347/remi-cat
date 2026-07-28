@@ -492,8 +492,8 @@ enum UpdateCliCommand {
     },
     #[command(
         name = "self",
-        about = "Install a selected remi-cat release with cargo install",
-        after_help = "Examples:\n  remi-cat update self --dry-run\n  remi-cat update self --version v0.2.1\n\nThe installer uses `cargo install --git https://github.com/another-s347/remi-cat.git --tag <version>`."
+        about = "Install a selected remi-cat release",
+        after_help = "Examples:\n  remi-cat update self --dry-run\n  remi-cat update self --binary\n  remi-cat update self --binary --version v0.2.1\n\nBy default the installer uses `cargo install`. Pass `--binary` to download the platform release asset and replace the local executable."
     )]
     SelfUpdate {
         #[arg(
@@ -504,8 +504,13 @@ enum UpdateCliCommand {
         version: Option<String>,
         #[arg(long, help = "Reinstall even when the selected version is not newer")]
         force: bool,
-        #[arg(long, help = "Print the install command without running it")]
+        #[arg(long, help = "Print the installation plan without running it")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Download the platform release binary instead of building with cargo install"
+        )]
+        binary: bool,
     },
 }
 
@@ -855,6 +860,7 @@ pub(crate) enum UpdateCommand {
         version: Option<String>,
         force: bool,
         dry_run: bool,
+        binary: bool,
     },
 }
 
@@ -1149,10 +1155,12 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
                 version,
                 force,
                 dry_run,
+                binary,
             } => UpdateCommand::SelfUpdate {
                 version,
                 force,
                 dry_run,
+                binary,
             },
         })),
         Some(CliCommand::Feedback(args)) => {

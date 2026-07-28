@@ -377,8 +377,8 @@ fn try_recv_background_side_event(
 
 pub const ASYNC_TOOL_SYSTEM_PROMPT: &str = "\
 Async tool execution:
-- Tool calls can keep running in the background after the foreground observation window closes.
-- You are free to process other user request, any other tasks or patiently waiting by doing nothing.
+- When a tool call exceeds the foreground wait threshold, it is moved to background execution and returns a `task_id`.
+- You are free to process other user requests, work on independent tasks, or patiently wait by doing nothing.
 - Do not continuously poll background tasks. The system will automatically send a system message with the tool name, task_id, elapsed time, and result when the task finishes.
 - Use `tool_tasks` only when you need to inspect current status/recent output or cancel an existing background task.";
 
