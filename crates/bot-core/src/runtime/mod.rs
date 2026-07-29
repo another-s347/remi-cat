@@ -11,9 +11,8 @@ use bot_runtime_core::{
 };
 use futures::{Stream, StreamExt};
 use remi_agentloop::prelude::{
-    AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, OpenAIClient,
-    ProtocolEvent, ResumePayload, Role, RunId, SubSessionEvent, ThreadId, Tool, ToolOutput,
-    ToolResult,
+    AgentBuilder, AgentConfig, AgentError, CancellationToken, LoopInput, MessageId, ProtocolEvent,
+    ResumePayload, Role, RunId, SubSessionEvent, ThreadId, Tool, ToolOutput, ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use tokio::sync::Mutex as AsyncMutex;
@@ -56,8 +55,9 @@ use environment_context::{
 };
 use memory_runtime::{persist_intermediate_user_state, persist_turn};
 use model_provider::{
-    auto_compress_context_percent, build_inner_agent, context_percent_tokens,
-    resolve_effective_model_profile, tool_output_overflow_bytes_from_env, InnerAgent,
+    auto_compress_context_percent, build_inner_agent, build_provider_client,
+    context_percent_tokens, resolve_effective_model_profile, tool_output_overflow_bytes_from_env,
+    InnerAgent,
 };
 pub use model_provider::{EffectiveModelProfile, EffectiveModelSource};
 pub(crate) use partial_turn::PartialTurnRecorder;
@@ -4308,14 +4308,11 @@ impl CatBotBuilder {
             );
         }
 
-        let mut oai = OpenAIClient::new(self.api_key.clone()).with_model(profile.model.clone());
-        if let Some(url) = resolved_base_url.clone() {
-            oai = oai.with_base_url(url);
-        }
+        let model = build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
         let extra_options = self.extra_options.clone();
         let agent_config = AgentConfig::default().with_max_tokens(profile.max_output_tokens);
         let mut inner_builder = AgentBuilder::new()
-            .model(oai)
+            .model(model)
             .config(agent_config)
             .system(system_prompt.clone())
             .max_turns(self.max_turns.unwrap_or(usize::MAX));
@@ -4394,11 +4391,8 @@ impl CatBotBuilder {
             data_dir.clone(),
             self.im_bridge.clone(),
         ));
-        let mut acp_local_model =
-            OpenAIClient::new(self.api_key.clone()).with_model(profile.model.clone());
-        if let Some(url) = resolved_base_url.clone() {
-            acp_local_model = acp_local_model.with_base_url(url);
-        }
+        let acp_local_model =
+            build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
         let mut acp_local_builder = AgentBuilder::new()
             .model(acp_local_model)
             .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
@@ -4918,7 +4912,6 @@ struct RemiSubAgentTool {
     description: String,
     parameters_schema: serde_json::Value,
     agent_name: String,
-    model_name: String,
     model_profile: ModelProfileConfig,
     base_url: Option<String>,
     api_key: String,
@@ -5087,10 +5080,8 @@ impl Tool for RemiSubAgentTool {
 
         let title = Self::title_from_args(&arguments);
         let agent_name = self.agent_name.clone();
-        let mut model = OpenAIClient::new(self.api_key.clone()).with_model(self.model_name.clone());
-        if let Some(url) = self.base_url.clone() {
-            model = model.with_base_url(url);
-        }
+        let model =
+            build_provider_client(&self.api_key, &self.model_profile, self.base_url.clone());
         let mut builder = AgentBuilder::new()
             .model(model)
             .config(AgentConfig::default().with_max_tokens(self.model_profile.max_output_tokens))
@@ -5125,7 +5116,7 @@ impl Tool for RemiSubAgentTool {
         let workspace_root = self.deps.workspace_root.clone();
         let environment_context_source = self.deps.environment_context_source.clone();
         let subagent_system_prompt = self.system_prompt.clone();
-        let model_name = self.model_name.clone();
+        let model_name = self.model_profile.model.clone();
         let model_profile = self.model_profile.clone();
         let hook_manager = Arc::clone(&self.deps.hook_manager);
         let persistent = true;
@@ -5899,7 +5890,6 @@ fn register_delegate_agent_tools(
             description: tool_description,
             parameters_schema,
             agent_name,
-            model_name,
             model_profile,
             base_url: tool_base_url,
             api_key: tool_api_key,

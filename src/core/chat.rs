@@ -181,6 +181,12 @@ impl From<ChatRequest> for SteerInput {
     }
 }
 
+fn apply_preprocessed_text(content: &mut Content, original_text: &str, processed_text: String) {
+    if processed_text != original_text.trim() {
+        *content = Content::text(processed_text);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum CoreChatEvent {
     Prefix(String),
@@ -338,7 +344,11 @@ impl Runtime {
                             if !prefix.is_empty() {
                                 yield CoreChatEvent::Prefix(prefix);
                             }
-                            content = Content::text(text);
+                            // Ordinary input also passes through the runtime-command
+                            // pipeline. Preserve its structured content (images,
+                            // audio, and files) when preprocessing did not rewrite
+                            // the textual portion.
+                            apply_preprocessed_text(&mut content, &user_text, text);
                             skill_injections = injections;
                         }
                         Err(error) => {
@@ -429,8 +439,8 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatChannel, ChatRequest};
-    use bot_core::ReasoningEffort;
+    use super::{apply_preprocessed_text, ChatChannel, ChatRequest};
+    use bot_core::{Content, ContentPart, ReasoningEffort};
 
     #[test]
     fn text_request_enables_user_turn_preprocessing_and_sub_session_routing() {
@@ -441,6 +451,47 @@ mod tests {
         assert!(request.command_preprocess);
         assert!(request.sub_session_routing);
         assert_eq!(request.platform(), Some("tui".to_string()));
+    }
+
+    #[test]
+    fn unchanged_preprocessing_preserves_multimodal_content() {
+        let mut content = Content::parts(vec![
+            ContentPart::image_base64("image/png", "YWJj"),
+            ContentPart::text("describe this image"),
+        ]);
+
+        apply_preprocessed_text(
+            &mut content,
+            "describe this image",
+            "describe this image".to_string(),
+        );
+
+        assert!(matches!(
+            content,
+            Content::Parts(ref parts)
+                if matches!(
+                    parts.first(),
+                    Some(ContentPart::ImageBase64 { media_type, data })
+                        if media_type == "image/png" && data == "YWJj"
+                )
+        ));
+    }
+
+    #[test]
+    fn rewritten_preprocessing_replaces_multimodal_content() {
+        let mut content = Content::parts(vec![
+            ContentPart::image_base64("image/png", "YWJj"),
+            ContentPart::text("/skill:test describe this image"),
+        ]);
+
+        apply_preprocessed_text(
+            &mut content,
+            "/skill:test describe this image",
+            "describe this image".to_string(),
+        );
+
+        assert_eq!(content.text_content(), "describe this image");
+        assert!(!content.is_multimodal());
     }
 
     #[test]

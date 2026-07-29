@@ -775,7 +775,16 @@ impl Tool for ToolTasksTool {
                 .unwrap_or("list")
                 .trim()
                 .to_ascii_lowercase();
-            let thread_id = ctx.thread_id().0.clone();
+            let metadata = ctx.metadata();
+            let fallback_thread_id = ctx.thread_id().0;
+            let thread_id = metadata
+                .as_ref()
+                .and_then(|value| value.get("thread_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&fallback_thread_id)
+                .to_string();
             Ok(ToolResult::Output(
                 stream! {
                     let value = match action.as_str() {
@@ -823,6 +832,19 @@ mod tests {
             serde_json::from_value(serde_json::json!("test-run"))
                 .expect("run_id should deserialize"),
             bot_runtime_core::ChatCtxState::default(),
+        )
+    }
+
+    fn tool_context_with_outer_thread(inner_thread_id: &str, outer_thread_id: &str) -> ToolContext {
+        ToolContext::with_ids(
+            serde_json::from_value(serde_json::json!(inner_thread_id))
+                .expect("thread_id should deserialize"),
+            serde_json::from_value(serde_json::json!("test-run"))
+                .expect("run_id should deserialize"),
+            bot_runtime_core::ChatCtxState {
+                metadata: Some(serde_json::json!({"thread_id": outer_thread_id})),
+                ..bot_runtime_core::ChatCtxState::default()
+            },
         )
     }
 
@@ -970,6 +992,45 @@ mod tests {
         assert_eq!(completed.success, Some(true));
         assert_eq!(completed.result_preview.as_deref(), Some("start\nend"));
         assert_eq!(completed.recent_output, vec!["start", "end"]);
+    }
+
+    #[tokio::test]
+    async fn tool_get_uses_outer_thread_id_from_context_metadata() {
+        let manager = Arc::new(ToolTaskManager::load(temp_data_dir("tool-get-outer")).unwrap());
+        let tool = ToolTasksTool::new(Arc::clone(&manager));
+        let task_id = manager
+            .start(
+                "outer-thread".to_string(),
+                "run-a".to_string(),
+                "call-a".to_string(),
+                "bash".to_string(),
+                serde_json::json!({"command": "sleep 25"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager.promote_to_background(&task_id, true).await.unwrap();
+
+        let result = tool
+            .execute(
+                serde_json::json!({"action": "get", "task_id": task_id}),
+                None,
+                tool_context_with_outer_thread("inner-agent-thread", "outer-thread"),
+            )
+            .await
+            .expect("tool_tasks get should succeed");
+        let ToolResult::Output(mut stream) = result else {
+            panic!("expected tool output");
+        };
+        let output = match stream.next().await {
+            Some(ToolOutput::Result(content)) => content.text_content(),
+            other => panic!("expected text output, got {other:?}"),
+        };
+        let record: ToolTaskRecord =
+            serde_json::from_str(&output).expect("outer-thread task should be visible");
+        assert_eq!(record.task_id, task_id);
+        assert_eq!(record.thread_id, "outer-thread");
+        assert_eq!(record.status, TOOL_TASK_RUNNING);
     }
 
     #[tokio::test]

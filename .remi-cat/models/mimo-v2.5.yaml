@@ -1,11 +1,11 @@
 id: mimo-v2.5
 name: MiMo V2.5
-description: Balanced MiMo text profile.
+description: MiMo V2.5 multimodal profile.
 provider: mimo
 model: mimo-v2.5
 base_url: https://api.xiaomimimo.com/v1
 max_output_tokens: 131072
 context_tokens: 1000000
-supports_images: false
+supports_images: true
 overflow_bytes: 32000
 auto_compress: true
