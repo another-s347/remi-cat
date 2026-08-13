@@ -23,7 +23,11 @@ pub fn builtin_feedback_dsn() -> Option<&'static str> {
         .filter(|value| !value.is_empty())
 }
 
-fn options(dsn: &str, app_id: &str) -> anyhow::Result<sentry::ClientOptions> {
+fn options(
+    dsn: &str,
+    app_id: &str,
+    traces_sample_rate: f32,
+) -> anyhow::Result<sentry::ClientOptions> {
     let dsn = dsn.parse().with_context(|| {
         "invalid Sentry DSN supplied at build time or through ApplicationBuilder"
     })?;
@@ -46,6 +50,7 @@ fn options(dsn: &str, app_id: &str) -> anyhow::Result<sentry::ClientOptions> {
         })),
         shutdown_timeout: FLUSH_TIMEOUT,
         send_default_pii: false,
+        traces_sample_rate,
         ..Default::default()
     })
 }
@@ -55,8 +60,13 @@ pub struct CliTelemetryGuard {
 }
 
 impl CliTelemetryGuard {
-    pub fn init(dsn: &str, profile: &str, surface: &str) -> anyhow::Result<Self> {
-        let guard = sentry::init(options(dsn, "remi-cat")?);
+    pub fn init(
+        dsn: &str,
+        profile: &str,
+        surface: &str,
+        traces_sample_rate: f32,
+    ) -> anyhow::Result<Self> {
+        let guard = sentry::init(options(dsn, "remi-cat", traces_sample_rate)?);
         sentry::configure_scope(|scope| {
             scope.set_tag("app.id", "remi-cat");
             scope.set_tag("app.version", APP_VERSION);
@@ -73,8 +83,8 @@ pub struct ApplicationTelemetry {
 }
 
 impl ApplicationTelemetry {
-    pub fn new(dsn: &str, app_id: &str) -> anyhow::Result<Self> {
-        let options = sentry::apply_defaults(options(dsn, app_id)?);
+    pub fn new(dsn: &str, app_id: &str, traces_sample_rate: f32) -> anyhow::Result<Self> {
+        let options = sentry::apply_defaults(options(dsn, app_id, traces_sample_rate)?);
         let client = Arc::new(sentry::Client::from_config(options));
         if !client.is_enabled() {
             return Err(anyhow!("Sentry client is disabled for the supplied DSN"));
@@ -193,7 +203,7 @@ pub fn capture_feedback(
         anyhow!("feedback is unavailable because this binary has no embedded feedback Sentry DSN")
     })?;
     let client = Arc::new(sentry::Client::from_config(sentry::apply_defaults(
-        options(dsn, "remi-cat")?,
+        options(dsn, "remi-cat", 0.0)?,
     )));
     if !client.is_enabled() {
         return Err(anyhow!("feedback Sentry client is disabled"));
@@ -251,7 +261,7 @@ mod tests {
 
     #[test]
     fn options_attach_release_app_id_and_version_without_request_data() {
-        let options = options("https://public@example.com/1", "host-app").unwrap();
+        let options = options("https://public@example.com/1", "host-app", 0.0).unwrap();
         assert_eq!(
             options.release.as_deref(),
             Some(format!("remi-cat@{APP_VERSION}").as_str())

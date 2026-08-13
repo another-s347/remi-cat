@@ -136,10 +136,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         ensure_builtin_diagnostic_profile()?;
     }
     let mut data_dir = selected_profile.data_dir.clone();
-    let profile_telemetry_enabled = match detect_setup_state(&data_dir) {
-        SetupState::Initialized { config, .. } => config.telemetry.enabled,
-        _ => true,
+    let profile_telemetry = match detect_setup_state(&data_dir) {
+        SetupState::Initialized { config, .. } => config.telemetry,
+        _ => crate::runtime_config::TelemetryConfig::default(),
     };
+    let profile_telemetry_enabled = profile_telemetry.enabled;
     let explicit_feedback = matches!(&command, AppCommand::Feedback(command) if !command.dry_run);
     let telemetry_enabled = effective_telemetry_enabled(
         profile_telemetry_enabled,
@@ -147,6 +148,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         crate::telemetry::builtin_dsn().is_some(),
         explicit_feedback,
     );
+    let agent_tracing_enabled = effective_agent_tracing_enabled(
+        telemetry_enabled,
+        profile_telemetry_enabled,
+        no_telemetry,
+        profile_telemetry.agent_tracing,
+    );
+    let agent_trace_sample_rate = if agent_tracing_enabled {
+        f32::from(profile_telemetry.agent_trace_sample_rate_percent) / 100.0
+    } else {
+        0.0
+    };
+    unsafe {
+        std::env::set_var(
+            "REMI_SENTRY_AGENT_TRACING",
+            if agent_tracing_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        std::env::set_var(
+            "REMI_SENTRY_CAPTURE_AGENT_CONTENT",
+            if agent_tracing_enabled && profile_telemetry.capture_agent_content {
+                "true"
+            } else {
+                "false"
+            },
+        );
+    }
     let surface = command_surface(&command);
     let _observability_guard = init_observability(
         matches!(
@@ -160,6 +190,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .flatten(),
         selected_profile.label(),
         surface,
+        agent_trace_sample_rate,
     )?;
     let result: anyhow::Result<()> = async {
     std::fs::create_dir_all(&data_dir)?;
@@ -235,6 +266,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 crate::cli::TelemetryCommand::Status => {
                     println!("profile: {}", selected_profile.label());
                     println!("configured: {profile_telemetry_enabled}");
+                    println!(
+                        "agent_tracing_configured: {}",
+                        profile_telemetry.agent_tracing
+                    );
+                    println!(
+                        "agent_trace_sample_rate_percent: {}",
+                        profile_telemetry.agent_trace_sample_rate_percent
+                    );
+                    println!(
+                        "capture_agent_content: {}",
+                        profile_telemetry.capture_agent_content
+                    );
                     println!("process_override_disabled: {no_telemetry}");
                     println!(
                         "embedded_dsn: {}",
@@ -246,6 +289,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                             && !no_telemetry
                             && crate::telemetry::builtin_dsn().is_some()
                     );
+                    println!("agent_tracing_effective: {agent_tracing_enabled}");
                 }
                 crate::cli::TelemetryCommand::Enable => {
                     apply_runtime_config_entries(
@@ -487,6 +531,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 builder = builder.sentry_dsn(dsn);
             }
         }
+        if agent_tracing_enabled {
+            builder = builder.sentry_agent_tracing(
+                crate::SentryAgentTracingOptions::new(
+                    profile_telemetry.agent_trace_sample_rate_percent,
+                )
+                .with_content_capture(profile_telemetry.capture_agent_content),
+            );
+        }
         let application = builder.spawn().await?;
         return crate::channel::tui::TuiChannel::new(cli)
             .run_once(application)
@@ -518,6 +570,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     ));
     let bot = Rc::new(
         CatBotBuilder::from_env()?
+            .agent_tracing(if agent_tracing_enabled {
+                bot_core::AgentTracingOptions::enabled(
+                    profile_telemetry.capture_agent_content,
+                )
+            } else {
+                bot_core::AgentTracingOptions::default()
+            })
             .im_bridge(Arc::clone(&bridge))
             .build()?,
     );
@@ -767,9 +826,12 @@ fn init_observability(
     sentry_dsn: Option<&str>,
     profile: &str,
     surface: &str,
+    traces_sample_rate: f32,
 ) -> anyhow::Result<ObservabilityGuard> {
     let sentry = sentry_dsn
-        .map(|dsn| crate::telemetry::CliTelemetryGuard::init(dsn, profile, surface))
+        .map(|dsn| {
+            crate::telemetry::CliTelemetryGuard::init(dsn, profile, surface, traces_sample_rate)
+        })
         .transpose()?;
     use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -850,6 +912,15 @@ fn effective_telemetry_enabled(
     explicit_feedback: bool,
 ) -> bool {
     dsn_available && (explicit_feedback || (profile_enabled && !process_disabled))
+}
+
+fn effective_agent_tracing_enabled(
+    telemetry_enabled: bool,
+    profile_enabled: bool,
+    process_disabled: bool,
+    configured: bool,
+) -> bool {
+    telemetry_enabled && profile_enabled && !process_disabled && configured
 }
 
 #[cfg(test)]
@@ -1737,6 +1808,25 @@ mod cli_tests {
     }
 
     #[test]
+    fn agent_tracing_never_overrides_effective_telemetry() {
+        assert!(super::effective_agent_tracing_enabled(
+            true, true, false, true
+        ));
+        assert!(!super::effective_agent_tracing_enabled(
+            false, true, false, true
+        ));
+        assert!(!super::effective_agent_tracing_enabled(
+            true, false, false, true
+        ));
+        assert!(!super::effective_agent_tracing_enabled(
+            true, true, true, true
+        ));
+        assert!(!super::effective_agent_tracing_enabled(
+            true, true, false, false
+        ));
+    }
+
+    #[test]
     fn legacy_github_feedback_flags_and_issue_alias_are_rejected() {
         assert!(parse_command(&args(&["feedback", "--title", "bug", "--repo", "o/r"])).is_err());
         assert!(parse_command(&args(&["issue", "create", "--title", "bug"])).is_err());
@@ -1765,11 +1855,13 @@ mod cli_tests {
     }
 
     #[test]
-    fn feishu_reply_events_pair_tool_request_and_response() {
+    fn feishu_reply_events_follow_tui_cell_boundaries() {
         assert!(!FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Text)));
         assert!(FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Text)));
-        assert!(FeishuReplyKind::ToolCall.starts_new_message(Some(FeishuReplyKind::ToolCall)));
-        assert!(!FeishuReplyKind::ToolResult.starts_new_message(Some(FeishuReplyKind::ToolCall)));
+        assert!(FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Thinking)));
+        assert!(!FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Thinking)));
+        assert!(!FeishuReplyKind::ToolCall.starts_new_message(Some(FeishuReplyKind::ToolCall)));
+        assert!(FeishuReplyKind::ToolResult.starts_new_message(Some(FeishuReplyKind::ToolCall)));
         assert!(FeishuReplyKind::ToolResult.starts_new_message(None));
         assert!(FeishuReplyKind::ToolResult.finishes_message());
         assert!(FeishuReplyKind::Text.starts_new_message(None));

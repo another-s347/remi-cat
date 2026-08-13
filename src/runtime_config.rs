@@ -39,11 +39,35 @@ pub struct RuntimeConfig {
 pub struct TelemetryConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub agent_tracing: bool,
+    #[serde(default = "default_agent_trace_sample_rate_percent")]
+    pub agent_trace_sample_rate_percent: u8,
+    #[serde(default)]
+    pub capture_agent_content: bool,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            agent_tracing: false,
+            agent_trace_sample_rate_percent: default_agent_trace_sample_rate_percent(),
+            capture_agent_content: false,
+        }
+    }
+}
+
+const fn default_agent_trace_sample_rate_percent() -> u8 {
+    10
+}
+
+impl TelemetryConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=100).contains(&self.agent_trace_sample_rate_percent) {
+            anyhow::bail!("telemetry.agent_trace_sample_rate_percent must be between 1 and 100");
+        }
+        Ok(())
     }
 }
 
@@ -81,6 +105,22 @@ impl RuntimeConfig {
         set_env_if_absent("REMI_DATA_DIR", &self.data_dir);
         set_env_if_absent("REMI_AGENT_ID", &self.root_agent_id);
         set_env_if_absent("REMI_MODEL_PROFILE", &self.model_profile);
+        set_env_if_absent(
+            "REMI_SENTRY_AGENT_TRACING",
+            if self.telemetry.agent_tracing {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        set_env_if_absent(
+            "REMI_SENTRY_CAPTURE_AGENT_CONTENT",
+            if self.telemetry.capture_agent_content {
+                "true"
+            } else {
+                "false"
+            },
+        );
         if let Some(overflow_bytes) = self.tool_output.overflow_bytes {
             set_env_if_absent(
                 "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
@@ -707,14 +747,17 @@ pub fn load_runtime_config(data_dir: &Path) -> Result<Option<RuntimeConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    Figment::from(Serialized::defaults(RuntimeConfig::default_for(data_dir)))
-        .merge(Yaml::file(&path))
-        .extract()
-        .with_context(|| format!("loading runtime config {}", path.display()))
-        .map(Some)
+    let config: RuntimeConfig =
+        Figment::from(Serialized::defaults(RuntimeConfig::default_for(data_dir)))
+            .merge(Yaml::file(&path))
+            .extract()
+            .with_context(|| format!("loading runtime config {}", path.display()))?;
+    config.telemetry.validate()?;
+    Ok(Some(config))
 }
 
 pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
+    config.telemetry.validate()?;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
     let path = runtime_config_path(data_dir);
@@ -883,6 +926,26 @@ model_profile: default
         assert_eq!(cfg.tool_output.overflow_bytes, None);
         assert_eq!(cfg.tool_output.foreground_timeout_ms, None);
         assert!(cfg.telemetry.enabled);
+        assert!(!cfg.telemetry.agent_tracing);
+        assert_eq!(cfg.telemetry.agent_trace_sample_rate_percent, 10);
+        assert!(!cfg.telemetry.capture_agent_content);
+    }
+
+    #[test]
+    fn telemetry_rejects_invalid_agent_trace_sample_rate() {
+        for percent in [0, 101] {
+            let telemetry = super::TelemetryConfig {
+                agent_trace_sample_rate_percent: percent,
+                ..Default::default()
+            };
+            assert!(telemetry.validate().is_err());
+        }
+        assert!(super::TelemetryConfig {
+            agent_trace_sample_rate_percent: 100,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

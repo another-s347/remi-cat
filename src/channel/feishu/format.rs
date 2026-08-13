@@ -1,8 +1,6 @@
 use remi_agentloop::prelude::ProtocolEvent;
 use remi_agentloop::types::SubSessionEvent;
 
-use super::FeishuReplyKind;
-
 pub(crate) fn format_context_compaction_line(event: &bot_core::ContextCompactionEvent) -> String {
     match event.status {
         bot_core::ContextCompactionStatus::Started => format!(
@@ -106,46 +104,6 @@ fn format_elapsed(ms: u64) -> String {
         let days = ms / 86_400_000;
         let hours = (ms % 86_400_000) / 3_600_000;
         format!("{days}d{hours:02}h")
-    }
-}
-
-pub(super) fn format_supervisor_progress(event: &bot_core::SupervisorTraceEvent) -> String {
-    match event {
-        bot_core::SupervisorTraceEvent::Thinking { content } => {
-            format!("\n**Thinking**\n{}\n", fenced_block("text", content))
-        }
-        bot_core::SupervisorTraceEvent::ToolCallStart { name, .. } => {
-            format!("\n**Tool `{name}`**\nstarting\n")
-        }
-        bot_core::SupervisorTraceEvent::ToolCallArgumentsDelta { delta, .. } => delta.clone(),
-        bot_core::SupervisorTraceEvent::ToolCall { name, args, .. } => {
-            let json = serde_json::to_string_pretty(args).unwrap_or_default();
-            format!("\n**Tool `{name}`**\n{}\n", fenced_block("json", &json))
-        }
-        bot_core::SupervisorTraceEvent::ToolResult { name, result, .. } => format!(
-            "\n**Tool result `{name}`**\n{}\n",
-            fenced_block("text", result)
-        ),
-        bot_core::SupervisorTraceEvent::OutputDelta { content } => content.clone(),
-        bot_core::SupervisorTraceEvent::Output { content } => {
-            format!("\n**Output**\n{}\n", fenced_block("json", content))
-        }
-        bot_core::SupervisorTraceEvent::AgentMessage { content } => {
-            format!("\n**Agent message**\n{}\n", fenced_block("text", content))
-        }
-    }
-}
-
-pub(super) fn supervisor_reply_kind(event: &bot_core::SupervisorTraceEvent) -> FeishuReplyKind {
-    match event {
-        bot_core::SupervisorTraceEvent::Thinking { .. } => FeishuReplyKind::Thinking,
-        bot_core::SupervisorTraceEvent::ToolCallStart { .. }
-        | bot_core::SupervisorTraceEvent::ToolCallArgumentsDelta { .. }
-        | bot_core::SupervisorTraceEvent::ToolCall { .. } => FeishuReplyKind::ToolCall,
-        bot_core::SupervisorTraceEvent::ToolResult { .. } => FeishuReplyKind::ToolResult,
-        bot_core::SupervisorTraceEvent::OutputDelta { .. }
-        | bot_core::SupervisorTraceEvent::Output { .. }
-        | bot_core::SupervisorTraceEvent::AgentMessage { .. } => FeishuReplyKind::Supervisor,
     }
 }
 

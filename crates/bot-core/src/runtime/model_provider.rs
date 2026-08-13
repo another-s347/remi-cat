@@ -1,20 +1,26 @@
 use futures::Stream;
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    Agent, AgentBuilder, AgentConfig, AgentError, ChatCtx, ChatResponseChunk, MiMoClient,
-    ModelRequest, OpenAIClient, ReqwestTransport,
+    Agent, AgentBuilder, AgentConfig, AgentError, ChatCtx, ChatResponseChunk, Content, ContentPart,
+    Message, MiMoClient, ModelRequest, OpenAIClient, ReqwestTransport,
 };
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{context_budget_tokens, ModelProfileConfig, ModelProfileRegistry};
+use crate::{context_budget_tokens, ModelProfileConfig, ModelProfileRegistry, SharedRedactor};
 
-use super::DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT;
+use super::{sentry_tracer, AgentTracingOptions, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT};
 
 #[derive(Clone)]
 pub(super) enum ProviderClient {
-    OpenAI(OpenAIClient<ReqwestTransport>),
-    MiMo(MiMoClient<ReqwestTransport>),
+    OpenAI {
+        client: OpenAIClient<ReqwestTransport>,
+        supports_multimodal: bool,
+    },
+    MiMo {
+        client: MiMoClient<ReqwestTransport>,
+        supports_multimodal: bool,
+    },
 }
 
 impl Agent for ProviderClient {
@@ -26,17 +32,126 @@ impl Agent for ProviderClient {
     fn chat(
         &self,
         ctx: ChatCtx,
-        req: ModelRequest,
+        mut req: ModelRequest,
     ) -> impl Future<Output = Result<Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>, AgentError>> + '_
     {
         async move {
+            let supports_multimodal = match self {
+                Self::OpenAI {
+                    supports_multimodal,
+                    ..
+                }
+                | Self::MiMo {
+                    supports_multimodal,
+                    ..
+                } => *supports_multimodal,
+            };
+            if !supports_multimodal {
+                let lowered_messages = lower_messages_for_text_model(&mut req.messages);
+                if lowered_messages > 0 {
+                    tracing::info!(
+                        model = %req.model,
+                        lowered_messages,
+                        "lowered multimodal model input to text"
+                    );
+                }
+            }
             match self {
-                Self::OpenAI(client) => client.chat(ctx, req).await.map(|stream| {
+                Self::OpenAI { client, .. } => client.chat(ctx, req).await.map(|stream| {
                     Box::pin(stream) as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
                 }),
-                Self::MiMo(client) => client.chat(ctx, req).await.map(|stream| {
+                Self::MiMo { client, .. } => client.chat(ctx, req).await.map(|stream| {
                     Box::pin(stream) as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
                 }),
+            }
+        }
+    }
+}
+
+fn lower_messages_for_text_model(messages: &mut [Message]) -> usize {
+    let mut lowered = 0;
+    for message in messages {
+        if message.content.is_multimodal() {
+            message.content = lower_content_to_text(&message.content);
+            lowered += 1;
+        }
+    }
+    lowered
+}
+
+fn lower_content_to_text(content: &Content) -> Content {
+    let Content::Parts(parts) = content else {
+        return content.clone();
+    };
+    Content::text(
+        parts
+            .iter()
+            .map(lower_content_part_to_text)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn lower_content_part_to_text(part: &ContentPart) -> String {
+    match part {
+        ContentPart::Text { text } => text.clone(),
+        ContentPart::ImageUrl { image_url } => {
+            let url = image_url.url.trim();
+            if let Some(header) = url
+                .strip_prefix("data:")
+                .and_then(|value| value.split(',').next())
+            {
+                format!("[image: embedded {header}; data omitted]")
+            } else if url.is_empty() {
+                "[image]".to_string()
+            } else {
+                format!("[image: {url}]")
+            }
+        }
+        ContentPart::ImageBase64 { media_type, .. } => {
+            let media_type = media_type.trim();
+            if media_type.is_empty() {
+                "[image: embedded data omitted]".to_string()
+            } else {
+                format!("[image: {media_type}; embedded data omitted]")
+            }
+        }
+        ContentPart::Audio { input_audio } => {
+            let format = input_audio.format.trim();
+            if format.is_empty() {
+                "[audio: embedded data omitted]".to_string()
+            } else {
+                format!("[audio: format={format}; embedded data omitted]")
+            }
+        }
+        ContentPart::File {
+            file_id,
+            filename,
+            media_type,
+            data,
+        } => {
+            let mut attributes = Vec::new();
+            if let Some(filename) = filename.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                attributes.push(format!("filename={filename}"));
+            }
+            if let Some(media_type) = media_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                attributes.push(format!("media_type={media_type}"));
+            }
+            if let Some(file_id) = file_id.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                attributes.push(format!("file_id={file_id}"));
+            }
+            if data.is_some() {
+                attributes.push("embedded data omitted".to_string());
+            }
+            if attributes.is_empty() {
+                "[file]".to_string()
+            } else {
+                format!("[file: {}]", attributes.join("; "))
             }
         }
     }
@@ -92,15 +207,25 @@ pub(super) fn build_inner_agent(
     system_prompt: String,
     max_turns: Option<usize>,
     extra_options: serde_json::Map<String, serde_json::Value>,
+    tracing: AgentTracingOptions,
+    agent_name: &str,
+    redactor: &SharedRedactor,
 ) -> InnerAgent {
     let model = build_provider_client(api_key, profile, profile.base_url.clone());
     let mut builder = AgentBuilder::new()
         .model(model)
-        .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
+        .config(
+            AgentConfig::default()
+                .with_model(profile.model.clone())
+                .with_max_tokens(profile.max_output_tokens),
+        )
         .system(system_prompt)
         .max_turns(max_turns.unwrap_or(usize::MAX));
     if !extra_options.is_empty() {
         builder = builder.extra_options(extra_options);
+    }
+    if let Some(tracer) = sentry_tracer(tracing, agent_name, profile, redactor) {
+        builder = builder.tracer(tracer);
     }
     builder.build_loop()
 }
@@ -115,13 +240,19 @@ pub(super) fn build_provider_client(
         if let Some(url) = base_url {
             client = client.with_base_url(url);
         }
-        ProviderClient::MiMo(client)
+        ProviderClient::MiMo {
+            client,
+            supports_multimodal: profile.supports_images,
+        }
     } else {
         let mut client = OpenAIClient::new(api_key.to_string()).with_model(profile.model.clone());
         if let Some(url) = base_url {
             client = client.with_base_url(url);
         }
-        ProviderClient::OpenAI(client)
+        ProviderClient::OpenAI {
+            client,
+            supports_multimodal: profile.supports_images,
+        }
     }
 }
 
@@ -171,6 +302,7 @@ pub(super) fn context_percent_tokens(profile: &ModelProfileConfig, percent: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remi_agentloop::types::AudioDetail;
 
     fn profile(provider: Option<&str>) -> ModelProfileConfig {
         ModelProfileConfig {
@@ -196,7 +328,7 @@ mod tests {
     fn mimo_provider_uses_mimo_client() {
         assert!(matches!(
             build_provider_client("test-key", &profile(Some("mimo")), None),
-            ProviderClient::MiMo(_)
+            ProviderClient::MiMo { .. }
         ));
     }
 
@@ -204,11 +336,58 @@ mod tests {
     fn other_providers_keep_using_openai_compatible_client() {
         assert!(matches!(
             build_provider_client("test-key", &profile(Some("openai")), None),
-            ProviderClient::OpenAI(_)
+            ProviderClient::OpenAI { .. }
         ));
         assert!(matches!(
             build_provider_client("test-key", &profile(None), None),
-            ProviderClient::OpenAI(_)
+            ProviderClient::OpenAI { .. }
         ));
+    }
+
+    #[test]
+    fn text_model_lowering_preserves_order_and_omits_embedded_data() {
+        let mut messages = vec![Message::user_content(Content::parts(vec![
+            ContentPart::text("inspect"),
+            ContentPart::image_url("https://example.test/photo.png"),
+            ContentPart::image_base64("image/png", "SECRET_IMAGE_DATA"),
+            ContentPart::Audio {
+                input_audio: AudioDetail {
+                    data: "SECRET_AUDIO_DATA".to_string(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::File {
+                file_id: Some("file-1".to_string()),
+                filename: Some("notes.pdf".to_string()),
+                media_type: Some("application/pdf".to_string()),
+                data: Some("SECRET_FILE_DATA".to_string()),
+            },
+        ]))];
+
+        assert_eq!(lower_messages_for_text_model(&mut messages), 1);
+        let text = messages[0].content.text_content();
+        assert_eq!(
+            text,
+            "inspect\n[image: https://example.test/photo.png]\n[image: image/png; embedded data omitted]\n[audio: format=wav; embedded data omitted]\n[file: filename=notes.pdf; media_type=application/pdf; file_id=file-1; embedded data omitted]"
+        );
+        assert!(!text.contains("SECRET_"));
+        assert!(!messages[0].content.is_multimodal());
+    }
+
+    #[test]
+    fn text_model_lowering_redacts_data_urls_but_keeps_plain_text_unchanged() {
+        let mut messages = vec![
+            Message::user("plain"),
+            Message::user_content(Content::parts(vec![ContentPart::image_url(
+                "data:image/jpeg;base64,SECRET_IMAGE_DATA",
+            )])),
+        ];
+
+        assert_eq!(lower_messages_for_text_model(&mut messages), 1);
+        assert_eq!(messages[0].content.text_content(), "plain");
+        assert_eq!(
+            messages[1].content.text_content(),
+            "[image: embedded image/jpeg;base64; data omitted]"
+        );
     }
 }

@@ -179,6 +179,18 @@ pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> 
                     );
                     println!("async_agent: {}", config.tool_output.async_agent);
                     println!("telemetry_enabled: {}", config.telemetry.enabled);
+                    println!(
+                        "telemetry_agent_tracing: {}",
+                        config.telemetry.agent_tracing
+                    );
+                    println!(
+                        "telemetry_agent_trace_sample_rate_percent: {}",
+                        config.telemetry.agent_trace_sample_rate_percent
+                    );
+                    println!(
+                        "telemetry_capture_agent_content: {}",
+                        config.telemetry.capture_agent_content
+                    );
                     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
                     println!("sandbox_container: {}", config.sandbox.container_name);
                     println!("im_mode: {}", config.im.mode.as_env_value());
@@ -910,6 +922,16 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "telemetry_enabled" | "telemetry.enabled" | "telemetry" => {
             config.telemetry.enabled = parse_bool(value)?
         }
+        "telemetry_agent_tracing" | "telemetry.agent_tracing" => {
+            config.telemetry.agent_tracing = parse_bool(value)?
+        }
+        "telemetry_agent_trace_sample_rate_percent"
+        | "telemetry.agent_trace_sample_rate_percent" => {
+            config.telemetry.agent_trace_sample_rate_percent = parse_percent(value)?
+        }
+        "telemetry_capture_agent_content" | "telemetry.capture_agent_content" => {
+            config.telemetry.capture_agent_content = parse_bool(value)?
+        }
         "sandbox_kind" | "sandbox.kind" => config.sandbox.kind = parse_sandbox_kind(value)?,
         "sandbox_host_dir" | "sandbox.host_dir" => config.sandbox.host_dir = value.to_string(),
         "sandbox_container_dir" | "sandbox.container_dir" => {
@@ -1033,6 +1055,14 @@ fn parse_bool(value: &str) -> anyhow::Result<bool> {
         "0" | "false" | "no" | "n" | "off" => Ok(false),
         _ => anyhow::bail!("expected boolean, got `{value}`"),
     }
+}
+
+fn parse_percent(value: &str) -> anyhow::Result<u8> {
+    let parsed: u8 = value.parse().context("invalid percentage")?;
+    if !(1..=100).contains(&parsed) {
+        anyhow::bail!("percentage must be between 1 and 100");
+    }
+    Ok(parsed)
 }
 
 fn parse_port(value: &str) -> anyhow::Result<u16> {

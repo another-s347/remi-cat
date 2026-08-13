@@ -12,8 +12,9 @@ publish = false
 doctest = false
 
 [dependencies]
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "cb50247ea07134d0d956b49108da6a7c1753ca1b", features = [
-    "tracing-langsmith",
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "889866c6edb33ca7a928bf83eac11bc7057870ac", features = [
+    "http-client",
+    "tracing-sentry",
 ] }
 anyhow = "1"
 async-stream = "0.3"

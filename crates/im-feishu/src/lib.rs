@@ -863,6 +863,10 @@ impl FeishuGateway {
         self.client.get_user_name(user_id).await
     }
 
+    pub async fn get_chat_info(&self, chat_id: &str) -> Result<client::ChatInfoData> {
+        self.client.get_chat_info(chat_id).await
+    }
+
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {
         self.client.send_text(chat_id, text).await
     }
@@ -904,6 +908,14 @@ impl FeishuGateway {
         self.client.reply_card_raw(message_id, card).await
     }
 
+    pub async fn reply_card_raw_in_thread(
+        &self,
+        message_id: &str,
+        card: serde_json::Value,
+    ) -> Result<String> {
+        self.client.reply_card_raw_in_thread(message_id, card).await
+    }
+
     /// Update the body of an existing card with a fully-built card JSON value.
     pub async fn update_card_raw(&self, message_id: &str, card: serde_json::Value) -> Result<()> {
         self.client.update_card_raw(message_id, card).await
@@ -913,7 +925,12 @@ impl FeishuGateway {
     /// The actual card message is created lazily on the first [`StreamingCard::push`]
     /// or [`StreamingCard::finish`] call, so no placeholder is sent upfront.
     pub fn begin_streaming_reply(&self, parent_msg_id: &str) -> StreamingCard {
-        StreamingCard::new(self.client.clone(), parent_msg_id.to_string())
+        StreamingCard::new(self.client.clone(), parent_msg_id.to_string(), false)
+    }
+
+    /// Stream a card under a topic created from `parent_msg_id`.
+    pub fn begin_streaming_thread_reply(&self, parent_msg_id: &str) -> StreamingCard {
+        StreamingCard::new(self.client.clone(), parent_msg_id.to_string(), true)
     }
 
     /// Add an emoji reaction to a message. Returns the `reaction_id` (needed to delete it later).

@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -77,6 +78,19 @@ struct ChatData {
     chat_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatInfoResponse {
+    code: i64,
+    msg: String,
+    data: Option<ChatInfoData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatInfoData {
+    pub chat_mode: Option<String>,
+    pub group_message_type: Option<String>,
+}
+
 // ── Generic API response ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +149,7 @@ pub struct FeishuClient {
     token: Arc<RwLock<String>>,
     /// Bot's own `open_id`, fetched once via `/open-apis/bot/v3/info`.
     bot_open_id: Arc<RwLock<Option<String>>>,
+    chat_info_cache: Arc<RwLock<HashMap<String, ChatInfoData>>>,
 }
 
 impl FeishuClient {
@@ -145,7 +160,53 @@ impl FeishuClient {
             http: Client::new(),
             token: Arc::new(RwLock::new(String::new())),
             bot_open_id: Arc::new(RwLock::new(None)),
+            chat_info_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Fetch the group mode used to decide whether process cells may create a
+    /// nested topic. Results are stable for a chat and cached after the first
+    /// lookup so normal turns do not pay another network round trip.
+    pub async fn get_chat_info(&self, chat_id: &str) -> Result<ChatInfoData> {
+        if let Some(info) = self.chat_info_cache.read().await.get(chat_id).cloned() {
+            return Ok(info);
+        }
+
+        let res = self.get_chat_info_once(chat_id).await;
+        let info = if res
+            .as_ref()
+            .err()
+            .map(is_token_expired_err)
+            .unwrap_or(false)
+        {
+            warn!("get_chat_info: token expired, refreshing and retrying");
+            self.refresh_token().await?;
+            self.get_chat_info_once(chat_id).await?
+        } else {
+            res?
+        };
+        self.chat_info_cache
+            .write()
+            .await
+            .insert(chat_id.to_string(), info.clone());
+        Ok(info)
+    }
+
+    async fn get_chat_info_once(&self, chat_id: &str) -> Result<ChatInfoData> {
+        let token = self.token().await;
+        let resp: ChatInfoResponse = self
+            .http
+            .get(format!("{FEISHU_BASE}/im/v1/chats/{chat_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("get_chat_info")?
+            .json()
+            .await
+            .context("parse get_chat_info response")?;
+        ensure_ok(resp.code, &resp.msg, "get_chat_info")?;
+        resp.data
+            .ok_or_else(|| anyhow!("get_chat_info response missing data"))
     }
 
     /// Fetch a fresh `tenant_access_token` and store it internally.
@@ -828,7 +889,23 @@ impl FeishuClient {
     /// Reply to an existing message with an interactive card.
     /// Returns the new card `message_id` (used for subsequent [`update_card`] calls).
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
-        let res = self.reply_card_once(message_id, text).await;
+        self.reply_card_with_thread(message_id, text, false).await
+    }
+
+    /// Reply with an interactive card and force the reply into a topic thread.
+    pub async fn reply_card_in_thread(&self, message_id: &str, text: &str) -> Result<String> {
+        self.reply_card_with_thread(message_id, text, true).await
+    }
+
+    async fn reply_card_with_thread(
+        &self,
+        message_id: &str,
+        text: &str,
+        reply_in_thread: bool,
+    ) -> Result<String> {
+        let res = self
+            .reply_card_once(message_id, text, reply_in_thread)
+            .await;
         if res
             .as_ref()
             .err()
@@ -837,12 +914,19 @@ impl FeishuClient {
         {
             warn!("reply_card: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.reply_card_once(message_id, text).await;
+            return self
+                .reply_card_once(message_id, text, reply_in_thread)
+                .await;
         }
         res
     }
 
-    async fn reply_card_once(&self, message_id: &str, text: &str) -> Result<String> {
+    async fn reply_card_once(
+        &self,
+        message_id: &str,
+        text: &str,
+        reply_in_thread: bool,
+    ) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
 
@@ -853,6 +937,7 @@ impl FeishuClient {
             .json(&serde_json::json!({
                 "msg_type": "interactive",
                 "content": content,
+                "reply_in_thread": reply_in_thread,
             }))
             .send()
             .await
@@ -950,7 +1035,29 @@ impl FeishuClient {
         message_id: &str,
         card: serde_json::Value,
     ) -> Result<String> {
-        let res = self.reply_card_raw_once(message_id, card.clone()).await;
+        self.reply_card_raw_with_thread(message_id, card, false)
+            .await
+    }
+
+    /// Reply with a fully-built card and force the reply into a topic thread.
+    pub async fn reply_card_raw_in_thread(
+        &self,
+        message_id: &str,
+        card: serde_json::Value,
+    ) -> Result<String> {
+        self.reply_card_raw_with_thread(message_id, card, true)
+            .await
+    }
+
+    async fn reply_card_raw_with_thread(
+        &self,
+        message_id: &str,
+        card: serde_json::Value,
+        reply_in_thread: bool,
+    ) -> Result<String> {
+        let res = self
+            .reply_card_raw_once(message_id, card.clone(), reply_in_thread)
+            .await;
         if res
             .as_ref()
             .err()
@@ -959,7 +1066,9 @@ impl FeishuClient {
         {
             warn!("reply_card_raw: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.reply_card_raw_once(message_id, card).await;
+            return self
+                .reply_card_raw_once(message_id, card, reply_in_thread)
+                .await;
         }
         res
     }
@@ -968,6 +1077,7 @@ impl FeishuClient {
         &self,
         message_id: &str,
         card: serde_json::Value,
+        reply_in_thread: bool,
     ) -> Result<String> {
         let content = card.to_string();
         let token = self.token().await;
@@ -979,6 +1089,7 @@ impl FeishuClient {
             .json(&serde_json::json!({
                 "msg_type": "interactive",
                 "content": content,
+                "reply_in_thread": reply_in_thread,
             }))
             .send()
             .await

@@ -25,6 +25,7 @@ pub struct StreamingCard {
     pub(crate) client: FeishuClient,
     /// The message to reply under — used for deferred card creation.
     parent_msg_id: String,
+    reply_in_thread: bool,
     /// The `message_id` of the created card, once it exists.
     pub message_id: Option<String>,
     /// Accumulated reply text.
@@ -36,7 +37,7 @@ pub struct StreamingCard {
 }
 
 impl StreamingCard {
-    pub(crate) fn new(client: FeishuClient, parent_msg_id: String) -> Self {
+    pub(crate) fn new(client: FeishuClient, parent_msg_id: String, reply_in_thread: bool) -> Self {
         // Subtract UPDATE_INTERVAL * 2 so the first push triggers an update immediately.
         let last_update = Instant::now()
             .checked_sub(UPDATE_INTERVAL * 2)
@@ -44,6 +45,7 @@ impl StreamingCard {
         Self {
             client,
             parent_msg_id,
+            reply_in_thread,
             message_id: None,
             buffer: String::new(),
             done: false,
@@ -54,10 +56,15 @@ impl StreamingCard {
     /// Create the card now if it hasn't been created yet.
     async fn ensure_card(&mut self, initial_text: &str) -> anyhow::Result<()> {
         if self.message_id.is_none() {
-            let id = self
-                .client
-                .reply_card(&self.parent_msg_id, initial_text)
-                .await?;
+            let id = if self.reply_in_thread {
+                self.client
+                    .reply_card_in_thread(&self.parent_msg_id, initial_text)
+                    .await?
+            } else {
+                self.client
+                    .reply_card(&self.parent_msg_id, initial_text)
+                    .await?
+            };
             self.message_id = Some(id);
             self.last_update = Instant::now();
         }
@@ -87,7 +94,8 @@ impl StreamingCard {
         Ok(())
     }
 
-    /// Replace the full visible card text and flush immediately.
+    /// Replace the full visible card text, creating the card immediately but
+    /// debouncing subsequent PATCH calls.
     ///
     /// This is used for status-style streaming where the same message should
     /// update from "running" to "completed" instead of appending another line.
@@ -95,7 +103,13 @@ impl StreamingCard {
         self.buffer.clear();
         self.buffer.push_str(text);
         let content = format!("{}▋", self.buffer);
-        self.flush_text(&content).await
+        if self.message_id.is_none() {
+            self.ensure_card(&content).await
+        } else if self.last_update.elapsed() >= UPDATE_INTERVAL {
+            self.flush_text(&content).await
+        } else {
+            Ok(())
+        }
     }
 
     /// Replace the full card text without a cursor and mark it complete.

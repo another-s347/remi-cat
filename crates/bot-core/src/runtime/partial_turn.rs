@@ -19,6 +19,12 @@ pub(crate) struct PartialTurnRecorder {
     tools: Vec<PartialToolActivity>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PartialTurnEnd {
+    Cancelled,
+    Error,
+}
+
 impl PartialTurnRecorder {
     pub(crate) fn new(base_messages: Vec<Message>) -> Self {
         Self {
@@ -83,7 +89,15 @@ impl PartialTurnRecorder {
         }
     }
 
-    pub(crate) fn synthesize_history(&self) -> Option<Vec<Message>> {
+    pub(crate) fn synthesize_cancelled_history(&self) -> Option<Vec<Message>> {
+        self.synthesize_history(PartialTurnEnd::Cancelled)
+    }
+
+    pub(crate) fn synthesize_error_history(&self) -> Option<Vec<Message>> {
+        self.synthesize_history(PartialTurnEnd::Error)
+    }
+
+    fn synthesize_history(&self, end: PartialTurnEnd) -> Option<Vec<Message>> {
         if self.assistant_text.is_empty()
             && self.reasoning_content.is_none()
             && self.tools.is_empty()
@@ -97,7 +111,10 @@ impl PartialTurnRecorder {
             if !content.is_empty() {
                 content.push_str("\n\n");
             }
-            content.push_str("[Cancelled tool activity]");
+            content.push_str(match end {
+                PartialTurnEnd::Cancelled => "[Cancelled tool activity]",
+                PartialTurnEnd::Error => "[Tool activity before model error]",
+            });
             for tool in &self.tools {
                 content.push_str("\n- ");
                 content.push_str(&format!("{} ({})", tool.name, tool.id));
@@ -117,12 +134,22 @@ impl PartialTurnRecorder {
                             result, success, elapsed_ms
                         ));
                     }
-                    _ => content.push_str(" status: cancelled before completion"),
+                    _ => content.push_str(match end {
+                        PartialTurnEnd::Cancelled => " status: cancelled before completion",
+                        PartialTurnEnd::Error => " status: interrupted by model error",
+                    }),
                 }
             }
         }
         if content.is_empty() {
-            content = "[Cancelled before assistant text was produced]".to_string();
+            content = match end {
+                PartialTurnEnd::Cancelled => {
+                    "[Cancelled before assistant text was produced]".to_string()
+                }
+                PartialTurnEnd::Error => {
+                    "[Model call failed before assistant text was produced]".to_string()
+                }
+            };
         }
 
         let mut message = Message::assistant(content);

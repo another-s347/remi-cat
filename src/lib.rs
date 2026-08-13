@@ -27,7 +27,8 @@ pub use application::{
     ActiveRunInfo, ActiveRunState, Application, ApplicationBuilder, ApplicationCatalog,
     ApplicationEvent, ApplicationHandle, ApplicationInfo, ChannelConfig, ChannelHandle,
     CommandPreprocessResult, EffectiveSessionConfig, HookMutationResult, HookReloadReport,
-    RunControl, RunHandle, RunOptions, RunRequest, SessionPatch, SubSessionEventPage,
+    RunControl, RunHandle, RunOptions, RunRequest, SentryAgentTracingOptions, SessionPatch,
+    SubSessionEventPage,
 };
 pub use bot_core::{
     AgentError, AgentProfile, BuiltinSkill, CatEvent, Content, DynamicTool, DynamicToolRisk,

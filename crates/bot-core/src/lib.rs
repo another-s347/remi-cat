@@ -76,8 +76,8 @@ pub use profile::{
     AgentRegistry,
 };
 pub use runtime::{
-    CatBot, CatBotBuilder, EffectiveModelProfile, EffectiveModelSource, RegisteredToolStatus,
-    SteerInput, SteerSubmitResult, StreamOptions,
+    AgentTracingOptions, CatBot, CatBotBuilder, EffectiveModelProfile, EffectiveModelSource,
+    RegisteredToolStatus, SteerInput, SteerSubmitResult, StreamOptions,
 };
 pub use sandbox::SandboxConfig;
 pub use skill::store::{BuiltinSkill, BuiltinSkillStore, FileSkillStore};

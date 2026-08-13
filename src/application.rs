@@ -38,6 +38,43 @@ pub struct ApplicationInfo {
     pub workspace: PathBuf,
     pub data_dir: PathBuf,
     pub telemetry_enabled: bool,
+    pub agent_tracing_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentryAgentTracingOptions {
+    pub sample_rate_percent: u8,
+    pub capture_content: bool,
+}
+
+impl Default for SentryAgentTracingOptions {
+    fn default() -> Self {
+        Self {
+            sample_rate_percent: 10,
+            capture_content: false,
+        }
+    }
+}
+
+impl SentryAgentTracingOptions {
+    pub const fn new(sample_rate_percent: u8) -> Self {
+        Self {
+            sample_rate_percent,
+            capture_content: false,
+        }
+    }
+
+    pub const fn with_content_capture(mut self, capture_content: bool) -> Self {
+        self.capture_content = capture_content;
+        self
+    }
+
+    fn validate(self) -> anyhow::Result<Self> {
+        if !(1..=100).contains(&self.sample_rate_percent) {
+            anyhow::bail!("Sentry Agent Tracing sample rate must be between 1 and 100");
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +310,7 @@ pub struct ApplicationBuilder {
     discover_hooks: bool,
     hook_sources: Vec<bot_core::HookSource>,
     sentry_dsn: Option<String>,
+    sentry_agent_tracing: Option<SentryAgentTracingOptions>,
     credentials: Option<std::collections::BTreeMap<String, String>>,
     secret_store: Option<SecretStore>,
 }
@@ -297,6 +335,7 @@ impl ApplicationBuilder {
             discover_hooks: true,
             hook_sources: Vec::new(),
             sentry_dsn: None,
+            sentry_agent_tracing: None,
             credentials: None,
             secret_store: None,
         }
@@ -310,6 +349,14 @@ impl ApplicationBuilder {
     /// Applications that do not call this method never initialize Sentry.
     pub fn sentry_dsn(mut self, dsn: impl Into<String>) -> Self {
         self.sentry_dsn = Some(dsn.into());
+        self
+    }
+
+    /// Explicitly enable application-scoped Sentry Agent Tracing.
+    ///
+    /// A DSN must also be supplied with [`Self::sentry_dsn`].
+    pub fn sentry_agent_tracing(mut self, options: SentryAgentTracingOptions) -> Self {
+        self.sentry_agent_tracing = Some(options);
         self
     }
     pub fn credentials(mut self, credentials: std::collections::BTreeMap<String, String>) -> Self {
@@ -405,6 +452,18 @@ impl ApplicationBuilder {
     pub async fn spawn(self) -> anyhow::Result<Application> {
         let app_id = self.app_id.trim().to_string();
         validate_app_id(&app_id)?;
+        let sentry_agent_tracing = self
+            .sentry_agent_tracing
+            .map(SentryAgentTracingOptions::validate)
+            .transpose()?;
+        if sentry_agent_tracing.is_some() && self.sentry_dsn.is_none() {
+            return Err(anyhow!(
+                "Sentry Agent Tracing requires an Application Sentry DSN"
+            ));
+        }
+        let traces_sample_rate = sentry_agent_tracing
+            .map(|options| f32::from(options.sample_rate_percent) / 100.0)
+            .unwrap_or(0.0);
         let telemetry = match self.sentry_dsn.as_deref() {
             None => None,
             Some(dsn) if dsn.trim().is_empty() => {
@@ -413,6 +472,7 @@ impl ApplicationBuilder {
             Some(dsn) => Some(Arc::new(crate::telemetry::ApplicationTelemetry::new(
                 dsn.trim(),
                 &app_id,
+                traces_sample_rate,
             )?)),
         };
         if !self.unsupported_extensions.is_empty() {
@@ -428,6 +488,7 @@ impl ApplicationBuilder {
             workspace: self.workspace.clone(),
             data_dir: self.data_dir.clone(),
             telemetry_enabled: telemetry.is_some(),
+            agent_tracing_enabled: sentry_agent_tracing.is_some(),
         });
         let data_dir = self.data_dir;
         let workspace = self.workspace;
@@ -443,6 +504,9 @@ impl ApplicationBuilder {
         let credentials = self.credentials;
         let secret_store = self.secret_store;
         let thread_telemetry = telemetry.clone();
+        let agent_tracing = sentry_agent_tracing
+            .map(|options| bot_core::AgentTracingOptions::enabled(options.capture_content))
+            .unwrap_or_default();
         let mut text_ids = std::collections::HashSet::new();
         for source in &hook_sources {
             if let bot_core::HookSource::Text { id, .. } = source {
@@ -498,6 +562,7 @@ impl ApplicationBuilder {
                             hook_sources,
                             credentials,
                             secret_store,
+                            agent_tracing,
                         )
                         .await
                         {
@@ -1313,6 +1378,7 @@ async fn build_runtime(
     hook_sources: Vec<bot_core::HookSource>,
     credentials: Option<std::collections::BTreeMap<String, String>>,
     configured_secret_store: Option<SecretStore>,
+    agent_tracing: bot_core::AgentTracingOptions,
 ) -> anyhow::Result<Rc<Runtime>> {
     std::fs::create_dir_all(&data_dir)?;
     let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge::new(None));
@@ -1343,6 +1409,7 @@ async fn build_runtime(
         &secret_entries,
     )?
     .workspace(workspace)
+    .agent_tracing(agent_tracing)
     .hook_manager(hook_manager);
     let agents = bot_core::AgentRegistry::load(data_dir.join("agents"))?;
     if let Some(profile) = agents.get(&root_agent_id) {
@@ -1360,6 +1427,7 @@ async fn build_runtime(
         builder = builder.builtin_skill(skill);
     }
     let bot = Rc::new(builder.build()?);
+    bot.update_secret_redactor(&crate::secret_store::redaction_entries(&secret_entries));
     let secret_store = Arc::new(tokio::sync::Mutex::new(secrets));
     Ok(Rc::new(Runtime {
         bot,
@@ -2222,11 +2290,34 @@ mod tests {
     fn application_telemetry_is_opt_in() {
         let builder = ApplicationBuilder::new("data");
         assert!(builder.sentry_dsn.is_none());
+        assert!(builder.sentry_agent_tracing.is_none());
         let builder = builder.sentry_dsn("https://public@example.com/1");
         assert_eq!(
             builder.sentry_dsn.as_deref(),
             Some("https://public@example.com/1")
         );
+    }
+
+    #[tokio::test]
+    async fn application_agent_tracing_requires_dsn_and_valid_sample_rate() {
+        let error = ApplicationBuilder::new("data")
+            .sentry_agent_tracing(SentryAgentTracingOptions::default())
+            .spawn()
+            .await
+            .err()
+            .expect("tracing without a DSN should fail");
+        assert!(error
+            .to_string()
+            .contains("requires an Application Sentry DSN"));
+
+        let error = ApplicationBuilder::new("data")
+            .sentry_dsn("https://public@example.com/1")
+            .sentry_agent_tracing(SentryAgentTracingOptions::new(0))
+            .spawn()
+            .await
+            .err()
+            .expect("zero sample rate should fail");
+        assert!(error.to_string().contains("between 1 and 100"));
     }
 
     #[tokio::test]

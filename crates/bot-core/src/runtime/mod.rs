@@ -86,6 +86,56 @@ const MODEL_PROTOCOL_MARGIN_TOKENS: u32 = 512;
 const AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE: &str =
     "Agent.md exists in the current working directory; read it before substantive work and follow any applicable project instructions.";
 
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentTracingOptions {
+    pub enabled: bool,
+    pub capture_content: bool,
+}
+
+impl AgentTracingOptions {
+    pub const fn enabled(capture_content: bool) -> Self {
+        Self {
+            enabled: true,
+            capture_content,
+        }
+    }
+}
+
+fn sentry_tracer(
+    options: AgentTracingOptions,
+    agent_name: &str,
+    profile: &ModelProfileConfig,
+    redactor: &SharedRedactor,
+) -> Option<remi_agentloop::prelude::SentryTracer> {
+    if !options.enabled {
+        return None;
+    }
+    let shared_redactor = Arc::clone(redactor);
+    Some(remi_agentloop::prelude::SentryTracer::new(
+        remi_agentloop::prelude::SentryTraceOptions::new(agent_name)
+            .with_provider_name(profile.provider.as_deref().unwrap_or("openai"))
+            .with_content_capture(options.capture_content)
+            .with_content_redactor(Arc::new(move |content| {
+                shared_redactor
+                    .read()
+                    .map(|redactor| redactor.redact(content))
+                    .unwrap_or_else(|_| "[REDACTED:LOCK_POISONED]".to_string())
+            })),
+    ))
+}
+
 fn supervisor_prompt_budget_tokens(profile: &ModelProfileConfig) -> u32 {
     let percent_budget = (profile.context_tokens as usize)
         .saturating_mul(SUPERVISOR_PROMPT_CONTEXT_PERCENT)
@@ -1113,8 +1163,6 @@ impl CatBot {
     /// | `REMI_REASONING_EFFORT`   | Optional reasoning effort override (`auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
     /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers auto compression (default: 80) |
-    /// | `LANGSMITH_API_KEY`       | Enable LangSmith tracing (optional)                   |
-    /// | `LANGSMITH_PROJECT`       | LangSmith project name (default: `remi-cat`)          |
     pub fn from_env() -> anyhow::Result<Self> {
         CatBotBuilder::from_env()?.build()
     }
@@ -2785,22 +2833,6 @@ impl CatBot {
                 let should_log_media_input = content.is_multimodal()
                     || !round_opts.im_attachments.is_empty()
                     || !round_opts.im_documents.is_empty();
-                if should_log_media_input && !effective_model.profile.supports_images {
-                    let err = AgentError::other(format!(
-                        "current model profile `{}` does not support image/document inputs; switch REMI_MODEL_PROFILE to a multimodal model",
-                        effective_model.profile.id
-                    ));
-                    tracing::warn!(
-                        thread_id = %thread_id_owned,
-                        model_profile = %effective_model.profile.id,
-                        model = %effective_model.profile.model,
-                        elapsed_ms = turn_started.elapsed().as_millis() as u64,
-                        error = %err,
-                        "agent_turn.failed"
-                    );
-                    yield CatEvent::Error(err);
-                    return;
-                }
                 if should_log_media_input {
                     tracing::info!(
                         thread_id = %thread_id_owned,
@@ -3082,7 +3114,9 @@ impl CatBot {
                             }
                             for event in persist_turn(
                                 &self.memory, &thread_id_owned,
-                                raw_history.take().or_else(|| partial_turn.synthesize_history()),
+                                raw_history
+                                    .take()
+                                    .or_else(|| partial_turn.synthesize_cancelled_history()),
                                 raw_user_state.take().or_else(|| Some(initial_user_state.clone())),
                                 skip_count, &tool_elapsed_ms,
                             ).await {
@@ -3670,10 +3704,19 @@ impl CatBot {
                                 return;
                             }
                             CatEvent::Error(e) => {
-                                // Best-effort save on error (partial history is better than nothing).
+                                // Best-effort save on error. The inner loop only emits a complete
+                                // History snapshot on success, so preserve the observed turn when
+                                // a model request fails before that terminal snapshot arrives.
                                 for event in persist_turn(
                                     &self.memory, &thread_id_owned,
-                                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                                    raw_history
+                                        .take()
+                                        .or_else(|| partial_turn.synthesize_error_history()),
+                                    raw_user_state
+                                        .take()
+                                        .or_else(|| Some(initial_user_state.clone())),
+                                    skip_count,
+                                    &tool_elapsed_ms,
                                 ).await {
                                     yield event;
                                 }
@@ -3821,6 +3864,7 @@ struct LocalToolDeps {
     environment_context_source: EnvironmentContextSource,
     bash_enabled: bool,
     redactor: SharedRedactor,
+    agent_tracing: AgentTracingOptions,
     data_dir: PathBuf,
     workspace_root: PathBuf,
     agents_dir: PathBuf,
@@ -3891,6 +3935,7 @@ impl LocalToolDeps {
             environment_context_source: self.environment_context_source.clone(),
             bash_enabled: self.bash_enabled,
             redactor: Arc::clone(&self.redactor),
+            agent_tracing: self.agent_tracing,
             data_dir: self.data_dir.clone(),
             workspace_root: self.workspace_root.clone(),
             agents_dir: self.agents_dir.clone(),
@@ -3982,6 +4027,7 @@ pub struct CatBotBuilder {
     include_default_agents: bool,
     hook_manager: Option<Arc<HookManager>>,
     api_keys: Option<Arc<std::collections::BTreeMap<String, String>>>,
+    agent_tracing: AgentTracingOptions,
 }
 
 impl CatBotBuilder {
@@ -4044,6 +4090,10 @@ impl CatBotBuilder {
             include_default_agents: true,
             hook_manager: None,
             api_keys: None,
+            agent_tracing: AgentTracingOptions {
+                enabled: env_flag("REMI_SENTRY_AGENT_TRACING"),
+                capture_content: env_flag("REMI_SENTRY_CAPTURE_AGENT_CONTENT"),
+            },
         };
         let agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| DEFAULT_AGENT_ID.into());
         let agents_dir = std::env::var("REMI_AGENTS_DIR")
@@ -4134,6 +4184,7 @@ impl CatBotBuilder {
             include_default_agents: true,
             hook_manager: None,
             api_keys: api_keys.map(|values| Arc::new(values.clone())),
+            agent_tracing: AgentTracingOptions::default(),
         })
     }
 
@@ -4166,6 +4217,11 @@ impl CatBotBuilder {
 
     pub fn im_bridge(mut self, bridge: Arc<dyn ImFileBridge>) -> Self {
         self.im_bridge = Some(bridge);
+        self
+    }
+
+    pub fn agent_tracing(mut self, options: AgentTracingOptions) -> Self {
+        self.agent_tracing = options;
         self
     }
 
@@ -4308,9 +4364,12 @@ impl CatBotBuilder {
             );
         }
 
+        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
         let model = build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
         let extra_options = self.extra_options.clone();
-        let agent_config = AgentConfig::default().with_max_tokens(profile.max_output_tokens);
+        let agent_config = AgentConfig::default()
+            .with_model(profile.model.clone())
+            .with_max_tokens(profile.max_output_tokens);
         let mut inner_builder = AgentBuilder::new()
             .model(model)
             .config(agent_config)
@@ -4320,16 +4379,13 @@ impl CatBotBuilder {
             inner_builder = inner_builder.extra_options(extra_options.clone());
         }
 
-        // ── LangSmith tracing (optional) ──────────────────────────────────
-        if let Ok(api_key) = std::env::var("LANGSMITH_API_KEY") {
-            if !api_key.is_empty() {
-                let project =
-                    std::env::var("LANGSMITH_PROJECT").unwrap_or_else(|_| "remi-cat".into());
-                tracing::info!(project = %project, "LangSmith tracing enabled");
-                inner_builder = inner_builder.tracer(
-                    remi_agentloop::prelude::LangSmithTracer::new(api_key).with_project(project),
-                );
-            }
+        if let Some(tracer) = sentry_tracer(
+            self.agent_tracing,
+            &self.active_agent_id,
+            &profile,
+            &redactor,
+        ) {
+            inner_builder = inner_builder.tracer(tracer);
         }
 
         let inner_loop: InnerAgent = inner_builder.build_loop();
@@ -4395,14 +4451,22 @@ impl CatBotBuilder {
             build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
         let mut acp_local_builder = AgentBuilder::new()
             .model(acp_local_model)
-            .config(AgentConfig::default().with_max_tokens(profile.max_output_tokens))
+            .config(
+                AgentConfig::default()
+                    .with_model(profile.model.clone())
+                    .with_max_tokens(profile.max_output_tokens),
+            )
             .system(system_prompt.clone())
             .max_turns(self.max_turns.unwrap_or(usize::MAX));
         if !self.extra_options.is_empty() {
             acp_local_builder = acp_local_builder.extra_options(self.extra_options.clone());
         }
+        if let Some(tracer) =
+            sentry_tracer(self.agent_tracing, &active_agent_id, &profile, &redactor)
+        {
+            acp_local_builder = acp_local_builder.tracer(tracer);
+        }
         let acp_local_inner: InnerAgent = acp_local_builder.build_loop();
-        let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
         let acp_tool_deps = LocalToolDeps {
             skill_store: Arc::clone(&skill_store),
             memory: Arc::clone(&memory),
@@ -4412,6 +4476,7 @@ impl CatBotBuilder {
             environment_context_source: environment_context_source.clone(),
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
+            agent_tracing: self.agent_tracing,
             data_dir: data_dir.clone(),
             workspace_root: workspace_root.clone(),
             agents_dir: agents_dir.clone(),
@@ -4478,6 +4543,7 @@ impl CatBotBuilder {
             environment_context_source: environment_context_source.clone(),
             bash_enabled: self.sandbox_config.bash_enabled(),
             redactor: Arc::clone(&redactor),
+            agent_tracing: self.agent_tracing,
             data_dir: data_dir.clone(),
             workspace_root: workspace_root.clone(),
             agents_dir: agents_dir.clone(),
@@ -4522,6 +4588,9 @@ impl CatBotBuilder {
                     system_prompt.clone(),
                     self.max_turns,
                     variant.extra_options.clone(),
+                    self.agent_tracing,
+                    &active_agent_id,
+                    &redactor,
                 );
                 let model_tools = tool_deps
                     .with_api_key(model_api_key)
@@ -4622,6 +4691,7 @@ impl CatBotBuilder {
                 environment_context_source: environment_context_source.clone(),
                 bash_enabled: self.sandbox_config.bash_enabled(),
                 redactor: Arc::clone(&redactor),
+                agent_tracing: self.agent_tracing,
                 data_dir: data_dir.clone(),
                 workspace_root: workspace_root.clone(),
                 agents_dir: agents_dir.clone(),
@@ -4652,6 +4722,9 @@ impl CatBotBuilder {
                         agent_profile.system_prompt.clone(),
                         agent_profile.max_turns,
                         variant.extra_options.clone(),
+                        self.agent_tracing,
+                        &agent_profile.id,
+                        &redactor,
                     );
                     let model_tools = agent_tool_deps
                         .with_api_key(model_api_key)
@@ -5084,11 +5157,23 @@ impl Tool for RemiSubAgentTool {
             build_provider_client(&self.api_key, &self.model_profile, self.base_url.clone());
         let mut builder = AgentBuilder::new()
             .model(model)
-            .config(AgentConfig::default().with_max_tokens(self.model_profile.max_output_tokens))
+            .config(
+                AgentConfig::default()
+                    .with_model(self.model_profile.model.clone())
+                    .with_max_tokens(self.model_profile.max_output_tokens),
+            )
             .system(self.system_prompt.clone())
             .max_turns(self.max_turns);
         if !self.extra_options.is_empty() {
             builder = builder.extra_options(self.extra_options.clone());
+        }
+        if let Some(tracer) = sentry_tracer(
+            self.deps.agent_tracing,
+            &self.agent_name,
+            &self.model_profile,
+            &self.deps.redactor,
+        ) {
+            builder = builder.tracer(tracer);
         }
         let agent = CatAgent {
             inner: builder.build_loop(),
@@ -5916,11 +6001,12 @@ mod tests {
         model_input_snapshot_from_loop_input, model_request_budget_tokens,
         prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
-        try_recv_completed_tool_task, validate_host_tool_names, AgentModelBindings, CatBotBuilder,
-        CatEvent, Content, ContentPart, GoalMaxRounds, LlmCompressor, LoopInput, Message,
-        ModelProfileRegistry, PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, StreamOptions,
-        SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
-        ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        try_recv_completed_tool_task, validate_host_tool_names, AgentModelBindings,
+        AgentTracingOptions, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds,
+        LlmCompressor, LoopInput, Message, ModelProfileRegistry, PartialTurnRecorder,
+        RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent, ThreadRunLocks,
+        WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE, ASYNC_TOOL_SYSTEM_PROMPT,
+        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::ModelProfileConfig;
@@ -5931,7 +6017,7 @@ mod tests {
     use futures::StreamExt as _;
     use remi_agentloop::prelude::CancellationToken;
     use remi_agentloop::prelude::Role;
-    use remi_agentloop::types::{FunctionCall, RunId, ThreadId, ToolCallMessage};
+    use remi_agentloop::types::{AudioDetail, FunctionCall, RunId, ThreadId, ToolCallMessage};
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
@@ -5968,6 +6054,24 @@ mod tests {
     use uuid::Uuid;
 
     static LARGE_STACK_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[derive(Default)]
+    struct SentryCaptureTransport {
+        transactions: StdMutex<Vec<serde_json::Value>>,
+    }
+
+    impl sentry::Transport for SentryCaptureTransport {
+        fn send_envelope(&self, envelope: sentry::Envelope) {
+            for item in envelope.into_items() {
+                if let sentry::protocol::EnvelopeItem::Transaction(transaction) = item {
+                    self.transactions
+                        .lock()
+                        .expect("Sentry transaction lock poisoned")
+                        .push(serde_json::to_value(transaction).unwrap());
+                }
+            }
+        }
+    }
 
     fn run_large_stack_local_test<F, Fut>(test: F)
     where
@@ -6012,6 +6116,181 @@ mod tests {
             auto_compress: true,
             extra_options: serde_json::Map::new(),
         }
+    }
+
+    fn build_mock_bot(
+        data_dir: &tempfile::TempDir,
+        base_url: String,
+        supports_images: bool,
+        max_turns: usize,
+    ) -> super::CatBot {
+        let skills_dir = data_dir.path().join("skills");
+        let agents_dir = data_dir.path().join("agents");
+        let models_dir = data_dir.path().join("models");
+        install_embedded_model_profiles(&models_dir).unwrap();
+        let mut model_profile = test_model_profile();
+        model_profile.base_url = Some(base_url);
+        model_profile.model = "mock-model".to_string();
+        model_profile.supports_images = supports_images;
+        CatBotBuilder {
+            api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
+            api_key: "test".to_string(),
+            model_profile,
+            runtime_model_locked: false,
+            system: default_system_prompt(),
+            skills_dir,
+            data_dir: data_dir.path().to_path_buf(),
+            agent_md_path: None,
+            overflow_bytes: None,
+            memory_days: 7,
+            sandbox_config: SandboxConfig::Disabled {
+                host_dir: data_dir.path().to_path_buf(),
+            },
+            im_bridge: None,
+            extra_options: serde_json::Map::new(),
+            tool_allowlist: None,
+            delegate_ids: Vec::new(),
+            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+            model_bindings: AgentModelBindings::default(),
+            approval_model_profile_id: None,
+            agents_dir,
+            max_turns: Some(max_turns),
+            model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+            acp_client_tools: None,
+            host_tools: Vec::new(),
+            builtin_skills: Vec::new(),
+            include_default_skills: true,
+            file_skills: true,
+            include_default_agents: true,
+            hook_manager: None,
+        }
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn sentry_agent_tracing_covers_runtime_model_and_tool_end_to_end() {
+        let capture = Arc::new(SentryCaptureTransport::default());
+        let transport = Arc::clone(&capture);
+        let client = Arc::new(sentry::Client::from_config(sentry::ClientOptions {
+            dsn: "http://public@example.com/1".parse().ok(),
+            traces_sample_rate: 1.0,
+            transport: Some(Arc::new(
+                move |_: &sentry::ClientOptions| -> Arc<dyn sentry::Transport> {
+                    transport.clone()
+                },
+            )),
+            ..Default::default()
+        }));
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::clone(&client)),
+            Arc::new(sentry::Scope::default()),
+        ));
+
+        std::thread::Builder::new()
+            .name("sentry-agent-tracing-e2e".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                sentry::Hub::run(hub, || {
+                    runtime.block_on(local.run_until(async {
+                        std::env::set_var("OPENAI_API_KEY", "test");
+                        let responses = vec![
+                            sse_tool_call("call-now", "now", json!({})),
+                            sse_text("trace e2e complete"),
+                        ];
+                        let (base_url, requests) = start_openai_mock_server(responses).await;
+                        let data_dir = tempfile::tempdir().unwrap();
+                        let skills_dir = data_dir.path().join("skills");
+                        let agents_dir = data_dir.path().join("agents");
+                        let models_dir = data_dir.path().join("models");
+                        install_embedded_model_profiles(&models_dir).unwrap();
+                        let mut model_profile = test_model_profile();
+                        model_profile.base_url = Some(base_url);
+                        model_profile.model = "mock-model".to_string();
+                        let bot = CatBotBuilder {
+                            api_keys: None,
+                            agent_tracing: AgentTracingOptions::enabled(false),
+                            api_key: "test".to_string(),
+                            model_profile,
+                            runtime_model_locked: false,
+                            system: default_system_prompt(),
+                            skills_dir,
+                            data_dir: data_dir.path().to_path_buf(),
+                            agent_md_path: None,
+                            overflow_bytes: None,
+                            memory_days: 7,
+                            sandbox_config: SandboxConfig::Disabled {
+                                host_dir: data_dir.path().to_path_buf(),
+                            },
+                            im_bridge: None,
+                            extra_options: serde_json::Map::new(),
+                            tool_allowlist: None,
+                            delegate_ids: Vec::new(),
+                            active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                            model_bindings: AgentModelBindings::default(),
+                            approval_model_profile_id: None,
+                            agents_dir,
+                            max_turns: Some(3),
+                            model_registry: Arc::new(
+                                ModelProfileRegistry::load(models_dir).unwrap(),
+                            ),
+                            acp_client_tools: None,
+                            host_tools: Vec::new(),
+                            builtin_skills: Vec::new(),
+                            include_default_skills: true,
+                            file_skills: true,
+                            include_default_agents: true,
+                            hook_manager: None,
+                        }
+                        .build()
+                        .unwrap();
+
+                        let events = collect_stream(
+                            bot.stream("sentry-e2e-thread", "private e2e prompt marker"),
+                        )
+                        .await;
+                        assert!(events.iter().any(
+                            |event| matches!(event, CatEvent::ToolCallResult { name, .. } if name == "now")
+                        ));
+                        assert!(events.iter().any(
+                            |event| matches!(event, CatEvent::Text(text) if text.contains("trace e2e complete"))
+                        ));
+                        assert_eq!(requests.lock().unwrap().len(), 2);
+                    }));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        client.flush(Some(Duration::from_secs(1)));
+
+        let transactions = capture.transactions.lock().unwrap();
+        assert_eq!(transactions.len(), 1);
+        let serialized = transactions[0].to_string();
+        let span_ops = transactions[0]["spans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|span| span["op"].as_str())
+            .collect::<Vec<_>>();
+        assert!(serialized.contains("gen_ai.invoke_agent"));
+        assert!(serialized.contains("gen_ai.chat"));
+        assert!(
+            serialized.contains("gen_ai.execute_tool"),
+            "captured span ops: {span_ops:?}"
+        );
+        assert!(serialized.contains("gen_ai.conversation.id"));
+        assert!(serialized.contains("mock-model"));
+        assert!(serialized.contains("\"now\""));
+        assert!(!serialized.contains("private e2e prompt marker"));
+        assert!(!serialized.contains("gen_ai.input.messages"));
+        assert!(!serialized.contains("gen_ai.tool.call.arguments"));
     }
 
     #[test]
@@ -6268,6 +6547,7 @@ mod tests {
 
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6327,6 +6607,7 @@ mod tests {
         let build_bot = || {
             CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile: test_model_profile(),
                 runtime_model_locked: false,
@@ -6424,6 +6705,7 @@ You are Remi.
 
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6526,7 +6808,7 @@ You are Remi.
         recorder.on_tool_arguments_delta("call_1", "{\"path\":\"src/lib.rs\"");
 
         let history = recorder
-            .synthesize_history()
+            .synthesize_cancelled_history()
             .expect("partial history should be synthesized");
         let assistant = history.last().expect("assistant message should exist");
 
@@ -6539,6 +6821,181 @@ You are Remi.
         assert!(content.contains("[Cancelled tool activity]"));
         assert!(content.contains("read_file (call_1)"));
         assert!(content.contains("cancelled before completion"));
+    }
+
+    #[test]
+    fn partial_turn_recorder_synthesizes_model_error_history() {
+        let mut recorder = PartialTurnRecorder::new(vec![
+            Message::system("system"),
+            Message::user("inspect repo"),
+        ]);
+        recorder.on_text("I found part of the issue.");
+        recorder.on_tool_result(
+            "call_1".to_string(),
+            "read_file".to_string(),
+            json!({"path": "src/lib.rs"}),
+            "file contents".to_string(),
+            true,
+            12,
+        );
+        recorder.on_tool_start("call_2".to_string(), "search".to_string());
+
+        let history = recorder
+            .synthesize_error_history()
+            .expect("partial history should be synthesized");
+        let content = history.last().unwrap().content.text_content();
+
+        assert!(content.contains("I found part of the issue."));
+        assert!(content.contains("[Tool activity before model error]"));
+        assert!(content.contains("file contents success: true elapsed_ms: 12"));
+        assert!(content.contains("search (call_2) status: interrupted by model error"));
+        assert!(!content.contains("Cancelled tool activity"));
+    }
+
+    #[test]
+    fn partial_turn_recorder_keeps_user_input_when_first_model_call_fails() {
+        let recorder = PartialTurnRecorder::new(vec![
+            Message::system("system"),
+            Message::user("input that triggered the error"),
+        ]);
+
+        let history = recorder
+            .synthesize_error_history()
+            .expect("the accepted user input should remain persistable");
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history.last().unwrap().content.text_content(),
+            "input that triggered the error"
+        );
+        assert!(matches!(history.last().unwrap().role, Role::User));
+    }
+
+    #[tokio::test]
+    async fn text_only_model_receives_lowered_request_and_persists_original_media() {
+        std::env::set_var("OPENAI_API_KEY", "test");
+        let (base_url, requests) = start_openai_mock_server(vec![sse_text("lowered")]).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let bot = build_mock_bot(&data_dir, base_url, false, 2);
+        let content = Content::parts(vec![
+            ContentPart::text("inspect these inputs"),
+            ContentPart::image_url("https://example.test/photo.png"),
+            ContentPart::image_base64("image/png", "SECRET_IMAGE_DATA"),
+            ContentPart::Audio {
+                input_audio: AudioDetail {
+                    data: "SECRET_AUDIO_DATA".to_string(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::File {
+                file_id: Some("file-1".to_string()),
+                filename: Some("notes.pdf".to_string()),
+                media_type: Some("application/pdf".to_string()),
+                data: Some("SECRET_FILE_DATA".to_string()),
+            },
+        ]);
+
+        let events = collect_stream(bot.stream_content("text-lowering-thread", content)).await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Text(text) if text == "lowered")));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Error(_))));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let sent_content = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("lowered user content should be plain text");
+        assert!(sent_content.contains("inspect these inputs"));
+        assert!(sent_content.contains("[image: https://example.test/photo.png]"));
+        assert!(sent_content.contains("[audio: format=wav; embedded data omitted]"));
+        assert!(sent_content.contains("filename=notes.pdf"));
+        assert!(!sent_content.contains("SECRET_"));
+        drop(requests);
+
+        let persisted = tokio::fs::read_to_string(
+            data_dir
+                .path()
+                .join("memory/text-lowering-thread/short_term.jsonl"),
+        )
+        .await
+        .unwrap();
+        assert!(persisted.contains("image_base64"));
+        assert!(persisted.contains("SECRET_IMAGE_DATA"));
+    }
+
+    #[test]
+    fn model_error_after_tool_round_persists_and_replays_the_complete_turn() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            let partial_chunk = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "partial before failure"},
+                    "finish_reason": null
+                }]
+            });
+            let responses = vec![
+                sse_tool_call("call-now", "now", json!({})),
+                format!("data: {partial_chunk}\n\n"),
+                sse_text("continued with preserved context"),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot(&data_dir, base_url, true, 3);
+
+            let failed_events = {
+                let failed_stream = bot.stream("model-error-thread", "keep this turn");
+                let mut failed_stream = std::pin::pin!(failed_stream);
+                let mut events = Vec::new();
+                while let Some(event) = failed_stream.next().await {
+                    let failed = matches!(event, CatEvent::Error(_));
+                    events.push(event);
+                    if failed {
+                        break;
+                    }
+                }
+                events
+            };
+            assert!(failed_events
+                .iter()
+                .any(|event| matches!(event, CatEvent::ToolCallResult { name, success: true, .. } if name == "now")));
+            assert!(failed_events
+                .iter()
+                .any(|event| matches!(event, CatEvent::Error(_))));
+
+            let persisted = tokio::fs::read_to_string(
+                data_dir
+                    .path()
+                    .join("memory/model-error-thread/short_term.jsonl"),
+            )
+            .await
+            .unwrap();
+            assert!(persisted.contains("keep this turn"));
+            assert!(persisted.contains("partial before failure"));
+            assert!(persisted.contains("Tool activity before model error"));
+            assert!(persisted.contains("call-now"));
+
+            let continued_events =
+                collect_stream(bot.stream("model-error-thread", "continue")).await;
+            assert!(continued_events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text == "continued with preserved context")
+            ));
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[2].contains("keep this turn"));
+            assert!(requests[2].contains("Tool activity before model error"));
+            assert!(requests[2].contains("call-now"));
+        });
     }
 
     #[tokio::test]
@@ -6555,6 +7012,7 @@ You are Remi.
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6638,6 +7096,7 @@ You are Remi.
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6731,6 +7190,7 @@ You are Remi.
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6851,6 +7311,7 @@ You are Remi.
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7054,6 +7515,7 @@ You are Remi.
         .unwrap();
         let builder = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -7108,6 +7570,7 @@ You are Remi.
         .unwrap();
         let builder = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile: ModelProfileConfig {
                 id: "deepseek-v4-flash".to_string(),
@@ -7172,6 +7635,7 @@ You are Remi.
         let models_dir = data_dir.join("models");
         let builder = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -7435,6 +7899,7 @@ You are Remi.
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7521,6 +7986,7 @@ You are Remi.
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7657,6 +8123,7 @@ You are Remi.
         model_profile.model = "mock-model".to_string();
         let bot = CatBotBuilder {
             api_keys: None,
+            agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7783,6 +8250,7 @@ You are Remi.
             model_profile.model = "mock-model".to_string();
             let bot = CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -7926,6 +8394,7 @@ You are Remi.
             profile.max_output_tokens = 4_096;
             let bot = CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,
@@ -8007,6 +8476,7 @@ You are Remi.
             profile.max_output_tokens = 4_096;
             let bot = CatBotBuilder {
                 api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,
