@@ -1148,18 +1148,22 @@ mod cli_tests {
         format_feishu_tool_line, is_goal_set_command, normalize_release_tag, parse_cli_args,
         parse_command, parse_global_args, parse_goal_max_rounds, parse_release_version,
         parse_workflow_start_options, prefix_short_config_entry, redact_known_secrets,
-        resolve_instance_profile, resolve_profile_registry_root, run_streaming_command,
-        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
-        try_parse_cli_args, update_available, AcpAdapterCommand, AcpCommand, AppCommand, CliConfig,
-        CodexCommand, FeedbackCommand, FeishuCommand, FeishuDoctorStatus, HooksCommand,
-        ProfileCommand, TelemetryCommand, UpdateCommand,
+        resolve_instance_profile, resolve_profile_registry_root,
+        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
+        AcpAdapterCommand, AcpCommand, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
+        FeishuCommand, FeishuDoctorStatus, HooksCommand, ProfileCommand, TelemetryCommand,
+        UpdateCommand,
     };
+    #[cfg(unix)]
+    use super::{run_streaming_command, run_streaming_command_with_stdin};
     use crate::direct_workflow_options;
     use crate::profile_command::{ProfileAgentCommand, ProfileWorkflowCommand};
     use bot_core::{GoalMaxRounds, PrettyToolCall};
     use clap::error::ErrorKind;
     use im_feishu::FeishuMessage;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
@@ -2428,6 +2432,7 @@ mod cli_tests {
             .contains("lark-cli is logged in"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn streaming_command_captures_url_and_success() {
         let script = write_mock_cli(
@@ -2456,6 +2461,7 @@ exit 1
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn streaming_command_reports_failure_without_url() {
         let script = write_mock_cli(
@@ -2482,6 +2488,7 @@ exit 1
             .any(|line| line.contains("login failed")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn streaming_command_can_write_stdin() {
         let script = write_mock_cli(
@@ -2509,6 +2516,7 @@ exit 1
         assert!(result.lines.iter().any(|line| line == "secret received"));
     }
 
+    #[cfg(unix)]
     fn write_mock_cli(name: &str, body: &str) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("remi-cat-{name}-{}.sh", uuid::Uuid::new_v4()));

@@ -33,8 +33,11 @@ impl ExternalAgentClient {
         let command_line = profile.expanded_local_command()?;
         #[cfg(windows)]
         let mut command = {
+            use std::os::windows::process::CommandExt;
+
             let mut command = tokio::process::Command::new("cmd.exe");
-            command.args(["/D", "/S", "/C", &command_line]);
+            command.args(["/D", "/S", "/C"]);
+            command.as_std_mut().raw_arg(format!("\"{command_line}\""));
             command
         };
         #[cfg(not(windows))]
@@ -449,6 +452,9 @@ mod tests {
     use super::*;
     use remi_agentloop::prelude::Tool;
 
+    #[cfg(windows)]
+    use tokio::io::AsyncReadExt;
+
     #[test]
     fn external_tool_names_are_explicit_and_stable() {
         let tools = external_agent_tools(PathBuf::from("registry"));
@@ -521,5 +527,39 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("cannot ask itself"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quoted_local_endpoint_with_spaces_is_passed_raw_to_cmd() {
+        let root = tempfile::tempdir().unwrap();
+        let endpoint_dir = root.path().join("endpoint with spaces");
+        std::fs::create_dir_all(&endpoint_dir).unwrap();
+        let endpoint = endpoint_dir.join("fixture.cmd");
+        std::fs::write(&endpoint, "@echo off\r\necho RAW_ARG_OK\r\n").unwrap();
+        let manifest = root.path().join("profile.yaml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "schema_version: 1\nid: raw-arg-test\nname: Raw Arg Test\nendpoint:\n  type: local\n  command: '\"{}\"'\n",
+                endpoint.display().to_string().replace('\'', "''")
+            ),
+        )
+        .unwrap();
+        let profile = InstanceProfile::from_manifest(&manifest).unwrap();
+        let ExternalAgentClient {
+            mut child,
+            input,
+            mut output,
+        } = ExternalAgentClient::spawn(&profile, root.path())
+            .await
+            .unwrap();
+        drop(input);
+        let mut text = String::new();
+        output.read_to_string(&mut text).await.unwrap();
+        let status = child.wait().await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(text.trim(), "RAW_ARG_OK");
     }
 }
