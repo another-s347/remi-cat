@@ -320,6 +320,7 @@ mod tests {
 
     fn memory_store(data_dir: PathBuf) -> Arc<MemoryStore> {
         Arc::new(MemoryStore {
+            memory_dir: data_dir.join("memory"),
             data_dir,
             agent_md_path: None,
             compressor: LlmCompressor::new(

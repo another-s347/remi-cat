@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::FeedbackCommand;
 use crate::command::sandbox_doctor_report;
-use crate::config::{detect_setup_state, SetupState};
+use crate::config::SetupState;
 use crate::instance_profile::InstanceProfile;
 use crate::secret_store::{redaction_entries, SecretStore};
 
@@ -132,7 +132,8 @@ fn build_feedback_issue_body(
     include_logs: bool,
     redactions: &HashMap<String, String>,
 ) -> String {
-    let setup_state = detect_setup_state(data_dir);
+    let setup_state =
+        crate::runtime_config::detect_setup_state_at(&profile.runtime_config, data_dir);
     let setup_label = match &setup_state {
         SetupState::Initialized { .. } => "initialized",
         SetupState::Invalid { .. } => "invalid",

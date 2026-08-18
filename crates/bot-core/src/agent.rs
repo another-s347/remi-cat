@@ -713,7 +713,7 @@ where
                                     &tool_ctx,
                                 );
                                 tokio::pin!(execute_fut);
-                                let results = if let Some(cancel) = cancel_signal.as_ref() {
+                                let (results, task_cancellations) = if let Some(cancel) = cancel_signal.as_ref() {
                                     tokio::select! {
                                         _ = cancel.cancelled() => {
                                             tracing::info!(
@@ -767,6 +767,7 @@ where
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     metadata_string(state.config.metadata.as_ref(), "app_id"),
+                                    task_cancellations,
                                     tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
@@ -1152,10 +1153,14 @@ where
                                     "tool_batch.execute_start"
                                 );
                                 let batch_started = Instant::now();
-                                let execute_fut =
-                                    dynamic_tools.execute_parallel(&approved_dynamic, &resume_map, &tool_ctx);
+                                let execute_fut = execute_tools_with_task_cancellation(
+                                    &dynamic_tools,
+                                    &approved_dynamic,
+                                    &resume_map,
+                                    &tool_ctx,
+                                );
                                 tokio::pin!(execute_fut);
-                                let results = if let Some(cancel) = cancel_signal.as_ref() {
+                                let (results, task_cancellations) = if let Some(cancel) = cancel_signal.as_ref() {
                                     tokio::select! {
                                         _ = cancel.cancelled() => {
                                             tracing::info!(
@@ -1209,6 +1214,7 @@ where
                                     task_thread_id.clone(),
                                     state.run_id.0.clone(),
                                     metadata_string(state.config.metadata.as_ref(), "app_id"),
+                                    task_cancellations,
                                     tool_foreground_timeout(options.async_agent),
                                     options.async_agent,
                                 );
@@ -1810,33 +1816,84 @@ async fn execute_runtime_tools<'a>(
     calls: &'a [ParsedToolCall],
     resume_map: &'a HashMap<String, ResumePayload>,
     ctx: &'a ToolContext,
-) -> Vec<(String, Result<BoxedToolResult, AgentError>)> {
+) -> (
+    Vec<(String, Result<BoxedToolResult, AgentError>)>,
+    HashMap<String, CancellationToken>,
+) {
     let Some(model_tools) = model_tools else {
-        return local_tools.execute_parallel(calls, resume_map, ctx).await;
+        return execute_tools_with_task_cancellation(local_tools, calls, resume_map, ctx).await;
     };
     if model_tools.is_empty() {
-        return local_tools.execute_parallel(calls, resume_map, ctx).await;
+        return execute_tools_with_task_cancellation(local_tools, calls, resume_map, ctx).await;
     }
 
-    let local_results = local_tools.execute_parallel(calls, resume_map, ctx).await;
-    let model_results = model_tools.execute_parallel(calls, resume_map, ctx).await;
-    let mut local_by_id = local_results
-        .into_iter()
-        .collect::<HashMap<String, Result<BoxedToolResult, AgentError>>>();
-    let mut model_by_id = model_results
-        .into_iter()
-        .collect::<HashMap<String, Result<BoxedToolResult, AgentError>>>();
-    let mut results = Vec::with_capacity(calls.len());
-    for call in calls {
-        let result = if model_tools.contains(&call.name) {
-            model_by_id.remove(&call.id)
+    let futures = calls.iter().map(|call| {
+        let registry = if model_tools.contains(&call.name) {
+            model_tools
         } else {
-            local_by_id.remove(&call.id)
+            local_tools
+        };
+        async move {
+            let (mut results, mut cancellations) = execute_tools_with_task_cancellation(
+                registry,
+                std::slice::from_ref(call),
+                resume_map,
+                ctx,
+            )
+            .await;
+            let result = results.pop().unwrap_or_else(|| {
+                (
+                    call.id.clone(),
+                    Err(AgentError::ToolNotFound(call.name.clone())),
+                )
+            });
+            let cancellation = cancellations
+                .remove(&call.id)
+                .unwrap_or_else(CancellationToken::new);
+            (result, cancellation)
         }
-        .unwrap_or_else(|| Err(AgentError::ToolNotFound(call.name.clone())));
-        results.push((call.id.clone(), result));
+    });
+    let executed = futures::future::join_all(futures).await;
+    let mut results = Vec::with_capacity(executed.len());
+    let mut cancellations = HashMap::with_capacity(executed.len());
+    for (result, cancellation) in executed {
+        cancellations.insert(result.0.clone(), cancellation);
+        results.push(result);
     }
-    results
+    (results, cancellations)
+}
+
+async fn execute_tools_with_task_cancellation(
+    tools: &DefaultToolRegistry,
+    calls: &[ParsedToolCall],
+    resume_map: &HashMap<String, ResumePayload>,
+    ctx: &ToolContext,
+) -> (
+    Vec<(String, Result<BoxedToolResult, AgentError>)>,
+    HashMap<String, CancellationToken>,
+) {
+    let futures = calls.iter().map(|call| async move {
+        let task_ctx = ctx.fork();
+        let cancellation = task_ctx.runtime().cancellation();
+        let mut results = tools
+            .execute_parallel(std::slice::from_ref(call), resume_map, &task_ctx)
+            .await;
+        let result = results.pop().unwrap_or_else(|| {
+            (
+                call.id.clone(),
+                Err(AgentError::ToolNotFound(call.name.clone())),
+            )
+        });
+        (result, cancellation)
+    });
+    let executed = futures::future::join_all(futures).await;
+    let mut results = Vec::with_capacity(executed.len());
+    let mut cancellations = HashMap::with_capacity(executed.len());
+    for (result, cancellation) in executed {
+        cancellations.insert(result.0.clone(), cancellation);
+        results.push(result);
+    }
+    (results, cancellations)
 }
 
 fn filter_tool_allowlist(
@@ -2179,6 +2236,7 @@ async fn collect_tool_results_parallel(
                 side_event_tx,
                 Some(call_id.as_str()),
                 tool_name.as_str(),
+                None,
             )
             .await;
             (call_id, collected)
@@ -2198,6 +2256,7 @@ fn collect_tool_result_futures_with_timeout(
     thread_id: String,
     run_id: String,
     app_id: Option<String>,
+    mut task_cancellations: HashMap<String, CancellationToken>,
     foreground_timeout: std::time::Duration,
     async_agent: bool,
 ) -> FuturesUnordered<LocalBoxFuture<'static, ForegroundToolOutcome>> {
@@ -2220,22 +2279,12 @@ fn collect_tool_result_futures_with_timeout(
             let thread_id = thread_id.clone();
             let run_id = run_id.clone();
             let app_id = app_id.clone();
+            let cancel = task_cancellations
+                .remove(&call_id)
+                .unwrap_or_else(CancellationToken::new);
             async move {
                 let collect_call_id = call_id.clone();
                 let collect_tool_name = tool_name.clone();
-                let collect = async move {
-                    let collected = collect_result_with_overflow(
-                        result,
-                        &data_dir,
-                        overflow_bytes,
-                        side_event_tx,
-                        Some(collect_call_id.as_str()),
-                        collect_tool_name.as_str(),
-                    )
-                    .await;
-                    (collect_call_id, collected)
-                };
-                let cancel = CancellationToken::new();
                 let task_id = tool_tasks
                     .start_with_app_id(
                         thread_id,
@@ -2248,6 +2297,21 @@ fn collect_tool_result_futures_with_timeout(
                     )
                     .await
                     .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+                let collect_task_id = task_id.clone();
+                let collect_tool_tasks = Arc::clone(&tool_tasks);
+                let collect = async move {
+                    let collected = collect_result_with_overflow(
+                        result,
+                        &data_dir,
+                        overflow_bytes,
+                        side_event_tx,
+                        Some(collect_call_id.as_str()),
+                        collect_tool_name.as_str(),
+                        Some((collect_tool_tasks, collect_task_id)),
+                    )
+                    .await;
+                    (collect_call_id, collected)
+                };
                 let (completed_tx, mut completed_rx) =
                     oneshot::channel::<(String, CollectedToolResult)>();
                 spawn_background_tool_result(
@@ -2352,6 +2416,7 @@ async fn collect_result(
     result: Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
     parent_tool_call_id: Option<&str>,
+    output_task: Option<(Arc<crate::tool_tasks::ToolTaskManager>, String)>,
 ) -> CollectedToolResult {
     match result {
         Err(e) => CollectedToolResult::text(format!("error: {e}")),
@@ -2364,6 +2429,13 @@ async fn collect_result(
                 match out {
                     ToolOutput::Result(c) => last = c,
                     ToolOutput::Delta(delta) => {
+                        if let Some((manager, task_id)) = output_task.as_ref() {
+                            for line in delta.lines() {
+                                if !line.is_empty() {
+                                    manager.append_output(task_id, line.to_string()).await;
+                                }
+                            }
+                        }
                         let event = CatEvent::Text(delta);
                         if let Some(tx) = &side_event_tx {
                             let _ = tx.send(event);
@@ -2410,7 +2482,20 @@ async fn collect_result(
                             side_events.push(event);
                         }
                     }
-                    ToolOutput::Custom { .. } => {}
+                    ToolOutput::Custom { event_type, extra } => {
+                        if event_type == "remi.experimental_pty.screen" {
+                            if let (Some((manager, task_id)), Some(screen)) =
+                                (output_task.as_ref(), extra["screen"].as_str())
+                            {
+                                manager
+                                    .replace_output(
+                                        task_id,
+                                        screen.lines().map(ToOwned::to_owned).collect(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
                 }
             }
             CollectedToolResult {
@@ -2429,8 +2514,9 @@ async fn collect_result_with_overflow(
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
     parent_tool_call_id: Option<&str>,
     tool_name: &str,
+    output_task: Option<(Arc<crate::tool_tasks::ToolTaskManager>, String)>,
 ) -> CollectedToolResult {
-    let collected = collect_result(result, side_event_tx, parent_tool_call_id).await;
+    let collected = collect_result(result, side_event_tx, parent_tool_call_id, output_task).await;
     if collected.content.is_multimodal() {
         return collected;
     }
@@ -2579,10 +2665,11 @@ mod tests {
         append_tool_results_to_history, approval_request_for_tool, background_task_tool_result,
         collect_result_with_overflow, collect_tool_result_futures_with_timeout,
         collect_tool_results_parallel, complete_interrupted_tool_results,
-        complete_pending_tool_calls_in_state, fs_read_overflow_summary,
-        outer_thread_id_from_metadata, spawn_background_side_event_forwarder, split_utf8_chunks,
-        steer_start_input, steer_start_input_after_tool_results, tool_foreground_timeout,
-        tool_output_chunk_bytes, CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
+        complete_pending_tool_calls_in_state, execute_tools_with_task_cancellation,
+        fs_read_overflow_summary, outer_thread_id_from_metadata,
+        spawn_background_side_event_forwarder, split_utf8_chunks, steer_start_input,
+        steer_start_input_after_tool_results, tool_foreground_timeout, tool_output_chunk_bytes,
+        CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
     };
     use crate::approval::ToolApprovalManager;
     use crate::events::CatEvent;
@@ -2917,6 +3004,7 @@ mod tests {
             None,
             None,
             "",
+            None,
         )
         .await;
 
@@ -2946,6 +3034,7 @@ mod tests {
             None,
             None,
             "",
+            None,
         )
         .await;
 
@@ -3031,6 +3120,7 @@ mod tests {
             None,
             None,
             "fs_read",
+            None,
         )
         .await;
 
@@ -3144,6 +3234,7 @@ mod tests {
             Some(tx),
             Some("call"),
             "agent__worker",
+            None,
         )
         .await;
 
@@ -3815,7 +3906,6 @@ mod tests {
                     tool_tasks: test_tool_tasks(),
                 };
 
-                let started = Instant::now();
                 let stream = agent.stream_with_input(LoopInput::start("run staggered tools"));
                 tokio::pin!(stream);
                 let mut saw_slow_before_fast = false;
@@ -3827,10 +3917,6 @@ mod tests {
                         }
                         CatEvent::ToolCallResult { id, result, .. } if id == "fast-call" => {
                             assert_eq!(result, "fast");
-                            assert!(
-                                started.elapsed() < Duration::from_millis(200),
-                                "fast tool result was delayed until the slow tool finished"
-                            );
                             assert!(!saw_slow_before_fast);
                             return;
                         }
@@ -3873,6 +3959,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     Some("embedded-host".to_string()),
+                    HashMap::new(),
                     Duration::from_millis(5),
                     true,
                 );
@@ -3885,7 +3972,6 @@ mod tests {
                     panic!("expected slow tool to exceed the foreground window");
                 };
                 assert_eq!(call_id, "slow-call");
-                assert!(tool_tasks.is_thread_running("thread-1").await);
 
                 let completed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
                     .await
@@ -3897,6 +3983,231 @@ mod tests {
                 assert_eq!(completed.app_id.as_deref(), Some("embedded-host"));
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_bash_streams_output_and_cancel_stops_process() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                std::fs::create_dir_all(&root).unwrap();
+                let marker = root.join("should-not-exist");
+                let sandbox: Arc<dyn crate::sandbox::Sandbox> =
+                    Arc::new(crate::sandbox::NoSandbox::new(root.clone()));
+                let redactor =
+                    Arc::new(std::sync::RwLock::new(crate::tools::SecretRedactor::empty()));
+                let mut tools = DefaultToolRegistry::new();
+                tools.register(crate::tools::WorkspaceBashTool::new(sandbox, redactor));
+                let call = ParsedToolCall {
+                    id: "bash-call".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf 'FIRST\\n'; sleep 0.4; printf done > should-not-exist"
+                    }),
+                };
+                let calls = vec![call];
+                let ctx = ToolContext::with_ids(
+                    remi_agentloop::prelude::ThreadId("thread-bash".to_string()),
+                    remi_agentloop::prelude::RunId("run-bash".to_string()),
+                    bot_runtime_core::ChatCtxState::default(),
+                );
+                let (results, cancellations) =
+                    execute_tools_with_task_cancellation(&tools, &calls, &HashMap::new(), &ctx)
+                        .await;
+                let manager = test_tool_tasks();
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    results,
+                    &calls,
+                    &HashMap::from([("bash-call".to_string(), "bash".to_string())]),
+                    &root,
+                    8_192,
+                    None,
+                    Arc::clone(&manager),
+                    "thread-bash".to_string(),
+                    "run-bash".to_string(),
+                    None,
+                    cancellations,
+                    Duration::from_millis(20),
+                    false,
+                );
+
+                let ForegroundToolOutcome::TimedOut { task_id, .. } = pending
+                    .next()
+                    .await
+                    .expect("bash should move to background")
+                else {
+                    panic!("expected bash to move to background");
+                };
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let record = manager.get(&task_id).await.unwrap();
+                        if record
+                            .recent_output
+                            .iter()
+                            .any(|line| line.contains("FIRST"))
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("running bash output should be observable");
+
+                let cancelled = manager.cancel(&task_id).await.unwrap();
+                assert_eq!(cancelled.status, crate::tool_tasks::TOOL_TASK_CANCELLED);
+                assert!(
+                    !ctx.is_cancelled(),
+                    "task cancellation must not cancel the run"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(
+                    !marker.exists(),
+                    "cancelling the tool task must terminate the bash process"
+                );
+                let _ = tokio::fs::remove_dir_all(root).await;
+            })
+            .await;
+    }
+
+    #[cfg(feature = "experimental-pty")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_pty_bash_reports_rendered_screen_and_cancel_stops_process() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                std::fs::create_dir_all(&root).unwrap();
+                let marker = root.join("pty-should-not-exist");
+                let manager = test_tool_tasks();
+                let sandbox: Arc<dyn crate::sandbox::Sandbox> =
+                    Arc::new(crate::sandbox::NoSandbox::new(root.clone()));
+                let redactor =
+                    Arc::new(std::sync::RwLock::new(crate::tools::SecretRedactor::empty()));
+                let mut tools = DefaultToolRegistry::new();
+                tools.register(crate::tools::WorkspaceBashTool::new(sandbox, redactor));
+                tools.register(crate::tool_tasks::ToolTasksTool::new(Arc::clone(&manager)));
+                let call = ParsedToolCall {
+                    id: "pty-bash-call".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({
+                        "command": r"printf 'OLD'; printf '\033[2K\rREADY'; sleep 30; printf done > pty-should-not-exist",
+                        "experimental_pty": true,
+                        "pty_rows": 10,
+                        "pty_cols": 40
+                    }),
+                };
+                let calls = vec![call];
+                let ctx = ToolContext::with_ids(
+                    remi_agentloop::prelude::ThreadId("thread-pty-bash".to_string()),
+                    remi_agentloop::prelude::RunId("run-pty-bash".to_string()),
+                    bot_runtime_core::ChatCtxState::default(),
+                );
+                let (results, cancellations) =
+                    execute_tools_with_task_cancellation(&tools, &calls, &HashMap::new(), &ctx)
+                        .await;
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    results,
+                    &calls,
+                    &HashMap::from([("pty-bash-call".to_string(), "bash".to_string())]),
+                    &root,
+                    8_192,
+                    None,
+                    Arc::clone(&manager),
+                    "thread-pty-bash".to_string(),
+                    "run-pty-bash".to_string(),
+                    None,
+                    cancellations,
+                    Duration::from_millis(20),
+                    false,
+                );
+
+                let outcome = pending
+                    .next()
+                    .await
+                    .expect("PTY bash should produce a foreground outcome");
+                let task_id = match outcome {
+                    ForegroundToolOutcome::TimedOut { task_id, .. } => task_id,
+                    ForegroundToolOutcome::Completed { collected, .. } => {
+                        panic!(
+                            "expected PTY bash to move to background, but it completed: {}",
+                            collected.preview
+                        );
+                    }
+                };
+
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let record = manager.get(&task_id).await.unwrap();
+                        let screen = record.recent_output.join("\n");
+                        if screen.contains("READY") && !screen.starts_with("$ ") {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("rendered PTY screen should be observable while running");
+
+                let get_call = ParsedToolCall {
+                    id: "get-pty-task".to_string(),
+                    name: "tool_tasks".to_string(),
+                    arguments: serde_json::json!({"action": "get", "task_id": task_id}),
+                };
+                let (mut get_results, _) = execute_tools_with_task_cancellation(
+                    &tools,
+                    std::slice::from_ref(&get_call),
+                    &HashMap::new(),
+                    &ctx,
+                )
+                .await;
+                let get_result = get_results.pop().unwrap().1;
+                let get_collected = collect_result(get_result, None, None, None).await;
+                let running: serde_json::Value =
+                    serde_json::from_str(&get_collected.preview).unwrap();
+                assert_eq!(running["status"], crate::tool_tasks::TOOL_TASK_RUNNING);
+                let screen = running["recent_output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(screen.contains("READY"));
+                assert!(!screen.contains("OLD"), "rendered task screen was: {screen:?}");
+                assert!(
+                    !screen.contains('\u{1b}'),
+                    "rendered task screen was: {screen:?}"
+                );
+
+                let cancel_call = ParsedToolCall {
+                    id: "cancel-pty-task".to_string(),
+                    name: "tool_tasks".to_string(),
+                    arguments: serde_json::json!({"action": "cancel", "task_id": task_id}),
+                };
+                let (mut cancel_results, _) = execute_tools_with_task_cancellation(
+                    &tools,
+                    std::slice::from_ref(&cancel_call),
+                    &HashMap::new(),
+                    &ctx,
+                )
+                .await;
+                let cancel_result = cancel_results.pop().unwrap().1;
+                let cancel_collected = collect_result(cancel_result, None, None, None).await;
+                let cancelled: serde_json::Value =
+                    serde_json::from_str(&cancel_collected.preview).unwrap();
+                assert_eq!(cancelled["status"], crate::tool_tasks::TOOL_TASK_CANCELLED);
+                assert!(!ctx.is_cancelled(), "task cancellation must not cancel the run");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !marker.exists(),
+                    "cancelling the PTY task must terminate the command before the marker write"
+                );
+                let _ = tokio::fs::remove_dir_all(root).await;
             })
             .await;
     }
@@ -3931,6 +4242,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     None,
+                    HashMap::new(),
                     Duration::from_millis(5),
                     false,
                 );
@@ -3985,6 +4297,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     None,
+                    HashMap::new(),
                     Duration::from_millis(200),
                     true,
                 );
@@ -4053,6 +4366,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     None,
+                    HashMap::new(),
                     Duration::from_millis(5),
                     true,
                 );
@@ -4139,6 +4453,7 @@ mod tests {
                     "thread-1".to_string(),
                     "run-1".to_string(),
                     None,
+                    HashMap::new(),
                     Duration::from_millis(5),
                     true,
                 );

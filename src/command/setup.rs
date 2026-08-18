@@ -7,7 +7,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::config::{
-    detect_setup_state, upsert_dotenv_value, write_runtime_config, FeishuTransport, ImMode,
+    detect_setup_state_at, upsert_dotenv_value, write_runtime_config_at, FeishuTransport, ImMode,
     RuntimeConfig, RuntimeSandboxKind, SetupState,
 };
 use crate::instance_profile::InstanceProfile;
@@ -37,7 +37,7 @@ pub(crate) async fn run_setup(
         println!("Data dir: {}\n", data_dir.display());
     }
     std::fs::create_dir_all(&data_dir)?;
-    let existing_config = match detect_setup_state(data_dir) {
+    let existing_config = match detect_setup_state_at(&profile.runtime_config, data_dir) {
         SetupState::Initialized {
             config_path,
             config,
@@ -57,12 +57,12 @@ pub(crate) async fn run_setup(
         }
         _ => None,
     };
-    install_embedded_model_profiles(data_dir.join("models"))?;
-    install_embedded_agent_profiles(data_dir.join("agents"))?;
-    std::fs::create_dir_all(data_dir.join("workflows"))?;
+    install_embedded_model_profiles(&profile.models_dir)?;
+    install_embedded_agent_profiles(&profile.agents_dir)?;
+    std::fs::create_dir_all(&profile.workflows_dir)?;
 
-    let agents_dir = data_dir.join("agents");
-    let models_dir = data_dir.join("models");
+    let agents_dir = profile.agents_dir.clone();
+    let models_dir = profile.models_dir.clone();
     let agent_registry = AgentRegistry::load(&agents_dir)?;
     let model_registry = ModelProfileRegistry::load(&models_dir)?;
     let mut agents: Vec<AgentProfile> = agent_registry.profiles().cloned().collect();
@@ -232,8 +232,16 @@ pub(crate) async fn run_setup(
         print_port_adjustment("Feishu Event Hook", requested, config.im.event_hook.port);
     }
 
-    let runtime_path = write_runtime_config(data_dir, &config)?;
-    match run_setup_smoke(data_dir, &config, &api_key_env_key, api_key.trim()).await {
+    let runtime_path = write_runtime_config_at(&profile.runtime_config, &config)?;
+    match run_setup_smoke(
+        data_dir,
+        &profile.memory_dir,
+        &config,
+        &api_key_env_key,
+        api_key.trim(),
+    )
+    .await
+    {
         Ok(reply) => {
             let env_path = PathBuf::from(".env");
             if !profile.is_named() {
@@ -264,7 +272,7 @@ pub(crate) async fn run_setup(
         }
         Err(err) => {
             if let Some(previous_config) = previous_config {
-                let _ = write_runtime_config(data_dir, &previous_config);
+                let _ = write_runtime_config_at(&profile.runtime_config, &previous_config);
             } else {
                 let _ = std::fs::remove_file(&runtime_path);
             }
@@ -274,7 +282,8 @@ pub(crate) async fn run_setup(
 }
 
 async fn run_setup_smoke(
-    data_dir: &Path,
+    _data_dir: &Path,
+    memory_dir: &Path,
     config: &RuntimeConfig,
     api_key_env_key: &str,
     api_key: &str,
@@ -321,7 +330,7 @@ async fn run_setup_smoke(
     if output.trim().is_empty() {
         anyhow::bail!("model returned an empty reply")
     }
-    let _ = std::fs::remove_dir_all(data_dir.join("memory").join(session_id));
+    let _ = std::fs::remove_dir_all(memory_dir.join(session_id));
     Ok(output)
 }
 

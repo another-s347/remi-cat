@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -20,6 +20,9 @@ use crate::parse_feishu_document_url;
 
 /// Feishu error code for expired / invalid access token.
 const TOKEN_EXPIRED: i64 = 99991663;
+const COT_MAX_ATTEMPTS: usize = 5;
+const COT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const COT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 const FEISHU_BASE: &str = "https://open.feishu.cn/open-apis";
 /// Base URL for the WebSocket endpoint (NOT under /open-apis/).
@@ -66,6 +69,53 @@ struct MessageData {
     thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CotMessage {
+    pub cot_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CotEvent {
+    pub event_type: String,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+impl CotEvent {
+    pub fn new(event_type: impl Into<String>, content: serde_json::Value) -> Self {
+        Self::at(event_type, content, current_timestamp_millis())
+    }
+
+    pub fn at(event_type: impl Into<String>, content: serde_json::Value, timestamp: u64) -> Self {
+        Self {
+            event_type: event_type.into(),
+            content: content.to_string(),
+            timestamp,
+        }
+    }
+}
+
+fn current_timestamp_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Debug, Deserialize)]
+struct CotResponse {
+    code: i64,
+    msg: String,
+    data: Option<CotData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CotData {
+    cot_id: String,
+    message_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     code: i64,
@@ -76,19 +126,6 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct ChatData {
     chat_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatInfoResponse {
-    code: i64,
-    msg: String,
-    data: Option<ChatInfoData>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatInfoData {
-    pub chat_mode: Option<String>,
-    pub group_message_type: Option<String>,
 }
 
 // ── Generic API response ──────────────────────────────────────────────────────
@@ -149,7 +186,6 @@ pub struct FeishuClient {
     token: Arc<RwLock<String>>,
     /// Bot's own `open_id`, fetched once via `/open-apis/bot/v3/info`.
     bot_open_id: Arc<RwLock<Option<String>>>,
-    chat_info_cache: Arc<RwLock<HashMap<String, ChatInfoData>>>,
 }
 
 impl FeishuClient {
@@ -160,53 +196,158 @@ impl FeishuClient {
             http: Client::new(),
             token: Arc::new(RwLock::new(String::new())),
             bot_open_id: Arc::new(RwLock::new(None)),
-            chat_info_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Fetch the group mode used to decide whether process cells may create a
-    /// nested topic. Results are stable for a chat and cached after the first
-    /// lookup so normal turns do not pay another network round trip.
-    pub async fn get_chat_info(&self, chat_id: &str) -> Result<ChatInfoData> {
-        if let Some(info) = self.chat_info_cache.read().await.get(chat_id).cloned() {
-            return Ok(info);
-        }
-
-        let res = self.get_chat_info_once(chat_id).await;
-        let info = if res
-            .as_ref()
-            .err()
-            .map(is_token_expired_err)
-            .unwrap_or(false)
-        {
-            warn!("get_chat_info: token expired, refreshing and retrying");
-            self.refresh_token().await?;
-            self.get_chat_info_once(chat_id).await?
-        } else {
-            res?
-        };
-        self.chat_info_cache
-            .write()
-            .await
-            .insert(chat_id.to_string(), info.clone());
-        Ok(info)
+    /// Create one native Feishu Chain-of-Thought message for an assistant run.
+    pub async fn create_cot(
+        &self,
+        chat_id: &str,
+        origin_message_id: &str,
+        reply_in_thread: bool,
+    ) -> Result<CotMessage> {
+        self.retry_cot_request("create_cot", || {
+            self.create_cot_once(chat_id, origin_message_id, reply_in_thread)
+        })
+        .await
     }
 
-    async fn get_chat_info_once(&self, chat_id: &str) -> Result<ChatInfoData> {
+    async fn create_cot_once(
+        &self,
+        chat_id: &str,
+        origin_message_id: &str,
+        reply_in_thread: bool,
+    ) -> Result<CotMessage> {
         let token = self.token().await;
-        let resp: ChatInfoResponse = self
+        let resp: CotResponse = self
             .http
-            .get(format!("{FEISHU_BASE}/im/v1/chats/{chat_id}"))
+            .post(format!(
+                "{FEISHU_BASE}/im/v1/message_cot?receive_id_type=chat_id"
+            ))
             .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "receive_id": chat_id,
+                "origin_message_id": origin_message_id,
+                "reply_in_thread": reply_in_thread,
+            }))
             .send()
             .await
-            .context("get_chat_info")?
+            .context("create_cot")?
+            .error_for_status()
+            .context("create_cot HTTP status")?
             .json()
             .await
-            .context("parse get_chat_info response")?;
-        ensure_ok(resp.code, &resp.msg, "get_chat_info")?;
-        resp.data
-            .ok_or_else(|| anyhow!("get_chat_info response missing data"))
+            .context("parse create_cot response")?;
+        ensure_ok(resp.code, &resp.msg, "create_cot")?;
+        let data = resp
+            .data
+            .ok_or_else(|| anyhow!("create_cot response missing data"))?;
+        Ok(CotMessage {
+            cot_id: data.cot_id,
+            message_id: data.message_id,
+        })
+    }
+
+    /// Append ordered AG-UI events to a native Feishu COT message.
+    pub async fn append_cot_events(&self, cot: &CotMessage, events: &[CotEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.retry_cot_request("append_cot_events", || {
+            self.append_cot_events_once(cot, events)
+        })
+        .await
+    }
+
+    async fn append_cot_events_once(&self, cot: &CotMessage, events: &[CotEvent]) -> Result<()> {
+        let token = self.token().await;
+        let resp: ApiResponse = self
+            .http
+            .put(format!("{FEISHU_BASE}/im/v1/message_cot"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "message_id": cot.message_id,
+                "cot_id": cot.cot_id,
+                "events": events,
+            }))
+            .send()
+            .await
+            .context("append_cot_events")?
+            .error_for_status()
+            .context("append_cot_events HTTP status")?
+            .json()
+            .await
+            .context("parse append_cot_events response")?;
+        ensure_ok(resp.code, &resp.msg, "append_cot_events")
+    }
+
+    /// Complete a native COT message. External callers should use `done` or
+    /// `error`; Feishu reserves `timeout` for trusted internal fallback paths.
+    pub async fn complete_cot(&self, cot: &CotMessage, reason: &str) -> Result<()> {
+        if !matches!(reason, "done" | "error") {
+            return Err(anyhow!(
+                "unsupported external COT completion reason `{reason}`"
+            ));
+        }
+        self.retry_cot_request("complete_cot", || self.complete_cot_once(cot, reason))
+            .await
+    }
+
+    async fn complete_cot_once(&self, cot: &CotMessage, reason: &str) -> Result<()> {
+        let token = self.token().await;
+        let resp: ApiResponse = self
+            .http
+            .post(format!(
+                "{FEISHU_BASE}/im/v1/message_cot/complete/{}",
+                cot.cot_id
+            ))
+            .query(&[("message_id", cot.message_id.as_str()), ("reason", reason)])
+            .bearer_auth(&token)
+            .header(CONTENT_TYPE, "application/json;charset=utf-8")
+            .body(String::new())
+            .send()
+            .await
+            .context("complete_cot")?
+            .error_for_status()
+            .context("complete_cot HTTP status")?
+            .json()
+            .await
+            .context("parse complete_cot response")?;
+        ensure_ok(resp.code, &resp.msg, "complete_cot")
+    }
+
+    async fn retry_cot_request<T, F, Fut>(&self, api: &str, mut request: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let mut attempt = 1usize;
+        let mut backoff = COT_INITIAL_BACKOFF;
+        let mut token_refreshed = false;
+        loop {
+            match request().await {
+                Ok(value) => return Ok(value),
+                Err(err) if is_token_expired_err(&err) && !token_refreshed => {
+                    warn!(api, "COT request token expired; refreshing and retrying");
+                    self.refresh_token().await?;
+                    token_refreshed = true;
+                }
+                Err(err) if attempt < COT_MAX_ATTEMPTS && is_retryable_cot_error(&err) => {
+                    warn!(
+                        api,
+                        attempt,
+                        max_attempts = COT_MAX_ATTEMPTS,
+                        delay_ms = backoff.as_millis() as u64,
+                        error = %err,
+                        "transient COT request failure; backing off before retry"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(COT_MAX_BACKOFF);
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Fetch a fresh `tenant_access_token` and store it internally.
@@ -1929,6 +2070,32 @@ fn is_token_expired_err(e: &anyhow::Error) -> bool {
     s.contains(&TOKEN_EXPIRED.to_string())
 }
 
+fn is_retryable_cot_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = error.status() {
+                return status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error();
+            }
+            return error.is_connect() || error.is_timeout() || error.is_body();
+        }
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "rate limit",
+        "frequency limit",
+        "too many requests",
+        "temporarily unavailable",
+        "temporary unavailable",
+        "service unavailable",
+        "internal server error",
+        "error 99991400",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 fn message_id_from(data: Option<MessageData>) -> String {
     data.map(|d| d.message_id).unwrap_or_default()
 }
@@ -2124,9 +2291,45 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        build_tool_approval_card, log_text_preview, preferred_contact_user_id_types,
-        should_retry_contact_user_lookup, ContactUserIdType, MessageResponse,
+        build_tool_approval_card, is_retryable_cot_error, log_text_preview,
+        preferred_contact_user_id_types, should_retry_contact_user_lookup, ContactUserIdType,
+        CotEvent, MessageResponse,
     };
+
+    #[test]
+    fn cot_retry_classifier_accepts_transient_api_failures() {
+        assert!(is_retryable_cot_error(&anyhow!(
+            "append_cot_events error 99991400: rate limit"
+        )));
+        assert!(is_retryable_cot_error(&anyhow!(
+            "complete_cot: service unavailable"
+        )));
+    }
+
+    #[test]
+    fn cot_retry_classifier_rejects_deterministic_api_failures() {
+        assert!(!is_retryable_cot_error(&anyhow!(
+            "create_cot error 99991672: permission denied"
+        )));
+        assert!(!is_retryable_cot_error(&anyhow!(
+            "create_cot error 10003: invalid parameter"
+        )));
+    }
+
+    #[test]
+    fn cot_event_serializes_content_as_a_json_string() {
+        let event = CotEvent::new(
+            "TEXT_MESSAGE_CONTENT",
+            serde_json::json!({"messageId": "text-1", "delta": "处理中"}),
+        );
+        let encoded = serde_json::to_value(event).unwrap();
+        let content = encoded["content"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).unwrap(),
+            serde_json::json!({"messageId": "text-1", "delta": "处理中"})
+        );
+        assert!(encoded["timestamp"].as_u64().unwrap() > 0);
+    }
 
     #[test]
     fn message_response_parses_thread_id_when_present() {

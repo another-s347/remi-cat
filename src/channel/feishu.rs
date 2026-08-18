@@ -42,25 +42,36 @@ use actions::process_feishu_card_action;
 pub(crate) use bridge::LocalImFileBridge;
 use format::{fenced_block, format_feishu_sub_session_line};
 pub(crate) use format::{format_context_compaction_line, format_feishu_tool_line};
-use reply_stream::FeishuReplyStream;
-pub(crate) use reply_stream::{FeishuReplyKind, FeishuTurnLayout};
+use reply_stream::{FeishuReplyKind, FeishuReplyStream};
 pub(crate) use routing::{
     feishu_session_channel_id, feishu_topic_channel_id, should_ignore_unaddressed_topic_start,
 };
-pub(crate) use settings::im_mode_from_env;
-use settings::{feishu_hook_config_from_env, feishu_transport_from_env};
+use settings::feishu_hook_config;
 use sub_session::record_sub_session_event;
 
 const MAX_FEISHU_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_FEISHU_IMAGES: usize = 8;
 
 pub(crate) struct FeishuChannel {
+    platform: String,
     gateway: FeishuGateway,
+    transport: FeishuTransport,
+    event_hook: crate::runtime_config::FeishuEventHookRuntimeConfig,
 }
 
 impl FeishuChannel {
-    pub(crate) fn new(gateway: FeishuGateway) -> Self {
-        Self { gateway }
+    pub(crate) fn configured(
+        platform: String,
+        gateway: FeishuGateway,
+        transport: FeishuTransport,
+        event_hook: crate::runtime_config::FeishuEventHookRuntimeConfig,
+    ) -> Self {
+        Self {
+            platform,
+            gateway,
+            transport,
+            event_hook,
+        }
     }
 }
 
@@ -74,17 +85,28 @@ impl Channel for FeishuChannel {
         runtime: Rc<Runtime>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
         let gateway = self.gateway.clone();
-        Box::pin(async move { run_feishu(runtime, gateway).await })
+        let platform = self.platform.clone();
+        let transport = self.transport.clone();
+        let event_hook = self.event_hook.clone();
+        Box::pin(async move {
+            run_feishu_configured(runtime, platform, gateway, transport, event_hook).await
+        })
     }
 }
 
-pub(crate) async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> anyhow::Result<()> {
-    info!("remi-cat runtime: initializing Feishu gateway connection");
-    let mut rx = match feishu_transport_from_env() {
+async fn run_feishu_configured(
+    runtime: Rc<Runtime>,
+    platform: String,
+    gateway: FeishuGateway,
+    transport: FeishuTransport,
+    event_hook: crate::runtime_config::FeishuEventHookRuntimeConfig,
+) -> anyhow::Result<()> {
+    info!(connector = %platform, "remi-cat runtime: initializing Feishu gateway connection");
+    let mut rx = match transport {
         FeishuTransport::WebSocket => gateway.start().await?,
         FeishuTransport::EventHook => {
             gateway
-                .start_event_hook(feishu_hook_config_from_env()?)
+                .start_event_hook(feishu_hook_config(&event_hook)?)
                 .await?
         }
     };
@@ -93,8 +115,10 @@ pub(crate) async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> 
             FeishuEvent::MessageReceived(msg) => {
                 let runtime = Rc::clone(&runtime);
                 let gateway = gateway.clone();
+                let platform = platform.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = process_feishu_message(runtime, gateway, msg).await {
+                    if let Err(err) = process_feishu_message(runtime, gateway, platform, msg).await
+                    {
                         warn!("failed to process Feishu message: {err:#}");
                     }
                 });
@@ -117,8 +141,10 @@ pub(crate) async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> 
                 };
                 let runtime = Rc::clone(&runtime);
                 let gateway = gateway.clone();
+                let platform = platform.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = process_feishu_message(runtime, gateway, msg).await {
+                    if let Err(err) = process_feishu_message(runtime, gateway, platform, msg).await
+                    {
                         warn!("failed to process Feishu reaction: {err:#}");
                     }
                 });
@@ -155,6 +181,7 @@ pub(crate) async fn run_feishu(runtime: Rc<Runtime>, gateway: FeishuGateway) -> 
 async fn process_feishu_message(
     runtime: Rc<Runtime>,
     gateway: FeishuGateway,
+    platform: String,
     msg: FeishuMessage,
 ) -> anyhow::Result<()> {
     let channel_id = feishu_session_channel_id(&msg);
@@ -162,7 +189,7 @@ async fn process_feishu_message(
         .sessions
         .lock()
         .await
-        .channel_session_id(FEISHU_CHANNEL, &channel_id)
+        .channel_session_id(&platform, &channel_id)
         .is_some();
     if should_ignore_unaddressed_topic_start(&msg, session_exists) {
         info!(
@@ -176,7 +203,7 @@ async fn process_feishu_message(
 
     let sender_uuid = runtime
         .user_store
-        .resolve_or_create(FEISHU_CHANNEL, &msg.sender_user_id);
+        .resolve_or_create(&platform, &msg.sender_user_id);
     let sender_username = ensure_im_username(
         &runtime.user_store,
         &gateway,
@@ -185,38 +212,18 @@ async fn process_feishu_message(
     )
     .await;
     let reaction_id = gateway.add_reaction(&msg.message_id, "THINKING").await.ok();
-    let chat_info = if msg.chat_type == "group" {
-        match gateway.get_chat_info(&msg.chat_id).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(chat_id = %msg.chat_id, "failed to get Feishu chat mode: {err:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let chat_mode = chat_info
-        .as_ref()
-        .and_then(|info| info.chat_mode.as_deref());
-    let layout = FeishuTurnLayout::for_message(&msg.chat_type, chat_mode, msg.thread_id.as_deref());
     info!(
         chat_id = %msg.chat_id,
         message_id = %msg.message_id,
         chat_type = %msg.chat_type,
-        chat_mode = chat_mode.unwrap_or("unknown"),
-        group_message_type = chat_info
-            .as_ref()
-            .and_then(|info| info.group_message_type.as_deref())
-            .unwrap_or("unknown"),
         thread_id = msg.thread_id.as_deref().unwrap_or(""),
-        layout = ?layout,
-        "selected Feishu turn layout"
+        "created Feishu COT turn"
     );
-    let mut replies = FeishuReplyStream::new(gateway.clone(), msg.message_id.clone(), layout);
+    let mut replies =
+        FeishuReplyStream::new(gateway.clone(), msg.chat_id.clone(), msg.message_id.clone());
     let result = collect_bot_reply(
         runtime,
-        FEISHU_CHANNEL,
+        &platform,
         msg.clone(),
         sender_username,
         Some(&gateway),
@@ -390,8 +397,8 @@ async fn collect_bot_reply(
         &channel_id,
         &runtime.root_agent_id,
     )?;
-    if platform == FEISHU_CHANNEL && is_fork_command(msg.text.trim()) {
-        let reply = handle_feishu_fork_command(&runtime, &session_id, &msg).await?;
+    if is_feishu_platform(platform) && is_fork_command(msg.text.trim()) {
+        let reply = handle_feishu_fork_command(&runtime, platform, &session_id, &msg).await?;
         append_reply_chunk(
             &mut String::new(),
             &mut replies,
@@ -423,7 +430,7 @@ async fn collect_bot_reply(
         im_attachments.len(),
         msg.documents.len(),
     );
-    let channel = if platform == FEISHU_CHANNEL {
+    let channel = if is_feishu_platform(platform) {
         ChatChannel::Feishu
     } else {
         ChatChannel::Cli
@@ -481,12 +488,17 @@ async fn collect_bot_reply(
     Ok(forwarder.output)
 }
 
+fn is_feishu_platform(platform: &str) -> bool {
+    platform == FEISHU_CHANNEL || platform.starts_with("feishu:")
+}
+
 fn is_fork_command(command: &str) -> bool {
     command == "/fork" || command.starts_with("/fork ")
 }
 
 async fn handle_feishu_fork_command(
     runtime: &Runtime,
+    platform: &str,
     source_session_id: &str,
     msg: &FeishuMessage,
 ) -> anyhow::Result<String> {
@@ -505,12 +517,7 @@ async fn handle_feishu_fork_command(
         .sessions
         .lock()
         .await
-        .fork_session(
-            source_session_id,
-            FEISHU_CHANNEL,
-            &temporary_channel_id,
-            title,
-        )?
+        .fork_session(source_session_id, platform, &temporary_channel_id, title)?
         .ok_or_else(|| anyhow::anyhow!("source session `{source_session_id}` not found"))?;
     if let Err(error) = runtime
         .bot
@@ -529,7 +536,7 @@ async fn handle_feishu_fork_command(
             kind: "fork".to_string(),
             target: "session".to_string(),
             title: fork.title.clone(),
-            platform: FEISHU_CHANNEL.to_string(),
+            platform: platform.to_string(),
             parent_channel_id: msg.chat_id.clone(),
             parent_thread_id: msg.thread_id.clone(),
             actor_user_id: Some(msg.sender_user_id.clone()),
@@ -813,6 +820,8 @@ impl FeishuEventForwarder<'_, '_> {
                 self.finish_streaming_tools("cancelled").await;
                 self.append_narrative(FeishuReplyKind::Text, "\n\n_已取消。_")
                     .await;
+                self.interrupt_run("cancelled").await;
+                return true;
             }
             CatEvent::UserInterrupted { reason } => {
                 self.finish_streaming_tools("interrupted").await;
@@ -822,6 +831,8 @@ impl FeishuEventForwarder<'_, '_> {
                     format!("\n\n_已中断：{}_", reason.trim())
                 };
                 self.append_narrative(FeishuReplyKind::Text, &chunk).await;
+                self.interrupt_run(reason.trim()).await;
+                return true;
             }
             CatEvent::Error(err) => {
                 self.finish_streaming_tools(&err.to_string()).await;
@@ -1026,6 +1037,12 @@ impl FeishuEventForwarder<'_, '_> {
         }
     }
 
+    async fn interrupt_run(&mut self, reason: &str) {
+        if let Some(replies) = self.replies.as_deref_mut() {
+            replies.interrupt_run(reason).await;
+        }
+    }
+
     async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) {
         if self.replies.is_some() {
             self.had_visible_event = true;
@@ -1131,17 +1148,8 @@ fn format_narrative_delta(
     if delta.is_empty() {
         return None;
     }
-    let prefix = match (previous, kind) {
-        (Some(previous), current) if previous == current => "",
-        (None, FeishuReplyKind::Thinking) | (Some(_), FeishuReplyKind::Thinking) => {
-            "**Thinking**\n\n"
-        }
-        (None, FeishuReplyKind::SupervisorThinking)
-        | (Some(_), FeishuReplyKind::SupervisorThinking) => "**Supervisor thinking**\n\n",
-        (None, _) => "",
-        (Some(_), _) => "",
-    };
-    Some(format!("{prefix}{delta}"))
+    let _ = (previous, kind);
+    Some(delta.to_string())
 }
 
 #[cfg(test)]
@@ -1164,12 +1172,8 @@ mod tests {
         )
         .expect("second thinking delta");
 
-        assert_eq!(first, "**Thinking**\n\ninspect");
+        assert_eq!(first, "inspect");
         assert_eq!(second, " more");
-        assert_eq!(
-            format!("{first}{second}").matches("**Thinking**").count(),
-            1
-        );
     }
 
     #[test]
@@ -1188,7 +1192,7 @@ mod tests {
     fn thinking_after_an_intervening_activity_starts_a_new_section() {
         let chunk = format_narrative_delta(None, FeishuReplyKind::Thinking, "resume")
             .expect("thinking after activity");
-        assert_eq!(chunk, "**Thinking**\n\nresume");
+        assert_eq!(chunk, "resume");
     }
 
     #[test]

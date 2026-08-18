@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{AcpCommand, CodexCommand};
 use crate::config::{
-    detect_setup_state, AcpClient, AcpMode, FeishuTransport, RuntimeConfig, RuntimeSandboxKind,
+    detect_setup_state_at, AcpClient, AcpMode, FeishuTransport, RuntimeConfig, RuntimeSandboxKind,
     SetupState,
 };
 use crate::core::Runtime;
@@ -11,7 +11,7 @@ use crate::profile_command::apply_runtime_config_entries;
 use bot_core::{api_key_from_env, AgentRegistry, CatBot, ModelProfileRegistry};
 
 pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
-    let setup_state = detect_setup_state(data_dir);
+    let setup_state = detect_setup_state_at(&profile.runtime_config, data_dir);
     println!("remi-cat doctor");
     println!("profile: {}", profile.label());
     println!("data_dir: {}", data_dir.display());
@@ -69,10 +69,8 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
         }
     }
 
-    let agents_dir = std::env::var("REMI_AGENTS_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| data_dir.join("agents"));
-    let models_dir = data_dir.join("models");
+    let agents_dir = profile.agents_dir.clone();
+    let models_dir = profile.models_dir.clone();
     let agent_registry = AgentRegistry::load(&agents_dir)?;
     let model_registry = ModelProfileRegistry::load(&models_dir)?;
     let api_key_present = match &setup_state {
@@ -335,7 +333,7 @@ fn run_acp_doctor(profile: &InstanceProfile, data_dir: &Path, label: &str) -> an
     println!("remi-cat {label} doctor");
     println!("profile: {}", profile.label());
     println!("data_dir: {}", data_dir.display());
-    match detect_setup_state(data_dir) {
+    match crate::runtime_config::detect_setup_state_at(&profile.runtime_config, data_dir) {
         SetupState::Initialized {
             config_path,
             config,

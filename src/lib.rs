@@ -1,16 +1,21 @@
+mod a2a_channel;
+mod a2a_stdio;
 mod acp_agent;
 mod app;
 mod application;
+mod atomic_file;
 mod channel;
 mod cli;
 mod codex_acp_adapter;
 mod command;
 mod config;
 mod core;
+mod external_agent;
 mod host_admin;
 mod instance_profile;
 mod model_input_store;
 mod profile_command;
+mod profile_registry;
 mod runtime_config;
 mod secret_store;
 mod session;
@@ -23,17 +28,28 @@ mod tui_theme;
 mod web_chat;
 mod workspace_files;
 
+pub use a2a_stdio::serve_application as serve_application_a2a_stdio;
 pub use application::{
     ActiveRunInfo, ActiveRunState, Application, ApplicationBuilder, ApplicationCatalog,
-    ApplicationEvent, ApplicationHandle, ApplicationInfo, ChannelConfig, ChannelHandle,
-    CommandPreprocessResult, EffectiveSessionConfig, HookMutationResult, HookReloadReport,
-    RunControl, RunHandle, RunOptions, RunRequest, SentryAgentTracingOptions, SessionPatch,
-    SubSessionEventPage,
+    ApplicationEvent, ApplicationHandle, ApplicationInfo, ApplicationProfileInfo, ChannelConfig,
+    ChannelHandle, CommandPreprocessResult, EffectiveSessionConfig, HookMutationResult,
+    HookReloadReport, RunControl, RunHandle, RunOptions, RunRequest, SentryAgentTracingOptions,
+    SessionPatch, SubSessionEventPage,
 };
 pub use bot_core::{
     AgentError, AgentProfile, BuiltinSkill, CatEvent, Content, DynamicTool, DynamicToolRisk,
     HookSource, HookStatus, HookTextFormat, ModelProfileConfig, ReasoningEffort, SteerSubmitResult,
     ThreadHistoryMessage, ToolOutput, ToolResult, WorkflowDefinition,
+};
+pub use instance_profile::{
+    ApplicationProfileManifest, InstanceProfile as ResolvedApplicationProfile, ProfileCapabilities,
+    ProfileConfigRefs, ProfileEndpoint, ProfileEndpointAuth, ProfileResourceRefs, ProfileStateRefs,
+    PROFILE_FILE_NAME, PROFILE_SCHEMA_VERSION,
+};
+pub use profile_registry::{ProfileRegistry, RegisteredProfile};
+pub use runtime_config::{
+    ChannelInstanceConfig, ChannelsConfig, FeishuChannelEventHookConfig, FeishuCredentialRefs,
+    FeishuEventHookRuntimeConfig, FeishuTransport,
 };
 pub use session::{ChannelBinding, Session, SubSession, SubSessionKind};
 

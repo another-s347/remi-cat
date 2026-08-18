@@ -13,16 +13,34 @@ use super::feishu_topic_channel_id;
 use crate::app::FEISHU_CHANNEL;
 
 pub(crate) struct LocalImFileBridge {
-    gateway: Option<FeishuGateway>,
+    gateways: HashMap<String, FeishuGateway>,
     sub_session_cards: Mutex<HashMap<String, StreamingCard>>,
 }
 
 impl LocalImFileBridge {
     pub(crate) fn new(gateway: Option<FeishuGateway>) -> Self {
+        let gateways = gateway
+            .map(|gateway| HashMap::from([(FEISHU_CHANNEL.to_string(), gateway)]))
+            .unwrap_or_default();
         Self {
-            gateway,
+            gateways,
             sub_session_cards: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn with_gateways(gateways: HashMap<String, FeishuGateway>) -> Self {
+        Self {
+            gateways,
+            sub_session_cards: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn gateway(&self, platform: &str) -> Option<&FeishuGateway> {
+        self.gateways.get(platform).or_else(|| {
+            (platform == FEISHU_CHANNEL && self.gateways.len() == 1)
+                .then(|| self.gateways.values().next())
+                .flatten()
+        })
     }
 }
 
@@ -34,10 +52,10 @@ impl ImFileBridge for LocalImFileBridge {
         Box<dyn std::future::Future<Output = anyhow::Result<DownloadedImFile>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let Some(gateway) = &self.gateway else {
+            let Some(gateway) = self.gateway(&req.platform) else {
                 anyhow::bail!("current transport does not support IM file download");
             };
-            if req.platform != FEISHU_CHANNEL {
+            if req.platform != FEISHU_CHANNEL && !req.platform.starts_with("feishu:") {
                 anyhow::bail!("unsupported platform: {}", req.platform);
             }
             let (mime_type, file_name, content, source_label) =
@@ -78,10 +96,10 @@ impl ImFileBridge for LocalImFileBridge {
         Box<dyn std::future::Future<Output = anyhow::Result<UploadedImFile>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let Some(gateway) = &self.gateway else {
+            let Some(gateway) = self.gateway(&req.platform) else {
                 anyhow::bail!("current transport does not support IM file upload");
             };
-            if req.platform != FEISHU_CHANNEL {
+            if req.platform != FEISHU_CHANNEL && !req.platform.starts_with("feishu:") {
                 anyhow::bail!("unsupported platform: {}", req.platform);
             }
             let file_key = gateway
@@ -138,10 +156,10 @@ impl ImFileBridge for LocalImFileBridge {
         Box<dyn std::future::Future<Output = anyhow::Result<Option<BoundImChannel>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if request.platform != FEISHU_CHANNEL {
+            if request.platform != FEISHU_CHANNEL && !request.platform.starts_with("feishu:") {
                 return Ok(None);
             }
-            let Some(gateway) = &self.gateway else {
+            let Some(gateway) = self.gateway(&request.platform) else {
                 return Ok(None);
             };
             let title = request
@@ -174,7 +192,7 @@ impl ImFileBridge for LocalImFileBridge {
                         )
                     })?;
                 return Ok(Some(BoundImChannel {
-                    platform: FEISHU_CHANNEL.to_string(),
+                    platform: request.platform.clone(),
                     channel_id: feishu_topic_channel_id(&request.parent_channel_id, &thread_id),
                 }));
             }
@@ -207,7 +225,7 @@ impl ImFileBridge for LocalImFileBridge {
                 )
                 .await;
             Ok(Some(BoundImChannel {
-                platform: FEISHU_CHANNEL.to_string(),
+                platform: request.platform.clone(),
                 channel_id: chat_id,
             }))
         })
@@ -221,23 +239,46 @@ impl ImFileBridge for LocalImFileBridge {
         done: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            if platform != FEISHU_CHANNEL {
+            if platform != FEISHU_CHANNEL && !platform.starts_with("feishu:") {
                 return Ok(());
             }
-            let Some(gateway) = &self.gateway else {
+            let Some(gateway) = self.gateway(platform) else {
                 return Ok(());
             };
             let mut cards = self.sub_session_cards.lock().await;
+            let card_key = format!("{platform}:{channel_id}");
             let card = cards
-                .entry(channel_id.to_string())
+                .entry(card_key.clone())
                 .or_insert_with(|| gateway.begin_streaming_reply(channel_id));
             if done {
                 card.replace_final(text).await?;
-                cards.remove(channel_id);
+                cards.remove(&card_key);
             } else {
                 card.replace(text).await?;
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_platform_selects_the_matching_gateway() {
+        let bridge = LocalImFileBridge::with_gateways(HashMap::from([
+            (
+                "feishu:work".to_string(),
+                FeishuGateway::new("work-app", "work-secret"),
+            ),
+            (
+                "feishu:travel".to_string(),
+                FeishuGateway::new("travel-app", "travel-secret"),
+            ),
+        ]));
+        assert!(bridge.gateway("feishu:work").is_some());
+        assert!(bridge.gateway("feishu:travel").is_some());
+        assert!(bridge.gateway("feishu:missing").is_none());
     }
 }

@@ -15,6 +15,7 @@
 //!         └── long_term/<uuid>.md           (LLM-compressed, with raw archive)
 //! ```
 
+mod a2a_delegate;
 pub mod acp;
 pub mod agent;
 pub mod approval;

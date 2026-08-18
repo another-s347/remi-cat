@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 doctest = false
 
+[features]
+default = []
+experimental-pty = ["dep:portable-pty", "dep:vt100"]
+
 [dependencies]
 bot-runtime-core = { path = "../bot-runtime-core" }
 agent-client-protocol = "1.0.1"
@@ -34,10 +38,14 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
 ] }
+a2a = { package = "a2a-lf", version = "0.3.0" }
 aho-corasick = "1"
 html2md = "0.2.15"
 libc = "0.2"
+portable-pty = { version = "0.9", optional = true }
+vt100 = { version = "0.15.2", optional = true }
 
 [dev-dependencies]
 sentry = { version = "0.47", default-features = false }
 tempfile = "3"
+axum = "0.8"

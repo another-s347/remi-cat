@@ -523,7 +523,7 @@ pub fn embedded_goal_definition() -> WorkflowDefinition {
 
 pub fn list_definitions(data_dir: &Path) -> Result<Vec<WorkflowDefinition>, String> {
     let mut definitions = vec![embedded_goal_definition()];
-    let dir = data_dir.join("workflows");
+    let dir = workflow_definitions_dir(data_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(definitions),
@@ -583,8 +583,7 @@ pub fn remove_instance_from_user_state(user_state: &mut serde_json::Value) {
 }
 
 pub fn instance_path(data_dir: &Path, thread_id: &str) -> PathBuf {
-    data_dir
-        .join("memory")
+    memory_dir(data_dir)
         .join(sanitize_id(thread_id))
         .join("supervisor_workflow.json")
 }
@@ -623,9 +622,7 @@ pub async fn load_definition(data_dir: &Path, id: &str) -> Result<WorkflowDefini
     if id.is_empty() || sanitize_id(id) != id {
         return Err("workflow id may only contain letters, numbers, '-' and '_'".into());
     }
-    let path = data_dir
-        .join("workflows")
-        .join(format!("{}.json", sanitize_id(id)));
+    let path = workflow_definitions_dir(data_dir).join(format!("{}.json", sanitize_id(id)));
     let text = tokio::fs::read_to_string(&path)
         .await
         .map_err(|err| format!("reading {}: {err}", path.display()))?;
@@ -639,6 +636,18 @@ pub async fn load_definition(data_dir: &Path, id: &str) -> Result<WorkflowDefini
         ));
     }
     Ok(definition)
+}
+
+fn workflow_definitions_dir(data_dir: &Path) -> PathBuf {
+    std::env::var_os("REMI_WORKFLOWS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("workflows"))
+}
+
+fn memory_dir(data_dir: &Path) -> PathBuf {
+    std::env::var_os("REMI_MEMORY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("memory"))
 }
 
 pub fn parse_decision(raw: &str) -> Result<WorkflowDecision, String> {

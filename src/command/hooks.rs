@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::HooksCommand;
-use crate::config::{detect_setup_state, SetupState};
+use crate::config::SetupState;
 use crate::instance_profile::InstanceProfile;
 use bot_core::HookManager;
 
@@ -14,7 +14,9 @@ pub(crate) async fn run_hooks_command(
         std::env::set_var("REMI_DATA_DIR", data_dir);
     }
     let mut effective_data_dir = data_dir.to_path_buf();
-    if let SetupState::Initialized { config, .. } = detect_setup_state(data_dir) {
+    if let SetupState::Initialized { config, .. } =
+        crate::runtime_config::detect_setup_state_at(&profile.runtime_config, data_dir)
+    {
         config.apply_env_defaults();
         effective_data_dir = PathBuf::from(
             std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| config.data_dir.clone()),

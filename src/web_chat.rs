@@ -52,6 +52,7 @@ pub struct WebRuntimeOptions {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub agent_id: Option<String>,
     pub async_agent: Option<bool>,
+    pub platform: Option<String>,
 }
 
 pub(crate) enum WebChatCommand {
@@ -83,6 +84,18 @@ pub(crate) enum WebChatCommand {
     },
     ActiveRuns {
         response: oneshot::Sender<Vec<ActiveWebRun>>,
+    },
+    ListToolTasks {
+        session_id: String,
+        response: oneshot::Sender<Vec<bot_core::ToolTaskRecord>>,
+    },
+    GetToolTask {
+        task_id: String,
+        response: oneshot::Sender<Option<bot_core::ToolTaskRecord>>,
+    },
+    CancelToolTask {
+        task_id: String,
+        response: oneshot::Sender<Option<bot_core::ToolTaskRecord>>,
     },
     History {
         session_id: String,
@@ -259,6 +272,48 @@ impl WebChatHandle {
             .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("web chat runtime dropped active runs response"))
+    }
+
+    pub async fn list_tool_tasks(
+        &self,
+        session_id: String,
+    ) -> anyhow::Result<Vec<bot_core::ToolTaskRecord>> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::ListToolTasks {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped tool task response"))
+    }
+
+    pub async fn get_tool_task(
+        &self,
+        task_id: String,
+    ) -> anyhow::Result<Option<bot_core::ToolTaskRecord>> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::GetToolTask { task_id, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped tool task response"))
+    }
+
+    pub async fn cancel_tool_task(
+        &self,
+        task_id: String,
+    ) -> anyhow::Result<Option<bot_core::ToolTaskRecord>> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(WebChatCommand::CancelToolTask { task_id, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("web chat runtime is unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("web chat runtime dropped tool task response"))
     }
 
     pub async fn history(&self, session_id: String) -> anyhow::Result<Vec<ThreadHistoryMessage>> {
@@ -733,6 +788,25 @@ pub async fn run_dispatcher(runtime: Rc<Runtime>, mut rx: mpsc::Receiver<WebChat
                     })
                     .collect();
                 let _ = response.send(active_runs);
+            }
+            WebChatCommand::ListToolTasks {
+                session_id,
+                response,
+            } => {
+                let tasks = runtime
+                    .bot
+                    .tool_task_manager()
+                    .list_session_background(&session_id)
+                    .await;
+                let _ = response.send(tasks);
+            }
+            WebChatCommand::GetToolTask { task_id, response } => {
+                let task = runtime.bot.tool_task_manager().get(&task_id).await;
+                let _ = response.send(task);
+            }
+            WebChatCommand::CancelToolTask { task_id, response } => {
+                let task = runtime.bot.tool_task_manager().cancel(&task_id).await;
+                let _ = response.send(task);
             }
             WebChatCommand::History {
                 session_id,
@@ -1737,6 +1811,10 @@ async fn run_turn(
             .or(model_profile_id.as_deref()),
         runtime_options.agent_id.as_deref().or(agent_id.as_deref()),
     );
+    let platform = runtime_options
+        .platform
+        .clone()
+        .unwrap_or_else(|| WEB_CHANNEL.to_string());
     let request = ChatRequest::text(session_id.to_string(), ChatChannel::Web, "")
         .with_content(content)
         .with_runtime_overrides(
@@ -1747,7 +1825,7 @@ async fn run_turn(
         )
         .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
         .with_message(run_id.to_string(), "p2p")
-        .with_platform(Some(WEB_CHANNEL.to_string()))
+        .with_platform(Some(platform))
         .with_cancel(cancel);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let timeout = tokio::time::sleep(Duration::from_secs(300));

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use bot_core::{
     ToolApprovalDecision, ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse,
@@ -8,8 +9,12 @@ use im_feishu::client::{
     build_tool_approval_card, build_tool_approval_resolved_card, build_user_question_card,
     build_user_question_resolved_card,
 };
-use im_feishu::{FeishuGateway, StreamingCard};
+use im_feishu::{CotEvent, CotMessage, FeishuGateway};
+use serde_json::json;
 use tracing::warn;
+
+const COT_FLUSH_INTERVAL: Duration = Duration::from_millis(350);
+const COT_FLUSH_EVENT_LIMIT: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeishuReplyKind {
@@ -24,159 +29,71 @@ pub(crate) enum FeishuReplyKind {
     Error,
 }
 
-impl FeishuReplyKind {
-    fn is_standalone(self) -> bool {
-        matches!(self, Self::Stats | Self::Error)
-    }
-
-    pub(crate) fn starts_new_message(self, active: Option<Self>) -> bool {
-        active != Some(self) || self.is_standalone()
-    }
-
-    pub(crate) fn finishes_message(self) -> bool {
-        matches!(self, Self::ToolResult | Self::Stats | Self::Error)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FeishuTurnLayout {
-    /// A normal group message can become a topic. Keep every process cell as a
-    /// separate card in that topic and leave only the final answer outside it.
-    ThreadedProcessCells,
-    /// Topic messages cannot create nested topics. Fold their process cells
-    /// into one card in the current topic instead.
-    CompressedProcessCard,
+enum NarrativeKind {
+    Text,
+    Reasoning,
 }
 
-impl FeishuTurnLayout {
-    pub(crate) fn for_message(
-        chat_type: &str,
-        chat_mode: Option<&str>,
-        thread_id: Option<&str>,
-    ) -> Self {
-        if chat_type != "group" {
-            return Self::CompressedProcessCard;
-        }
-        match chat_mode.map(str::trim) {
-            // A real topic-mode group cannot contain a nested topic.
-            Some("topic") => Self::CompressedProcessCard,
-            // In a normal group, create the process topic even when the
-            // inbound event happens to carry a thread id. Group mode, not the
-            // message field, is the source of truth for this product layout.
-            Some("group") => Self::ThreadedProcessCells,
-            // Preserve the conservative behavior if group metadata cannot be
-            // fetched (for example because the app lacks the chat-read scope).
-            _ if thread_id.is_some_and(|value| !value.trim().is_empty()) => {
-                Self::CompressedProcessCard
-            }
-            _ => Self::ThreadedProcessCells,
+impl NarrativeKind {
+    fn for_reply(kind: FeishuReplyKind) -> Self {
+        match kind {
+            FeishuReplyKind::Thinking | FeishuReplyKind::SupervisorThinking => Self::Reasoning,
+            _ => Self::Text,
         }
     }
 }
 
-#[derive(Default)]
-struct ProcessTimeline {
-    cells: Vec<(Option<String>, FeishuReplyKind, String)>,
-    active_stream: Option<(FeishuReplyKind, usize)>,
+struct ActiveNarrative {
+    id: String,
+    kind: NarrativeKind,
+    title: String,
+    content: String,
 }
 
-impl ProcessTimeline {
-    fn append_stream(&mut self, kind: FeishuReplyKind, chunk: &str) {
-        if let Some((active_kind, index)) = self.active_stream {
-            if active_kind == kind {
-                self.cells[index].2.push_str(chunk);
-                return;
-            }
-        }
-        let index = self.cells.len();
-        self.cells.push((None, kind, chunk.to_string()));
-        self.active_stream = Some((kind, index));
-    }
-
-    fn replace_stream(&mut self, kind: FeishuReplyKind, content: &str) {
-        if let Some((active_kind, index)) = self.active_stream {
-            if active_kind == kind {
-                self.cells[index].2 = content.to_string();
-                return;
-            }
-        }
-        let index = self.cells.len();
-        self.cells.push((None, kind, content.to_string()));
-        self.active_stream = Some((kind, index));
-    }
-
-    fn push_fixed(&mut self, kind: FeishuReplyKind, content: String) {
-        self.active_stream = None;
-        self.cells.push((None, kind, content));
-    }
-
-    fn upsert(&mut self, key: String, kind: FeishuReplyKind, content: &str) -> bool {
-        if let Some((_, _, body)) = self
-            .cells
-            .iter_mut()
-            .find(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()))
-        {
-            *body = content.to_string();
-            return false;
-        }
-        self.active_stream = None;
-        self.cells.push((Some(key), kind, content.to_string()));
-        true
-    }
-
-    fn break_stream(&mut self) {
-        self.active_stream = None;
-    }
-
-    fn render(&self) -> String {
-        self.cells
-            .iter()
-            .filter_map(|(_, _, body)| (!body.trim().is_empty()).then_some(body.trim()))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    }
-}
-
+/// Maps one assistant run to one native Feishu COT message. The final answer
+/// deliberately remains an ordinary reply card so it is visible independently
+/// from the collapsed process view.
 pub(super) struct FeishuReplyStream {
     gateway: FeishuGateway,
+    chat_id: String,
     parent_message_id: String,
-    layout: FeishuTurnLayout,
+    thread_id: String,
+    run_id: String,
     pending_final_text: String,
     final_output_committed: bool,
-    process_topic_root_message_id: Option<String>,
-    active_kind: Option<FeishuReplyKind>,
-    active_card: Option<StreamingCard>,
-    compressed_card: Option<StreamingCard>,
-    process_timeline: ProcessTimeline,
-    tool_cards: HashMap<String, StreamingCard>,
-    compaction_cards: HashMap<String, StreamingCard>,
-    sub_session_cards: HashMap<String, StreamingCard>,
-    status_cards: HashMap<String, StreamingCard>,
+    cot: Option<CotMessage>,
+    cot_create_failed: bool,
+    cot_completed: bool,
+    pending_events: Vec<CotEvent>,
+    last_cot_flush: Instant,
+    active_narrative: Option<ActiveNarrative>,
+    sequence: u64,
+    last_event_timestamp: u64,
+    activities: HashSet<String>,
     approval_cards: HashMap<String, String>,
     question_cards: HashMap<String, String>,
 }
 
 impl FeishuReplyStream {
-    pub(super) fn new(
-        gateway: FeishuGateway,
-        parent_message_id: String,
-        layout: FeishuTurnLayout,
-    ) -> Self {
+    pub(super) fn new(gateway: FeishuGateway, chat_id: String, parent_message_id: String) -> Self {
         Self {
             gateway,
+            chat_id: chat_id.clone(),
+            thread_id: chat_id,
             parent_message_id,
-            layout,
+            run_id: format!("run-{}", uuid::Uuid::new_v4()),
             pending_final_text: String::new(),
             final_output_committed: false,
-            process_topic_root_message_id: None,
-            active_kind: None,
-            active_card: None,
-            compressed_card: None,
-            process_timeline: ProcessTimeline::default(),
-            tool_cards: HashMap::new(),
-            compaction_cards: HashMap::new(),
-            sub_session_cards: HashMap::new(),
-            status_cards: HashMap::new(),
+            cot: None,
+            cot_create_failed: false,
+            cot_completed: false,
+            pending_events: Vec::new(),
+            last_cot_flush: Instant::now() - COT_FLUSH_INTERVAL,
+            active_narrative: None,
+            sequence: 0,
+            last_event_timestamp: 0,
+            activities: HashSet::new(),
             approval_cards: HashMap::new(),
             question_cards: HashMap::new(),
         }
@@ -184,172 +101,258 @@ impl FeishuReplyStream {
 
     pub(super) async fn push(&mut self, kind: FeishuReplyKind, chunk: &str) {
         if kind == FeishuReplyKind::Text {
-            self.finish_active().await;
+            self.close_active_narrative().await;
             self.pending_final_text.push_str(chunk);
             return;
         }
         if kind == FeishuReplyKind::Error {
             self.flush_pending_as_process().await;
-            self.finish_active().await;
+            self.fail_run("AGENT_ERROR", chunk).await;
             self.send_final(chunk).await;
             return;
         }
         self.flush_pending_as_process().await;
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            self.process_timeline.append_stream(kind, chunk);
-            self.flush_compressed_process().await;
-            if kind.finishes_message() {
-                self.process_timeline.break_stream();
-            }
-            return;
-        }
-        if kind.starts_new_message(self.active_kind) {
-            self.finish_active().await;
-            self.active_card = Some(self.begin_process_card());
-        }
-        self.active_kind = Some(kind);
-
-        if let Some(card) = self.active_card.as_mut() {
-            if let Err(err) = card.push(chunk).await {
-                warn!("stream process card failed: {err:#}");
-            }
-        }
-        self.capture_process_topic_root_from_active();
-
-        if kind.finishes_message() {
-            self.finish_active().await;
-        }
+        self.append_narrative(kind, chunk).await;
     }
 
     pub(super) async fn replace(&mut self, kind: FeishuReplyKind, content: &str) {
         self.flush_pending_as_process().await;
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            self.process_timeline.replace_stream(kind, content);
-            self.flush_compressed_process().await;
-            return;
-        }
-        if kind.starts_new_message(self.active_kind) {
-            self.finish_active().await;
-            self.active_card = Some(self.begin_process_card());
-        }
-        self.active_kind = Some(kind);
-        if let Some(card) = self.active_card.as_mut() {
-            if let Err(err) = card.replace(content).await {
-                warn!("replace process card failed: {err:#}");
-            }
-        }
-        self.capture_process_topic_root_from_active();
+        self.close_active_narrative().await;
+        self.append_narrative(kind, content).await;
     }
 
-    /// Emit an auxiliary/debug cell without changing which text cell the
-    /// explicit final-output marker will commit.
     pub(super) async fn push_auxiliary(&mut self, kind: FeishuReplyKind, chunk: &str) {
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            self.process_timeline.append_stream(kind, chunk);
-            self.flush_compressed_process().await;
-            self.process_timeline.break_stream();
-            return;
-        }
-        self.finish_active().await;
-        let mut card = self.begin_process_card();
-        card.replace_final(chunk).await.ok();
-        self.capture_process_topic_root(card.message_id.clone());
+        self.close_active_narrative().await;
+        self.append_narrative(kind, chunk).await;
+        self.close_active_narrative().await;
     }
 
     pub(super) async fn start_new_cell(&mut self) {
         self.flush_pending_as_process().await;
-        self.finish_active().await;
-        self.process_timeline.break_stream();
+        self.close_active_narrative().await;
     }
 
     pub(super) async fn finish(&mut self) {
-        self.finish_active().await;
-        if !self.pending_final_text.is_empty() {
-            self.flush_pending_as_process().await;
+        if self.final_output_committed || self.cot_completed {
+            return;
         }
-        if let Some(mut card) = self.compressed_card.take() {
-            card.finish().await.ok();
-        }
-        for (_, mut card) in self.tool_cards.drain() {
-            card.finish().await.ok();
-        }
-        for (_, mut card) in self.compaction_cards.drain() {
-            card.finish().await.ok();
-        }
-        for (_, mut card) in self.sub_session_cards.drain() {
-            card.finish().await.ok();
-        }
-        for (_, mut card) in self.status_cards.drain() {
-            card.finish().await.ok();
+        self.flush_pending_as_process().await;
+        if self.cot.is_some() {
+            self.fail_run("STREAM_ENDED", "运行未收到完成事件").await;
         }
     }
 
-    /// Commit the last text cell as the turn's final output. This is called
-    /// only from the explicit run-completion marker, never from stream teardown.
     pub(super) async fn commit_final_output(&mut self) {
         if self.final_output_committed {
             return;
         }
         self.final_output_committed = true;
-        self.finish_active().await;
+        self.close_active_narrative().await;
+        self.finish_run("done").await;
         let final_text = std::mem::take(&mut self.pending_final_text);
         self.send_final(&final_text).await;
     }
 
-    async fn finish_active(&mut self) {
-        if let Some(mut card) = self.active_card.take() {
-            card.finish().await.ok();
+    pub(super) async fn interrupt_run(&mut self, reason: &str) {
+        self.flush_pending_as_process().await;
+        self.close_active_narrative().await;
+        if self.cot.is_none() || self.cot_completed {
+            return;
         }
-        self.active_kind = None;
+        self.queue_event(
+            "RUN_FINISHED",
+            json!({
+                "threadId": self.thread_id,
+                "runId": self.run_id,
+                "status": "interrupted",
+                "reason": reason,
+                "input": {"statusText": {"interrupted": {
+                    "zh_cn": "任务已中断", "en_us": "Interrupted"
+                }}}
+            }),
+        )
+        .await;
+        self.complete_run("error").await;
     }
 
-    fn begin_process_card(&self) -> StreamingCard {
-        let (parent_message_id, reply_in_thread) = process_reply_target(
-            self.layout,
-            &self.parent_message_id,
-            self.process_topic_root_message_id.as_deref(),
-        );
-        if reply_in_thread {
-            self.gateway.begin_streaming_thread_reply(parent_message_id)
-        } else {
-            self.gateway.begin_streaming_reply(parent_message_id)
+    async fn ensure_cot(&mut self) -> bool {
+        if self.cot.is_some() {
+            return true;
         }
-    }
-
-    async fn send_process_raw(&mut self, card: serde_json::Value) -> anyhow::Result<String> {
-        let (parent_message_id, reply_in_thread) = process_reply_target(
-            self.layout,
-            &self.parent_message_id,
-            self.process_topic_root_message_id.as_deref(),
-        );
-        let parent_message_id = parent_message_id.to_string();
-        let message_id = if reply_in_thread {
-            self.gateway
-                .reply_card_raw_in_thread(&parent_message_id, card)
-                .await?
-        } else {
-            self.gateway
-                .reply_card_raw(&parent_message_id, card)
-                .await?
-        };
-        self.capture_process_topic_root(Some(message_id.clone()));
-        Ok(message_id)
-    }
-
-    fn capture_process_topic_root(&mut self, message_id: Option<String>) {
-        if self.layout == FeishuTurnLayout::ThreadedProcessCells
-            && self.process_topic_root_message_id.is_none()
+        if self.cot_create_failed || self.cot_completed {
+            return false;
+        }
+        match self
+            .gateway
+            .create_cot(&self.chat_id, &self.parent_message_id)
+            .await
         {
-            self.process_topic_root_message_id = message_id;
+            Ok(cot) => {
+                self.cot = Some(cot);
+                let timestamp = self.next_event_timestamp();
+                self.pending_events.push(CotEvent::at(
+                    "RUN_STARTED",
+                    json!({
+                        "threadId": self.thread_id,
+                        "runId": self.run_id,
+                        "input": {"statusText": {
+                            "running": {"zh_cn": "任务进行中", "en_us": "Working on it"},
+                            "thinking": {"zh_cn": "正在思考", "en_us": "Thinking"},
+                            "done": {"zh_cn": "任务已完成", "en_us": "Done"},
+                            "error": {"zh_cn": "任务失败", "en_us": "Failed"},
+                            "paused": {"zh_cn": "任务已暂停", "en_us": "Paused"},
+                            "interrupted": {"zh_cn": "任务已中断", "en_us": "Interrupted"}
+                        }}
+                    }),
+                    timestamp,
+                ));
+                true
+            }
+            Err(err) => {
+                self.cot_create_failed = true;
+                warn!("create Feishu COT failed: {err:#}");
+                false
+            }
         }
     }
 
-    fn capture_process_topic_root_from_active(&mut self) {
-        let message_id = self
-            .active_card
-            .as_ref()
-            .and_then(|card| card.message_id.clone());
-        self.capture_process_topic_root(message_id);
+    async fn queue_event(&mut self, event_type: &str, content: serde_json::Value) {
+        if !self.enqueue_event(event_type, content).await {
+            return;
+        }
+        self.flush_events_if_due().await;
+    }
+
+    async fn enqueue_event(&mut self, event_type: &str, content: serde_json::Value) -> bool {
+        if !self.ensure_cot().await {
+            return false;
+        }
+        let timestamp = self.next_event_timestamp();
+        self.pending_events
+            .push(CotEvent::at(event_type, content, timestamp));
+        true
+    }
+
+    async fn flush_events_if_due(&mut self) {
+        let force = self.pending_events.len() >= COT_FLUSH_EVENT_LIMIT
+            || self.last_cot_flush.elapsed() >= COT_FLUSH_INTERVAL;
+        if force {
+            self.flush_events().await;
+        }
+    }
+
+    fn next_event_timestamp(&mut self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let timestamp = now.max(self.last_event_timestamp.saturating_add(1));
+        self.last_event_timestamp = timestamp;
+        timestamp
+    }
+
+    async fn flush_events(&mut self) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        let Some(cot) = self.cot.clone() else {
+            return;
+        };
+        let events = std::mem::take(&mut self.pending_events);
+        match self.gateway.append_cot_events(&cot, &events).await {
+            Ok(()) => self.last_cot_flush = Instant::now(),
+            Err(err) => {
+                warn!("append Feishu COT events failed: {err:#}");
+                let mut retry = events;
+                retry.append(&mut self.pending_events);
+                self.pending_events = retry;
+            }
+        }
+    }
+
+    async fn append_narrative(&mut self, reply_kind: FeishuReplyKind, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let kind = NarrativeKind::for_reply(reply_kind);
+        if self.active_narrative.as_ref().map(|active| active.kind) != Some(kind) {
+            self.close_active_narrative().await;
+            self.sequence += 1;
+            self.active_narrative = Some(ActiveNarrative {
+                id: format!("narrative-{}", self.sequence),
+                kind,
+                title: match reply_kind {
+                    FeishuReplyKind::Thinking => "Thinking".to_string(),
+                    FeishuReplyKind::SupervisorThinking => "Supervisor thinking".to_string(),
+                    _ => process_title(delta),
+                },
+                content: String::new(),
+            });
+        }
+        let Some(active) = self.active_narrative.as_mut() else {
+            return;
+        };
+        active.content.push_str(delta);
+    }
+
+    async fn close_active_narrative(&mut self) {
+        let Some(active) = self.active_narrative.take() else {
+            return;
+        };
+        if active.content.is_empty() {
+            return;
+        }
+        match active.kind {
+            NarrativeKind::Text => {
+                self.enqueue_event(
+                    "TEXT_MESSAGE_START",
+                    json!({"messageId": active.id, "role": "assistant"}),
+                )
+                .await;
+                self.enqueue_event(
+                    "TEXT_MESSAGE_CONTENT",
+                    json!({"messageId": active.id, "delta": active.content}),
+                )
+                .await;
+                self.enqueue_event("TEXT_MESSAGE_END", json!({"messageId": active.id}))
+                    .await;
+            }
+            NarrativeKind::Reasoning => {
+                self.enqueue_process_title(&active.id, &active.title).await;
+                self.enqueue_event("REASONING_START", json!({"messageId": active.id}))
+                    .await;
+                self.enqueue_event(
+                    "REASONING_MESSAGE_START",
+                    json!({"messageId": active.id, "role": "reasoning"}),
+                )
+                .await;
+                self.enqueue_event(
+                    "REASONING_MESSAGE_CONTENT",
+                    json!({"messageId": active.id, "delta": active.content}),
+                )
+                .await;
+                self.enqueue_event("REASONING_MESSAGE_END", json!({"messageId": active.id}))
+                    .await;
+                self.enqueue_event("REASONING_END", json!({"messageId": active.id}))
+                    .await;
+            }
+        }
+        self.flush_events().await;
+    }
+
+    async fn enqueue_process_title(&mut self, cell_id: &str, title: &str) {
+        if title.trim().is_empty() {
+            return;
+        }
+        self.enqueue_event(
+            "TEXT_MESSAGE_CHUNK",
+            json!({
+                "messageId": format!("title-{cell_id}"),
+                "role": "assistant",
+                "delta": title
+            }),
+        )
+        .await;
     }
 
     async fn flush_pending_as_process(&mut self) {
@@ -357,27 +360,60 @@ impl FeishuReplyStream {
             return;
         }
         let content = std::mem::take(&mut self.pending_final_text);
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            self.process_timeline
-                .push_fixed(FeishuReplyKind::Text, content);
-            self.flush_compressed_process().await;
-        } else {
-            let mut card = self.begin_process_card();
-            card.replace_final(&content).await.ok();
-            self.capture_process_topic_root(card.message_id.clone());
-        }
+        self.close_active_narrative().await;
+        self.append_narrative(FeishuReplyKind::SupervisorMessage, &content)
+            .await;
+        self.close_active_narrative().await;
     }
 
-    async fn flush_compressed_process(&mut self) {
-        let content = self.process_timeline.render();
-        if content.is_empty() {
+    async fn finish_run(&mut self, status: &str) {
+        if self.cot.is_none() || self.cot_completed {
             return;
         }
-        if self.compressed_card.is_none() {
-            self.compressed_card = Some(self.begin_process_card());
+        self.queue_event(
+            "RUN_FINISHED",
+            json!({
+                "threadId": self.thread_id,
+                "runId": self.run_id,
+                "status": status,
+                "input": {"statusText": {"done": {
+                    "zh_cn": "任务已完成", "en_us": "Done"
+                }}}
+            }),
+        )
+        .await;
+        self.complete_run("done").await;
+    }
+
+    async fn fail_run(&mut self, code: &str, message: &str) {
+        self.close_active_narrative().await;
+        if self.cot.is_none() || self.cot_completed {
+            return;
         }
-        if let Some(card) = self.compressed_card.as_mut() {
-            card.replace(&content).await.ok();
+        self.queue_event(
+            "RUN_ERROR",
+            json!({
+                "threadId": self.thread_id,
+                "runId": self.run_id,
+                "message": message,
+                "code": code,
+                "input": {"statusText": {"error": {
+                    "zh_cn": "任务失败", "en_us": "Failed"
+                }}}
+            }),
+        )
+        .await;
+        self.complete_run("error").await;
+    }
+
+    async fn complete_run(&mut self, reason: &str) {
+        self.flush_events().await;
+        let Some(cot) = self.cot.as_ref() else {
+            return;
+        };
+        match self.gateway.complete_cot(cot, reason).await {
+            Ok(()) => self.cot_completed = true,
+            Err(err) => warn!("complete Feishu COT failed: {err:#}"),
         }
     }
 
@@ -390,45 +426,8 @@ impl FeishuReplyStream {
     }
 
     pub(super) async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) -> bool {
-        let key = format!("tool:{call_id}");
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            let created = !self
-                .process_timeline
-                .cells
-                .iter()
-                .any(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()));
-            if created {
-                self.flush_pending_as_process().await;
-            }
-            self.process_timeline
-                .upsert(key, FeishuReplyKind::ToolCall, line);
-            self.flush_compressed_process().await;
-            return created;
-        }
-        let created = !self.tool_cards.contains_key(call_id);
-        if created {
-            self.flush_pending_as_process().await;
-            self.finish_active().await;
-            let card = self.begin_process_card();
-            self.tool_cards.insert(call_id.to_string(), card);
-        }
-        let message_id = {
-            let card = self
-                .tool_cards
-                .get_mut(call_id)
-                .expect("tool card inserted");
-            if done {
-                card.replace_final(line).await.ok();
-            } else {
-                card.replace(line).await.ok();
-            }
-            card.message_id.clone()
-        };
-        if done {
-            self.tool_cards.remove(call_id);
-        }
-        self.capture_process_topic_root(message_id);
-        created
+        self.update_activity(call_id, "tool", "bash", line, done)
+            .await
     }
 
     pub(super) async fn update_context_compaction(
@@ -437,136 +436,99 @@ impl FeishuReplyStream {
         line: &str,
         done: bool,
     ) -> bool {
-        let key = format!("compaction:{id}");
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            let created = !self
-                .process_timeline
-                .cells
-                .iter()
-                .any(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()));
-            self.process_timeline
-                .upsert(key, FeishuReplyKind::ToolCall, line);
-            self.flush_compressed_process().await;
-            return created;
-        }
-        let created = !self.compaction_cards.contains_key(id);
-        if created {
-            self.finish_active().await;
-            let card = self.begin_process_card();
-            self.compaction_cards.insert(id.to_string(), card);
-        }
-        let message_id = {
-            let card = self
-                .compaction_cards
-                .get_mut(id)
-                .expect("compaction card inserted");
-            if done {
-                card.replace_final(line).await.ok();
-            } else {
-                card.replace(line).await.ok();
-            }
-            card.message_id.clone()
-        };
-        if done {
-            self.compaction_cards.remove(id);
-        }
-        self.capture_process_topic_root(message_id);
-        created
+        self.update_activity(
+            &format!("compaction-{id}"),
+            "context_compaction",
+            "read",
+            line,
+            done,
+        )
+        .await
     }
 
     pub(super) async fn update_sub_session(&mut self, id: &str, line: &str, done: bool) -> bool {
-        let key = format!("sub-session:{id}");
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            let created = !self
-                .process_timeline
-                .cells
-                .iter()
-                .any(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()));
-            if created {
-                self.flush_pending_as_process().await;
-            }
-            self.process_timeline
-                .upsert(key, FeishuReplyKind::ToolCall, line);
-            self.flush_compressed_process().await;
-            return created;
-        }
-        let created = !self.sub_session_cards.contains_key(id);
-        if created {
-            self.flush_pending_as_process().await;
-            self.finish_active().await;
-            let card = self.begin_process_card();
-            self.sub_session_cards.insert(id.to_string(), card);
-        }
-        let message_id = {
-            let card = self
-                .sub_session_cards
-                .get_mut(id)
-                .expect("sub-session card inserted");
-            if done {
-                card.replace_final(line).await.ok();
-            } else {
-                card.replace(line).await.ok();
-            }
-            card.message_id.clone()
-        };
-        if done {
-            self.sub_session_cards.remove(id);
-        }
-        self.capture_process_topic_root(message_id);
-        created
+        self.update_activity(
+            &format!("sub-session-{id}"),
+            "sub_session",
+            "task",
+            line,
+            done,
+        )
+        .await
     }
 
     pub(super) async fn update_status(&mut self, id: &str, line: &str) -> bool {
-        let key = format!("status:{id}");
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            let created = !self
-                .process_timeline
-                .cells
-                .iter()
-                .any(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()));
-            self.process_timeline
-                .upsert(key, FeishuReplyKind::ToolCall, line);
-            self.flush_compressed_process().await;
-            return created;
-        }
-        let created = !self.status_cards.contains_key(id);
-        if created {
-            self.finish_active().await;
-            let card = self.begin_process_card();
-            self.status_cards.insert(id.to_string(), card);
-        }
-        let card = self.status_cards.get_mut(id).expect("status card inserted");
-        card.replace(line).await.ok();
-        let message_id = card.message_id.clone();
-        self.capture_process_topic_root(message_id);
-        created
+        self.update_activity(&format!("status-{id}"), "status", "task", line, false)
+            .await
     }
 
     pub(super) async fn finish_status(&mut self, id: &str, line: &str) -> bool {
-        if self.layout == FeishuTurnLayout::CompressedProcessCard {
-            let key = format!("status:{id}");
-            let exists = self
-                .process_timeline
-                .cells
-                .iter()
-                .any(|(cell_key, _, _)| cell_key.as_deref() == Some(key.as_str()));
-            if exists {
-                self.process_timeline
-                    .upsert(key, FeishuReplyKind::ToolResult, line);
-                self.flush_compressed_process().await;
-            }
-            return exists;
-        }
-        let Some(mut card) = self.status_cards.remove(id) else {
+        let key = format!("status-{id}");
+        if !self.activities.contains(&key) {
             return false;
-        };
-        card.replace_final(line).await.ok();
+        }
+        self.update_activity(&key, "status", "task", line, true)
+            .await;
         true
+    }
+
+    async fn update_activity(
+        &mut self,
+        id: &str,
+        name: &str,
+        icon: &str,
+        line: &str,
+        done: bool,
+    ) -> bool {
+        self.flush_pending_as_process().await;
+        self.close_active_narrative().await;
+        let created = self.activities.insert(id.to_string());
+        if created {
+            self.enqueue_process_title(id, &process_title(line)).await;
+            self.enqueue_event(
+                "TOOL_CALL_START",
+                json!({
+                    "toolCallId": id,
+                    "toolCallName": name,
+                    "title": line,
+                    "icon": icon,
+                    "status": "running"
+                }),
+            )
+            .await;
+            self.enqueue_event("TOOL_CALL_END", json!({"toolCallId": id}))
+                .await;
+        }
+        if done {
+            self.enqueue_process_title(&format!("{id}-done"), &process_title(line))
+                .await;
+            self.enqueue_event(
+                "TOOL_CALL_RESULT",
+                json!({
+                    "messageId": format!("result-{id}"),
+                    "toolCallId": id,
+                    "content": line,
+                    "role": "tool",
+                    "status": "completed"
+                }),
+            )
+            .await;
+        }
+        if created || done {
+            self.flush_events().await;
+        }
+        created
+    }
+
+    async fn send_interactive_card(&self, card: serde_json::Value) -> anyhow::Result<String> {
+        self.gateway
+            .reply_card_raw(&self.parent_message_id, card)
+            .await
     }
 
     pub(super) async fn approval_requested(&mut self, request: &ToolApprovalRequest) {
         self.flush_pending_as_process().await;
-        self.finish_active().await;
+        self.close_active_narrative().await;
         let card = build_tool_approval_card(
             &request.id,
             &request.tool_name,
@@ -574,18 +536,16 @@ impl FeishuReplyStream {
             &request.args_summary,
             approval_review_text(request).as_deref(),
         );
-        let result = self.send_process_raw(card).await;
-        match result {
-            Ok(card_message_id) => {
-                self.approval_cards
-                    .insert(request.id.clone(), card_message_id);
+        match self.send_interactive_card(card).await {
+            Ok(message_id) => {
+                self.approval_cards.insert(request.id.clone(), message_id);
             }
             Err(err) => warn!("send approval card failed: {err:#}"),
         }
     }
 
     pub(super) async fn approval_updated(&mut self, request: &ToolApprovalRequest) {
-        let Some(card_message_id) = self.approval_cards.get(&request.id) else {
+        let Some(message_id) = self.approval_cards.get(&request.id) else {
             return;
         };
         let card = build_tool_approval_card(
@@ -595,7 +555,7 @@ impl FeishuReplyStream {
             &request.args_summary,
             approval_review_text(request).as_deref(),
         );
-        if let Err(err) = self.gateway.update_card_raw(card_message_id, card).await {
+        if let Err(err) = self.gateway.update_card_raw(message_id, card).await {
             warn!("update approval card failed: {err:#}");
         }
     }
@@ -605,7 +565,7 @@ impl FeishuReplyStream {
         request: &ToolApprovalRequest,
         decision: ToolApprovalDecision,
     ) {
-        let Some(card_message_id) = self.approval_cards.remove(&request.id) else {
+        let Some(message_id) = self.approval_cards.remove(&request.id) else {
             return;
         };
         let card = build_tool_approval_resolved_card(
@@ -614,14 +574,14 @@ impl FeishuReplyStream {
             &request.args_summary,
             tool_approval_decision_value(decision),
         );
-        if let Err(err) = self.gateway.update_card_raw(&card_message_id, card).await {
+        if let Err(err) = self.gateway.update_card_raw(&message_id, card).await {
             warn!("resolve approval card failed: {err:#}");
         }
     }
 
     pub(super) async fn user_question_requested(&mut self, request: &UserQuestionRequest) {
         self.flush_pending_as_process().await;
-        self.finish_active().await;
+        self.close_active_narrative().await;
         let options = request
             .options
             .iter()
@@ -635,18 +595,16 @@ impl FeishuReplyStream {
             request.allow_free_text,
             request.placeholder.as_deref(),
         );
-        let result = self.send_process_raw(card).await;
-        match result {
-            Ok(card_message_id) => {
-                self.question_cards
-                    .insert(request.id.clone(), card_message_id);
+        match self.send_interactive_card(card).await {
+            Ok(message_id) => {
+                self.question_cards.insert(request.id.clone(), message_id);
             }
             Err(err) => warn!("send user question card failed: {err:#}"),
         }
     }
 
     pub(super) async fn user_question_updated(&mut self, request: &UserQuestionRequest) {
-        let Some(card_message_id) = self.question_cards.get(&request.id) else {
+        let Some(message_id) = self.question_cards.get(&request.id) else {
             return;
         };
         let options = request
@@ -662,7 +620,7 @@ impl FeishuReplyStream {
             request.allow_free_text,
             request.placeholder.as_deref(),
         );
-        if let Err(err) = self.gateway.update_card_raw(card_message_id, card).await {
+        if let Err(err) = self.gateway.update_card_raw(message_id, card).await {
             warn!("update user question card failed: {err:#}");
         }
     }
@@ -672,7 +630,7 @@ impl FeishuReplyStream {
         request: &UserQuestionRequest,
         response: &UserQuestionResponse,
     ) {
-        let Some(card_message_id) = self.question_cards.remove(&request.id) else {
+        let Some(message_id) = self.question_cards.remove(&request.id) else {
             return;
         };
         let card = build_user_question_resolved_card(
@@ -680,10 +638,31 @@ impl FeishuReplyStream {
             user_question_status_value(response.status),
             response.answer_text.as_deref(),
         );
-        if let Err(err) = self.gateway.update_card_raw(&card_message_id, card).await {
+        if let Err(err) = self.gateway.update_card_raw(&message_id, card).await {
             warn!("resolve user question card failed: {err:#}");
         }
     }
+}
+
+fn process_title(content: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let title = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_start_matches('#')
+        .trim();
+    let plain = title
+        .chars()
+        .filter(|character| !matches!(character, '*' | '`'))
+        .collect::<String>();
+    let mut chars = plain.trim().chars();
+    let mut compact = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        compact.push('…');
+    }
+    compact
 }
 
 fn tool_approval_decision_value(decision: ToolApprovalDecision) -> &'static str {
@@ -726,90 +705,39 @@ fn approval_review_text(request: &ToolApprovalRequest) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn process_reply_target<'a>(
-    layout: FeishuTurnLayout,
-    user_message_id: &'a str,
-    process_root_message_id: Option<&'a str>,
-) -> (&'a str, bool) {
-    match (layout, process_root_message_id) {
-        (FeishuTurnLayout::ThreadedProcessCells, Some(root_message_id)) => (root_message_id, true),
-        _ => (user_message_id, false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{process_reply_target, FeishuReplyKind, FeishuTurnLayout, ProcessTimeline};
+    use super::{process_title, FeishuReplyKind, NarrativeKind};
 
     #[test]
-    fn normal_group_turns_process_cells_into_a_sub_topic() {
+    fn reasoning_is_hidden_inside_expanded_cot() {
         assert_eq!(
-            FeishuTurnLayout::for_message("group", Some("group"), None),
-            FeishuTurnLayout::ThreadedProcessCells
+            NarrativeKind::for_reply(FeishuReplyKind::Thinking),
+            NarrativeKind::Reasoning
         );
         assert_eq!(
-            FeishuTurnLayout::for_message("group", Some("group"), Some("omt_existing")),
-            FeishuTurnLayout::ThreadedProcessCells
+            NarrativeKind::for_reply(FeishuReplyKind::SupervisorThinking),
+            NarrativeKind::Reasoning
         );
     }
 
     #[test]
-    fn first_process_cell_becomes_root_and_later_cells_reply_in_its_topic() {
+    fn progress_copy_uses_cot_text_events() {
         assert_eq!(
-            process_reply_target(FeishuTurnLayout::ThreadedProcessCells, "user-message", None,),
-            ("user-message", false)
+            NarrativeKind::for_reply(FeishuReplyKind::SupervisorMessage),
+            NarrativeKind::Text
         );
         assert_eq!(
-            process_reply_target(
-                FeishuTurnLayout::ThreadedProcessCells,
-                "user-message",
-                Some("first-process-cell"),
-            ),
-            ("first-process-cell", true)
-        );
-        assert_eq!(
-            process_reply_target(
-                FeishuTurnLayout::CompressedProcessCard,
-                "topic-user-message",
-                Some("ignored-process-root"),
-            ),
-            ("topic-user-message", false)
+            NarrativeKind::for_reply(FeishuReplyKind::Stats),
+            NarrativeKind::Text
         );
     }
 
     #[test]
-    fn existing_topics_and_direct_messages_compress_process_cells() {
+    fn process_copy_uses_the_first_non_empty_cell_title() {
         assert_eq!(
-            FeishuTurnLayout::for_message("group", Some("topic"), Some("omt_topic")),
-            FeishuTurnLayout::CompressedProcessCard
-        );
-        assert_eq!(
-            FeishuTurnLayout::for_message("p2p", Some("p2p"), None),
-            FeishuTurnLayout::CompressedProcessCard
-        );
-    }
-
-    #[test]
-    fn compressed_process_card_preserves_tui_cell_boundaries() {
-        let mut timeline = ProcessTimeline::default();
-        timeline.append_stream(FeishuReplyKind::Thinking, "think one");
-        timeline.append_stream(FeishuReplyKind::Thinking, " + two");
-        assert!(timeline.upsert(
-            "tool:1".to_string(),
-            FeishuReplyKind::ToolCall,
-            "tool running"
-        ));
-        assert!(!timeline.upsert(
-            "tool:1".to_string(),
-            FeishuReplyKind::ToolResult,
-            "tool done"
-        ));
-        timeline.append_stream(FeishuReplyKind::Thinking, "think after tool");
-
-        assert_eq!(timeline.cells.len(), 3);
-        assert_eq!(
-            timeline.render(),
-            "think one + two\n\n---\n\ntool done\n\n---\n\nthink after tool"
+            process_title("\n**Running bash** — cargo test\nmore details"),
+            "Running bash — cargo test"
         );
     }
 }

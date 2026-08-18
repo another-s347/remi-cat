@@ -1,15 +1,15 @@
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::channel::cli::{process_cli_message, process_prompt_message};
-use crate::channel::feishu::im_mode_from_env;
 #[cfg(test)]
 pub(crate) use crate::channel::feishu::{
     feishu_session_channel_id, feishu_topic_channel_id, format_context_compaction_line,
-    format_feishu_tool_line, should_ignore_unaddressed_topic_start, FeishuReplyKind,
+    format_feishu_tool_line, should_ignore_unaddressed_topic_start,
 };
 use crate::channel::Channel;
 #[cfg(test)]
@@ -43,8 +43,9 @@ pub(crate) use crate::command::{
     run_update_command,
 };
 use crate::config::{
-    detect_setup_state, has_legacy_env_credentials, resolve_runtime_config_for_run, ImMode,
-    SetupState,
+    detect_setup_state_at, has_legacy_env_credentials, load_channels_config_at,
+    load_runtime_config_at, resolve_runtime_config_at_for_run, ChannelInstanceConfig,
+    ChannelsConfig, RuntimeConfig, SetupState,
 };
 use crate::core::Runtime;
 use crate::instance_profile::{tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
@@ -56,6 +57,7 @@ use crate::profile_command::{
     apply_runtime_config_entries, ensure_builtin_diagnostic_profile, prefix_short_config_entry,
     run_noninteractive_setup, run_profile_command,
 };
+use crate::profile_registry::ProfileRegistry;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::SessionRuntime;
 use crate::{host_admin, web_chat};
@@ -86,7 +88,13 @@ pub(crate) fn parse_session_reasoning_effort(
 }
 
 fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
-    match resolve_runtime_config_for_run(data_dir, tui_mode) {
+    let config_path = std::env::var_os("REMI_RUNTIME_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::runtime_config::runtime_config_path(data_dir));
+    let manifest_data_dir = std::env::var_os("REMI_PROFILE_PATH")
+        .and_then(|_| std::env::var_os("REMI_DATA_DIR"))
+        .map(PathBuf::from);
+    match resolve_runtime_config_at_for_run(&config_path, data_dir, tui_mode) {
         Ok(resolution) => {
             tracing::info!(
                 source = ?resolution.source,
@@ -98,7 +106,11 @@ fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
                 data_dir = %resolution.data_dir.display(),
                 "resolved runtime config"
             );
-            *data_dir = resolution.data_dir;
+            *data_dir = manifest_data_dir.unwrap_or(resolution.data_dir);
+            unsafe { std::env::set_var("REMI_DATA_DIR", &*data_dir) };
+            if let Some(workspace) = std::env::var_os("REMI_PROFILE_WORKSPACE") {
+                unsafe { std::env::set_var("REMI_SANDBOX_HOST_DIR", workspace) };
+            }
         }
         Err(err) => tracing::warn!(error = %err, "failed to resolve runtime config"),
     }
@@ -119,6 +131,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let command = parsed.command;
     let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
     let acp_agent_mode = matches!(&command, AppCommand::Acp(AcpCommand::Agent));
+    let a2a_stdio_mode = matches!(&command, AppCommand::A2a(crate::cli::A2aCommand::Stdio));
     let explicit_data_dir = if tui_mode {
         None
     } else if acp_agent_mode {
@@ -126,17 +139,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     } else {
         std::env::var_os("REMI_DATA_DIR").map(PathBuf::from)
     };
+    let profile_registry_root =
+        resolve_profile_registry_root(explicit_data_dir.clone(), tui_mode || acp_agent_mode);
     let selected_profile = resolve_instance_profile(
         parsed.profile,
         explicit_data_dir.clone(),
         tui_mode,
         acp_agent_mode,
     )?;
+    selected_profile.apply_resource_env();
     if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
         ensure_builtin_diagnostic_profile()?;
     }
     let mut data_dir = selected_profile.data_dir.clone();
-    let profile_telemetry = match detect_setup_state(&data_dir) {
+    let profile_telemetry = match detect_setup_state_at(&selected_profile.runtime_config, &data_dir)
+    {
         SetupState::Initialized { config, .. } => config.telemetry,
         _ => crate::runtime_config::TelemetryConfig::default(),
     };
@@ -183,7 +200,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             &command,
             AppCommand::Run(cli) if cli.tui
         ),
-        acp_agent_mode,
+        acp_agent_mode || a2a_stdio_mode,
         &data_dir,
         telemetry_enabled
             .then(crate::telemetry::builtin_dsn)
@@ -194,8 +211,27 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     )?;
     let result: anyhow::Result<()> = async {
     std::fs::create_dir_all(&data_dir)?;
+    let default_dotenv_path = if tui_mode || acp_agent_mode {
+        data_dir.join(".env")
+    } else {
+        std::env::current_dir()
+            .context("resolving process secret directory")?
+            .join(".env")
+    };
+    if std::env::var_os("REMI_SECRET_DOTENV_PATH").is_none() {
+        let absolute_dotenv_path = if default_dotenv_path.is_absolute() {
+            default_dotenv_path.clone()
+        } else {
+            std::env::current_dir()
+                .context("resolving process secret directory")?
+                .join(&default_dotenv_path)
+        };
+        unsafe {
+            std::env::set_var("REMI_SECRET_DOTENV_PATH", absolute_dotenv_path);
+        }
+    }
     let secret_store = Arc::new(Mutex::new(if tui_mode || acp_agent_mode {
-        SecretStore::from_env_with_default_dotenv_path(data_dir.join(".env"))
+        SecretStore::from_env_with_default_dotenv_path(default_dotenv_path)
     } else {
         SecretStore::from_env()
     }));
@@ -217,7 +253,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     );
 
     if let AppCommand::Profile(profile_command) = &command {
-        run_profile_command(profile_command, &data_dir).await?;
+        run_profile_command(
+            profile_command,
+            &profile_registry_root,
+            &selected_profile,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -239,7 +280,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         AppCommand::Tasks(command) => {
-            run_tasks_command(&data_dir, &command).await?;
+            run_tasks_command(&selected_profile.tasks_dir, &command).await?;
             return Ok(());
         }
         AppCommand::Secrets(command) => {
@@ -313,6 +354,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         AppCommand::Profile(_) => unreachable!(),
+        AppCommand::A2a(crate::cli::A2aCommand::Stdio) => {
+            unsafe { std::env::set_var("REMI_DATA_DIR", &data_dir) };
+            apply_runtime_env_defaults(&mut data_dir, false);
+            if !matches!(
+                detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
+                SetupState::Initialized { .. }
+            ) && !has_legacy_env_credentials()
+            {
+                anyhow::bail!("selected profile is not initialized; configure its runtime before serving A2A");
+            }
+        }
         AppCommand::Feishu(FeishuCommand::Init) => {
             run_feishu_init(Arc::clone(&secret_store)).await?;
             return Ok(());
@@ -346,7 +398,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 }
             }
             if !matches!(
-                detect_setup_state(&data_dir),
+                detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
                 SetupState::Initialized { .. }
             ) && !has_legacy_env_credentials()
             {
@@ -391,7 +443,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     std::env::set_var("REMI_ASYNC_AGENT", "false");
                 }
             }
-            if cli.tui {
+            if cli.tui && selected_profile.workspace.is_none() {
                 let workspace_dir =
                     std::env::current_dir().context("resolving current workspace")?;
                 unsafe {
@@ -408,7 +460,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
             if !matches!(cli.admin_only, true)
                 && !matches!(
-                    detect_setup_state(&data_dir),
+                    detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
                     SetupState::Initialized { .. }
                 )
                 && !has_legacy_env_credentials()
@@ -422,7 +474,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             unsafe {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
             }
-            if let Ok(resolution) = resolve_runtime_config_for_run(&data_dir, false) {
+            if let Ok(resolution) = resolve_runtime_config_at_for_run(
+                &selected_profile.runtime_config,
+                &data_dir,
+                false,
+            ) {
                 tracing::debug!(
                     source = ?resolution.source,
                     model_profile = resolution
@@ -433,7 +489,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     data_dir = %resolution.data_dir.display(),
                     "resolved runtime config"
                 );
-                data_dir = resolution.data_dir;
+                data_dir = if selected_profile.manifest_path.is_some() {
+                    selected_profile.data_dir.clone()
+                } else {
+                    resolution.data_dir
+                };
             }
             if let Some(overflow_bytes) = tool_output_overflow_bytes {
                 unsafe {
@@ -444,7 +504,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 }
             }
             if !matches!(
-                detect_setup_state(&data_dir),
+                detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
                 SetupState::Initialized { .. }
             ) && !has_legacy_env_credentials()
             {
@@ -455,14 +515,40 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
 
-    install_embedded_model_profiles(data_dir.join("models"))?;
-    install_embedded_agent_profiles(data_dir.join("agents"))?;
-    std::fs::create_dir_all(data_dir.join("workflows"))?;
+    install_embedded_model_profiles(&selected_profile.models_dir)?;
+    install_embedded_agent_profiles(&selected_profile.agents_dir)?;
+    std::fs::create_dir_all(&selected_profile.workflows_dir)?;
+
+    if matches!(&command, AppCommand::A2a(crate::cli::A2aCommand::Stdio)) {
+        let root_agent_id =
+            std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
+        let workspace = selected_profile
+            .workspace
+            .clone()
+            .unwrap_or(std::env::current_dir().context("resolving A2A workspace")?);
+        let (credentials, application_secret_store) = {
+            let store = secret_store.lock().await;
+            (store.entries()?, store.clone())
+        };
+        let mut builder = crate::application::ApplicationBuilder::new(data_dir.clone())
+            .profile(&selected_profile.manifest)
+            .workspace(workspace)
+            .credentials(credentials)
+            .secret_store(application_secret_store)
+            .default_agent(root_agent_id);
+        for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+            builder = builder.tool(tool);
+        }
+        let application = builder.spawn().await?;
+        return crate::a2a_stdio::serve_application(application.handle()).await;
+    }
 
     if matches!(&command, AppCommand::Acp(AcpCommand::Agent)) {
         let root_agent_id =
             std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
-        let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
+        let sessions = Arc::new(Mutex::new(SessionRuntime::load_path(
+            selected_profile.sessions_path.clone(),
+        )?));
         let factory = Rc::new(crate::acp_agent::AcpRuntimeFactory::new(
             data_dir.clone(),
             secret_store,
@@ -488,25 +574,33 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             wait_background_tasks: false,
             async_agent: false,
         },
+        AppCommand::A2a(_) => unreachable!(),
         _ => unreachable!(),
     };
     let root_agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
-    let agents_dir = std::env::var("REMI_AGENTS_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| data_dir.join("agents"));
+    let agents_dir = selected_profile.agents_dir.clone();
+    let primary_skills_dir = selected_profile
+        .skills_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| data_dir.join("skills"));
 
     if cli.admin_only {
         let workspace_dir = current_workspace_dir(&data_dir);
-        let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
+        let sessions = Arc::new(Mutex::new(SessionRuntime::load_path(
+            selected_profile.sessions_path.clone(),
+        )?));
         maybe_start_admin(host_admin::AdminState {
+            data_dir: data_dir.clone(),
             agents_dir,
-            skills_dir: data_dir.join("skills"),
+            skills_dir: primary_skills_dir.clone(),
+            tasks_dir: selected_profile.tasks_dir.clone(),
             workspace_root_label: current_workspace_root_label(&workspace_dir),
             workspace_dir,
             secret_store: Arc::clone(&secret_store),
             sessions,
             root_agent_id,
-            setup_state: detect_setup_state(&data_dir),
+            setup_state: detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
             web_chat: None,
         })
         .await?;
@@ -521,7 +615,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             (store.entries()?, store.clone())
         };
         let mut builder = crate::application::ApplicationBuilder::new(data_dir.clone())
-            .app_id("remi-cat")
+            .profile(&selected_profile.manifest)
             .workspace(workspace)
             .credentials(credentials)
             .secret_store(application_secret_store)
@@ -539,37 +633,92 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .with_content_capture(profile_telemetry.capture_agent_content),
             );
         }
+        for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+            builder = builder.tool(tool);
+        }
         let application = builder.spawn().await?;
+        let application_handle = application.handle();
+        let a2a_required_for_delegates = application_handle
+            .channel(crate::application::ChannelConfig::new("a2a-bootstrap"))
+            .catalog()
+            .await?
+            .agents
+            .iter()
+            .any(|agent| !agent.delegates.is_empty());
+        crate::a2a_channel::maybe_start_application(
+            application_handle,
+            data_dir.clone(),
+            a2a_required_for_delegates,
+        )
+        .await?;
         return crate::channel::tui::TuiChannel::new(cli)
             .run_once(application)
             .await;
     }
 
-    let im_disabled = matches!(im_mode_from_env(), ImMode::Disabled);
-    let gateway = if im_disabled || cli.enabled || cli.tui || cli.once.is_some() {
-        None
-    } else {
-        match (
-            std::env::var("FEISHU_APP_ID").ok(),
-            std::env::var("FEISHU_APP_SECRET").ok(),
-        ) {
-            (Some(app_id), Some(app_secret))
-                if !app_id.trim().is_empty() && !app_secret.trim().is_empty() =>
-            {
-                Some(FeishuGateway::new(app_id, app_secret))
+    let channels_config = load_channels_config_at(&selected_profile.channels_config)?
+        .unwrap_or_else(|| {
+            let runtime = load_runtime_config_at(&selected_profile.runtime_config, &data_dir)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| RuntimeConfig::default_for(&data_dir));
+            ChannelsConfig::from_legacy(&runtime.im)
+        });
+    let mut feishu_channels = Vec::new();
+    let mut feishu_gateways = HashMap::new();
+    if !cli.enabled && !cli.tui && cli.once.is_none() {
+        for channel in channels_config.channels {
+            let ChannelInstanceConfig::Feishu {
+                id,
+                enabled,
+                transport,
+                event_hook,
+                credentials,
+            } = channel;
+            if !enabled {
+                continue;
             }
-            _ => {
-                warn!("Feishu credentials are not configured — running in Web-only mode");
-                None
+            let app_id = std::env::var(&credentials.app_id_env).ok();
+            let app_secret = std::env::var(&credentials.app_secret_env).ok();
+            let (Some(app_id), Some(app_secret)) = (app_id, app_secret) else {
+                warn!(
+                    connector = %id,
+                    app_id_env = %credentials.app_id_env,
+                    app_secret_env = %credentials.app_secret_env,
+                    "Feishu connector credentials are not configured"
+                );
+                continue;
+            };
+            if app_id.trim().is_empty() || app_secret.trim().is_empty() {
+                warn!(connector = %id, "Feishu connector credentials are empty");
+                continue;
             }
+            let platform = feishu_platform_for_instance(&id);
+            let gateway = FeishuGateway::new(app_id, app_secret);
+            let event_hook = crate::runtime_config::FeishuEventHookRuntimeConfig {
+                host: event_hook.host,
+                port: event_hook.port,
+                path: event_hook.path,
+                verification_token: event_hook
+                    .verification_token_env
+                    .as_deref()
+                    .and_then(|key| std::env::var(key).ok())
+                    .unwrap_or_default(),
+            };
+            feishu_gateways.insert(platform.clone(), gateway.clone());
+            feishu_channels.push(crate::channel::feishu::FeishuChannel::configured(
+                platform,
+                gateway,
+                transport,
+                event_hook,
+            ));
         }
-    };
+    }
 
-    let bridge: Arc<dyn ImFileBridge> = Arc::new(crate::channel::feishu::LocalImFileBridge::new(
-        gateway.clone(),
-    ));
-    let bot = Rc::new(
-        CatBotBuilder::from_env()?
+    let bridge: Arc<dyn ImFileBridge> = Arc::new(
+        crate::channel::feishu::LocalImFileBridge::with_gateways(feishu_gateways),
+    );
+    let mut bot_builder = CatBotBuilder::from_env()?
             .agent_tracing(if agent_tracing_enabled {
                 bot_core::AgentTracingOptions::enabled(
                     profile_telemetry.capture_agent_content,
@@ -577,19 +726,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             } else {
                 bot_core::AgentTracingOptions::default()
             })
-            .im_bridge(Arc::clone(&bridge))
-            .build()?,
-    );
+            .im_bridge(Arc::clone(&bridge));
+    for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+        bot_builder = bot_builder.enabled_tool(tool);
+    }
+    let bot = Rc::new(bot_builder.build()?);
     bot.update_secret_redactor(&redaction_entries(&secret_store.lock().await.entries()?));
     if let AppCommand::Tools(args) = &command {
         print_registered_tools(&bot, args.json)?;
         return Ok(());
     }
-    let sessions = Arc::new(Mutex::new(SessionRuntime::load(data_dir.clone())?));
+    let sessions = Arc::new(Mutex::new(SessionRuntime::load_path(
+        selected_profile.sessions_path.clone(),
+    )?));
+    let a2a_required_for_delegates = bot.has_delegate_agents();
     let runtime = Rc::new(Runtime {
         bot,
         secret_store,
-        user_store: Arc::new(UserStore::load(data_dir.join("users.json"))?),
+        user_store: Arc::new(UserStore::load(&selected_profile.users_path)?),
         sessions,
         im_bridge: Arc::clone(&bridge),
         root_agent_id,
@@ -599,18 +753,28 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if !cli.pure_prompt && !cli.tui {
         let workspace_dir = current_workspace_dir(&data_dir);
         maybe_start_admin(host_admin::AdminState {
+            data_dir: data_dir.clone(),
             agents_dir,
-            skills_dir: data_dir.join("skills"),
+            skills_dir: primary_skills_dir,
+            tasks_dir: selected_profile.tasks_dir.clone(),
             workspace_root_label: current_workspace_root_label(&workspace_dir),
             workspace_dir,
             secret_store: Arc::clone(&runtime.secret_store),
             sessions: Arc::clone(&runtime.sessions),
             root_agent_id: runtime.root_agent_id.clone(),
-            setup_state: detect_setup_state(&data_dir),
-            web_chat: Some(web_chat),
+            setup_state: detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
+            web_chat: Some(web_chat.clone()),
         })
         .await?;
     }
+    crate::a2a_channel::maybe_start(
+        web_chat.clone(),
+        Arc::clone(&runtime.sessions),
+        runtime.root_agent_id.clone(),
+        data_dir.clone(),
+        a2a_required_for_delegates,
+    )
+    .await?;
 
     let local_set = tokio::task::LocalSet::new();
     local_set
@@ -629,18 +793,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if cli.enabled {
                 return crate::channel::cli::CliChannel::new(cli).run(runtime).await;
             }
-            match gateway {
-                Some(gateway) => {
-                    crate::channel::feishu::FeishuChannel::new(gateway)
-                        .run(runtime)
-                        .await
-                }
-                None => {
-                    info!("Web Chat ready; waiting for shutdown");
-                    tokio::signal::ctrl_c().await?;
-                    Ok(())
-                }
+            for channel in feishu_channels {
+                let runtime = Rc::clone(&runtime);
+                tokio::task::spawn_local(async move {
+                    let connector = channel.kind().as_platform();
+                    if let Err(error) = channel.run(runtime).await {
+                        warn!(connector, error = %error, "IM channel stopped");
+                    }
+                });
             }
+            info!("Web Chat and configured IM channels ready; waiting for shutdown");
+            tokio::signal::ctrl_c().await?;
+            Ok(())
         })
         .await
     }
@@ -651,6 +815,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     result
 }
 
+fn feishu_platform_for_instance(id: &str) -> String {
+    if id == "feishu.default" {
+        FEISHU_CHANNEL.to_string()
+    } else {
+        format!("feishu:{id}")
+    }
+}
+
 fn resolve_instance_profile(
     cli_profile: Option<String>,
     explicit_data_dir: Option<PathBuf>,
@@ -658,41 +830,84 @@ fn resolve_instance_profile(
     home_default: bool,
 ) -> anyhow::Result<InstanceProfile> {
     if tui_mode {
-        if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
-            return InstanceProfile::named_in_data_root(&name, &tui_home_data_dir());
+        if let Some(selector) = cli_profile
+            .clone()
+            .or_else(|| std::env::var("REMI_PROFILE").ok())
+        {
+            return resolve_profile_selector(&selector, &tui_home_data_dir());
         }
-        return Ok(InstanceProfile {
-            name: None,
-            data_dir: tui_home_data_dir(),
-        });
+        return Ok(InstanceProfile::builtin_default(tui_home_data_dir()));
+    }
+    if let Some(selector) = cli_profile {
+        if let Some(data_root) = explicit_data_dir.as_deref() {
+            return resolve_profile_selector(&selector, data_root);
+        }
+        if home_default {
+            return resolve_profile_selector(&selector, &tui_home_data_dir());
+        }
+        return resolve_profile_selector(
+            &selector,
+            Path::new(crate::instance_profile::DEFAULT_DATA_DIR),
+        );
     }
     if let Some(data_dir) = explicit_data_dir {
-        return Ok(InstanceProfile {
-            name: None,
-            data_dir,
-        });
+        return Ok(InstanceProfile::builtin_default(data_dir));
     }
-    if let Some(name) = cli_profile.or_else(|| std::env::var("REMI_PROFILE").ok()) {
+    if let Ok(selector) = std::env::var("REMI_PROFILE") {
         if home_default {
-            return InstanceProfile::named_in_data_root(&name, &tui_home_data_dir());
+            return resolve_profile_selector(&selector, &tui_home_data_dir());
         }
-        return InstanceProfile::named(&name);
+        return resolve_profile_selector(
+            &selector,
+            Path::new(crate::instance_profile::DEFAULT_DATA_DIR),
+        );
     }
     if !home_default {
         if let Some(data_dir) = std::env::var_os("REMI_DATA_DIR").map(PathBuf::from) {
-            return Ok(InstanceProfile {
-                name: None,
-                data_dir,
-            });
+            return Ok(InstanceProfile::builtin_default(data_dir));
         }
     }
     if home_default {
-        return Ok(InstanceProfile {
-            name: None,
-            data_dir: tui_home_data_dir(),
-        });
+        return Ok(InstanceProfile::builtin_default(tui_home_data_dir()));
     }
     Ok(InstanceProfile::default_instance())
+}
+
+fn resolve_profile_selector(selector: &str, data_root: &Path) -> anyhow::Result<InstanceProfile> {
+    if looks_like_profile_path(selector) {
+        return InstanceProfile::from_manifest(selector);
+    }
+    if selector.starts_with('@') || selector.starts_with("id:") {
+        let registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.to_path_buf());
+        return ProfileRegistry::load(registry_root)?.resolve(selector);
+    }
+    InstanceProfile::from_label_in_data_root(selector, data_root)
+}
+
+fn resolve_profile_registry_root(
+    explicit_data_dir: Option<PathBuf>,
+    home_default: bool,
+) -> PathBuf {
+    std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
+        .map(PathBuf::from)
+        .or(explicit_data_dir)
+        .unwrap_or_else(|| {
+            if home_default {
+                tui_home_data_dir()
+            } else {
+                PathBuf::from(crate::instance_profile::DEFAULT_DATA_DIR)
+            }
+        })
+}
+
+fn looks_like_profile_path(value: &str) -> bool {
+    value.ends_with(".yaml")
+        || value.ends_with(".yml")
+        || value.contains('/')
+        || value.contains('\\')
+        || Path::new(value).is_dir()
 }
 
 fn absolute_env_path(key: &str) -> Option<PathBuf> {
@@ -739,8 +954,8 @@ async fn wait_for_cli_background_tasks(runtime: Rc<Runtime>, cli: &CliConfig) {
     }
 }
 
-async fn run_tasks_command(data_dir: &Path, command: &TasksCommand) -> anyhow::Result<()> {
-    let manager = bot_core::ToolTaskManager::load(data_dir)?;
+async fn run_tasks_command(tasks_dir: &Path, command: &TasksCommand) -> anyhow::Result<()> {
+    let manager = bot_core::ToolTaskManager::load_store_dir(tasks_dir)?;
     match command {
         TasksCommand::List { json } => {
             let tasks = manager.list(None).await;
@@ -899,6 +1114,7 @@ fn command_surface(command: &AppCommand) -> &'static str {
         AppCommand::Run(cli) if cli.tui => "tui",
         AppCommand::Run(_) => "cli",
         AppCommand::Acp(_) | AppCommand::AcpAdapter(_) => "acp",
+        AppCommand::A2a(_) => "a2a-stdio",
         AppCommand::Feishu(_) => "feishu",
         AppCommand::Feedback(_) => "feedback",
         _ => "cli-command",
@@ -927,21 +1143,19 @@ fn effective_agent_tracing_enabled(
 mod cli_tests {
     use super::{
         build_cargo_install_args, extract_first_url, extract_lark_cli_config_from_json,
-        feishu_doctor_message, feishu_session_channel_id, feishu_topic_channel_id,
-        first_available_port, format_context_compaction_line, format_feishu_tool_line,
-        is_goal_set_command, normalize_release_tag, parse_cli_args, parse_command,
-        parse_global_args, parse_goal_max_rounds, parse_release_version,
+        feishu_doctor_message, feishu_platform_for_instance, feishu_session_channel_id,
+        feishu_topic_channel_id, first_available_port, format_context_compaction_line,
+        format_feishu_tool_line, is_goal_set_command, normalize_release_tag, parse_cli_args,
+        parse_command, parse_global_args, parse_goal_max_rounds, parse_release_version,
         parse_workflow_start_options, prefix_short_config_entry, redact_known_secrets,
-        run_streaming_command, run_streaming_command_with_stdin,
-        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
-        AcpAdapterCommand, AcpCommand, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-        FeishuCommand, FeishuDoctorStatus, FeishuReplyKind, HooksCommand, ProfileCommand,
-        TelemetryCommand, UpdateCommand,
+        resolve_instance_profile, resolve_profile_registry_root, run_streaming_command,
+        run_streaming_command_with_stdin, should_ignore_unaddressed_topic_start,
+        try_parse_cli_args, update_available, AcpAdapterCommand, AcpCommand, AppCommand, CliConfig,
+        CodexCommand, FeedbackCommand, FeishuCommand, FeishuDoctorStatus, HooksCommand,
+        ProfileCommand, TelemetryCommand, UpdateCommand,
     };
     use crate::direct_workflow_options;
-    use crate::profile_command::{
-        ProfileAgentCommand, ProfileWorkflowCommand, PROFILE_RUNTIME_ENV_KEYS,
-    };
+    use crate::profile_command::{ProfileAgentCommand, ProfileWorkflowCommand};
     use bot_core::{GoalMaxRounds, PrettyToolCall};
     use clap::error::ErrorKind;
     use im_feishu::FeishuMessage;
@@ -953,6 +1167,50 @@ mod cli_tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn named_feishu_instances_receive_distinct_platform_namespaces() {
+        assert_eq!(feishu_platform_for_instance("feishu.default"), "feishu");
+        assert_eq!(feishu_platform_for_instance("work"), "feishu:work");
+        assert_ne!(
+            feishu_platform_for_instance("work"),
+            feishu_platform_for_instance("travel")
+        );
+    }
+
+    #[test]
+    fn explicit_profile_name_wins_over_explicit_data_root() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = resolve_instance_profile(
+            Some("travel".to_string()),
+            Some(root.path().to_path_buf()),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(profile.name.as_deref(), Some("travel"));
+        assert_eq!(profile.data_dir, root.path().join("profiles/travel"));
+    }
+
+    #[test]
+    fn tui_registry_defaults_to_the_same_home_root_as_profile_selection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT");
+        unsafe { std::env::remove_var("REMI_PROFILE_REGISTRY_ROOT") };
+
+        assert_eq!(
+            resolve_profile_registry_root(None, true),
+            crate::instance_profile::tui_home_data_dir()
+        );
+
+        unsafe {
+            match old_registry_root {
+                Some(value) => std::env::set_var("REMI_PROFILE_REGISTRY_ROOT", value),
+                None => std::env::remove_var("REMI_PROFILE_REGISTRY_ROOT"),
+            }
+        }
     }
 
     #[test]
@@ -1099,6 +1357,61 @@ mod cli_tests {
                 .join("profiles")
                 .join("dev")
         );
+    }
+
+    #[test]
+    fn registered_alias_is_a_valid_global_profile_selector() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("profile.yaml");
+        std::fs::write(
+            &manifest,
+            "schema_version: 1\nid: travel.planner\nname: Travel\nendpoint:\n  type: local\n  command: sleep 1\n",
+        )
+        .unwrap();
+        let mut registry =
+            crate::profile_registry::ProfileRegistry::load(data_root.path()).unwrap();
+        registry.register(&manifest, Some("travel"), false).unwrap();
+
+        let profile = super::resolve_instance_profile(
+            Some("@travel".to_string()),
+            Some(data_root.path().to_path_buf()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(profile.manifest.id, "travel.planner");
+    }
+
+    #[test]
+    fn explicit_registry_root_controls_tui_alias_selection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let registry_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let manifest = project.path().join("profile.yaml");
+        std::fs::write(
+            &manifest,
+            "schema_version: 1\nid: custom.travel\nname: Custom Travel\nendpoint:\n  type: local\n  command: sleep 1\n",
+        )
+        .unwrap();
+        crate::profile_registry::ProfileRegistry::load(registry_root.path())
+            .unwrap()
+            .register(&manifest, Some("travel"), false)
+            .unwrap();
+        let old_registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT");
+        unsafe { std::env::set_var("REMI_PROFILE_REGISTRY_ROOT", registry_root.path()) };
+
+        let profile =
+            resolve_instance_profile(Some("@travel".to_string()), None, true, false).unwrap();
+
+        assert_eq!(profile.manifest.id, "custom.travel");
+        unsafe {
+            match old_registry_root {
+                Some(value) => std::env::set_var("REMI_PROFILE_REGISTRY_ROOT", value),
+                None => std::env::remove_var("REMI_PROFILE_REGISTRY_ROOT"),
+            }
+        }
     }
 
     #[test]
@@ -1293,8 +1606,10 @@ mod cli_tests {
     }
 
     #[test]
-    fn rejects_invalid_or_duplicate_global_profiles() {
-        assert!(parse_global_args(&args(&["--profile", "../dev", "doctor"])).is_err());
+    fn accepts_profile_paths_and_rejects_duplicate_global_profiles() {
+        let parsed =
+            parse_global_args(&args(&["--profile", "../dev/profile.yaml", "doctor"])).unwrap();
+        assert_eq!(parsed.profile.as_deref(), Some("../dev/profile.yaml"));
         assert!(
             parse_global_args(&args(&["--profile", "dev", "--profile", "prod", "doctor",]))
                 .is_err()
@@ -1305,7 +1620,8 @@ mod cli_tests {
     fn profile_management_commands_are_recognized() {
         assert!(matches!(
             parse_command(&args(&["profile", "list"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::List)
+            AppCommand::Profile(ProfileCommand::List { scope, format })
+                if scope == "all" && format == "table"
         ));
         assert!(matches!(
             parse_command(&args(&["profile", "delete", "dev", "--force"])).unwrap(),
@@ -1322,25 +1638,16 @@ mod cli_tests {
         assert!(
             parse_command(&args(&["profile", "delete", "remi_diagnostics", "--force"])).is_err()
         );
+        assert!(parse_command(&args(&["profile", "start", "default"])).is_err());
+        assert!(parse_command(&args(&["profile", "status", "--all"])).is_err());
         assert!(matches!(
-            parse_command(&args(&["profile", "start", "default"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::Start(name)) if name == "default"
+            parse_command(&args(&["profile", "ask", "@travel", "plan", "a", "trip"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Ask { reference, task, named, agent_id })
+                if reference == "@travel" && task == "plan a trip" && named == "default" && agent_id.is_none()
         ));
         assert!(matches!(
-            parse_command(&args(&["profile", "stop", "dev", "--force"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::Stop { name, force }) if name == "dev" && force
-        ));
-        assert!(matches!(
-            parse_command(&args(&["profile", "restart", "dev"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::Restart { name, force }) if name == "dev" && !force
-        ));
-        assert!(matches!(
-            parse_command(&args(&["profile", "status", "--all"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::StatusAll)
-        ));
-        assert!(matches!(
-            parse_command(&args(&["profile", "status", "default"])).unwrap(),
-            AppCommand::Profile(ProfileCommand::Status(name)) if name == "default"
+            parse_command(&args(&["a2a", "stdio"])).unwrap(),
+            AppCommand::A2a(crate::cli::A2aCommand::Stdio)
         ));
         assert!(matches!(
             parse_command(&args(&["profile", "agent", "list", "dev"])).unwrap(),
@@ -1443,26 +1750,6 @@ mod cli_tests {
             parse_workflow_start_options("--context {\"goal\":\"verify the task\"}").unwrap();
         assert_eq!(context, serde_json::json!({ "goal": "verify the task" }));
         assert_eq!(max_rounds, bot_core::WorkflowMaxRounds::Limited(20));
-    }
-
-    #[test]
-    fn profile_start_clears_runtime_override_env() {
-        for key in [
-            "REMI_AGENT_ID",
-            "REMI_MODEL_PROFILE",
-            "REMI_AGENTS_DIR",
-            "REMI_SANDBOX_KIND",
-            "REMI_SANDBOX_HOST_DIR",
-            "REMI_ADMIN_PORT",
-            "REMI_IM_MODE",
-            "REMI_SHELL_MODE",
-            "REMI_ACP_CLIENT",
-        ] {
-            assert!(
-                PROFILE_RUNTIME_ENV_KEYS.contains(&key),
-                "missing runtime env cleanup for {key}"
-            );
-        }
     }
 
     #[test]
@@ -1852,19 +2139,6 @@ mod cli_tests {
             redact_known_secrets("token=ghp_secret", &redactions),
             "token=***REDACTED***"
         );
-    }
-
-    #[test]
-    fn feishu_reply_events_follow_tui_cell_boundaries() {
-        assert!(!FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Text)));
-        assert!(FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Text)));
-        assert!(FeishuReplyKind::Text.starts_new_message(Some(FeishuReplyKind::Thinking)));
-        assert!(!FeishuReplyKind::Thinking.starts_new_message(Some(FeishuReplyKind::Thinking)));
-        assert!(!FeishuReplyKind::ToolCall.starts_new_message(Some(FeishuReplyKind::ToolCall)));
-        assert!(FeishuReplyKind::ToolResult.starts_new_message(Some(FeishuReplyKind::ToolCall)));
-        assert!(FeishuReplyKind::ToolResult.starts_new_message(None));
-        assert!(FeishuReplyKind::ToolResult.finishes_message());
-        assert!(FeishuReplyKind::Text.starts_new_message(None));
     }
 
     #[test]

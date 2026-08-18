@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -14,64 +11,109 @@ use bot_core::{
 };
 
 use crate::instance_profile::{
-    configured_profiles_excluding_in_data_root, discover_profiles_in_data_root, read_run_metadata,
-    remove_named_profile_in_data_root, remove_run_metadata, write_run_metadata, InstanceProfile,
-    ProfileRunMetadata, DIAGNOSTIC_PROFILE_NAME,
+    configured_profiles_excluding_in_data_root, discover_profiles_in_data_root,
+    remove_named_profile_in_data_root, validate_manifest, ApplicationProfileManifest,
+    InstanceProfile, ProfileCapabilities, ProfileConfigRefs, ProfileEndpoint, ProfileResourceRefs,
+    ProfileStateRefs, DIAGNOSTIC_PROFILE_NAME, PROFILE_FILE_NAME, PROFILE_SCHEMA_VERSION,
 };
+
+use crate::profile_registry::ProfileRegistry;
 use crate::runtime_config::{
-    detect_setup_state, write_runtime_config, AcpClient, AcpMode, FeishuTransport, ImMode,
-    RuntimeConfig, RuntimeSandboxKind, SetupState, ShellMode,
+    detect_setup_state, AcpClient, AcpMode, FeishuTransport, ImMode, RuntimeConfig,
+    RuntimeSandboxKind, SetupState, ShellMode,
 };
-
-pub(crate) const PROFILE_RUNTIME_ENV_KEYS: &[&str] = &[
-    "REMI_DATA_DIR",
-    "REMI_PROFILE",
-    "REMI_AGENT_ID",
-    "REMI_MODEL_PROFILE",
-    "REMI_AGENTS_DIR",
-    "AGENT_MD_PATH",
-    "REMI_SANDBOX_KIND",
-    "REMI_SANDBOX_HOST_DIR",
-    "REMI_SANDBOX_CONTAINER_DIR",
-    "REMI_SANDBOX_IMAGE",
-    "REMI_SANDBOX_CONTAINER_NAME",
-    "REMI_SANDBOX_USER",
-    "REMI_ADMIN_ENABLED",
-    "REMI_ADMIN_HOST",
-    "REMI_ADMIN_PORT",
-    "REMI_IM_MODE",
-    "REMI_FEISHU_TRANSPORT",
-    "REMI_FEISHU_HOOK_HOST",
-    "REMI_FEISHU_HOOK_PORT",
-    "REMI_FEISHU_HOOK_PATH",
-    "REMI_FEISHU_HOOK_VERIFICATION_TOKEN",
-    "REMI_SHELL_MODE",
-    "REMI_BASH_MODE",
-    "REMI_ACP_MODE",
-    "REMI_ACP_CLIENT",
-    "REMI_ACP_BASE_URL",
-    "REMI_ACP_AGENT_NAME",
-    "REMI_ACP_MODEL",
-];
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn setsid() -> i32;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileCommand {
-    List,
-    Show(String),
-    Create { name: String, entries: Vec<String> },
-    Delete { name: String, force: bool },
-    Start(String),
-    Stop { name: String, force: bool },
-    Restart { name: String, force: bool },
-    Status(String),
-    StatusAll,
+    Current,
+    List {
+        scope: String,
+        format: String,
+    },
+    Find {
+        tags: Vec<String>,
+        intents: Vec<String>,
+        channel: Option<String>,
+        format: String,
+    },
+    Show {
+        reference: Option<String>,
+        view: ProfileShowView,
+        format: String,
+    },
+    Check {
+        reference: Option<String>,
+        strict: bool,
+        format: String,
+    },
+    Init {
+        directory: String,
+        id: Option<String>,
+        name: Option<String>,
+        template: String,
+        register: Option<String>,
+        with_runtime: bool,
+    },
+    Register {
+        path: String,
+        alias: Option<String>,
+        replace: bool,
+    },
+    Unregister {
+        reference: String,
+    },
+    Set {
+        reference: String,
+        field: String,
+        value: String,
+        dry_run: bool,
+    },
+    Unset {
+        reference: String,
+        field: String,
+        dry_run: bool,
+    },
+    Ask {
+        reference: String,
+        task: String,
+        named: String,
+        agent_id: Option<String>,
+    },
+    Create {
+        name: String,
+        entries: Vec<String>,
+    },
+    Delete {
+        name: String,
+        force: bool,
+    },
+    Resource(ProfileResourceCommand),
+    Registry(ProfileRegistryCommand),
     Agent(ProfileAgentCommand),
     Workflow(ProfileWorkflowCommand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileShowView {
+    Summary,
+    Manifest,
+    Resolved,
+    Sources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileResourceCommand {
+    List { reference: String },
+    Show { reference: String, resource: String },
+    Check { reference: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileRegistryCommand {
+    Info,
+    List,
+    Repair,
+    RebuildIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,106 +156,119 @@ pub async fn run_noninteractive_setup(
     apply_runtime_config_entries(profile, data_dir, &entries, true).await
 }
 
-pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> anyhow::Result<()> {
-    ensure_builtin_diagnostic_profile_in_data_root(data_root)?;
+pub async fn run_profile_command(
+    command: &ProfileCommand,
+    data_root: &Path,
+    current: &InstanceProfile,
+) -> anyhow::Result<()> {
+    let mut registry = ProfileRegistry::load(data_root)?;
     match command {
-        ProfileCommand::List => {
-            println!("NAME\tSETUP\tRUNNING\tADMIN\tSANDBOX\tDATA DIR");
-            for profile in discover_profiles_in_data_root(data_root)? {
-                let state = detect_setup_state(&profile.data_dir);
-                let running = profile_run_state(&profile).label();
-                let (setup, admin, sandbox) = match &state {
-                    SetupState::Initialized { config, .. } => (
-                        "initialized",
-                        format_admin_addr(config),
-                        config.sandbox.kind.as_env_value().to_string(),
-                    ),
-                    SetupState::Invalid { .. } => ("invalid", "-".to_string(), "-".to_string()),
-                    SetupState::LegacyEnvCompatible { .. } => {
-                        ("legacy-env", "-".to_string(), "-".to_string())
-                    }
-                    SetupState::Uninitialized { .. } => {
-                        ("uninitialized", "-".to_string(), "-".to_string())
-                    }
-                };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    profile.label(),
-                    setup,
-                    running,
-                    admin,
-                    sandbox,
-                    profile.data_dir.display()
-                );
-            }
+        ProfileCommand::Current => print_current_profile(current, &registry)?,
+        ProfileCommand::List { scope, format } => {
+            print_profile_list(data_root, &registry, scope, format)?
         }
-        ProfileCommand::Show(name) => {
-            let profile = profile_from_label(name, data_root)?;
-            println!("profile: {}", profile.label());
-            println!("data_dir: {}", profile.data_dir.display());
-            println!("run_status: {}", profile_run_state(&profile).label());
-            match detect_setup_state(&profile.data_dir) {
-                SetupState::Initialized {
-                    config_path,
-                    config,
-                } => {
-                    println!("status: initialized");
-                    println!("runtime_config: {}", config_path.display());
-                    println!("root_agent_id: {}", config.root_agent_id);
-                    println!("model_profile: {}", config.model_profile);
-                    println!(
-                        "tool_output_overflow_bytes: {}",
-                        config
-                            .tool_output
-                            .overflow_bytes
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "model_profile_default".to_string())
-                    );
-                    println!(
-                        "tool_foreground_timeout_ms: {}",
-                        config
-                            .tool_output
-                            .foreground_timeout_ms
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "10000".to_string())
-                    );
-                    println!("async_agent: {}", config.tool_output.async_agent);
-                    println!("telemetry_enabled: {}", config.telemetry.enabled);
-                    println!(
-                        "telemetry_agent_tracing: {}",
-                        config.telemetry.agent_tracing
-                    );
-                    println!(
-                        "telemetry_agent_trace_sample_rate_percent: {}",
-                        config.telemetry.agent_trace_sample_rate_percent
-                    );
-                    println!(
-                        "telemetry_capture_agent_content: {}",
-                        config.telemetry.capture_agent_content
-                    );
-                    println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
-                    println!("sandbox_container: {}", config.sandbox.container_name);
-                    println!("im_mode: {}", config.im.mode.as_env_value());
-                    println!("admin: {}", format_admin_addr(&config));
-                    if matches!(config.im.transport, FeishuTransport::EventHook) {
-                        println!(
-                            "feishu_event_hook: http://{}:{}{}",
-                            config.im.event_hook.host,
-                            config.im.event_hook.port,
-                            config.im.event_hook.path
-                        );
-                    }
-                }
-                SetupState::Invalid { config_path, error } => {
-                    println!("status: invalid");
-                    println!("runtime_config: {}", config_path.display());
-                    println!("error: {error}");
-                }
-                SetupState::LegacyEnvCompatible { .. } => println!("status: legacy-env"),
-                SetupState::Uninitialized { .. } => println!("status: uninitialized"),
-            }
+        ProfileCommand::Find {
+            tags,
+            intents,
+            channel,
+            format,
+        } => print_profile_find(
+            data_root,
+            &registry,
+            tags,
+            intents,
+            channel.as_deref(),
+            format,
+        )?,
+        ProfileCommand::Show {
+            reference,
+            view,
+            format,
+        } => {
+            let profile = resolve_or_current(reference.as_deref(), current, &registry)?;
+            print_profile_show(&profile, &registry, *view, format)?;
+        }
+        ProfileCommand::Check {
+            reference,
+            strict,
+            format,
+        } => {
+            let profile = resolve_or_current(reference.as_deref(), current, &registry)?;
+            check_profile(&profile, *strict, format)?;
+        }
+        ProfileCommand::Init {
+            directory,
+            id,
+            name,
+            template,
+            register,
+            with_runtime,
+        } => {
+            init_profile(
+                data_root,
+                directory,
+                id.as_deref(),
+                name.as_deref(),
+                template,
+                register.as_deref(),
+                *with_runtime,
+            )?;
+        }
+        ProfileCommand::Register {
+            path,
+            alias,
+            replace,
+        } => {
+            let entry = registry.register(Path::new(path), alias.as_deref(), *replace)?;
+            println!(
+                "Registered @{}\n  ID: {}\n  Manifest: {}\n\nNo files were copied.",
+                entry.alias,
+                entry.id,
+                entry.manifest_path.display()
+            );
+        }
+        ProfileCommand::Unregister { reference } => {
+            let entry = registry.unregister(reference)?;
+            println!(
+                "Unregistered @{}.\n\nPreserved:\n  {}\n  all referenced resources and state",
+                entry.alias,
+                entry.manifest_path.display()
+            );
+        }
+        ProfileCommand::Set {
+            reference,
+            field,
+            value,
+            dry_run,
+        } => {
+            edit_manifest(&mut registry, reference, field, Some(value), *dry_run)?;
+        }
+        ProfileCommand::Unset {
+            reference,
+            field,
+            dry_run,
+        } => {
+            edit_manifest(&mut registry, reference, field, None, *dry_run)?;
+        }
+        ProfileCommand::Ask {
+            reference,
+            task,
+            named,
+            agent_id,
+        } => {
+            let answer = crate::external_agent::ask_profile(
+                data_root,
+                &current.manifest.id,
+                reference,
+                task,
+                named,
+                agent_id.as_deref(),
+            )
+            .await?;
+            println!("{answer}");
         }
         ProfileCommand::Create { name, entries } => {
+            eprintln!("Warning: `profile create` is deprecated; use `profile init`, `profile register`, and `setup --profile`.");
             let profile = InstanceProfile::named_in_data_root(name, data_root)?;
             if matches!(
                 detect_setup_state(&profile.data_dir),
@@ -222,44 +277,951 @@ pub async fn run_profile_command(command: &ProfileCommand, data_root: &Path) -> 
                 anyhow::bail!("profile `{name}` already exists");
             }
             apply_runtime_config_entries(&profile, &profile.data_dir, entries, true).await?;
+            let path = profile.write_manifest()?;
+            println!("Saved application profile manifest to {}", path.display());
         }
         ProfileCommand::Delete { name, force } => {
+            eprintln!("Warning: `profile delete` is deprecated because profiles do not own referenced resources; use `profile unregister`.");
             if !force {
                 anyhow::bail!("refusing to delete profile `{name}` without --force");
             }
             let path = remove_named_profile_in_data_root(name, data_root)?;
             println!("Deleted profile `{name}` at {}", path.display());
         }
-        ProfileCommand::Start(name) => {
-            let profile = profile_from_label(name, data_root)?;
-            start_profile(&profile)?;
+        ProfileCommand::Resource(command) => run_profile_resource_command(command, &registry)?,
+        ProfileCommand::Registry(command) => run_profile_registry_command(command, &mut registry)?,
+        ProfileCommand::Agent(command) => {
+            eprintln!(
+                "Warning: `profile agent` is deprecated; use the agent command with --profile."
+            );
+            run_profile_agent_command(command, data_root).await?
         }
-        ProfileCommand::Stop { name, force } => {
-            let profile = profile_from_label(name, data_root)?;
-            stop_profile(&profile, *force)?;
+        ProfileCommand::Workflow(command) => {
+            eprintln!("Warning: `profile workflow` is deprecated; use `workflow --profile`.");
+            run_profile_workflow_command(command, data_root)?
         }
-        ProfileCommand::Restart { name, force } => {
-            let profile = profile_from_label(name, data_root)?;
-            stop_profile(&profile, *force)?;
-            start_profile(&profile)?;
+    }
+    Ok(())
+}
+
+fn resolve_or_current(
+    reference: Option<&str>,
+    current: &InstanceProfile,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<InstanceProfile> {
+    match reference {
+        Some(reference) => registry.resolve(reference),
+        None => Ok(current.clone()),
+    }
+}
+
+fn print_current_profile(
+    current: &InstanceProfile,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<()> {
+    let registered = current
+        .manifest_path
+        .as_deref()
+        .and_then(|path| registry.registration_for_path(path));
+    println!(
+        "Profile:        {}",
+        registered
+            .map(|entry| format!("@{}", entry.alias))
+            .unwrap_or_else(|| current.label().to_string())
+    );
+    println!("ID:             {}", current.manifest.id);
+    println!(
+        "Manifest:       {}",
+        current
+            .manifest_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "builtin".to_string())
+    );
+    println!(
+        "Selected by:    {}",
+        if current.manifest_path.is_some() {
+            "--profile or registered/path selection"
+        } else {
+            "builtin/default data-root selection"
         }
-        ProfileCommand::Status(name) => {
-            let profile = profile_from_label(name, data_root)?;
-            print_profile_status(&profile)?;
+    );
+    println!(
+        "Registry alias: {}",
+        registered
+            .map(|entry| format!("@{}", entry.alias))
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "Workspace:      {}",
+        current
+            .workspace
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "Check:          {}",
+        if profile_check_issues(current).0.is_empty() {
+            "OK"
+        } else {
+            "FAILED"
         }
-        ProfileCommand::StatusAll => {
-            for profile in discover_profiles_in_data_root(data_root)? {
-                print_profile_status(&profile)?;
+    );
+    println!("\nSelection precedence:\n  1. --profile\n  2. REMI_PROFILE\n  3. REMI_DATA_DIR\n  4. builtin default");
+    Ok(())
+}
+
+fn collect_profiles(
+    data_root: &Path,
+    registry: &ProfileRegistry,
+    scope: &str,
+) -> anyhow::Result<Vec<(String, InstanceProfile)>> {
+    let mut profiles = Vec::new();
+    if scope != "registered" {
+        for profile in discover_profiles_in_data_root(data_root)? {
+            profiles.push((profile.label().to_string(), profile));
+        }
+    }
+    if scope != "legacy" {
+        for entry in registry.entries() {
+            match InstanceProfile::from_manifest(&entry.manifest_path) {
+                Ok(profile) => profiles.push((format!("@{}", entry.alias), profile)),
+                Err(err) => eprintln!("Warning: @{}: {err:#}", entry.alias),
             }
         }
-        ProfileCommand::Agent(command) => run_profile_agent_command(command, data_root).await?,
-        ProfileCommand::Workflow(command) => run_profile_workflow_command(command, data_root)?,
+    }
+    profiles.sort_by(|a, b| a.0.cmp(&b.0));
+    profiles.dedup_by(|a, b| a.0 == b.0);
+    Ok(profiles)
+}
+
+fn profile_summary_json(reference: &str, profile: &InstanceProfile) -> serde_json::Value {
+    let (errors, warnings) = profile_check_issues(profile);
+    serde_json::json!({
+        "reference": reference,
+        "id": profile.manifest.id,
+        "name": profile.manifest.name,
+        "manifest": profile.manifest_path,
+        "check": if errors.is_empty() { if warnings.is_empty() { "OK" } else { "WARN" } } else { "FAIL" },
+        "endpoint_type": match profile.endpoint { ProfileEndpoint::Local { .. } => "local", ProfileEndpoint::Remote { .. } => "remote" },
+        "channels": profile.manifest.capabilities.channels,
+    })
+}
+
+fn print_profile_list(
+    data_root: &Path,
+    registry: &ProfileRegistry,
+    scope: &str,
+    format: &str,
+) -> anyhow::Result<()> {
+    let profiles = collect_profiles(data_root, registry, scope)?;
+    let values = profiles
+        .iter()
+        .map(|(reference, profile)| profile_summary_json(reference, profile))
+        .collect::<Vec<_>>();
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else if format == "yaml" {
+        println!("{}", serde_yaml::to_string(&values)?);
+    } else {
+        if format == "table" {
+            println!("REF\tID\tNAME\tCHECK\tENDPOINT\tCHANNELS\tMANIFEST");
+        }
+        for (reference, profile) in profiles {
+            let (errors, warnings) = profile_check_issues(&profile);
+            let check = if !errors.is_empty() {
+                "FAIL"
+            } else if !warnings.is_empty() {
+                "WARN"
+            } else {
+                "OK"
+            };
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                reference,
+                profile.manifest.id,
+                profile.manifest.name,
+                check,
+                match profile.endpoint {
+                    ProfileEndpoint::Local { .. } => "local",
+                    ProfileEndpoint::Remote { .. } => "remote",
+                },
+                profile.manifest.capabilities.channels.join(","),
+                profile
+                    .manifest_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "builtin".to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_profile_find(
+    data_root: &Path,
+    registry: &ProfileRegistry,
+    tags: &[String],
+    intents: &[String],
+    channel: Option<&str>,
+    format: &str,
+) -> anyhow::Result<()> {
+    let matches = collect_profiles(data_root, registry, "all")?
+        .into_iter()
+        .filter(|(_, profile)| {
+            tags.iter()
+                .all(|tag| profile.manifest.capabilities.tags.contains(tag))
+        })
+        .filter(|(_, profile)| {
+            intents
+                .iter()
+                .all(|intent| profile.manifest.capabilities.intents.contains(intent))
+        })
+        .filter(|(_, profile)| {
+            channel
+                .map(|channel| {
+                    profile
+                        .manifest
+                        .capabilities
+                        .channels
+                        .iter()
+                        .any(|value| value == channel)
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let values = matches
+        .iter()
+        .map(|(reference, profile)| profile_summary_json(reference, profile))
+        .collect::<Vec<_>>();
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else if format == "yaml" {
+        println!("{}", serde_yaml::to_string(&values)?);
+    } else {
+        if format == "table" {
+            println!("REF\tID\tNAME\tCHANNELS");
+        }
+        for (reference, profile) in matches {
+            println!(
+                "{}\t{}\t{}\t{}",
+                reference,
+                profile.manifest.id,
+                profile.manifest.name,
+                profile.manifest.capabilities.channels.join(",")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolved_profile_json(profile: &InstanceProfile) -> serde_json::Value {
+    let channel_instances = effective_channels_config(profile)
+        .map(|config| config.channels)
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": profile.manifest.id,
+        "name": profile.manifest.name,
+        "manifest": profile.manifest_path,
+        "workspace": profile.workspace,
+        "config": { "runtime": profile.runtime_config, "channels": profile.channels_config },
+        "channel_instances": channel_instances,
+        "resources": { "agents": profile.agents_dir, "models": profile.models_dir, "skills": profile.skills_dirs, "workflows": profile.workflows_dir },
+        "state": { "data": profile.data_dir, "sessions": profile.sessions_path, "memory": profile.memory_dir, "users": profile.users_path, "tasks": profile.tasks_dir },
+        "capabilities": profile.manifest.capabilities,
+        "endpoint": profile.endpoint,
+    })
+}
+
+fn print_profile_show(
+    profile: &InstanceProfile,
+    registry: &ProfileRegistry,
+    view: ProfileShowView,
+    format: &str,
+) -> anyhow::Result<()> {
+    if matches!(view, ProfileShowView::Manifest) {
+        if format == "json" {
+            println!("{}", serde_json::to_string_pretty(&profile.manifest)?);
+        } else {
+            println!("{}", serde_yaml::to_string(&profile.manifest)?);
+        }
+        return Ok(());
+    }
+    let resolved = resolved_profile_json(profile);
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&resolved)?);
+        return Ok(());
+    }
+    if format == "yaml" {
+        println!("{}", serde_yaml::to_string(&resolved)?);
+        return Ok(());
+    }
+    if matches!(view, ProfileShowView::Sources) {
+        println!("FIELD\tDECLARED\tRESOLVED\tSOURCE");
+        print_source_row(
+            "workspace",
+            profile.manifest.workspace.as_deref(),
+            profile.workspace.as_deref(),
+            "manifest",
+        );
+        print_source_row(
+            "config.runtime",
+            profile.manifest.config.runtime.as_deref(),
+            Some(&profile.runtime_config),
+            if profile.manifest.config.runtime.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        print_source_row(
+            "config.channels",
+            profile.manifest.config.channels.as_deref(),
+            Some(&profile.channels_config),
+            if profile.manifest.config.channels.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        print_source_row(
+            "resources.agents",
+            profile.manifest.resources.agents.as_deref(),
+            Some(&profile.agents_dir),
+            if profile.manifest.resources.agents.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        print_source_row(
+            "resources.models",
+            profile.manifest.resources.models.as_deref(),
+            Some(&profile.models_dir),
+            if profile.manifest.resources.models.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        print_source_row(
+            "state.sessions",
+            profile.manifest.state.sessions.as_deref(),
+            Some(&profile.sessions_path),
+            if profile.manifest.state.sessions.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        print_source_row(
+            "state.memory",
+            profile.manifest.state.memory.as_deref(),
+            Some(&profile.memory_dir),
+            if profile.manifest.state.memory.is_some() {
+                "manifest"
+            } else {
+                "state.data default"
+            },
+        );
+        return Ok(());
+    }
+    let registration = profile
+        .manifest_path
+        .as_deref()
+        .and_then(|path| registry.registration_for_path(path));
+    let (errors, warnings) = profile_check_issues(profile);
+    println!("{}\n  ID:          {}\n  Manifest:    {}\n  Registered:  {}\n  Workspace:   {}\n  Check:       {}", profile.manifest.name, profile.manifest.id, profile.manifest_path.as_deref().map(|path| path.display().to_string()).unwrap_or_else(|| "builtin".to_string()), registration.map(|entry| format!("@{}", entry.alias)).unwrap_or_else(|| "no".to_string()), profile.workspace.as_deref().map(|path| path.display().to_string()).unwrap_or_else(|| "-".to_string()), if !errors.is_empty() { "FAIL" } else if !warnings.is_empty() { "WARN" } else { "OK" });
+    println!(
+        "\nCapabilities\n  Tags:        {}\n  Intents:     {}\n  Channels:    {}",
+        profile.manifest.capabilities.tags.join(", "),
+        profile.manifest.capabilities.intents.join(", "),
+        profile.manifest.capabilities.channels.join(", ")
+    );
+    println!(
+        "\nConfiguration\n  Runtime:     {}\n  Channels:    {}",
+        profile.runtime_config.display(),
+        profile.channels_config.display()
+    );
+    if let Some(config) = effective_channels_config(profile) {
+        println!("\nChannel instances");
+        if config.channels.is_empty() {
+            println!("  (none)");
+        }
+        for channel in config.channels {
+            match channel {
+                crate::runtime_config::ChannelInstanceConfig::Feishu {
+                    id,
+                    enabled,
+                    transport,
+                    credentials,
+                    ..
+                } => println!(
+                    "  {id}: feishu, enabled={enabled}, transport={}, credentials={}/{}",
+                    transport.as_env_value(),
+                    credentials.app_id_env,
+                    credentials.app_secret_env
+                ),
+            }
+        }
+    }
+    println!(
+        "\nResources\n  Agents:      {}\n  Models:      {}\n  Skills:      {}\n  Workflows:   {}",
+        profile.agents_dir.display(),
+        profile.models_dir.display(),
+        profile
+            .skills_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        profile.workflows_dir.display()
+    );
+    println!(
+        "\nState\n  Sessions:    {}\n  Memory:      {}\n  Users:       {}\n  Tasks:       {}",
+        profile.sessions_path.display(),
+        profile.memory_dir.display(),
+        profile.users_path.display(),
+        profile.tasks_dir.display()
+    );
+    match &profile.endpoint {
+        ProfileEndpoint::Local { .. } => {
+            println!("\nEndpoint\n  local: {}", profile.expanded_local_command()?)
+        }
+        ProfileEndpoint::Remote { url, .. } => {
+            println!("\nEndpoint\n  remote: {url} (not implemented)")
+        }
+    }
+    Ok(())
+}
+
+fn print_source_row(field: &str, declared: Option<&Path>, resolved: Option<&Path>, source: &str) {
+    println!(
+        "{}\t{}\t{}\t{}",
+        field,
+        declared
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        resolved
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        source
+    );
+}
+
+fn profile_check_issues(profile: &InstanceProfile) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    if let ProfileEndpoint::Local { command } = &profile.endpoint {
+        if command.trim().is_empty() {
+            errors.push("endpoint.command is empty".to_string());
+        }
+    }
+    if let Some(workspace) = profile.workspace.as_deref() {
+        if !workspace.is_dir() {
+            errors.push(format!("workspace does not exist: {}", workspace.display()));
+        }
+    }
+    for (label, path) in [
+        ("agents", &profile.agents_dir),
+        ("models", &profile.models_dir),
+        ("workflows", &profile.workflows_dir),
+    ] {
+        if !path.exists() {
+            warnings.push(format!("{label} path does not exist: {}", path.display()));
+        } else if !path.is_dir() {
+            errors.push(format!(
+                "{label} path is not a directory: {}",
+                path.display()
+            ));
+        }
+    }
+    for path in &profile.skills_dirs {
+        if !path.exists() {
+            warnings.push(format!("skill path does not exist: {}", path.display()));
+        }
+    }
+    if profile.runtime_config.exists() {
+        match crate::runtime_config::load_runtime_config_at(
+            &profile.runtime_config,
+            &profile.data_dir,
+        ) {
+            Ok(Some(config)) => {
+                if let Ok(agents) = AgentRegistry::load(&profile.agents_dir) {
+                    if agents.get(&config.root_agent_id).is_none() {
+                        errors.push(format!("root agent `{}` not found", config.root_agent_id));
+                    }
+                }
+                if let Ok(models) = ModelProfileRegistry::load(&profile.models_dir) {
+                    if models.get(&config.model_profile).is_none() {
+                        errors.push(format!(
+                            "model profile `{}` not found",
+                            config.model_profile
+                        ));
+                    }
+                }
+            }
+            Ok(None) => warnings.push(format!(
+                "runtime config is empty: {}",
+                profile.runtime_config.display()
+            )),
+            Err(err) => errors.push(format!("invalid runtime config: {err:#}")),
+        }
+    } else {
+        warnings.push(format!(
+            "runtime config does not exist: {}",
+            profile.runtime_config.display()
+        ));
+    }
+    if profile.channels_config.exists() {
+        match crate::runtime_config::load_channels_config_at(&profile.channels_config) {
+            Ok(Some(config)) => {
+                if config.channels.iter().any(|channel| {
+                    matches!(
+                        channel,
+                        crate::runtime_config::ChannelInstanceConfig::Feishu { enabled: true, .. }
+                    )
+                }) && !profile
+                    .manifest
+                    .capabilities
+                    .channels
+                    .iter()
+                    .any(|channel| channel == "feishu")
+                {
+                    warnings.push(
+                        "enabled Feishu instances are not declared in capabilities.channels"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => errors.push(format!("invalid channel config: {err:#}")),
+        }
+    } else if profile.manifest.config.channels.is_some() {
+        warnings.push(format!(
+            "channel config does not exist: {}",
+            profile.channels_config.display()
+        ));
+    }
+    (errors, warnings)
+}
+
+fn effective_channels_config(
+    profile: &InstanceProfile,
+) -> Option<crate::runtime_config::ChannelsConfig> {
+    if let Ok(Some(config)) =
+        crate::runtime_config::load_channels_config_at(&profile.channels_config)
+    {
+        return Some(config);
+    }
+    crate::runtime_config::load_runtime_config_at(&profile.runtime_config, &profile.data_dir)
+        .ok()
+        .flatten()
+        .map(|runtime| crate::runtime_config::ChannelsConfig::from_legacy(&runtime.im))
+}
+
+fn check_profile(profile: &InstanceProfile, strict: bool, format: &str) -> anyhow::Result<()> {
+    let (errors, warnings) = profile_check_issues(profile);
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"ok": errors.is_empty() && (!strict || warnings.is_empty()), "profile_id": profile.manifest.id, "errors": errors, "warnings": warnings})
+            )?
+        );
+    } else {
+        println!("Profile check: {}\n", profile.manifest.id);
+        println!(
+            "PASS  manifest.schema       schema_version {}",
+            profile.manifest.schema_version
+        );
+        println!("PASS  manifest.identity     {}", profile.manifest.id);
+        for warning in &warnings {
+            println!("WARN  {warning}");
+        }
+        for error in &errors {
+            println!("FAIL  {error}");
+        }
+        println!(
+            "\nResult: {}",
+            if errors.is_empty() && (!strict || warnings.is_empty()) {
+                "OK"
+            } else {
+                "FAILED"
+            }
+        );
+    }
+    if !errors.is_empty() || (strict && !warnings.is_empty()) {
+        anyhow::bail!(
+            "PROFILE_CHECK_FAILED: profile has {} error(s) and {} warning(s)",
+            errors.len(),
+            warnings.len()
+        );
+    }
+    Ok(())
+}
+
+fn init_profile(
+    data_root: &Path,
+    directory: &str,
+    id: Option<&str>,
+    name: Option<&str>,
+    template: &str,
+    register: Option<&str>,
+    with_runtime: bool,
+) -> anyhow::Result<()> {
+    let directory = PathBuf::from(directory);
+    let path = if directory
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| matches!(v, "yaml" | "yml"))
+        .unwrap_or(false)
+    {
+        directory
+    } else {
+        directory.join(PROFILE_FILE_NAME)
+    };
+    if path.exists() {
+        anyhow::bail!("PROFILE_EXISTS: {} already exists", path.display());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let _lock = ManifestLock::acquire(&path)?;
+    if path.exists() {
+        anyhow::bail!("PROFILE_EXISTS: {} already exists", path.display());
+    }
+    let inferred = parent
+        .file_name()
+        .and_then(|v| v.to_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("remi");
+    let id = id.unwrap_or(inferred).to_string();
+    let name = name.unwrap_or(inferred).to_string();
+    let remi_template = template == "remi-cat";
+    let manifest = ApplicationProfileManifest {
+        schema_version: PROFILE_SCHEMA_VERSION,
+        id,
+        name,
+        description: None,
+        version: None,
+        workspace: remi_template.then(|| PathBuf::from(".")),
+        config: ProfileConfigRefs {
+            runtime: remi_template.then(|| PathBuf::from("runtime.yaml")),
+            channels: remi_template.then(|| PathBuf::from("channels.yaml")),
+        },
+        resources: if remi_template {
+            ProfileResourceRefs {
+                agents: Some("agents".into()),
+                models: Some("models".into()),
+                skills: vec!["skills".into()],
+                workflows: Some("workflows".into()),
+            }
+        } else {
+            ProfileResourceRefs::default()
+        },
+        state: if remi_template {
+            ProfileStateRefs {
+                data: Some("state".into()),
+                sessions: Some("state/sessions.json".into()),
+                memory: Some("state/memory".into()),
+                users: Some("state/users.json".into()),
+                tasks: Some("state/tool_tasks".into()),
+            }
+        } else {
+            ProfileStateRefs::default()
+        },
+        capabilities: ProfileCapabilities {
+            tags: if template == "external" {
+                vec!["external".to_string()]
+            } else {
+                vec!["general".to_string()]
+            },
+            intents: Vec::new(),
+            channels: if remi_template {
+                vec!["tui".into(), "web".into(), "feishu".into(), "acp".into()]
+            } else {
+                Vec::new()
+            },
+        },
+        endpoint: ProfileEndpoint::Local {
+            command: if remi_template {
+                "remi-cat --profile \"${PROFILE_DIR}/profile.yaml\" a2a stdio".to_string()
+            } else {
+                "replace-with-agent-command --a2a-stdio".to_string()
+            },
+        },
+    };
+    validate_manifest(&manifest)?;
+    write_manifest_atomic(&path, &serde_yaml::to_string(&manifest)?)?;
+    let profile = InstanceProfile::from_manifest(&path)?;
+    if with_runtime {
+        install_embedded_agent_profiles(&profile.agents_dir)?;
+        install_embedded_model_profiles(&profile.models_dir)?;
+        for skills_dir in &profile.skills_dirs {
+            std::fs::create_dir_all(skills_dir)
+                .with_context(|| format!("creating {}", skills_dir.display()))?;
+        }
+        std::fs::create_dir_all(&profile.workflows_dir)?;
+        crate::runtime_config::write_runtime_config_at(
+            &profile.runtime_config,
+            &RuntimeConfig::default_for(&profile.data_dir),
+        )?;
+        crate::runtime_config::write_channels_config_at(
+            &profile.channels_config,
+            &crate::runtime_config::ChannelsConfig::from_legacy(
+                &RuntimeConfig::default_for(&profile.data_dir).im,
+            ),
+        )?;
+    }
+    println!("Created: {}", path.display());
+    if let Some(alias) = register {
+        let mut registry = ProfileRegistry::load(data_root)?;
+        let entry = registry.register(&path, Some(alias), false)?;
+        println!("Registered: @{}", entry.alias);
+    } else {
+        println!("\nNot performed:\n  Profile was not registered.\n\nNext:\n  remi-cat profile check {}\n  remi-cat profile register {}", path.display(), path.display());
+    }
+    Ok(())
+}
+
+fn edit_manifest(
+    registry: &mut ProfileRegistry,
+    reference: &str,
+    field: &str,
+    value: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let profile = registry.resolve(reference)?;
+    let path = profile.manifest_path.clone().ok_or_else(|| {
+        anyhow::anyhow!("builtin profiles cannot be edited; initialize a profile.yaml first")
+    })?;
+    let registered_alias = registry
+        .registration_for_path(&path)
+        .map(|entry| entry.alias.clone());
+    let _lock = ManifestLock::acquire(&path)?;
+    let profile = InstanceProfile::from_manifest(&path)?;
+    let mut manifest = profile.manifest;
+    set_manifest_field(&mut manifest, field, value)?;
+    validate_manifest(&manifest)?;
+    let raw = serde_yaml::to_string(&manifest)?;
+    if dry_run {
+        println!("Would update {}:\n{}", path.display(), raw);
+        return Ok(());
+    }
+    write_manifest_atomic(&path, &raw)?;
+    InstanceProfile::from_manifest(&path)?;
+    if let Some(alias) = registered_alias.as_deref() {
+        registry.register(&path, Some(alias), true)?;
+    }
+    println!(
+        "Updated {}\n  Field: {}\n  Value: {}",
+        path.display(),
+        field,
+        value.unwrap_or("<unset>")
+    );
+    Ok(())
+}
+
+struct ManifestLock {
+    path: PathBuf,
+}
+
+impl ManifestLock {
+    fn acquire(manifest_path: &Path) -> anyhow::Result<Self> {
+        let file_name = manifest_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(PROFILE_FILE_NAME);
+        let path = manifest_path.with_file_name(format!("{file_name}.lock"));
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= std::time::Duration::from_secs(5) {
+                        anyhow::bail!(
+                            "PROFILE_MANIFEST_BUSY: timed out waiting for {}",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ManifestLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn write_manifest_atomic(path: &Path, raw: &str) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(PROFILE_FILE_NAME),
+        std::process::id()
+    ));
+    std::fs::write(&temporary, raw).with_context(|| format!("writing {}", temporary.display()))?;
+    crate::atomic_file::replace(&temporary, path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+fn set_manifest_field(
+    manifest: &mut ApplicationProfileManifest,
+    field: &str,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = |value: Option<&str>| value.map(PathBuf::from);
+    let strings = |value: Option<&str>| -> anyhow::Result<Vec<String>> {
+        match value {
+            None => Ok(Vec::new()),
+            Some(raw) if raw.trim_start().starts_with('[') => Ok(serde_json::from_str(raw)?),
+            Some(raw) => Ok(raw
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect()),
+        }
+    };
+    match field {
+        "id" => {
+            manifest.id = value
+                .ok_or_else(|| anyhow::anyhow!("id cannot be unset"))?
+                .to_string()
+        }
+        "name" => {
+            manifest.name = value
+                .ok_or_else(|| anyhow::anyhow!("name cannot be unset"))?
+                .to_string()
+        }
+        "description" => manifest.description = value.map(str::to_string),
+        "version" => manifest.version = value.map(str::to_string),
+        "workspace" => manifest.workspace = path(value),
+        "config.runtime" => manifest.config.runtime = path(value),
+        "config.channels" => manifest.config.channels = path(value),
+        "resources.agents" => manifest.resources.agents = path(value),
+        "resources.models" => manifest.resources.models = path(value),
+        "resources.skills" => {
+            manifest.resources.skills = strings(value)?.into_iter().map(PathBuf::from).collect()
+        }
+        "resources.workflows" => manifest.resources.workflows = path(value),
+        "state.data" => manifest.state.data = path(value),
+        "state.sessions" => manifest.state.sessions = path(value),
+        "state.memory" => manifest.state.memory = path(value),
+        "state.users" => manifest.state.users = path(value),
+        "state.tasks" => manifest.state.tasks = path(value),
+        "capabilities.tags" => manifest.capabilities.tags = strings(value)?,
+        "capabilities.intents" => manifest.capabilities.intents = strings(value)?,
+        "capabilities.channels" => manifest.capabilities.channels = strings(value)?,
+        "endpoint.local.command" => {
+            manifest.endpoint = ProfileEndpoint::Local {
+                command: value
+                    .ok_or_else(|| anyhow::anyhow!("endpoint.local.command cannot be unset"))?
+                    .to_string(),
+            }
+        }
+        "endpoint.remote.url" => {
+            manifest.endpoint = ProfileEndpoint::Remote {
+                url: value
+                    .ok_or_else(|| anyhow::anyhow!("endpoint.remote.url cannot be unset"))?
+                    .to_string(),
+                auth: None,
+            }
+        }
+        _ => anyhow::bail!(
+            "unknown manifest field `{field}`; run `profile show --sources` for supported fields"
+        ),
+    }
+    Ok(())
+}
+
+fn run_profile_resource_command(
+    command: &ProfileResourceCommand,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<()> {
+    let reference = match command {
+        ProfileResourceCommand::List { reference }
+        | ProfileResourceCommand::Show { reference, .. }
+        | ProfileResourceCommand::Check { reference } => reference,
+    };
+    let profile = registry.resolve(reference)?;
+    match command {
+        ProfileResourceCommand::List { .. } => {
+            println!("RESOURCE\tRESOLVED PATH\tEXISTS");
+            for (name, path) in profile_resource_paths(&profile) {
+                println!("{}\t{}\t{}", name, path.display(), path.exists());
+            }
+        }
+        ProfileResourceCommand::Show { resource, .. } => {
+            let path = profile_resource_paths(&profile)
+                .into_iter()
+                .find(|(name, _)| name == resource)
+                .map(|(_, path)| path)
+                .ok_or_else(|| anyhow::anyhow!("unknown resource `{resource}`"))?;
+            println!("{}", path.display());
+        }
+        ProfileResourceCommand::Check { .. } => check_profile(&profile, false, "plain")?,
+    }
+    Ok(())
+}
+
+fn profile_resource_paths(profile: &InstanceProfile) -> Vec<(String, PathBuf)> {
+    let mut values = vec![
+        ("config.runtime".into(), profile.runtime_config.clone()),
+        ("config.channels".into(), profile.channels_config.clone()),
+        ("agents".into(), profile.agents_dir.clone()),
+        ("models".into(), profile.models_dir.clone()),
+        ("workflows".into(), profile.workflows_dir.clone()),
+        ("state.data".into(), profile.data_dir.clone()),
+        ("state.sessions".into(), profile.sessions_path.clone()),
+        ("state.memory".into(), profile.memory_dir.clone()),
+        ("state.users".into(), profile.users_path.clone()),
+        ("state.tasks".into(), profile.tasks_dir.clone()),
+    ];
+    values.extend(
+        profile
+            .skills_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (format!("skills[{index}]"), path.clone())),
+    );
+    values
+}
+
+fn run_profile_registry_command(
+    command: &ProfileRegistryCommand,
+    registry: &mut ProfileRegistry,
+) -> anyhow::Result<()> {
+    match command {
+        ProfileRegistryCommand::Info => println!("Registry\n  Scope:       user/data-root\n  Database:    {}\n  Profiles:    {}\n  Schema:      1\n  Health:      OK", registry.path().display(), registry.entries().len()),
+        ProfileRegistryCommand::List => { println!("ALIAS\tID\tMANIFEST\tREGISTERED AT"); for entry in registry.entries() { println!("@{}\t{}\t{}\t{}", entry.alias, entry.id, entry.manifest_path.display(), entry.registered_at); } }
+        ProfileRegistryCommand::Repair | ProfileRegistryCommand::RebuildIndex => { let removed = registry.repair()?; println!("Registry checked. Removed {removed} stale entr{}.", if removed == 1 { "y" } else { "ies" }); }
     }
     Ok(())
 }
 
 fn profile_from_label(label: &str, data_root: &Path) -> anyhow::Result<InstanceProfile> {
-    InstanceProfile::from_label_in_data_root(label, data_root)
+    if label.ends_with(".yaml")
+        || label.ends_with(".yml")
+        || label.contains('/')
+        || label.contains('\\')
+        || Path::new(label).is_dir()
+    {
+        InstanceProfile::from_manifest(label)
+    } else {
+        InstanceProfile::from_label_in_data_root(label, data_root)
+    }
 }
 
 async fn run_profile_agent_command(
@@ -269,8 +1231,8 @@ async fn run_profile_agent_command(
     match command {
         ProfileAgentCommand::List { profile } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
-            let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
+            ensure_profile_assets(&profile)?;
+            let registry = AgentRegistry::load(&profile.agents_dir)?;
             println!("ID\tNAME\tMODEL\tTOOLS\tDESCRIPTION");
             let mut agents = registry.profiles().collect::<Vec<_>>();
             agents.sort_by(|a, b| a.id.cmp(&b.id));
@@ -287,8 +1249,8 @@ async fn run_profile_agent_command(
         }
         ProfileAgentCommand::Show { profile, agent_id } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
-            let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
+            ensure_profile_assets(&profile)?;
+            let registry = AgentRegistry::load(&profile.agents_dir)?;
             let agent = registry
                 .get(agent_id)
                 .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
@@ -296,11 +1258,11 @@ async fn run_profile_agent_command(
         }
         ProfileAgentCommand::Upsert { profile, path } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
+            ensure_profile_assets(&profile)?;
             let markdown = read_cli_input(path)?;
             let parsed = AgentProfile::from_markdown(&markdown)?;
             validate_file_id(&parsed.id)?;
-            let agents_dir = profile.data_dir.join("agents");
+            let agents_dir = profile.agents_dir.clone();
             remove_agent_profiles_by_id(&agents_dir, &parsed.id)?;
             let mut registry = AgentRegistry::load(&agents_dir)?;
             let file_name = format!("{}.md", parsed.id);
@@ -314,8 +1276,8 @@ async fn run_profile_agent_command(
         }
         ProfileAgentCommand::SetDefault { profile, agent_id } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
-            let registry = AgentRegistry::load(profile.data_dir.join("agents"))?;
+            ensure_profile_assets(&profile)?;
+            let registry = AgentRegistry::load(&profile.agents_dir)?;
             if registry.get(agent_id).is_none() {
                 anyhow::bail!("agent `{agent_id}` not found");
             }
@@ -342,10 +1304,10 @@ fn run_profile_workflow_command(
     match command {
         ProfileWorkflowCommand::List { profile } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
+            ensure_profile_assets(&profile)?;
             println!("ID\tNAME\tNODES\tEDGES\tDESCRIPTION");
             println!("goal\tGoal\t2\t1\tEmbedded goal workflow");
-            let mut workflows = load_workflow_files(&profile.data_dir)?;
+            let mut workflows = load_workflow_files(&profile.workflows_dir)?;
             workflows.sort_by(|a, b| a.id.cmp(&b.id));
             for workflow in workflows {
                 println!(
@@ -363,29 +1325,29 @@ fn run_profile_workflow_command(
             workflow_id,
         } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
+            ensure_profile_assets(&profile)?;
             let workflow = if workflow_id == "goal" {
                 bot_core::supervisor_workflow::embedded_goal_definition()
             } else {
-                load_workflow_file(&profile.data_dir, workflow_id)?
+                load_workflow_file(&profile.workflows_dir, workflow_id)?
             };
             print_workflow(&workflow)?;
         }
         ProfileWorkflowCommand::Upsert { profile, path } => {
             let profile = profile_from_label(profile, data_root)?;
-            ensure_profile_assets(&profile.data_dir)?;
+            ensure_profile_assets(&profile)?;
             let raw = read_cli_input(path)?;
             let workflow: WorkflowDefinition =
                 serde_json::from_str(&raw).context("parsing workflow JSON")?;
             workflow
                 .validate()
                 .map_err(|err| anyhow::anyhow!("invalid workflow: {err}"))?;
-            validate_workflow_agents(&profile.data_dir, &workflow)?;
+            validate_workflow_agents(&profile.agents_dir, &workflow)?;
             validate_file_id(&workflow.id)?;
             if workflow.id == "goal" {
                 anyhow::bail!("embedded workflow `goal` cannot be overwritten");
             }
-            let workflows_dir = profile.data_dir.join("workflows");
+            let workflows_dir = profile.workflows_dir.clone();
             std::fs::create_dir_all(&workflows_dir)
                 .with_context(|| format!("creating {}", workflows_dir.display()))?;
             let path = workflows_dir.join(format!("{}.json", workflow.id));
@@ -404,10 +1366,7 @@ fn run_profile_workflow_command(
             workflow_id,
         } => {
             let profile = profile_from_label(profile, data_root)?;
-            let path = profile
-                .data_dir
-                .join("workflows")
-                .join(format!("{workflow_id}.json"));
+            let path = profile.workflows_dir.join(format!("{workflow_id}.json"));
             if !path.exists() {
                 anyhow::bail!("workflow `{workflow_id}` not found");
             }
@@ -422,8 +1381,10 @@ fn run_profile_workflow_command(
     Ok(())
 }
 
-fn validate_workflow_agents(data_dir: &Path, workflow: &WorkflowDefinition) -> anyhow::Result<()> {
-    let agents_dir = data_dir.join("agents");
+fn validate_workflow_agents(
+    agents_dir: &Path,
+    workflow: &WorkflowDefinition,
+) -> anyhow::Result<()> {
     install_embedded_agent_profiles(&agents_dir)?;
     let registry = AgentRegistry::load(&agents_dir)?;
     for node in &workflow.nodes {
@@ -446,36 +1407,11 @@ fn validate_workflow_agents(data_dir: &Path, workflow: &WorkflowDefinition) -> a
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileRunState {
-    Running,
-    Stopped,
-    Stale,
-}
-
-impl ProfileRunState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Running => "RUNNING",
-            Self::Stopped => "STOPPED",
-            Self::Stale => "STALE",
-        }
-    }
-}
-
-fn profile_run_state(profile: &InstanceProfile) -> ProfileRunState {
-    match read_run_metadata(profile) {
-        Ok(Some(metadata)) if process_is_alive(metadata.pid) => ProfileRunState::Running,
-        Ok(Some(_)) | Err(_) => ProfileRunState::Stale,
-        Ok(None) => ProfileRunState::Stopped,
-    }
-}
-
-fn ensure_profile_assets(data_dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(data_dir)?;
-    install_embedded_agent_profiles(data_dir.join("agents"))?;
-    install_embedded_model_profiles(data_dir.join("models"))?;
-    std::fs::create_dir_all(data_dir.join("workflows"))?;
+fn ensure_profile_assets(profile: &InstanceProfile) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&profile.data_dir)?;
+    install_embedded_agent_profiles(&profile.agents_dir)?;
+    install_embedded_model_profiles(&profile.models_dir)?;
+    std::fs::create_dir_all(&profile.workflows_dir)?;
     Ok(())
 }
 
@@ -487,8 +1423,11 @@ pub fn ensure_builtin_diagnostic_profile() -> anyhow::Result<()> {
 
 pub fn ensure_builtin_diagnostic_profile_in_data_root(data_root: &Path) -> anyhow::Result<()> {
     let profile = InstanceProfile::named_in_data_root(DIAGNOSTIC_PROFILE_NAME, data_root)?;
-    ensure_profile_assets(&profile.data_dir)?;
-    match detect_setup_state(&profile.data_dir) {
+    ensure_profile_assets(&profile)?;
+    if profile.manifest_path.is_none() {
+        profile.write_manifest()?;
+    }
+    match crate::runtime_config::detect_setup_state_at(&profile.runtime_config, &profile.data_dir) {
         SetupState::Initialized { .. } | SetupState::Invalid { .. } => return Ok(()),
         SetupState::LegacyEnvCompatible { .. } | SetupState::Uninitialized { .. } => {}
     }
@@ -511,7 +1450,7 @@ pub fn ensure_builtin_diagnostic_profile_in_data_root(data_root: &Path) -> anyho
         config.admin.port,
         &configured_ports_in_data_root(&profile.data_dir, data_root)?,
     )?;
-    write_runtime_config(&profile.data_dir, &config)?;
+    crate::runtime_config::write_runtime_config_at(&profile.runtime_config, &config)?;
     Ok(())
 }
 
@@ -562,8 +1501,7 @@ fn remove_agent_profiles_by_id(agents_dir: &Path, agent_id: &str) -> anyhow::Res
     Ok(())
 }
 
-fn load_workflow_files(data_dir: &Path) -> anyhow::Result<Vec<WorkflowDefinition>> {
-    let dir = data_dir.join("workflows");
+fn load_workflow_files(dir: &Path) -> anyhow::Result<Vec<WorkflowDefinition>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -586,11 +1524,12 @@ fn load_workflow_files(data_dir: &Path) -> anyhow::Result<Vec<WorkflowDefinition
     Ok(workflows)
 }
 
-fn load_workflow_file(data_dir: &Path, workflow_id: &str) -> anyhow::Result<WorkflowDefinition> {
+fn load_workflow_file(
+    workflows_dir: &Path,
+    workflow_id: &str,
+) -> anyhow::Result<WorkflowDefinition> {
     validate_file_id(workflow_id)?;
-    let path = data_dir
-        .join("workflows")
-        .join(format!("{workflow_id}.json"));
+    let path = workflows_dir.join(format!("{workflow_id}.json"));
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let workflow: WorkflowDefinition =
@@ -638,184 +1577,6 @@ fn print_workflow(workflow: &WorkflowDefinition) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_profile_status(profile: &InstanceProfile) -> anyhow::Result<()> {
-    let state = detect_setup_state(&profile.data_dir);
-    let run_state = profile_run_state(profile);
-    println!("profile: {}", profile.label());
-    println!("run_status: {}", run_state.label());
-    println!("data_dir: {}", profile.data_dir.display());
-    println!("pid_file: {}", profile.pid_file().display());
-    println!("log_path: {}", profile.log_file().display());
-    match read_run_metadata(profile)? {
-        Some(metadata) => {
-            println!("pid: {}", metadata.pid);
-            println!("started_at: {}", metadata.started_at);
-            println!("command: {}", metadata.command.join(" "));
-        }
-        None => println!("pid: -"),
-    }
-    match state {
-        SetupState::Initialized { config, .. } => {
-            println!("setup: initialized");
-            println!("admin: {}", format_admin_addr(&config));
-            println!("im_mode: {}", config.im.mode.as_env_value());
-        }
-        SetupState::Invalid { error, .. } => {
-            println!("setup: invalid");
-            println!("error: {error}");
-        }
-        SetupState::LegacyEnvCompatible { .. } => println!("setup: legacy-env-compatible"),
-        SetupState::Uninitialized { .. } => println!("setup: not initialized"),
-    }
-    Ok(())
-}
-
-fn start_profile(profile: &InstanceProfile) -> anyhow::Result<()> {
-    match detect_setup_state(&profile.data_dir) {
-        SetupState::Initialized { .. } | SetupState::LegacyEnvCompatible { .. } => {}
-        SetupState::Invalid { error, .. } => anyhow::bail!("cannot start invalid profile: {error}"),
-        SetupState::Uninitialized { .. } => {
-            anyhow::bail!("profile `{}` is not initialized", profile.label())
-        }
-    }
-    if let Some(metadata) = read_run_metadata(profile)? {
-        if process_is_alive(metadata.pid) {
-            anyhow::bail!(
-                "profile `{}` is already running with pid {}",
-                profile.label(),
-                metadata.pid
-            );
-        }
-        remove_run_metadata(profile)?;
-    }
-    std::fs::create_dir_all(profile.log_dir())
-        .with_context(|| format!("creating {}", profile.log_dir().display()))?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(profile.log_file())
-        .with_context(|| format!("opening {}", profile.log_file().display()))?;
-    let log_err = log
-        .try_clone()
-        .with_context(|| format!("cloning {}", profile.log_file().display()))?;
-    let exe = std::env::current_exe().context("resolving current executable")?;
-    let mut command = std::process::Command::new(&exe);
-    let mut command_display = vec![exe.display().to_string()];
-    if let Some(name) = profile.name.as_deref() {
-        command.arg("--profile").arg(name);
-        command_display.push("--profile".to_string());
-        command_display.push(name.to_string());
-    }
-    for key in PROFILE_RUNTIME_ENV_KEYS {
-        command.env_remove(key);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = command
-        .spawn()
-        .with_context(|| format!("starting profile `{}`", profile.label()))?;
-    let metadata = ProfileRunMetadata {
-        pid: child.id(),
-        profile: profile.label().to_string(),
-        data_dir: profile.data_dir.display().to_string(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        command: command_display,
-        log_path: profile.log_file().display().to_string(),
-    };
-    write_run_metadata(profile, &metadata)?;
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    if !process_is_alive(metadata.pid) {
-        remove_run_metadata(profile)?;
-        anyhow::bail!(
-            "profile `{}` exited immediately after start; see log at {}",
-            profile.label(),
-            metadata.log_path
-        );
-    }
-    println!(
-        "Started profile `{}` with pid {}. Logs: {}",
-        profile.label(),
-        metadata.pid,
-        metadata.log_path
-    );
-    Ok(())
-}
-
-fn stop_profile(profile: &InstanceProfile, force: bool) -> anyhow::Result<()> {
-    let Some(metadata) = read_run_metadata(profile)? else {
-        println!("Profile `{}` is not running.", profile.label());
-        return Ok(());
-    };
-    if !process_is_alive(metadata.pid) {
-        remove_run_metadata(profile)?;
-        println!(
-            "Removed stale pid metadata for profile `{}`.",
-            profile.label()
-        );
-        return Ok(());
-    }
-    let signal = if force { "-KILL" } else { "-TERM" };
-    send_signal(metadata.pid, signal)?;
-    if wait_for_exit(metadata.pid, std::time::Duration::from_secs(5)) {
-        remove_run_metadata(profile)?;
-        println!("Stopped profile `{}`.", profile.label());
-        return Ok(());
-    }
-    if force {
-        anyhow::bail!(
-            "profile `{}` did not exit after SIGKILL; pid {} may require manual inspection",
-            profile.label(),
-            metadata.pid
-        );
-    }
-    anyhow::bail!(
-        "profile `{}` did not stop after SIGTERM; rerun with --force to send SIGKILL",
-        profile.label()
-    )
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn send_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status()
-        .with_context(|| format!("sending {signal} to pid {pid}"))?;
-    if !status.success() {
-        anyhow::bail!("failed to send {signal} to pid {pid}");
-    }
-    Ok(())
-}
-
-fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if !process_is_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    !process_is_alive(pid)
-}
-
 pub async fn apply_runtime_config_entries(
     profile: &InstanceProfile,
     data_dir: &Path,
@@ -826,15 +1587,18 @@ pub async fn apply_runtime_config_entries(
         anyhow::bail!("provide at least one key=value entry");
     }
     std::fs::create_dir_all(data_dir)?;
-    install_embedded_model_profiles(data_dir.join("models"))?;
-    install_embedded_agent_profiles(data_dir.join("agents"))?;
-    std::fs::create_dir_all(data_dir.join("workflows"))?;
+    install_embedded_model_profiles(&profile.models_dir)?;
+    install_embedded_agent_profiles(&profile.agents_dir)?;
+    std::fs::create_dir_all(&profile.workflows_dir)?;
 
-    let existing_config = match detect_setup_state(data_dir) {
-        SetupState::Initialized { config, .. } => Some(config),
-        SetupState::Invalid { error, .. } => anyhow::bail!("runtime config is invalid: {error}"),
-        _ => None,
-    };
+    let existing_config =
+        match crate::runtime_config::detect_setup_state_at(&profile.runtime_config, data_dir) {
+            SetupState::Initialized { config, .. } => Some(config),
+            SetupState::Invalid { error, .. } => {
+                anyhow::bail!("runtime config is invalid: {error}")
+            }
+            _ => None,
+        };
     if existing_config.is_none() && !create_if_missing {
         anyhow::bail!(
             "runtime config is not initialized at {}; run `remi-cat{} setup --non-interactive` first",
@@ -863,13 +1627,13 @@ pub async fn apply_runtime_config_entries(
     let data_root = profile_data_root(profile);
     normalize_runtime_config(data_dir, &data_root, &mut config)?;
     if model_changed {
-        let registry = ModelProfileRegistry::load(data_dir.join("models"))?;
+        let registry = ModelProfileRegistry::load(&profile.models_dir)?;
         let model_profile = registry.get(&config.model_profile).ok_or_else(|| {
             anyhow::anyhow!("model profile `{}` does not exist", config.model_profile)
         })?;
         validate_model_profile_api_key(model_profile).await?;
     }
-    let path = write_runtime_config(data_dir, &config)?;
+    let path = crate::runtime_config::write_runtime_config_at(&profile.runtime_config, &config)?;
     println!(
         "Saved profile `{}` runtime config to {}",
         profile.label(),
@@ -1233,4 +1997,31 @@ pub fn available_container_name_in_data_root(
         }
     }
     unreachable!("u32 container-name suffix space exhausted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_with_runtime_materializes_declared_skill_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("travel");
+        init_profile(
+            root.path(),
+            directory.to_str().unwrap(),
+            Some("test.travel"),
+            Some("Travel"),
+            "remi-cat",
+            None,
+            true,
+        )
+        .unwrap();
+
+        let profile = InstanceProfile::from_manifest(directory.join(PROFILE_FILE_NAME)).unwrap();
+        assert!(!profile.skills_dirs.is_empty());
+        assert!(profile.skills_dirs.iter().all(|path| path.is_dir()));
+        assert!(profile_check_issues(&profile).0.is_empty());
+        assert!(profile_check_issues(&profile).1.is_empty());
+    }
 }

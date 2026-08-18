@@ -1072,6 +1072,9 @@ async fn execute_fetch_source_with_progress(
             file_type,
         } => {
             let bridge = bridge.context("fetching a Feishu file_key requires IM bridge support")?;
+            let platform = metadata_string(metadata, "platform")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "feishu".to_string());
             let fallback_message_id = metadata_string(metadata, "message_id").unwrap_or_default();
             let chat_id = metadata_string(metadata, "thread_id").unwrap_or_default();
             let decoded = decode_agent_file_key(&file_key);
@@ -1098,7 +1101,7 @@ async fn execute_fetch_source_with_progress(
                 });
             let downloaded = bridge
                 .download(ImDownloadRequest {
-                    platform: "feishu".to_string(),
+                    platform,
                     message_id,
                     chat_id,
                     attachment_key: Some(file_key),
@@ -1127,11 +1130,14 @@ async fn execute_fetch_source_with_progress(
         FetchSource::FeishuDocumentUrl { url } => {
             let bridge =
                 bridge.context("fetching a Feishu document URL requires IM bridge support")?;
+            let platform = metadata_string(metadata, "platform")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "feishu".to_string());
             let message_id = metadata_string(metadata, "message_id").unwrap_or_default();
             let chat_id = metadata_string(metadata, "thread_id").unwrap_or_default();
             let downloaded = bridge
                 .download(ImDownloadRequest {
-                    platform: "feishu".to_string(),
+                    platform,
                     message_id,
                     chat_id,
                     attachment_key: None,
@@ -1905,8 +1911,34 @@ mod tests {
             .expect("fetch should return tool output"),
         )
         .await;
-        let completed: serde_json::Value =
+        let mut completed: serde_json::Value =
             serde_json::from_str(&output).expect("fetch output should be valid json");
+        if completed["status"] == "running" {
+            let task_id = completed["task_id"]
+                .as_str()
+                .expect("running fetch should include task_id")
+                .to_string();
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let output = collect_tool_output(
+                    <FetchTool as remi_agentloop::prelude::Tool>::execute(
+                        &tool,
+                        serde_json::json!({ "task_id": task_id.clone() }),
+                        None,
+                        test_tool_context(),
+                    )
+                    .await
+                    .expect("fetch poll should return tool output"),
+                )
+                .await;
+                completed =
+                    serde_json::from_str(&output).expect("fetch poll output should be valid json");
+                if completed["status"] != "running" {
+                    break;
+                }
+            }
+        }
+        assert_eq!(completed["status"], "completed");
         let workspace_path = completed["workspace_path"]
             .as_str()
             .expect("workspace_path should be present");

@@ -73,6 +73,10 @@ pub struct ThreadHistoryMessage {
 pub struct MemoryStore {
     /// Root data dir (e.g. `.remi-cat`).  Soul.md and all thread data live here.
     pub data_dir: PathBuf,
+    /// Exact directory containing per-thread and named memory data.
+    /// Kept separate from `data_dir` so an application profile can reference
+    /// shared or external memory without relocating its other state.
+    pub memory_dir: PathBuf,
     /// If set, `Agent.md` is read from this exact path instead of
     /// `data_dir/Agent.md`.
     ///
@@ -146,10 +150,10 @@ fn sanitize_id(id: &str) -> String {
 
 impl MemoryStore {
     fn token_cache_key(&self, thread_id: &str) -> String {
-        format!("{}\0{}", self.data_dir.display(), sanitize_id(thread_id))
+        format!("{}\0{}", self.memory_dir.display(), sanitize_id(thread_id))
     }
     fn thread_dir(&self, thread_id: &str) -> PathBuf {
-        self.data_dir.join("memory").join(sanitize_id(thread_id))
+        self.memory_dir.join(sanitize_id(thread_id))
     }
 
     fn short_term_path(&self, thread_id: &str) -> PathBuf {
@@ -169,10 +173,7 @@ impl MemoryStore {
     }
 
     fn named_memory_dir(&self, agent_id: &str) -> PathBuf {
-        self.data_dir
-            .join("memory")
-            .join("named")
-            .join(sanitize_id(agent_id))
+        self.memory_dir.join("named").join(sanitize_id(agent_id))
     }
 
     // ── Index I/O ─────────────────────────────────────────────────────────────
@@ -1653,6 +1654,7 @@ mod tests {
 
     fn test_store(data_dir: PathBuf) -> MemoryStore {
         MemoryStore {
+            memory_dir: data_dir.join("memory"),
             data_dir,
             agent_md_path: None,
             compressor: LlmCompressor::new(
@@ -1746,7 +1748,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            // `save_turn` fsyncs the append-only ledger. That can exceed a
+            // sub-second deadline on CI or virtualized filesystems even though
+            // no compressor/network work is performed.
+            std::time::Duration::from_secs(2),
             store.save_turn("append-only-save", messages),
         )
         .await

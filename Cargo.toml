@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.32"
+version = "0.2.33"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -29,8 +29,12 @@ resolver = "2"
 [features]
 default = ["secure-storage"]
 secure-storage = ["dep:keyring"]
+experimental-pty = ["bot-core/experimental-pty"]
 
 [dependencies]
+a2a = { package = "a2a-lf", version = "0.3.0" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.1", default-features = false }
+async-trait = "0.1"
 bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
 user-store = { path = "crates/user-store" }
@@ -96,3 +100,4 @@ keyring = { version = "3.6.3", default-features = false, features = ["windows-na
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

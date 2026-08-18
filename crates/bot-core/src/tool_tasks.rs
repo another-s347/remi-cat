@@ -192,6 +192,17 @@ impl PerThreadManager {
         }
     }
 
+    async fn replace_output(&self, task_id: &str, output: impl IntoIterator<Item = String>) {
+        let mut store = self.store.lock().await;
+        if let Some(record) = store.tasks.get_mut(task_id) {
+            record.recent_output = output.into_iter().collect();
+            if record.recent_output.len() > 20 {
+                let drop_count = record.recent_output.len() - 20;
+                record.recent_output.drain(0..drop_count);
+            }
+        }
+    }
+
     async fn finish(
         &self,
         task_id: &str,
@@ -346,7 +357,7 @@ impl PerThreadManager {
 
 #[derive(Debug)]
 pub struct ToolTaskManager {
-    data_dir: PathBuf,
+    store_dir: PathBuf,
     threads: Mutex<HashMap<String, Arc<PerThreadManager>>>,
     /// Maps task_id -> thread_id for cross-thread lookups (cancel, get, etc.)
     task_thread_map: Mutex<HashMap<String, String>>,
@@ -356,10 +367,17 @@ impl ToolTaskManager {
     pub fn load(data_dir: impl AsRef<Path>) -> Result<Arc<Self>> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let store_dir = data_dir.join(STORE_DIR);
+        Self::load_from_paths(store_dir, Some(data_dir.join(LEGACY_STORE_FILE)))
+    }
+
+    pub fn load_store_dir(store_dir: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::load_from_paths(store_dir.as_ref().to_path_buf(), None)
+    }
+
+    fn load_from_paths(store_dir: PathBuf, legacy: Option<PathBuf>) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&store_dir).with_context(|| "creating tool task dir")?;
-        let legacy = data_dir.join(LEGACY_STORE_FILE);
         let mut source_paths = Vec::new();
-        if legacy.exists() {
+        if let Some(legacy) = legacy.filter(|path| path.exists()) {
             source_paths.push(legacy);
         }
         for entry in std::fs::read_dir(&store_dir)? {
@@ -398,7 +416,7 @@ impl ToolTaskManager {
         let mut destination_paths = std::collections::HashSet::new();
         for (thread_id, mut store) in grouped {
             normalize_loaded_store(&mut store);
-            let path = thread_store_path(&data_dir, &thread_id);
+            let path = thread_store_path(&store_dir, &thread_id);
             save_store(&path, &store)?;
             destination_paths.insert(path.clone());
             for task_id in store.tasks.keys() {
@@ -423,14 +441,14 @@ impl ToolTaskManager {
             }
         }
         Ok(Arc::new(Self {
-            data_dir,
+            store_dir,
             threads: Mutex::new(threads),
             task_thread_map: Mutex::new(task_thread_map),
         }))
     }
 
-    fn load_per_thread(data_dir: &Path, thread_id: &str) -> Result<Arc<PerThreadManager>> {
-        let path = thread_store_path(data_dir, thread_id);
+    fn load_per_thread(store_dir: &Path, thread_id: &str) -> Result<Arc<PerThreadManager>> {
+        let path = thread_store_path(store_dir, thread_id);
         let mut store = match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str::<ToolTaskStore>(&raw)
                 .with_context(|| format!("parsing {}", path.display()))?,
@@ -457,7 +475,7 @@ impl ToolTaskManager {
                 return Ok(Arc::clone(mgr));
             }
         }
-        let mgr = Self::load_per_thread(&self.data_dir, thread_id)?;
+        let mgr = Self::load_per_thread(&self.store_dir, thread_id)?;
         let mut threads = self.threads.lock().await;
         // Double-check after acquiring lock
         if let Some(existing) = threads.get(thread_id) {
@@ -569,6 +587,14 @@ impl ToolTaskManager {
         }
     }
 
+    pub async fn replace_output(&self, task_id: &str, output: Vec<String>) {
+        if let Some(thread_id) = self.task_thread_map.lock().await.get(task_id).cloned() {
+            if let Ok(mgr) = self.get_thread(&thread_id).await {
+                mgr.replace_output(task_id, output).await;
+            }
+        }
+    }
+
     pub async fn finish(
         &self,
         task_id: &str,
@@ -668,13 +694,13 @@ impl ToolTaskManager {
     }
 }
 
-fn thread_store_path(data_dir: &Path, thread_id: &str) -> PathBuf {
+fn thread_store_path(store_dir: &Path, thread_id: &str) -> PathBuf {
     let digest = Sha256::digest(thread_id.as_bytes());
     let name = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    data_dir.join(STORE_DIR).join(format!("{name}.json"))
+    store_dir.join(format!("{name}.json"))
 }
 
 fn normalize_loaded_store(store: &mut ToolTaskStore) {

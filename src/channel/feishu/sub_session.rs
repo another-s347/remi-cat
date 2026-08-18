@@ -51,12 +51,12 @@ pub(super) async fn record_sub_session_event(
     }
 
     if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
-        if platform == FEISHU_CHANNEL {
+        if platform == FEISHU_CHANNEL || platform.starts_with("feishu:") {
             forward_sub_session_event_to_bound_channel(runtime, parent_session_id, event).await;
         }
         return;
     }
-    if platform != FEISHU_CHANNEL {
+    if platform != FEISHU_CHANNEL && !platform.starts_with("feishu:") {
         return;
     }
     let already_bound = runtime

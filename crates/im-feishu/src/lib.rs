@@ -45,7 +45,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-pub use crate::client::FeishuClient;
+pub use crate::client::{CotEvent, CotMessage, FeishuClient};
 use crate::frame::PbFrame;
 pub use crate::streaming::StreamingCard;
 
@@ -863,8 +863,18 @@ impl FeishuGateway {
         self.client.get_user_name(user_id).await
     }
 
-    pub async fn get_chat_info(&self, chat_id: &str) -> Result<client::ChatInfoData> {
-        self.client.get_chat_info(chat_id).await
+    pub async fn create_cot(&self, chat_id: &str, origin_message_id: &str) -> Result<CotMessage> {
+        self.client
+            .create_cot(chat_id, origin_message_id, false)
+            .await
+    }
+
+    pub async fn append_cot_events(&self, cot: &CotMessage, events: &[CotEvent]) -> Result<()> {
+        self.client.append_cot_events(cot, events).await
+    }
+
+    pub async fn complete_cot(&self, cot: &CotMessage, reason: &str) -> Result<()> {
+        self.client.complete_cot(cot, reason).await
     }
 
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {

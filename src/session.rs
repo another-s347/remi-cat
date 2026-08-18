@@ -82,7 +82,11 @@ impl SessionRuntime {
     }
 
     pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self> {
-        let path = data_dir.into().join("sessions.json");
+        Self::load_path(data_dir.into().join("sessions.json"))
+    }
+
+    pub fn load_path(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
         let store = match std::fs::read_to_string(&path) {
             // A process can be interrupted after creating the file but before
             // its first contents reach disk. Treat that same empty-file state
@@ -624,6 +628,20 @@ mod tests {
         let second = runtime.resolve_channel("cli", "b", "default").unwrap();
         assert_ne!(first, second);
         assert_eq!(runtime.list().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connector_namespaces_create_different_sessions() {
+        let dir = std::env::temp_dir().join(format!("remi-session-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = SessionRuntime::load(&dir).unwrap();
+        let work = runtime
+            .resolve_channel("feishu:work", "shared-chat", "default")
+            .unwrap();
+        let travel = runtime
+            .resolve_channel("feishu:travel", "shared-chat", "default")
+            .unwrap();
+        assert_ne!(work, travel);
         let _ = std::fs::remove_dir_all(dir);
     }
 

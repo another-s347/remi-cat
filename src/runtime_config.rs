@@ -350,7 +350,15 @@ pub fn resolve_runtime_config_for_run(
     data_dir: &Path,
     tui_mode: bool,
 ) -> Result<RuntimeConfigResolution> {
-    match detect_setup_state(data_dir) {
+    resolve_runtime_config_at_for_run(&runtime_config_path(data_dir), data_dir, tui_mode)
+}
+
+pub fn resolve_runtime_config_at_for_run(
+    config_path: &Path,
+    data_dir: &Path,
+    tui_mode: bool,
+) -> Result<RuntimeConfigResolution> {
+    match detect_setup_state_at(config_path, data_dir) {
         SetupState::Initialized { config, .. } => {
             config.apply_env_overrides();
             let data_dir = PathBuf::from(
@@ -495,6 +503,146 @@ pub struct ImConfig {
     pub transport: FeishuTransport,
     #[serde(default)]
     pub event_hook: FeishuEventHookRuntimeConfig,
+}
+
+/// Non-secret configuration for the concrete IM connectors assembled by a
+/// profile. Credential fields name environment/secret-store keys; they never
+/// contain credential values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelsConfig {
+    pub channels: Vec<ChannelInstanceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChannelInstanceConfig {
+    Feishu {
+        id: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default)]
+        transport: FeishuTransport,
+        #[serde(default)]
+        event_hook: FeishuChannelEventHookConfig,
+        #[serde(default)]
+        credentials: FeishuCredentialRefs,
+    },
+}
+
+impl ChannelInstanceConfig {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Feishu { id, .. } => id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeishuCredentialRefs {
+    pub app_id_env: String,
+    pub app_secret_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeishuChannelEventHookConfig {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub verification_token_env: Option<String>,
+}
+
+impl Default for FeishuChannelEventHookConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8788,
+            path: "/feishu/events".to_string(),
+            verification_token_env: None,
+        }
+    }
+}
+
+impl Default for FeishuCredentialRefs {
+    fn default() -> Self {
+        Self {
+            app_id_env: "FEISHU_APP_ID".to_string(),
+            app_secret_env: "FEISHU_APP_SECRET".to_string(),
+        }
+    }
+}
+
+impl ChannelsConfig {
+    pub fn from_legacy(im: &ImConfig) -> Self {
+        let channels = if matches!(im.mode, ImMode::Disabled) {
+            Vec::new()
+        } else {
+            vec![ChannelInstanceConfig::Feishu {
+                id: "feishu.default".to_string(),
+                enabled: true,
+                transport: im.transport.clone(),
+                event_hook: FeishuChannelEventHookConfig {
+                    host: im.event_hook.host.clone(),
+                    port: im.event_hook.port,
+                    path: im.event_hook.path.clone(),
+                    verification_token_env: (!im.event_hook.verification_token.trim().is_empty())
+                        .then(|| "REMI_FEISHU_HOOK_VERIFICATION_TOKEN".to_string()),
+                },
+                credentials: FeishuCredentialRefs::default(),
+            }]
+        };
+        Self { channels }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut event_hooks = std::collections::HashSet::new();
+        for channel in &self.channels {
+            let id = channel.id().trim();
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            {
+                anyhow::bail!("invalid channel instance id `{id}`");
+            }
+            if !ids.insert(id) {
+                anyhow::bail!("duplicate channel instance id `{id}`");
+            }
+            match channel {
+                ChannelInstanceConfig::Feishu { credentials, .. }
+                    if credentials.app_id_env.trim().is_empty()
+                        || credentials.app_secret_env.trim().is_empty() =>
+                {
+                    anyhow::bail!("channel `{id}` credential environment names must not be empty")
+                }
+                ChannelInstanceConfig::Feishu {
+                    enabled: true,
+                    transport: FeishuTransport::EventHook,
+                    event_hook,
+                    ..
+                } => {
+                    if event_hook
+                        .verification_token_env
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        anyhow::bail!("channel `{id}` verification_token_env must not be empty");
+                    }
+                    let endpoint = (event_hook.host.trim().to_string(), event_hook.port);
+                    if !event_hooks.insert(endpoint) {
+                        anyhow::bail!(
+                            "multiple enabled Feishu event_hook channels cannot bind the same host and port"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ImConfig {
@@ -744,6 +892,10 @@ pub fn runtime_config_path(data_dir: &Path) -> PathBuf {
 
 pub fn load_runtime_config(data_dir: &Path) -> Result<Option<RuntimeConfig>> {
     let path = runtime_config_path(data_dir);
+    load_runtime_config_at(&path, data_dir)
+}
+
+pub fn load_runtime_config_at(path: &Path, data_dir: &Path) -> Result<Option<RuntimeConfig>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -756,20 +908,53 @@ pub fn load_runtime_config(data_dir: &Path) -> Result<Option<RuntimeConfig>> {
     Ok(Some(config))
 }
 
+pub fn load_channels_config_at(path: &Path) -> Result<Option<ChannelsConfig>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading channel config {}", path.display()))?;
+    let config: ChannelsConfig = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parsing channel config {}", path.display()))?;
+    config.validate()?;
+    Ok(Some(config))
+}
+
+pub fn write_channels_config_at(path: &Path, config: &ChannelsConfig) -> Result<PathBuf> {
+    config.validate()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let raw = serde_yaml::to_string(config).context("serializing channel config")?;
+    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
 pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
+    write_runtime_config_at(&runtime_config_path(data_dir), config)
+}
+
+pub fn write_runtime_config_at(path: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
     config.telemetry.validate()?;
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating {}", data_dir.display()))?;
-    let path = runtime_config_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     let raw = serde_yaml::to_string(config).context("serializing runtime config")?;
-    std::fs::write(&path, raw).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path.to_path_buf())
 }
 
 pub fn detect_setup_state(data_dir: &Path) -> SetupState {
     let path = runtime_config_path(data_dir);
+    detect_setup_state_at(&path, data_dir)
+}
+
+pub fn detect_setup_state_at(path: &Path, data_dir: &Path) -> SetupState {
+    let path = path.to_path_buf();
     if path.exists() {
-        match load_runtime_config(data_dir) {
+        match load_runtime_config_at(&path, data_dir) {
             Ok(Some(config)) => SetupState::Initialized {
                 config_path: path,
                 config,
@@ -929,6 +1114,59 @@ model_profile: default
         assert!(!cfg.telemetry.agent_tracing);
         assert_eq!(cfg.telemetry.agent_trace_sample_rate_percent, 10);
         assert!(!cfg.telemetry.capture_agent_content);
+    }
+
+    #[test]
+    fn channel_config_supports_multiple_named_feishu_instances() {
+        let config: super::ChannelsConfig = serde_yaml::from_str(
+            r#"
+channels:
+  - kind: feishu
+    id: work
+    credentials:
+      app_id_env: FEISHU_WORK_APP_ID
+      app_secret_env: FEISHU_WORK_APP_SECRET
+  - kind: feishu
+    id: travel
+    transport: event_hook
+    event_hook:
+      host: 127.0.0.1
+      port: 9788
+      path: /travel/events
+      verification_token_env: FEISHU_TRAVEL_VERIFICATION_TOKEN
+    credentials:
+      app_id_env: FEISHU_TRAVEL_APP_ID
+      app_secret_env: FEISHU_TRAVEL_APP_SECRET
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.channels.len(), 2);
+        assert_eq!(config.channels[0].id(), "work");
+        assert_eq!(config.channels[1].id(), "travel");
+    }
+
+    #[test]
+    fn channel_config_rejects_duplicate_instance_ids() {
+        let config = super::ChannelsConfig {
+            channels: vec![
+                super::ChannelInstanceConfig::Feishu {
+                    id: "work".into(),
+                    enabled: true,
+                    transport: Default::default(),
+                    event_hook: Default::default(),
+                    credentials: Default::default(),
+                },
+                super::ChannelInstanceConfig::Feishu {
+                    id: "work".into(),
+                    enabled: true,
+                    transport: Default::default(),
+                    event_hook: Default::default(),
+                    credentials: Default::default(),
+                },
+            ],
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

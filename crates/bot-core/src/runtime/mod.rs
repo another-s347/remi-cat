@@ -71,7 +71,7 @@ use supervisor_agent::{
     hook_context_message, workflow_round_allows_continue, SupervisorNodeOutcome,
     WorkflowRoundOutcome,
 };
-use tool_registry::{build_subagent_tools, register_runtime_tools};
+use tool_registry::register_runtime_tools;
 pub(crate) use tool_status::{
     builtin_tool_catalog, tool_errors, tool_runtime_errors, tool_warnings,
 };
@@ -96,6 +96,12 @@ fn env_flag(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn profile_skills_dirs_from_env() -> Option<Vec<PathBuf>> {
+    let raw = std::env::var("REMI_SKILLS_DIRS").ok()?;
+    let dirs = serde_json::from_str::<Vec<PathBuf>>(&raw).ok()?;
+    (!dirs.is_empty()).then_some(dirs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -735,6 +741,12 @@ pub enum EffectiveAgentSource {
 }
 
 impl CatBot {
+    pub fn has_delegate_agents(&self) -> bool {
+        self.agent_profiles
+            .values()
+            .any(|profile| !profile.delegates.is_empty())
+    }
+
     pub fn tool_task_manager(&self) -> Arc<crate::tool_tasks::ToolTaskManager> {
         Arc::clone(&self.tool_tasks)
     }
@@ -777,26 +789,23 @@ impl CatBot {
         thread_id: &str,
         mut input: SteerInput,
     ) -> SteerSubmitResult {
-        let Some(queue) = self.subagent_sessions.active_queue(thread_id) else {
-            return SteerSubmitResult::NotRunning;
-        };
-        input.session_id = thread_id.to_string();
-        let steer_id = uuid::Uuid::new_v4().to_string();
-        let preview = steer_preview(&input.content);
-        let message_metadata = steer_message_metadata(&input);
-        queue.push(CoreSteerInput {
-            id: steer_id.clone(),
-            content: input.content,
-            preview: preview.clone(),
-            message_metadata,
-            user_name: input.sender_username,
-            source: CoreSteerSource::User,
-        });
-        SteerSubmitResult::Queued(SteerQueuedEvent {
-            steer_id,
-            session_id: thread_id.to_string(),
-            preview,
-        })
+        if let Some(remote) = self.subagent_sessions.remote(thread_id) {
+            input.session_id = thread_id.to_string();
+            let steer_id = uuid::Uuid::new_v4().to_string();
+            let preview = steer_preview(&input.content);
+            let content = input.content;
+            tokio::spawn(async move {
+                if let Err(error) = remote.client.steer(&remote.task_id, content).await {
+                    tracing::warn!(task_id = %remote.task_id, %error, "A2A sub-agent steer failed");
+                }
+            });
+            return SteerSubmitResult::Queued(SteerQueuedEvent {
+                steer_id,
+                session_id: thread_id.to_string(),
+                preview,
+            });
+        }
+        SteerSubmitResult::NotRunning
     }
 
     pub fn cancel_subagent(&self, thread_id: &str) -> bool {
@@ -4002,6 +4011,7 @@ pub struct CatBotBuilder {
     system: String,
     skills_dir: PathBuf,
     data_dir: PathBuf,
+    memory_dir: PathBuf,
     /// If set, Agent.md is read from this path instead of `data_dir/Agent.md`.
     /// Allows placing Agent.md outside the agent's writable sandbox.
     agent_md_path: Option<PathBuf>,
@@ -4048,8 +4058,12 @@ impl CatBotBuilder {
         let data_dir =
             PathBuf::from(std::env::var("REMI_DATA_DIR").unwrap_or_else(|_| ".remi-cat".into()));
         let sandbox_config = SandboxConfig::from_env(data_dir.clone(), bash_mode);
-        let skills_dir = data_dir.join("skills");
-        let models_dir = data_dir.join("models");
+        let skills_dir = profile_skills_dirs_from_env()
+            .and_then(|dirs| dirs.into_iter().next())
+            .unwrap_or_else(|| data_dir.join("skills"));
+        let models_dir = std::env::var("REMI_MODELS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("models"));
         install_embedded_model_profiles(&models_dir)?;
         let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
         let resolved_model = resolve_model_profile_from_env(&models_dir)?;
@@ -4065,6 +4079,9 @@ impl CatBotBuilder {
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.clone(),
+            memory_dir: std::env::var("REMI_MEMORY_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| data_dir.join("memory")),
             agent_md_path,
             overflow_bytes,
             memory_days,
@@ -4127,6 +4144,21 @@ impl CatBotBuilder {
         Self::from_model_source_with_keys(data_dir, model_source, selected_model, Some(api_keys))
     }
 
+    /// Build an embedded runtime from an exact model-registry directory.
+    pub fn from_models_dir_with_api_keys(
+        data_dir: impl Into<PathBuf>,
+        models_dir: impl Into<PathBuf>,
+        selected_model: Option<&str>,
+        api_keys: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        Self::from_models_dir_with_keys(
+            data_dir.into(),
+            models_dir.into(),
+            selected_model,
+            Some(api_keys),
+        )
+    }
+
     fn from_model_source_with_keys(
         data_dir: impl Into<PathBuf>,
         model_source: impl Into<PathBuf>,
@@ -4136,6 +4168,15 @@ impl CatBotBuilder {
         let data_dir = data_dir.into();
         let model_source = model_source.into();
         let models_dir = model_source.join("models");
+        Self::from_models_dir_with_keys(data_dir, models_dir, selected_model, api_keys)
+    }
+
+    fn from_models_dir_with_keys(
+        data_dir: PathBuf,
+        models_dir: PathBuf,
+        selected_model: Option<&str>,
+        api_keys: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> anyhow::Result<Self> {
         let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
         let model_profile = if let Some(id) = selected_model {
             model_registry.get(id).cloned().ok_or_else(|| {
@@ -4162,6 +4203,7 @@ impl CatBotBuilder {
             system: default_system_prompt(),
             skills_dir: data_dir.join("skills"),
             data_dir: data_dir.clone(),
+            memory_dir: data_dir.join("memory"),
             agent_md_path: None,
             overflow_bytes: tool_output_overflow_bytes_from_env()?,
             memory_days: 7,
@@ -4199,7 +4241,14 @@ impl CatBotBuilder {
     }
 
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.data_dir = dir.into();
+        let dir = dir.into();
+        self.memory_dir = dir.join("memory");
+        self.data_dir = dir;
+        self
+    }
+
+    pub fn memory_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.memory_dir = dir.into();
         self
     }
 
@@ -4242,6 +4291,18 @@ impl CatBotBuilder {
 
     pub fn tool(mut self, tool: bot_runtime_core::DynamicTool) -> Self {
         self.host_tools.push(tool);
+        self
+    }
+
+    /// Register a host tool and add it to the active agent's allowlist.
+    pub fn enabled_tool(mut self, tool: bot_runtime_core::DynamicTool) -> Self {
+        let name = tool.name().to_string();
+        self.host_tools.push(tool);
+        if let Some(allowlist) = self.tool_allowlist.as_mut() {
+            if !allowlist.iter().any(|entry| entry == &name) {
+                allowlist.push(name);
+            }
+        }
         self
     }
 
@@ -4402,6 +4463,7 @@ impl CatBotBuilder {
 
         let memory = Arc::new(MemoryStore {
             data_dir: self.data_dir,
+            memory_dir: self.memory_dir,
             agent_md_path: self.agent_md_path,
             compressor,
             short_term_tokens,
@@ -4413,7 +4475,20 @@ impl CatBotBuilder {
         let environment_context_source =
             EnvironmentContextSource::from_sandbox_config(&self.sandbox_config);
         let file_skill_store = if self.file_skills {
-            FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone())
+            if let Some(profile_dirs) = profile_skills_dirs_from_env() {
+                let mut roots = profile_dirs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, path)| (path, format!("profile:{index}")))
+                    .collect::<Vec<_>>();
+                roots.push((
+                    workspace_root.join(".agents/skills"),
+                    ".agents/skills".to_string(),
+                ));
+                FileSkillStore::with_roots(roots)
+            } else {
+                FileSkillStore::new_in_workspace(self.skills_dir, workspace_root.clone())
+            }
         } else {
             FileSkillStore::with_roots([])
         };
@@ -4440,8 +4515,11 @@ impl CatBotBuilder {
         let hook_manager = self
             .hook_manager
             .unwrap_or_else(|| HookManager::new(workspace_root.clone(), data_dir.clone()));
-        let tool_tasks = crate::tool_tasks::ToolTaskManager::load(&data_dir)
-            .map_err(|err| AgentError::other(format!("load tool task store: {err:#}")))?;
+        let tool_tasks = match std::env::var("REMI_TASKS_DIR") {
+            Ok(path) => crate::tool_tasks::ToolTaskManager::load_store_dir(path),
+            Err(_) => crate::tool_tasks::ToolTaskManager::load(&data_dir),
+        }
+        .map_err(|err| AgentError::other(format!("load tool task store: {err:#}")))?;
         let subagent_sessions = Arc::new(SubagentSessionCoordinator::default());
         let acp_backend = Arc::new(acp::AcpBackend::new(
             data_dir.clone(),
@@ -4985,25 +5063,25 @@ struct RemiSubAgentTool {
     description: String,
     parameters_schema: serde_json::Value,
     agent_name: String,
-    model_profile: ModelProfileConfig,
-    base_url: Option<String>,
-    api_key: String,
-    system_prompt: String,
-    extra_options: serde_json::Map<String, serde_json::Value>,
-    max_turns: usize,
-    data_dir: PathBuf,
-    deps: LocalToolDeps,
-    profile: AgentProfile,
-    tool_allowlist: Vec<String>,
-    overflow_bytes: usize,
     sessions: Arc<SubagentSessionCoordinator>,
+    approval_manager: Arc<ToolApprovalManager>,
+    user_question_manager: Arc<UserQuestionManager>,
+    hook_manager: Arc<HookManager>,
+    workspace_root: PathBuf,
+    model_name: String,
 }
 
 #[derive(Default)]
 struct SubagentSessionCoordinator {
     locks: AsyncMutex<HashMap<String, ThreadRunLock>>,
-    active: ActiveSteerQueues,
     cancellations: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+    remote_tasks: Arc<std::sync::Mutex<HashMap<String, RemoteDelegateTask>>>,
+}
+
+#[derive(Clone)]
+struct RemoteDelegateTask {
+    client: crate::a2a_delegate::A2aDelegateClient,
+    task_id: String,
 }
 
 impl SubagentSessionCoordinator {
@@ -5015,43 +5093,15 @@ impl SubagentSessionCoordinator {
             .clone()
     }
 
-    fn active_queue(&self, thread_id: &str) -> Option<Arc<CoreSteerQueue>> {
-        self.active
-            .lock()
-            .expect("active sub-agent steer queue lock poisoned")
-            .get(thread_id)
-            .cloned()
-    }
-
-    fn register(
-        &self,
-        thread_id: &str,
-        cancel: CancellationToken,
-    ) -> (
-        Arc<CoreSteerQueue>,
-        SteerQueueRegistration,
-        SubagentCancelRegistration,
-    ) {
-        let queue = Arc::new(CoreSteerQueue::new());
-        self.active
-            .lock()
-            .expect("active sub-agent steer queue lock poisoned")
-            .insert(thread_id.to_string(), Arc::clone(&queue));
-        let guard = SteerQueueRegistration {
-            session_id: thread_id.to_string(),
-            queue: Arc::clone(&queue),
-            active: Arc::clone(&self.active),
-            removes_queue_on_drop: true,
-        };
+    fn register(&self, thread_id: &str, cancel: CancellationToken) -> SubagentCancelRegistration {
         self.cancellations
             .lock()
             .expect("active sub-agent cancellation lock poisoned")
             .insert(thread_id.to_string(), cancel);
-        let cancel_guard = SubagentCancelRegistration {
+        SubagentCancelRegistration {
             thread_id: thread_id.to_string(),
             cancellations: Arc::clone(&self.cancellations),
-        };
-        (queue, guard, cancel_guard)
+        }
     }
 
     fn cancel(&self, thread_id: &str) -> bool {
@@ -5065,6 +5115,36 @@ impl SubagentSessionCoordinator {
             token.cancel();
             true
         })
+    }
+
+    fn bind_remote(
+        &self,
+        thread_id: &str,
+        client: crate::a2a_delegate::A2aDelegateClient,
+        task_id: String,
+    ) {
+        self.remote_tasks
+            .lock()
+            .expect("active A2A sub-agent task lock poisoned")
+            .insert(
+                thread_id.to_string(),
+                RemoteDelegateTask { client, task_id },
+            );
+    }
+
+    fn remote(&self, thread_id: &str) -> Option<RemoteDelegateTask> {
+        self.remote_tasks
+            .lock()
+            .expect("active A2A sub-agent task lock poisoned")
+            .get(thread_id)
+            .cloned()
+    }
+
+    fn clear_remote(&self, thread_id: &str) {
+        self.remote_tasks
+            .lock()
+            .expect("active A2A sub-agent task lock poisoned")
+            .remove(thread_id);
     }
 }
 
@@ -5119,6 +5199,495 @@ impl RemiSubAgentTool {
         }
         Ok(named.to_string())
     }
+
+    async fn execute_a2a(
+        &self,
+        task: String,
+        named: String,
+        title: Option<String>,
+        ctx: ToolContext,
+    ) -> Result<ToolResult<remi_agentloop::tool::BoxedToolStream>, AgentError> {
+        let client = crate::a2a_delegate::A2aDelegateClient::from_env(&self.agent_name)
+            .map_err(|error| AgentError::tool("sub-agent", error))?;
+        let agent_name = self.agent_name.clone();
+        let sub_thread_id = ThreadId(format!("subagent:{agent_name}:{named}"));
+        let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
+        let parent_thread_id = ctx.thread_id().0;
+        let cancel = ctx.runtime().cancellation();
+        let sessions = Arc::clone(&self.sessions);
+        let approval_manager = Arc::clone(&self.approval_manager);
+        let user_question_manager = Arc::clone(&self.user_question_manager);
+        let hook_manager = Arc::clone(&self.hook_manager);
+        let hook_context = HookContext {
+            session_id: sub_thread_id.0.clone(),
+            app_id: ctx.metadata().and_then(|metadata| {
+                metadata
+                    .get("app_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+            transcript_path: None,
+            cwd: self.workspace_root.clone(),
+            model: Some(self.model_name.clone()),
+            turn_id: Some(sub_run_id.0.clone()),
+            permission_mode: None,
+        };
+        if let Some(active) = sessions.remote(&sub_thread_id.0) {
+            active
+                .client
+                .steer(&active.task_id, Content::text(task.clone()))
+                .await
+                .map_err(|error| AgentError::tool("sub-agent", error))?;
+        }
+        let session_lock = sessions.session_lock(&sub_thread_id.0).await;
+        let output: remi_agentloop::tool::BoxedToolStream = Box::pin(stream! {
+            let _session_guard = session_lock.lock().await;
+            let _cancel_registration = sessions.register(&sub_thread_id.0, cancel.clone());
+            yield ToolOutput::SubSession(SubSessionEvent::new(
+                String::new(),
+                sub_thread_id.clone(),
+                sub_run_id.clone(),
+                agent_name.clone(),
+                title.clone(),
+                0,
+                ProtocolEvent::RunStart {
+                    thread_id: sub_thread_id.0.clone(),
+                    run_id: sub_run_id.0.clone(),
+                    metadata: None,
+                },
+            ));
+
+            let mut delegate_task = task;
+            let start_hook = hook_manager
+                .run(
+                    HookEventName::SubagentStart,
+                    Some(&agent_name),
+                    &hook_context,
+                    serde_json::json!({
+                        "agent_id": &sub_thread_id.0,
+                        "agent_type": &agent_name,
+                        "agent_transcript_path": null,
+                    }),
+                )
+                .await;
+            for context in start_hook.additional_context {
+                delegate_task.push_str("\n\nHook SubagentStart provided additional context:\n");
+                delegate_task.push_str(&context);
+            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let client_task = client.clone();
+            let initial_tx = tx.clone();
+            let initial_cancel = cancel.clone();
+            let agent_for_task = agent_name.clone();
+            let session_for_task = sub_thread_id.0.clone();
+            let parent_for_task = parent_thread_id.clone();
+            tokio::spawn(async move {
+                let result = client_task
+                    .invoke(
+                        &agent_for_task,
+                        &session_for_task,
+                        &parent_for_task,
+                        delegate_task,
+                        initial_cancel,
+                        |event| initial_tx.send(event).map_err(|_| "delegate event receiver closed".to_string()),
+                    )
+                    .await;
+                let _ = initial_tx.send(crate::a2a_delegate::DelegateWireEvent::Activity(
+                    serde_json::json!({"event": "__transport_finished", "data": {"error": result.err()}}),
+                ));
+            });
+
+            let mut final_output = String::new();
+            let mut terminal_state = None;
+            let mut terminal_error = None;
+            let mut handed_off = false;
+            let mut remote_task_id = None;
+            let mut approval_ids = HashMap::new();
+            let mut question_ids = HashMap::new();
+            let mut stop_hook_active = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    crate::a2a_delegate::DelegateWireEvent::TaskAssigned { task_id, context_id } => {
+                        sessions.bind_remote(&sub_thread_id.0, client.clone(), task_id.clone());
+                        remote_task_id = Some(task_id.clone());
+                        tracing::debug!(%task_id, %context_id, sub_session_id = %sub_thread_id.0, "A2A delegate task assigned");
+                    }
+                    crate::a2a_delegate::DelegateWireEvent::Terminal { state, message } => {
+                        terminal_state = Some(state);
+                        terminal_error = message;
+                    }
+                    crate::a2a_delegate::DelegateWireEvent::Activity(mut value) => {
+                        if value.get("event").and_then(serde_json::Value::as_str) == Some("__transport_finished") {
+                            if let Some(error) = value
+                                .get("data")
+                                .and_then(|data| data.get("error"))
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                terminal_error = Some(error.to_string());
+                            }
+                            if terminal_error.is_none() && !handed_off && !stop_hook_active {
+                                let stop_hook = hook_manager
+                                    .run(
+                                        HookEventName::SubagentStop,
+                                        Some(&agent_name),
+                                        &hook_context,
+                                        serde_json::json!({
+                                            "agent_id": &sub_thread_id.0,
+                                            "agent_type": &agent_name,
+                                            "agent_transcript_path": null,
+                                            "stop_hook_active": false,
+                                            "last_assistant_message": &final_output,
+                                        }),
+                                    )
+                                    .await;
+                                if stop_hook.blocked || stop_hook.continue_flow == Some(false) {
+                                    stop_hook_active = true;
+                                    terminal_state = None;
+                                    let continuation = stop_hook.reason.unwrap_or_else(|| {
+                                        "Run one more focused pass inside the subagent.".to_string()
+                                    });
+                                    let tx = tx.clone();
+                                    let client_task = client.clone();
+                                    let agent_for_task = agent_name.clone();
+                                    let session_for_task = sub_thread_id.0.clone();
+                                    let parent_for_task = parent_thread_id.clone();
+                                    let cancel = cancel.clone();
+                                    tokio::spawn(async move {
+                                        let result = client_task
+                                            .invoke(
+                                                &agent_for_task,
+                                                &session_for_task,
+                                                &parent_for_task,
+                                                continuation,
+                                                cancel,
+                                                |event| tx.send(event).map_err(|_| "delegate event receiver closed".to_string()),
+                                            )
+                                            .await;
+                                        let _ = tx.send(crate::a2a_delegate::DelegateWireEvent::Activity(
+                                            serde_json::json!({"event": "__transport_finished", "data": {"error": result.err()}}),
+                                        ));
+                                    });
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        if value.get("event").and_then(serde_json::Value::as_str) == Some("steer_injected") {
+                            handed_off = true;
+                            yield ToolOutput::SubSession(SubSessionEvent::new(
+                                String::new(),
+                                sub_thread_id.clone(),
+                                sub_run_id.clone(),
+                                agent_name.clone(),
+                                title.clone(),
+                                0,
+                                ProtocolEvent::Custom {
+                                    event_type: "sub_session_handed_off".to_string(),
+                                    extra: serde_json::json!({"handed_off": true}),
+                                },
+                            ));
+                            continue;
+                        }
+                        proxy_a2a_interactive_event(
+                            &mut value,
+                            remote_task_id.as_deref(),
+                            &sub_thread_id.0,
+                            &client,
+                            &approval_manager,
+                            &user_question_manager,
+                            &mut approval_ids,
+                            &mut question_ids,
+                        )
+                        .await;
+                        if let Some(tool_output) = a2a_activity_tool_output(
+                            &value,
+                            &sub_thread_id,
+                            &sub_run_id,
+                            &agent_name,
+                            title.clone(),
+                            &mut final_output,
+                        ) {
+                            yield tool_output;
+                        }
+                    }
+                }
+            }
+
+            sessions.clear_remote(&sub_thread_id.0);
+            let success = terminal_state
+                .as_ref()
+                .is_some_and(|state| *state == a2a::TaskState::Completed)
+                && terminal_error.is_none();
+            if success {
+                yield ToolOutput::SubSession(SubSessionEvent::new(
+                    String::new(),
+                    sub_thread_id.clone(),
+                    sub_run_id.clone(),
+                    agent_name.clone(),
+                    title.clone(),
+                    0,
+                    sub_session_done_event((!final_output.is_empty()).then(|| final_output.clone())),
+                ));
+            } else {
+                let message = terminal_error.clone().unwrap_or_else(|| {
+                    format!("A2A delegate ended in state {:?}", terminal_state)
+                });
+                yield ToolOutput::SubSession(SubSessionEvent::new(
+                    String::new(),
+                    sub_thread_id.clone(),
+                    sub_run_id.clone(),
+                    agent_name.clone(),
+                    title.clone(),
+                    0,
+                    ProtocolEvent::Error { message: message.clone(), code: None },
+                ));
+            }
+            yield ToolOutput::text(format_subagent_tool_result_with_handoff(
+                &sub_thread_id,
+                &sub_run_id,
+                &agent_name,
+                success,
+                &final_output,
+                terminal_error.as_deref(),
+                handed_off,
+            ));
+        });
+        Ok(ToolResult::Output(output))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_a2a_interactive_event(
+    value: &mut serde_json::Value,
+    remote_task_id: Option<&str>,
+    sub_session_id: &str,
+    client: &crate::a2a_delegate::A2aDelegateClient,
+    approval_manager: &Arc<ToolApprovalManager>,
+    user_question_manager: &Arc<UserQuestionManager>,
+    approval_ids: &mut HashMap<String, String>,
+    question_ids: &mut HashMap<String, String>,
+) {
+    let Some(task_id) = remote_task_id else {
+        return;
+    };
+    let Some(kind) = value.get("event").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    match kind {
+        "approval_requested" => {
+            let Some(data) = value.get_mut("data") else {
+                return;
+            };
+            let Ok(mut request) =
+                serde_json::from_value::<crate::ToolApprovalRequest>(data.clone())
+            else {
+                return;
+            };
+            let remote_id = request.id.clone();
+            let proxy_id = format!("a2a-{}", uuid::Uuid::new_v4());
+            approval_ids.insert(remote_id.clone(), proxy_id.clone());
+            request.id = proxy_id;
+            request.session_id = sub_session_id.to_string();
+            *data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+            let (wait, _) = approval_manager.start_request(request).await;
+            let client = client.clone();
+            let task_id = task_id.to_string();
+            tokio::spawn(async move {
+                let decision = match wait {
+                    crate::approval::ApprovalWait::Immediate(
+                        crate::ApprovalResolution::Approved,
+                    ) => crate::ToolApprovalDecision::AllowOnce,
+                    crate::approval::ApprovalWait::Immediate(crate::ApprovalResolution::Denied) => {
+                        crate::ToolApprovalDecision::Deny
+                    }
+                    crate::approval::ApprovalWait::Pending(receiver) => {
+                        receiver.await.unwrap_or(crate::ToolApprovalDecision::Deny)
+                    }
+                };
+                if let Err(error) = client.decide_approval(&task_id, &remote_id, decision).await {
+                    tracing::warn!(%task_id, %error, "A2A delegate approval forwarding failed");
+                }
+            });
+        }
+        "approval_updated" => replace_interactive_id(value, approval_ids, false),
+        "approval_resolved" => replace_interactive_id(value, approval_ids, true),
+        "user_question_requested" => {
+            let Some(data) = value.get_mut("data") else {
+                return;
+            };
+            let Ok(mut request) =
+                serde_json::from_value::<crate::UserQuestionRequest>(data.clone())
+            else {
+                return;
+            };
+            let remote_id = request.id.clone();
+            let proxy_id = format!("a2a-{}", uuid::Uuid::new_v4());
+            question_ids.insert(remote_id.clone(), proxy_id.clone());
+            request.id = proxy_id;
+            request.session_id = sub_session_id.to_string();
+            *data = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+            let receiver = user_question_manager.start(request).await;
+            let client = client.clone();
+            let task_id = task_id.to_string();
+            tokio::spawn(async move {
+                let response = receiver.await.unwrap_or(crate::UserQuestionResponse {
+                    question_id: remote_id.clone(),
+                    status: crate::UserQuestionStatus::Cancelled,
+                    selected_option_ids: Vec::new(),
+                    free_text: None,
+                    answer_text: Some("User cancelled the question.".to_string()),
+                    answered_at: None,
+                    source: Some("a2a_proxy_dropped".to_string()),
+                });
+                if let Err(error) = client.answer_question(&task_id, &remote_id, response).await {
+                    tracing::warn!(%task_id, %error, "A2A delegate question forwarding failed");
+                }
+            });
+        }
+        "user_question_updated" => replace_interactive_id(value, question_ids, false),
+        "user_question_resolved" => replace_interactive_id(value, question_ids, true),
+        _ => {}
+    }
+}
+
+fn replace_interactive_id(
+    value: &mut serde_json::Value,
+    ids: &HashMap<String, String>,
+    nested_request: bool,
+) {
+    let request = if nested_request {
+        value
+            .get_mut("data")
+            .and_then(|data| data.get_mut("request"))
+    } else {
+        value.get_mut("data")
+    };
+    let Some(id) = request
+        .and_then(|request| request.get_mut("id"))
+        .and_then(|id| id.as_str().map(str::to_string))
+    else {
+        return;
+    };
+    if let Some(proxy_id) = ids.get(&id) {
+        if let Some(request) = if nested_request {
+            value
+                .get_mut("data")
+                .and_then(|data| data.get_mut("request"))
+        } else {
+            value.get_mut("data")
+        } {
+            request["id"] = serde_json::Value::String(proxy_id.clone());
+        }
+    }
+}
+
+fn a2a_activity_tool_output(
+    value: &serde_json::Value,
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    agent_name: &str,
+    title: Option<String>,
+    final_output: &mut String,
+) -> Option<ToolOutput> {
+    let event = value.get("event")?.as_str()?;
+    let data = value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if event == "sub_session" {
+        return serde_json::from_value::<SubSessionEvent>(data)
+            .ok()
+            .map(ToolOutput::SubSession);
+    }
+    let protocol = match event {
+        "text_delta" => {
+            let text = data.get("text")?.as_str()?.to_string();
+            final_output.push_str(&text);
+            ProtocolEvent::Delta {
+                content: text,
+                role: None,
+            }
+        }
+        "thinking_delta" | "thinking_finished" => ProtocolEvent::ThinkingEnd {
+            content: data.get("text")?.as_str()?.to_string(),
+        },
+        "tool_call_started" | "tool_call" => ProtocolEvent::ToolCallStart {
+            id: data.get("call_id")?.as_str()?.to_string(),
+            name: data.get("tool_name")?.as_str()?.to_string(),
+        },
+        "tool_call_arguments_delta" => ProtocolEvent::ToolCallDelta {
+            id: data.get("call_id")?.as_str()?.to_string(),
+            arguments_delta: data.get("delta")?.as_str()?.to_string(),
+        },
+        "tool_call_result" => ProtocolEvent::ToolResult {
+            id: data.get("call_id")?.as_str()?.to_string(),
+            name: data.get("tool_name")?.as_str()?.to_string(),
+            result: data
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| data.get("result").cloned().unwrap_or_default().to_string()),
+        },
+        "approval_requested" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                SUBAGENT_APPROVAL_REQUESTED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        "approval_updated" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                SUBAGENT_APPROVAL_UPDATED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        "approval_resolved" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                SUBAGENT_APPROVAL_RESOLVED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        "user_question_requested" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                USER_QUESTION_REQUESTED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        "user_question_updated" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                USER_QUESTION_UPDATED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        "user_question_resolved" => {
+            return Some(subagent_approval_marker(
+                sub_thread_id,
+                sub_run_id,
+                USER_QUESTION_RESOLVED_PREFIX,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ));
+        }
+        _ => return None,
+    };
+    Some(ToolOutput::SubSession(SubSessionEvent::new(
+        String::new(),
+        sub_thread_id.clone(),
+        sub_run_id.clone(),
+        agent_name.to_string(),
+        title,
+        0,
+        protocol,
+    )))
 }
 
 impl Tool for RemiSubAgentTool {
@@ -5152,662 +5721,11 @@ impl Tool for RemiSubAgentTool {
         let named = Self::named_from_args(&arguments)?;
 
         let title = Self::title_from_args(&arguments);
-        let agent_name = self.agent_name.clone();
-        let model =
-            build_provider_client(&self.api_key, &self.model_profile, self.base_url.clone());
-        let mut builder = AgentBuilder::new()
-            .model(model)
-            .config(
-                AgentConfig::default()
-                    .with_model(self.model_profile.model.clone())
-                    .with_max_tokens(self.model_profile.max_output_tokens),
-            )
-            .system(self.system_prompt.clone())
-            .max_turns(self.max_turns);
-        if !self.extra_options.is_empty() {
-            builder = builder.extra_options(self.extra_options.clone());
-        }
-        if let Some(tracer) = sentry_tracer(
-            self.deps.agent_tracing,
-            &self.agent_name,
-            &self.model_profile,
-            &self.deps.redactor,
-        ) {
-            builder = builder.tracer(tracer);
-        }
-        let agent = CatAgent {
-            inner: builder.build_loop(),
-            local_tools: Arc::new(build_subagent_tools(&self.deps, &self.profile)),
-            model_tools: None,
-            data_dir: self.data_dir.clone(),
-            workspace_root: self.deps.workspace_root.clone(),
-            workspace_root_label: self.deps.sandbox.workspace_root_label(),
-            allow_host_absolute_paths: self.deps.sandbox.kind() != "docker",
-            overflow_bytes: self.overflow_bytes,
-            im_bridge: None,
-            tool_allowlist: Some(self.tool_allowlist.clone()),
-            approval_manager: Arc::clone(&self.deps.approval_manager),
-            approval_reviewer: self.deps.approval_reviewer.clone(),
-            user_question_manager: Arc::clone(&self.deps.user_question_manager),
-            hook_manager: Arc::clone(&self.deps.hook_manager),
-            tool_tasks: Arc::clone(&self.deps.tool_tasks),
-        };
-        let sub_thread_id = ThreadId(format!("subagent:{}:{named}", self.agent_name));
-        let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
-        let sub_thread_id_for_memory = sub_thread_id.0.clone();
-        let subagent_cancel = ctx.runtime().cancellation();
-        let metadata = subagent_metadata(ctx, &sub_thread_id_for_memory);
-        let memory = Arc::clone(&self.deps.memory);
-        let workspace_root = self.deps.workspace_root.clone();
-        let environment_context_source = self.deps.environment_context_source.clone();
-        let subagent_system_prompt = self.system_prompt.clone();
-        let model_name = self.model_profile.model.clone();
-        let model_profile = self.model_profile.clone();
-        let hook_manager = Arc::clone(&self.deps.hook_manager);
-        let persistent = true;
-        let sessions = Arc::clone(&self.sessions);
-        let session_lock = sessions.session_lock(&sub_thread_id_for_memory).await;
-
-        let output: remi_agentloop::tool::BoxedToolStream = Box::pin(stream! {
-            if let Some(active) = sessions.active_queue(&sub_thread_id_for_memory) {
-                active.push(CoreSteerInput {
-                    id: sub_run_id.0.clone(),
-                    content: Content::text(task.clone()),
-                    preview: steer_preview(&Content::text(task.clone())),
-                    message_metadata: None,
-                    user_name: None,
-                    source: CoreSteerSource::UserNextTurn,
-                });
-            }
-            let _session_guard = session_lock.lock().await;
-            let (subagent_steer, _steer_registration, _cancel_registration) = sessions.register(
-                &sub_thread_id_for_memory,
-                subagent_cancel.clone(),
-            );
-            let mut sub_task = task.clone();
-            let sub_hook_context = HookContext {
-                session_id: sub_thread_id_for_memory.clone(),
-                app_id: metadata.get("app_id").and_then(serde_json::Value::as_str).map(str::to_string),
-                transcript_path: None,
-                cwd: workspace_root.clone(),
-                model: Some(model_name.clone()),
-                turn_id: Some(sub_run_id.0.clone()),
-                permission_mode: None,
-            };
-            let start_hook = hook_manager
-                .run(
-                    HookEventName::SubagentStart,
-                    Some(&agent_name),
-                    &sub_hook_context,
-                    serde_json::json!({
-                        "agent_id": &sub_thread_id_for_memory,
-                        "agent_type": &agent_name,
-                        "agent_transcript_path": null,
-                    }),
-                )
-                .await;
-            if start_hook.blocked || start_hook.continue_flow == Some(false) {
-                tracing::warn!(
-                    agent = %agent_name,
-                    reason = start_hook.reason.as_deref().unwrap_or(""),
-                    "SubagentStart hook requested stop; Codex compatibility ignores this decision"
-                );
-            }
-            for context in start_hook.additional_context {
-                sub_task.push_str("\n\n");
-                sub_task.push_str(&format!("Hook SubagentStart provided additional context:\n{context}"));
-            }
-            yield ToolOutput::SubSession(SubSessionEvent::new(
-                String::new(),
-                sub_thread_id.clone(),
-                sub_run_id.clone(),
-                agent_name.clone(),
-                title.clone(),
-                0,
-                ProtocolEvent::RunStart {
-                    thread_id: sub_thread_id.to_string(),
-                    run_id: sub_run_id.to_string(),
-                    metadata: None,
-                },
-            ));
-
-            let mut final_output = String::new();
-            let mut ephemeral_user_state = serde_json::Value::Null;
-            let ephemeral_environment_context = ensure_environment_context(
-                &mut ephemeral_user_state,
-                &environment_context_source,
-            );
-            let mut ephemeral_history = vec![Message::system(subagent_system_prompt.clone())];
-            insert_environment_context_prompt(
-                &mut ephemeral_history,
-                1,
-                ephemeral_environment_context.prompt,
-            );
-            let mut skip_count = ephemeral_history.len();
-            let mut input = LoopInput::start(&sub_task)
-                .history(ephemeral_history)
-                .metadata(metadata.clone())
-                .user_state(ephemeral_user_state);
-            if persistent {
-                match memory.load_context(&sub_thread_id_for_memory).await {
-                    Ok(mut ctx) => {
-                        let environment_context = ensure_environment_context(
-                            &mut ctx.user_state,
-                            &environment_context_source,
-                        );
-                        persist_new_environment_context(
-                            &memory,
-                            &sub_thread_id_for_memory,
-                            &ctx.user_state,
-                            environment_context.initialized,
-                        )
-                        .await;
-                        let mut history = build_injected_history(&ctx);
-                        history.insert(0, Message::system(subagent_system_prompt.clone()));
-                        insert_environment_context_prompt(
-                            &mut history,
-                            1,
-                            environment_context.prompt,
-                        );
-                        skip_count = history.len();
-                        input = input
-                            .history(history)
-                            .user_state(std::mem::take(&mut ctx.user_state));
-                    }
-                    Err(err) => {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::Error {
-                                message: format!("failed to load sub-agent session: {err}"),
-                                code: None,
-                            },
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            &agent_name,
-                            false,
-                            "",
-                            Some(&err.to_string()),
-                        ));
-                        return;
-                    }
-                }
-            }
-            let request_budget = model_request_budget_tokens(
-                &model_profile,
-                auto_compress_context_percent().unwrap_or(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
-            );
-            loop {
-                let request_tool_definitions = agent.tool_definitions_for_input(&input, None);
-                let Some(snapshot) = model_input_snapshot_from_loop_input(
-                    &input,
-                    &request_tool_definitions,
-                    &sub_thread_id_for_memory,
-                    None,
-                    &model_profile.id,
-                    &model_profile.model,
-                ) else {
-                    break;
-                };
-                if snapshot.totals.estimated_tokens <= request_budget {
-                    break;
-                }
-                if !persistent {
-                    let message = format!(
-                        "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; the current ephemeral task cannot be compressed",
-                        snapshot.totals.estimated_tokens, request_budget
-                    );
-                    yield ToolOutput::SubSession(SubSessionEvent::new(
-                        String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
-                        title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
-                    ));
-                    yield ToolOutput::text(format_subagent_tool_result(
-                        &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
-                    ));
-                    return;
-                }
-                if !memory.auto_compress {
-                    let message = format!(
-                        "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; automatic compression is disabled",
-                        snapshot.totals.estimated_tokens, request_budget
-                    );
-                    let _ = memory.append_failed_turn(
-                        &sub_thread_id_for_memory,
-                        vec![Message::user(sub_task.clone())],
-                    ).await;
-                    yield ToolOutput::SubSession(SubSessionEvent::new(
-                        String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
-                        title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
-                    ));
-                    yield ToolOutput::text(format_subagent_tool_result(
-                        &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
-                    ));
-                    return;
-                }
-                match memory.compact_for_request(&sub_thread_id_for_memory).await {
-                    Ok(count) if count > 0 => {}
-                    Ok(_) => {
-                        let message = format!(
-                            "sub-agent request exceeds context budget: estimated {} tokens, limit {} tokens; no complete older exchange is eligible for compression",
-                            snapshot.totals.estimated_tokens, request_budget
-                        );
-                        let _ = memory.append_failed_turn(
-                            &sub_thread_id_for_memory,
-                            vec![Message::user(sub_task.clone())],
-                        ).await;
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
-                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
-                        ));
-                        return;
-                    }
-                    Err(err) => {
-                        let message = format!(
-                            "pre-request sub-agent memory compression failed while reducing {} estimated tokens to the {} token limit: {err}",
-                            snapshot.totals.estimated_tokens, request_budget
-                        );
-                        let _ = memory.append_failed_turn(
-                            &sub_thread_id_for_memory,
-                            vec![Message::user(sub_task.clone())],
-                        ).await;
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
-                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
-                        ));
-                        return;
-                    }
-                }
-                let mut ctx = match memory.load_context(&sub_thread_id_for_memory).await {
-                    Ok(ctx) => ctx,
-                    Err(err) => {
-                        let message = format!("reload sub-agent memory after pre-request compression: {err}");
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(), sub_thread_id.clone(), sub_run_id.clone(), agent_name.clone(),
-                            title.clone(), 0, ProtocolEvent::Error { message: message.clone(), code: None },
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id, &sub_run_id, &agent_name, false, "", Some(&message),
-                        ));
-                        return;
-                    }
-                };
-                let environment_context = ensure_environment_context(
-                    &mut ctx.user_state,
-                    &environment_context_source,
-                );
-                let mut history = build_injected_history(&ctx);
-                history.insert(0, Message::system(subagent_system_prompt.clone()));
-                insert_environment_context_prompt(&mut history, 1, environment_context.prompt);
-                skip_count = history.len();
-                input = LoopInput::start(&sub_task)
-                    .history(history)
-                    .metadata(metadata.clone())
-                    .user_state(std::mem::take(&mut ctx.user_state));
-            }
-            let mut raw_history: Option<Vec<Message>> = None;
-            let mut raw_user_state: Option<serde_json::Value> = None;
-            let mut subagent_stop_hook_active = false;
-            let mut handed_off = false;
-            let mut inner_stream = Box::pin(agent.stream_with_input_and_options(
-                input,
-                CoreStreamOptions {
-                    cancel: Some(subagent_cancel.clone()),
-                    steer: Some(Arc::clone(&subagent_steer)),
-                    steer_behavior: CoreSteerBehavior::Handoff,
-                    async_agent: false,
-                },
-            ));
-            while let Some(event) = inner_stream.next().await {
-                match event {
-                    CatEvent::History(messages, user_state) => {
-                        if persistent {
-                            let next_skip_count = messages.len();
-                            let _ = persist_turn(
-                                &memory,
-                                &sub_thread_id_for_memory,
-                                Some(messages),
-                                Some(user_state),
-                                skip_count,
-                                &HashMap::new(),
-                            )
-                            .await;
-                            skip_count = next_skip_count;
-                        } else {
-                            raw_history = Some(messages);
-                            raw_user_state = Some(user_state);
-                        }
-                    }
-                    CatEvent::StateUpdate(user_state) => {
-                        if persistent {
-                            let _ = persist_turn(
-                                &memory,
-                                &sub_thread_id_for_memory,
-                                None,
-                                Some(user_state),
-                                skip_count,
-                                &HashMap::new(),
-                            )
-                            .await;
-                        } else {
-                            raw_user_state = Some(user_state);
-                        }
-                    }
-                    CatEvent::Text(content) => {
-                        final_output.push_str(&content);
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::Delta {
-                                content,
-                                role: None,
-                            },
-                        ));
-                    }
-                    CatEvent::Thinking(content) => {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::ThinkingEnd { content },
-                        ));
-                    }
-                    CatEvent::ToolCallStart { id, name } | CatEvent::ToolCall { id, name, .. } => {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::ToolCallStart { id, name },
-                        ));
-                    }
-                    CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::ToolCallDelta {
-                                id,
-                                arguments_delta: delta,
-                            },
-                        ));
-                    }
-                    CatEvent::ToolCallResult { id, name, result, .. } => {
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::ToolResult { id, name, result },
-                        ));
-                    }
-                    CatEvent::ToolApprovalRequested(request) => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            SUBAGENT_APPROVAL_REQUESTED_PREFIX,
-                            serde_json::to_string(&request).unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::ToolApprovalUpdated(request) => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            SUBAGENT_APPROVAL_UPDATED_PREFIX,
-                            serde_json::to_string(&request).unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::ToolApprovalResolved { request, decision } => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            SUBAGENT_APPROVAL_RESOLVED_PREFIX,
-                            serde_json::to_string(&serde_json::json!({
-                                "request": request,
-                                "decision": decision,
-                            }))
-                            .unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::UserQuestionRequested(request) => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            USER_QUESTION_REQUESTED_PREFIX,
-                            serde_json::to_string(&request).unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::UserQuestionUpdated(request) => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            USER_QUESTION_UPDATED_PREFIX,
-                            serde_json::to_string(&request).unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::UserQuestionResolved { request, response } => {
-                        yield subagent_approval_marker(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            USER_QUESTION_RESOLVED_PREFIX,
-                            serde_json::to_string(&serde_json::json!({
-                                "request": request,
-                                "response": response,
-                            }))
-                            .unwrap_or_default(),
-                        );
-                    }
-                    CatEvent::SteerInjected(_) => {
-                        handed_off = true;
-                    }
-                    CatEvent::Done => {
-                        if persistent {
-                            let _ = persist_turn(
-                                &memory,
-                                &sub_thread_id_for_memory,
-                                raw_history.take(),
-                                raw_user_state.take(),
-                                skip_count,
-                                &HashMap::new(),
-                            )
-                            .await;
-                        }
-                        if handed_off {
-                            yield ToolOutput::SubSession(SubSessionEvent::new(
-                                String::new(),
-                                sub_thread_id.clone(),
-                                sub_run_id.clone(),
-                                agent_name.clone(),
-                                title.clone(),
-                                0,
-                                ProtocolEvent::Custom {
-                                    event_type: "sub_session_handed_off".to_string(),
-                                    extra: serde_json::json!({
-                                        "final_output": &final_output,
-                                        "handed_off": true,
-                                    }),
-                                },
-                            ));
-                            yield ToolOutput::text(format_subagent_tool_result_with_handoff(
-                                &sub_thread_id,
-                                &sub_run_id,
-                                &agent_name,
-                                true,
-                                &final_output,
-                                None,
-                                true,
-                            ));
-                            return;
-                        }
-                        let stop_hook = hook_manager
-                            .run(
-                                HookEventName::SubagentStop,
-                                Some(&agent_name),
-                                &sub_hook_context,
-                                serde_json::json!({
-                                    "agent_id": &sub_thread_id_for_memory,
-                                    "agent_type": &agent_name,
-                                    "agent_transcript_path": null,
-                                    "stop_hook_active": subagent_stop_hook_active,
-                                    "last_assistant_message": &final_output,
-                                }),
-                            )
-                            .await;
-                        if (stop_hook.blocked || stop_hook.continue_flow == Some(false))
-                            && !subagent_stop_hook_active
-                        {
-                            let message = stop_hook
-                                .reason
-                                .unwrap_or_else(|| "Run one more focused pass inside the subagent.".to_string());
-                            subagent_stop_hook_active = true;
-                            let mut continuation_input =
-                                LoopInput::start(&message).metadata(metadata.clone());
-                            if persistent {
-                                if let Ok(mut ctx) = memory.load_context(&sub_thread_id_for_memory).await {
-                                    let environment_context = ensure_environment_context(
-                                        &mut ctx.user_state,
-                                        &environment_context_source,
-                                    );
-                                    let mut history = build_injected_history(&ctx);
-                                    history.insert(0, Message::system(subagent_system_prompt.clone()));
-                                    insert_environment_context_prompt(
-                                        &mut history,
-                                        1,
-                                        environment_context.prompt,
-                                    );
-                                    skip_count = history.len();
-                                    continuation_input = continuation_input
-                                        .history(history)
-                                        .user_state(std::mem::take(&mut ctx.user_state));
-                                }
-                            } else if let Some(history) = raw_history.take() {
-                                skip_count = history.len();
-                                continuation_input = continuation_input.history(history);
-                            }
-                            raw_user_state = None;
-                            inner_stream = Box::pin(agent.stream_with_input_and_options(
-                                continuation_input,
-                                CoreStreamOptions {
-                                    cancel: Some(subagent_cancel.clone()),
-                                    steer: Some(Arc::clone(&subagent_steer)),
-                                    steer_behavior: CoreSteerBehavior::Handoff,
-                                    async_agent: false,
-                                },
-                            ));
-                            continue;
-                        }
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            sub_session_done_event(if final_output.trim().is_empty() {
-                                None
-                            } else {
-                                Some(final_output.clone())
-                            }),
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            &agent_name,
-                            true,
-                            &final_output,
-                            None,
-                        ));
-                        return;
-                    }
-                    CatEvent::Error(error) => {
-                        let message = error.to_string();
-                        if persistent {
-                            let _ = persist_turn(
-                                &memory,
-                                &sub_thread_id_for_memory,
-                                raw_history.take(),
-                                raw_user_state.take(),
-                                skip_count,
-                                &HashMap::new(),
-                            )
-                            .await;
-                        }
-                        yield ToolOutput::SubSession(SubSessionEvent::new(
-                            String::new(),
-                            sub_thread_id.clone(),
-                            sub_run_id.clone(),
-                            agent_name.clone(),
-                            title.clone(),
-                            0,
-                            ProtocolEvent::Error {
-                                message: message.clone(),
-                                code: None,
-                            },
-                        ));
-                        yield ToolOutput::text(format_subagent_tool_result(
-                            &sub_thread_id,
-                            &sub_run_id,
-                            &agent_name,
-                            false,
-                            "",
-                            Some(&message),
-                        ));
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            yield ToolOutput::SubSession(SubSessionEvent::new(
-                String::new(),
-                sub_thread_id.clone(),
-                sub_run_id.clone(),
-                agent_name.clone(),
-                title.clone(),
-                0,
-                sub_session_done_event(if final_output.trim().is_empty() {
-                    None
-                } else {
-                    Some(final_output.clone())
-                }),
-            ));
-            yield ToolOutput::text(format_subagent_tool_result(
-                &sub_thread_id,
-                &sub_run_id,
-                &agent_name,
-                true,
-                &final_output,
-                None,
-            ));
-        });
-        Ok(ToolResult::Output(output))
+        return self.execute_a2a(task, named, title, ctx).await;
     }
 }
 
+#[cfg(test)]
 fn format_subagent_tool_result(
     sub_thread_id: &ThreadId,
     sub_run_id: &RunId,
@@ -5858,39 +5776,15 @@ fn sub_session_done_event(final_output: Option<String>) -> ProtocolEvent {
     }
 }
 
-fn subagent_metadata(ctx: ToolContext, sub_thread_id: &str) -> serde_json::Value {
-    let mut metadata = ctx.metadata().unwrap_or_else(|| serde_json::json!({}));
-    if !metadata.is_object() {
-        metadata = serde_json::json!({});
-    }
-    if let serde_json::Value::Object(map) = &mut metadata {
-        map.insert(
-            "thread_id".to_string(),
-            serde_json::Value::String(sub_thread_id.to_string()),
-        );
-        if !map.contains_key("parent_thread_id") {
-            map.insert(
-                "parent_thread_id".to_string(),
-                serde_json::Value::String(ctx.thread_id().0),
-            );
-        }
-        map.insert(
-            "subagent_run".to_string(),
-            serde_json::Value::String("true".to_string()),
-        );
-    }
-    metadata
-}
-
 fn register_delegate_agent_tools(
     registry: &mut DefaultToolRegistry,
     deps: &LocalToolDeps,
     delegate_ids: &[String],
-    api_key: String,
-    base_url: Option<String>,
-    default_model_profile: ModelProfileConfig,
-    extra_options: serde_json::Map<String, serde_json::Value>,
-    overflow_bytes: usize,
+    _api_key: String,
+    _base_url: Option<String>,
+    _default_model_profile: ModelProfileConfig,
+    _extra_options: serde_json::Map<String, serde_json::Value>,
+    _overflow_bytes: usize,
 ) {
     let agent_registry = match AgentRegistry::load(&deps.agents_dir) {
         Ok(registry) => Some(registry),
@@ -5932,26 +5826,10 @@ fn register_delegate_agent_tools(
             profile.name, profile.description
         );
         let agent_name = profile.id.clone();
-        let system_prompt =
-            system_prompt_with_agent_md_notice_for_current_dir(profile.system_prompt.clone());
         let model_name = profile
             .model
             .clone()
-            .unwrap_or_else(|| default_model_profile.model.clone());
-        let mut model_profile = default_model_profile.clone();
-        model_profile.model = model_name.clone();
-        let tool_base_url = profile.base_url.clone().or_else(|| base_url.clone());
-        let max_turns = profile.max_turns.unwrap_or(12);
-        let tool_api_key = api_key.clone();
-        let tool_extra_options = extra_options.clone();
-        let mut tool_allowlist = profile.tools.clone();
-        expand_skill_discovery_tools(&mut tool_allowlist);
-        for delegate in &profile.delegates {
-            let name = delegate_tool_name(delegate);
-            if !tool_allowlist.iter().any(|tool| tool == &name) {
-                tool_allowlist.push(name);
-            }
-        }
+            .unwrap_or_else(|| _default_model_profile.model.clone());
         let parameters_schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -5975,18 +5853,12 @@ fn register_delegate_agent_tools(
             description: tool_description,
             parameters_schema,
             agent_name,
-            model_profile,
-            base_url: tool_base_url,
-            api_key: tool_api_key,
-            system_prompt,
-            extra_options: tool_extra_options,
-            max_turns,
-            data_dir: deps.data_dir.clone(),
-            deps: deps.clone_for_subagent(),
-            profile,
-            tool_allowlist,
-            overflow_bytes,
             sessions: Arc::clone(&deps.subagent_sessions),
+            approval_manager: Arc::clone(&deps.approval_manager),
+            user_question_manager: Arc::clone(&deps.user_question_manager),
+            hook_manager: Arc::clone(&deps.hook_manager),
+            workspace_root: deps.workspace_root.clone(),
+            model_name,
         });
     }
 }
@@ -6141,6 +6013,7 @@ mod tests {
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -6221,8 +6094,9 @@ mod tests {
                             runtime_model_locked: false,
                             system: default_system_prompt(),
                             skills_dir,
-                            data_dir: data_dir.path().to_path_buf(),
-                            agent_md_path: None,
+            data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
+            agent_md_path: None,
                             overflow_bytes: None,
                             memory_days: 7,
                             sandbox_config: SandboxConfig::Disabled {
@@ -6554,6 +6428,7 @@ mod tests {
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -6614,6 +6489,7 @@ mod tests {
                 system: default_system_prompt(),
                 skills_dir: skills_dir.clone(),
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -6712,6 +6588,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -6795,6 +6672,169 @@ You are Remi.
         assert_eq!(value["success"], true);
         assert_eq!(value["final_output"], "done");
         assert_eq!(value["handed_off"], false);
+    }
+
+    #[tokio::test]
+    async fn a2a_interactive_proxy_forwards_parent_decisions_over_http() {
+        use axum::{extract::Path as AxumPath, http::StatusCode, routing::post, Json, Router};
+
+        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::channel(4);
+        let approval_tx = captured_tx.clone();
+        let question_tx = captured_tx.clone();
+        let steer_tx = captured_tx;
+        let app = Router::new()
+            .route(
+                "/tasks/{task_id}/remi:approval",
+                post(
+                    move |AxumPath(task_id): AxumPath<String>,
+                          Json(body): Json<serde_json::Value>| {
+                        let tx = approval_tx.clone();
+                        async move {
+                            tx.send(("approval", task_id, body)).await.unwrap();
+                            StatusCode::ACCEPTED
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/tasks/{task_id}/remi:question",
+                post(
+                    move |AxumPath(task_id): AxumPath<String>,
+                          Json(body): Json<serde_json::Value>| {
+                        let tx = question_tx.clone();
+                        async move {
+                            tx.send(("question", task_id, body)).await.unwrap();
+                            StatusCode::ACCEPTED
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/tasks/{task_id}/remi:steer",
+                post(
+                    move |AxumPath(task_id): AxumPath<String>,
+                          Json(body): Json<serde_json::Value>| {
+                        let tx = steer_tx.clone();
+                        async move {
+                            tx.send(("steer", task_id, body)).await.unwrap();
+                            StatusCode::ACCEPTED
+                        }
+                    },
+                ),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::a2a_delegate::A2aDelegateClient::for_test(format!("http://{address}"));
+        let approval_manager = crate::ToolApprovalManager::new();
+        let question_manager = crate::UserQuestionManager::new();
+        let mut approval_ids = HashMap::new();
+        let mut question_ids = HashMap::new();
+
+        let mut approval = json!({
+            "event": "approval_requested",
+            "data": {
+                "id": "remote-approval",
+                "session_id": "remote-session",
+                "run_id": "remote-run",
+                "tool_call_id": "call-1",
+                "tool_name": "bash",
+                "risk": "high",
+                "args_summary": "dangerous command"
+            }
+        });
+        super::proxy_a2a_interactive_event(
+            &mut approval,
+            Some("remote-task"),
+            "subagent:explorer:interactive",
+            &client,
+            &approval_manager,
+            &question_manager,
+            &mut approval_ids,
+            &mut question_ids,
+        )
+        .await;
+        let proxy_approval_id = approval["data"]["id"].as_str().unwrap().to_string();
+        assert_ne!(proxy_approval_id, "remote-approval");
+        assert_eq!(
+            approval["data"]["session_id"],
+            "subagent:explorer:interactive"
+        );
+        approval_manager
+            .decide(&proxy_approval_id, crate::ToolApprovalDecision::AllowOnce)
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), captured_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded.0, "approval");
+        assert_eq!(forwarded.1, "remote-task");
+        assert_eq!(forwarded.2["approval_id"], "remote-approval");
+        assert_eq!(forwarded.2["decision"], "allow_once");
+
+        let mut question = json!({
+            "event": "user_question_requested",
+            "data": {
+                "id": "remote-question",
+                "session_id": "remote-session",
+                "run_id": "remote-run",
+                "tool_call_id": "call-2",
+                "question": "continue?",
+                "options": [],
+                "allow_free_text": true,
+                "created_at": chrono::Utc::now().to_rfc3339()
+            }
+        });
+        super::proxy_a2a_interactive_event(
+            &mut question,
+            Some("remote-task"),
+            "subagent:explorer:interactive",
+            &client,
+            &approval_manager,
+            &question_manager,
+            &mut approval_ids,
+            &mut question_ids,
+        )
+        .await;
+        let proxy_question_id = question["data"]["id"].as_str().unwrap().to_string();
+        assert_ne!(proxy_question_id, "remote-question");
+        question_manager
+            .answer(
+                &proxy_question_id,
+                UserQuestionResponse {
+                    question_id: proxy_question_id.clone(),
+                    status: UserQuestionStatus::Answered,
+                    selected_option_ids: Vec::new(),
+                    free_text: Some("yes".to_string()),
+                    answer_text: Some("yes".to_string()),
+                    answered_at: None,
+                    source: Some("test".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), captured_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded.0, "question");
+        assert_eq!(forwarded.1, "remote-task");
+        assert_eq!(forwarded.2["question_id"], "remote-question");
+        assert_eq!(forwarded.2["response"]["answer_text"], "yes");
+
+        client
+            .steer("remote-task", Content::text("new direction"))
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), captured_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded.0, "steer");
+        assert_eq!(forwarded.1, "remote-task");
+        assert!(forwarded.2["content"].to_string().contains("new direction"));
+        server.abort();
     }
 
     #[test]
@@ -7019,6 +7059,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7103,6 +7144,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7197,6 +7239,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7318,6 +7361,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7522,6 +7566,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir: PathBuf::from("skills"),
             data_dir: PathBuf::from("data"),
+            memory_dir: PathBuf::from("data/memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7593,6 +7638,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir: PathBuf::from("skills"),
             data_dir: PathBuf::from("data"),
+            memory_dir: PathBuf::from("data/memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7642,6 +7688,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.clone(),
+            memory_dir: data_dir.join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -7906,6 +7953,7 @@ You are Remi.
                 system: default_system_prompt(),
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -7993,6 +8041,7 @@ You are Remi.
                 system: default_system_prompt(),
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -8130,6 +8179,7 @@ You are Remi.
             system: default_system_prompt(),
             skills_dir,
             data_dir: data_dir.path().to_path_buf(),
+            memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
             overflow_bytes: None,
             memory_days: 7,
@@ -8257,6 +8307,7 @@ You are Remi.
                 system: default_system_prompt(),
                 skills_dir,
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -8401,6 +8452,7 @@ You are Remi.
                 system: default_system_prompt(),
                 skills_dir: data_dir.path().join("skills"),
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -8483,6 +8535,7 @@ You are Remi.
                 system: default_system_prompt(),
                 skills_dir: data_dir.path().join("skills"),
                 data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
                 agent_md_path: None,
                 overflow_bytes: None,
                 memory_days: 7,
@@ -8808,6 +8861,7 @@ You are Remi.
             std::env::temp_dir().join(format!("remi-cat-state-update-{}", Uuid::new_v4()));
         let memory = super::MemoryStore {
             data_dir: data_dir.clone(),
+            memory_dir: data_dir.join("memory"),
             agent_md_path: None,
             compressor: LlmCompressor::new(
                 "test-key".to_string(),

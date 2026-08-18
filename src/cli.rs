@@ -17,6 +17,7 @@ pub(crate) enum AppCommand {
     ConfigSet(Vec<String>),
     SandboxSet(Vec<String>),
     Profile(ProfileCommand),
+    A2a(A2aCommand),
     Feishu(FeishuCommand),
     Acp(AcpCommand),
     AcpAdapter(AcpAdapterCommand),
@@ -24,6 +25,11 @@ pub(crate) enum AppCommand {
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
     Telemetry(TelemetryCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum A2aCommand {
+    Stdio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +57,9 @@ pub(crate) struct CliArgs {
     #[arg(
         long,
         global = true,
-        value_name = "NAME",
+        value_name = "PROFILE_REF",
         value_parser = validate_profile_arg,
-        help = "Select a named runtime profile"
+        help = "Select default, @alias, id:<id>, a legacy name, or a profile.yaml path"
     )]
     profile: Option<String>,
 
@@ -183,10 +189,19 @@ enum CliCommand {
         #[command(subcommand)]
         command: TelemetryCliCommand,
     },
-    #[command(about = "Manage runtime profiles")]
+    #[command(
+        about = "Create, register, inspect, validate, and run Application Profiles",
+        long_about = "Application Profiles are project-level configuration and resource assembly manifests. They reference resources; they do not own or isolate them.",
+        after_help = "Start here:\n  remi-cat profile current\n  remi-cat profile list\n  remi-cat profile show @travel --resolved\n  remi-cat profile check @travel\n\nReferences:\n  default | @alias | id:stable.id | ./path/profile.yaml | legacy-name\n\nUse the positional PROFILE_REF to operate on a target. The global --profile option selects the current profile when a command omits its target."
+    )]
     Profile {
         #[command(subcommand)]
         command: ProfileCliCommand,
+    },
+    #[command(about = "Serve the selected profile over the A2A protocol")]
+    A2a {
+        #[command(subcommand)]
+        command: A2aCliCommand,
     },
     #[command(about = "Manage supervisor workflows")]
     Workflow {
@@ -645,44 +660,213 @@ struct LocalCommonArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProfileCliCommand {
-    #[command(about = "List configured profiles")]
-    List,
-    #[command(about = "Show profile configuration and status")]
-    Show { name: String },
-    #[command(about = "Create a profile")]
+    #[command(about = "Explain which profile is currently selected and why")]
+    Current,
+    #[command(about = "List builtin, registered, and legacy profiles")]
+    List(ProfileListArgs),
+    #[command(about = "Find profiles by declared capabilities")]
+    Find(ProfileFindArgs),
+    #[command(about = "Show declared and resolved profile configuration")]
+    Show(ProfileShowArgs),
+    #[command(about = "Validate a profile manifest, references, resources, and A2A endpoint")]
+    Check(ProfileCheckArgs),
+    #[command(about = "Create a new profile.yaml manifest")]
+    Init(ProfileInitArgs),
+    #[command(about = "Register a profile manifest by reference; no files are copied")]
+    Register(ProfileRegisterArgs),
+    #[command(about = "Remove a registry alias; manifest and resources are preserved")]
+    Unregister { reference: String },
+    #[command(about = "Set one typed manifest field")]
+    Set(ProfileSetArgs),
+    #[command(about = "Remove one optional manifest field")]
+    Unset(ProfileUnsetArgs),
+    #[command(about = "Start a local profile on demand and ask it through A2A")]
+    Ask(ProfileAskArgs),
+    #[command(about = "Inspect referenced profile resources")]
+    Resource {
+        #[command(subcommand)]
+        command: ProfileResourceCliCommand,
+    },
+    #[command(about = "Inspect and repair the cross-process profile registry")]
+    Registry {
+        #[command(subcommand)]
+        command: ProfileRegistryCliCommand,
+    },
+    #[command(hide = true, about = "Deprecated: use profile init/register/setup")]
     Create(ProfileCreateArgs),
-    #[command(about = "Delete a profile")]
+    #[command(hide = true, about = "Deprecated: use profile unregister")]
     Delete {
         name: String,
         #[arg(long)]
         force: bool,
     },
-    #[command(about = "Start a profile in the background")]
-    Start { name: String },
-    #[command(about = "Stop a background profile process")]
-    Stop {
-        name: String,
-        #[arg(long)]
-        force: bool,
-    },
-    #[command(about = "Restart a background profile process")]
-    Restart {
-        name: String,
-        #[arg(long)]
-        force: bool,
-    },
-    #[command(about = "Show profile process status")]
-    Status(ProfileStatusArgs),
-    #[command(about = "Manage profile agent definitions")]
+    #[command(hide = true, about = "Deprecated: use remi-cat agent --profile")]
     Agent {
         #[command(subcommand)]
         command: ProfileAgentCliCommand,
     },
-    #[command(about = "Manage profile supervisor workflows")]
+    #[command(hide = true, about = "Deprecated: use remi-cat workflow --profile")]
     Workflow {
         #[command(subcommand)]
         command: ProfileWorkflowCliCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum A2aCliCommand {
+    #[command(about = "Serve framed A2A messages over stdin/stdout")]
+    Stdio,
+}
+
+#[derive(Debug, Args)]
+struct ProfileAskArgs {
+    #[arg(value_name = "PROFILE_REF")]
+    reference: String,
+    #[arg(long, default_value = "default")]
+    named: String,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(num_args = 1.., trailing_var_arg = true, value_name = "TASK")]
+    task: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProfileListArgs {
+    #[arg(long, default_value = "all", value_parser = ["all", "registered", "legacy"], help = "Select all profiles, registry entries only, or builtin/legacy profiles only")]
+    scope: String,
+    #[arg(long, default_value = "table", value_parser = ["table", "plain", "json", "yaml"], help = "Choose human or machine-readable output")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfileFindArgs {
+    #[arg(
+        long,
+        help = "Require a declared capability tag; repeat for AND matching"
+    )]
+    tag: Vec<String>,
+    #[arg(long, help = "Require a declared intent; repeat for AND matching")]
+    intent: Vec<String>,
+    #[arg(long, help = "Require a declared channel")]
+    channel: Option<String>,
+    #[arg(long, default_value = "table", value_parser = ["table", "plain", "json", "yaml"], help = "Choose human or machine-readable output")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfileShowArgs {
+    #[arg(
+        value_name = "PROFILE_REF",
+        help = "Target profile; defaults to the globally selected/current profile"
+    )]
+    reference: Option<String>,
+    #[arg(long, conflicts_with_all = ["resolved", "sources"], help = "Print the declared manifest without resolving paths")]
+    manifest: bool,
+    #[arg(long, conflicts_with_all = ["manifest", "sources"], help = "Print the effective paths and endpoint")]
+    resolved: bool,
+    #[arg(long, conflicts_with_all = ["manifest", "resolved"], help = "Explain each field's declared or default source")]
+    sources: bool,
+    #[arg(long, default_value = "plain", value_parser = ["plain", "json", "yaml"], help = "Choose human or machine-readable output")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfileCheckArgs {
+    #[arg(
+        value_name = "PROFILE_REF",
+        help = "Target profile; defaults to the globally selected/current profile"
+    )]
+    reference: Option<String>,
+    #[arg(long, help = "Treat warnings as validation failures")]
+    strict: bool,
+    #[arg(long, default_value = "plain", value_parser = ["plain", "json"], help = "Choose human or machine-readable output")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfileInitArgs {
+    #[arg(
+        default_value = ".",
+        value_name = "DIRECTORY",
+        help = "Directory to contain profile.yaml, or an explicit .yaml path"
+    )]
+    directory: String,
+    #[arg(long, help = "Stable manifest ID; defaults to the directory name")]
+    id: Option<String>,
+    #[arg(long, help = "Human-readable name; defaults to the directory name")]
+    name: Option<String>,
+    #[arg(long, default_value = "remi-cat", value_parser = ["minimal", "remi-cat", "external"], help = "Select the initial resource and state layout")]
+    template: String,
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Also register the new manifest as @ALIAS"
+    )]
+    register: Option<String>,
+    #[arg(
+        long,
+        help = "Materialize remi-cat runtime config and builtin agent/model resources"
+    )]
+    with_runtime: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileRegisterArgs {
+    #[arg(
+        value_name = "PROFILE_YAML",
+        help = "Manifest file or its containing directory"
+    )]
+    path: String,
+    #[arg(long, help = "Registry alias; defaults to a normalized manifest ID")]
+    alias: Option<String>,
+    #[arg(long, help = "Replace an existing alias mapping")]
+    replace: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileSetArgs {
+    #[arg(help = "Profile manifest to edit")]
+    reference: String,
+    #[arg(help = "Typed dotted manifest field, for example resources.skills")]
+    field: String,
+    #[arg(help = "New value; list fields accept comma-separated or JSON-array syntax")]
+    value: String,
+    #[arg(long, help = "Print the resulting manifest without writing it")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileUnsetArgs {
+    #[arg(help = "Profile manifest to edit")]
+    reference: String,
+    #[arg(help = "Optional dotted manifest field to remove or reset")]
+    field: String,
+    #[arg(long, help = "Print the resulting manifest without writing it")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileLaunchArgs {
+    #[arg(value_name = "PROFILE_REF", help = "Profile to launch")]
+    reference: String,
+    #[arg(
+        long,
+        default_value = "default",
+        help = "Independent runtime instance name"
+    )]
+    instance: String,
+    #[arg(long, help = "Channel capability to assign and expose to the process")]
+    channel: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProfileControlArgs {
+    #[arg(value_name = "PROFILE_REF", help = "Profile containing the instance")]
+    reference: String,
+    #[arg(long, default_value = "default", help = "Runtime instance name")]
+    instance: String,
+    #[arg(long, help = "Send SIGKILL instead of graceful SIGTERM")]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -700,9 +884,56 @@ struct ProfileCreateArgs {
 
 #[derive(Debug, Args)]
 struct ProfileStatusArgs {
-    name: Option<String>,
-    #[arg(long)]
+    #[arg(
+        value_name = "PROFILE_REF",
+        help = "Target profile; defaults to the selected/current profile"
+    )]
+    reference: Option<String>,
+    #[arg(long, help = "Show instances for all discoverable profiles")]
     all: bool,
+    #[arg(long, help = "Filter to one instance name")]
+    instance: Option<String>,
+    #[arg(long, default_value = "plain", value_parser = ["plain", "json"], help = "Choose human or machine-readable output")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfileLogsArgs {
+    #[arg(help = "Profile containing the instance")]
+    reference: String,
+    #[arg(long, default_value = "default", help = "Runtime instance name")]
+    instance: String,
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 100,
+        help = "Number of trailing lines to print"
+    )]
+    lines: usize,
+    #[arg(short = 'f', long, help = "Continue following appended log output")]
+    follow: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileResourceCliCommand {
+    #[command(about = "List all resolved resource and state references")]
+    List { reference: String },
+    #[command(about = "Show one resolved resource reference")]
+    Show { reference: String, resource: String },
+    #[command(about = "Validate referenced resource files and directories")]
+    Check { reference: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileRegistryCliCommand {
+    #[command(about = "Show registry path, schema, entry count, and health")]
+    Info,
+    #[command(about = "List raw registry entries")]
+    List,
+    #[command(about = "Remove registry entries whose manifests no longer exist")]
+    Repair,
+    #[command(about = "Revalidate and rewrite the registry index")]
+    RebuildIndex,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1072,6 +1303,25 @@ pub(crate) struct GlobalArgsAndCommand {
 }
 
 fn validate_profile_arg(value: &str) -> Result<String, String> {
+    if let Some(alias) = value.strip_prefix('@') {
+        return instance_profile::validate_profile_name(alias)
+            .map(|_| value.to_string())
+            .map_err(|err| err.to_string());
+    }
+    if let Some(id) = value.strip_prefix("id:") {
+        if id.is_empty() {
+            return Err("profile id after `id:` must not be empty".to_string());
+        }
+        return Ok(value.to_string());
+    }
+    if value.ends_with(".yaml")
+        || value.ends_with(".yml")
+        || value.contains('/')
+        || value.contains('\\')
+        || std::path::Path::new(value).is_dir()
+    {
+        return Ok(value.to_string());
+    }
     instance_profile::validate_profile_name(value)
         .map(|_| value.to_string())
         .map_err(|err| err.to_string())
@@ -1110,6 +1360,9 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Profile { command }) => {
             Ok(AppCommand::Profile(profile_cli_to_command(command)?))
         }
+        Some(CliCommand::A2a { command }) => Ok(AppCommand::A2a(match command {
+            A2aCliCommand::Stdio => A2aCommand::Stdio,
+        })),
         Some(CliCommand::Workflow { command }) => Ok(AppCommand::Profile(
             ProfileCommand::Workflow(workflow_cli_to_command(command)?),
         )),
@@ -1300,11 +1553,89 @@ fn feedback_args_to_command(args: FeedbackArgs) -> anyhow::Result<FeedbackComman
 
 fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileCommand> {
     match command {
-        ProfileCliCommand::List => Ok(ProfileCommand::List),
-        ProfileCliCommand::Show { name } => {
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Show(name))
-        }
+        ProfileCliCommand::Current => Ok(ProfileCommand::Current),
+        ProfileCliCommand::List(args) => Ok(ProfileCommand::List {
+            scope: args.scope,
+            format: args.format,
+        }),
+        ProfileCliCommand::Find(args) => Ok(ProfileCommand::Find {
+            tags: args.tag,
+            intents: args.intent,
+            channel: args.channel,
+            format: args.format,
+        }),
+        ProfileCliCommand::Show(args) => Ok(ProfileCommand::Show {
+            reference: args.reference,
+            view: if args.manifest {
+                profile_command::ProfileShowView::Manifest
+            } else if args.resolved {
+                profile_command::ProfileShowView::Resolved
+            } else if args.sources {
+                profile_command::ProfileShowView::Sources
+            } else {
+                profile_command::ProfileShowView::Summary
+            },
+            format: args.format,
+        }),
+        ProfileCliCommand::Check(args) => Ok(ProfileCommand::Check {
+            reference: args.reference,
+            strict: args.strict,
+            format: args.format,
+        }),
+        ProfileCliCommand::Init(args) => Ok(ProfileCommand::Init {
+            directory: args.directory,
+            id: args.id,
+            name: args.name,
+            template: args.template,
+            register: args.register,
+            with_runtime: args.with_runtime,
+        }),
+        ProfileCliCommand::Register(args) => Ok(ProfileCommand::Register {
+            path: args.path,
+            alias: args.alias,
+            replace: args.replace,
+        }),
+        ProfileCliCommand::Unregister { reference } => Ok(ProfileCommand::Unregister { reference }),
+        ProfileCliCommand::Set(args) => Ok(ProfileCommand::Set {
+            reference: args.reference,
+            field: args.field,
+            value: args.value,
+            dry_run: args.dry_run,
+        }),
+        ProfileCliCommand::Unset(args) => Ok(ProfileCommand::Unset {
+            reference: args.reference,
+            field: args.field,
+            dry_run: args.dry_run,
+        }),
+        ProfileCliCommand::Ask(args) => Ok(ProfileCommand::Ask {
+            reference: args.reference,
+            task: args.task.join(" "),
+            named: args.named,
+            agent_id: args.agent_id,
+        }),
+        ProfileCliCommand::Resource { command } => Ok(ProfileCommand::Resource(match command {
+            ProfileResourceCliCommand::List { reference } => {
+                profile_command::ProfileResourceCommand::List { reference }
+            }
+            ProfileResourceCliCommand::Show {
+                reference,
+                resource,
+            } => profile_command::ProfileResourceCommand::Show {
+                reference,
+                resource,
+            },
+            ProfileResourceCliCommand::Check { reference } => {
+                profile_command::ProfileResourceCommand::Check { reference }
+            }
+        })),
+        ProfileCliCommand::Registry { command } => Ok(ProfileCommand::Registry(match command {
+            ProfileRegistryCliCommand::Info => profile_command::ProfileRegistryCommand::Info,
+            ProfileRegistryCliCommand::List => profile_command::ProfileRegistryCommand::List,
+            ProfileRegistryCliCommand::Repair => profile_command::ProfileRegistryCommand::Repair,
+            ProfileRegistryCliCommand::RebuildIndex => {
+                profile_command::ProfileRegistryCommand::RebuildIndex
+            }
+        })),
         ProfileCliCommand::Create(args) => {
             if args.name == DIAGNOSTIC_PROFILE_NAME {
                 anyhow::bail!(
@@ -1326,29 +1657,6 @@ fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileC
             }
             instance_profile::validate_profile_name(&name)?;
             Ok(ProfileCommand::Delete { name, force })
-        }
-        ProfileCliCommand::Start { name } => {
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Start(name))
-        }
-        ProfileCliCommand::Stop { name, force } => {
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Stop { name, force })
-        }
-        ProfileCliCommand::Restart { name, force } => {
-            let _ = InstanceProfile::from_label(&name)?;
-            Ok(ProfileCommand::Restart { name, force })
-        }
-        ProfileCliCommand::Status(args) => {
-            if args.all {
-                Ok(ProfileCommand::StatusAll)
-            } else {
-                let name = args
-                    .name
-                    .ok_or_else(|| anyhow::anyhow!("usage: remi-cat profile status <profile>"))?;
-                let _ = InstanceProfile::from_label(&name)?;
-                Ok(ProfileCommand::Status(name))
-            }
         }
         ProfileCliCommand::Agent { command } => Ok(ProfileCommand::Agent(match command {
             ProfileAgentCliCommand::List { profile } => {
@@ -1541,7 +1849,7 @@ pub(crate) fn parse_global_args(args: &[String]) -> anyhow::Result<GlobalArgs> {
         match args[i].as_str() {
             "--profile" => {
                 let value = next_arg(args, i)?;
-                instance_profile::validate_profile_name(&value)?;
+                validate_profile_arg(&value).map_err(anyhow::Error::msg)?;
                 if profile.replace(value).is_some() {
                     anyhow::bail!("--profile may only be specified once");
                 }
@@ -1549,7 +1857,7 @@ pub(crate) fn parse_global_args(args: &[String]) -> anyhow::Result<GlobalArgs> {
             }
             value if value.starts_with("--profile=") => {
                 let value = value.trim_start_matches("--profile=").to_string();
-                instance_profile::validate_profile_name(&value)?;
+                validate_profile_arg(&value).map_err(anyhow::Error::msg)?;
                 if profile.replace(value).is_some() {
                     anyhow::bail!("--profile may only be specified once");
                 }

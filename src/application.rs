@@ -33,8 +33,48 @@ const EVENT_CAPACITY: usize = 64;
 const SESSION_APP_ID_METADATA_KEY: &str = "application_id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationProfileInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub capabilities: crate::instance_profile::ProfileCapabilities,
+    pub endpoint: crate::instance_profile::ProfileEndpoint,
+}
+
+impl ApplicationProfileInfo {
+    fn generic(app_id: impl Into<String>) -> Self {
+        let id = app_id.into();
+        Self {
+            name: id.clone(),
+            id,
+            description: None,
+            version: None,
+            capabilities: crate::instance_profile::ProfileCapabilities::default(),
+            endpoint: crate::instance_profile::ProfileEndpoint::Local {
+                command: String::new(),
+            },
+        }
+    }
+}
+
+impl From<&crate::instance_profile::ApplicationProfileManifest> for ApplicationProfileInfo {
+    fn from(profile: &crate::instance_profile::ApplicationProfileManifest) -> Self {
+        Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            description: profile.description.clone(),
+            version: profile.version.clone(),
+            capabilities: profile.capabilities.clone(),
+            endpoint: profile.endpoint.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationInfo {
     pub app_id: String,
+    pub profile: ApplicationProfileInfo,
     pub workspace: PathBuf,
     pub data_dir: PathBuf,
     pub telemetry_enabled: bool,
@@ -294,6 +334,7 @@ impl RunHandle {
 
 pub struct ApplicationBuilder {
     app_id: String,
+    profile: Option<ApplicationProfileInfo>,
     data_dir: PathBuf,
     workspace: PathBuf,
     root_agent_id: String,
@@ -309,6 +350,7 @@ pub struct ApplicationBuilder {
     file_skills: bool,
     discover_hooks: bool,
     hook_sources: Vec<bot_core::HookSource>,
+    external_agent_registry_root: Option<PathBuf>,
     sentry_dsn: Option<String>,
     sentry_agent_tracing: Option<SentryAgentTracingOptions>,
     credentials: Option<std::collections::BTreeMap<String, String>>,
@@ -319,6 +361,7 @@ impl ApplicationBuilder {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             app_id: "remi-cat".into(),
+            profile: None,
             data_dir: data_dir.into(),
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             root_agent_id: "default".into(),
@@ -334,6 +377,7 @@ impl ApplicationBuilder {
             file_skills: true,
             discover_hooks: true,
             hook_sources: Vec::new(),
+            external_agent_registry_root: None,
             sentry_dsn: None,
             sentry_agent_tracing: None,
             credentials: None,
@@ -343,6 +387,19 @@ impl ApplicationBuilder {
 
     pub fn app_id(mut self, app_id: impl Into<String>) -> Self {
         self.app_id = app_id.into();
+        self
+    }
+
+    /// Attach the application profile identity and declared capabilities.
+    /// The profile id becomes the application id so every public handle and
+    /// protocol adapter observes the same identity.
+    pub fn profile(
+        mut self,
+        profile: &crate::instance_profile::ApplicationProfileManifest,
+    ) -> Self {
+        let profile = ApplicationProfileInfo::from(profile);
+        self.app_id = profile.id.clone();
+        self.profile = Some(profile);
         self
     }
     /// Enable application-scoped telemetry using the embedding host's DSN.
@@ -443,6 +500,13 @@ impl ApplicationBuilder {
         self
     }
 
+    /// Enable discovery and A2A conversations with profiles registered beneath
+    /// the supplied remi-cat data root.
+    pub fn external_agents(mut self, registry_root: impl Into<PathBuf>) -> Self {
+        self.external_agent_registry_root = Some(registry_root.into());
+        self
+    }
+
     /// Reserved until bot-core exposes registry injection. Fails at `spawn` rather than silently ignoring it.
     pub fn extension(mut self, description: impl Into<String>) -> Self {
         self.unsupported_extensions.push(description.into());
@@ -452,6 +516,14 @@ impl ApplicationBuilder {
     pub async fn spawn(self) -> anyhow::Result<Application> {
         let app_id = self.app_id.trim().to_string();
         validate_app_id(&app_id)?;
+        if let Some(profile) = &self.profile {
+            if profile.id != app_id {
+                return Err(anyhow!(
+                    "application id `{app_id}` does not match attached profile id `{}`",
+                    profile.id
+                ));
+            }
+        }
         let sentry_agent_tracing = self
             .sentry_agent_tracing
             .map(SentryAgentTracingOptions::validate)
@@ -483,8 +555,12 @@ impl ApplicationBuilder {
         }
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let profile = self
+            .profile
+            .unwrap_or_else(|| ApplicationProfileInfo::generic(app_id.clone()));
         let info = Arc::new(ApplicationInfo {
             app_id: app_id.clone(),
+            profile,
             workspace: self.workspace.clone(),
             data_dir: self.data_dir.clone(),
             telemetry_enabled: telemetry.is_some(),
@@ -495,7 +571,13 @@ impl ApplicationBuilder {
         let root_agent_id = self.root_agent_id;
         let default_model = self.default_model;
         let model_source = self.model_source;
-        let tools = self.tools;
+        let mut tools = self.tools;
+        if let Some(registry_root) = self.external_agent_registry_root {
+            tools.extend(crate::external_agent::external_agent_tools_for(
+                registry_root,
+                info.profile.id.clone(),
+            ));
+        }
         let builtin_skills = self.builtin_skills;
         let include_default_skills = self.include_default_skills;
         let file_skills = self.file_skills;
@@ -653,6 +735,12 @@ impl ApplicationHandle {
     }
     pub fn info(&self) -> ApplicationInfo {
         (*self.info).clone()
+    }
+    pub fn profile(&self) -> &ApplicationProfileInfo {
+        &self.info.profile
+    }
+    pub async fn catalog(&self) -> anyhow::Result<ApplicationCatalog> {
+        request(&self.commands, |reply| Command::Catalog { reply }).await
     }
     pub fn channel(&self, config: ChannelConfig) -> ChannelHandle {
         ChannelHandle {
@@ -1389,12 +1477,19 @@ async fn build_runtime(
         Some(credentials) => credentials,
         None => secrets.entries()?,
     };
-    let selected = default_model.or_else(|| {
-        crate::runtime_config::load_runtime_config(source)
-            .ok()
-            .flatten()
-            .map(|config| config.model_profile)
-    });
+    let selected = default_model
+        .or_else(|| {
+            std::env::var("REMI_MODEL_PROFILE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            crate::runtime_config::load_runtime_config(source)
+                .ok()
+                .flatten()
+                .map(|config| config.model_profile)
+        });
     let hook_manager = bot_core::HookManager::with_sources(
         workspace.clone(),
         data_dir.clone(),
@@ -1402,16 +1497,27 @@ async fn build_runtime(
         hook_sources,
     )
     .context("loading application hook sources")?;
-    let mut builder = CatBotBuilder::from_model_source_with_api_keys(
+    let models_dir = std::env::var_os("REMI_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source.join("models"));
+    let mut builder = CatBotBuilder::from_models_dir_with_api_keys(
         &data_dir,
-        source,
+        models_dir,
         selected.as_deref(),
         &secret_entries,
     )?
+    .memory_dir(
+        std::env::var_os("REMI_MEMORY_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("memory")),
+    )
     .workspace(workspace)
     .agent_tracing(agent_tracing)
     .hook_manager(hook_manager);
-    let agents = bot_core::AgentRegistry::load(data_dir.join("agents"))?;
+    let agents_dir = std::env::var_os("REMI_AGENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("agents"));
+    let agents = bot_core::AgentRegistry::load(agents_dir)?;
     if let Some(profile) = agents.get(&root_agent_id) {
         builder = builder.agent_profile(profile.clone())?;
     }
@@ -1421,7 +1527,7 @@ async fn build_runtime(
         .include_default_skills(include_default_skills)
         .file_skills(file_skills);
     for tool in tools {
-        builder = builder.tool(tool);
+        builder = builder.enabled_tool(tool);
     }
     for skill in builtin_skills {
         builder = builder.builtin_skill(skill);
@@ -1432,9 +1538,15 @@ async fn build_runtime(
     Ok(Rc::new(Runtime {
         bot,
         secret_store,
-        user_store: Arc::new(UserStore::load(data_dir.join("users.json"))?),
-        sessions: Arc::new(tokio::sync::Mutex::new(SessionRuntime::load(
-            data_dir.clone(),
+        user_store: Arc::new(UserStore::load(
+            std::env::var_os("REMI_USERS_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("users.json")),
+        )?),
+        sessions: Arc::new(tokio::sync::Mutex::new(SessionRuntime::load_path(
+            std::env::var_os("REMI_SESSIONS_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("sessions.json")),
         )?)),
         im_bridge: bridge,
         root_agent_id,
@@ -2298,6 +2410,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn application_builder_exposes_profile_identity_and_capabilities() {
+        let mut profile = crate::instance_profile::InstanceProfile::default_instance().manifest;
+        profile.id = "travel.planner".into();
+        profile.name = "Travel Planner".into();
+        profile.capabilities.intents = vec!["plan-trip".into()];
+        let builder = ApplicationBuilder::new("data").profile(&profile);
+        assert_eq!(builder.app_id, "travel.planner");
+        let info = builder.profile.unwrap();
+        assert_eq!(info.name, "Travel Planner");
+        assert_eq!(info.capabilities.intents, vec!["plan-trip"]);
+    }
+
+    #[tokio::test]
+    async fn embedded_application_installs_external_agent_tools_during_spawn() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry_root = tempfile::tempdir().unwrap();
+        let mut profile = crate::instance_profile::InstanceProfile::default_instance().manifest;
+        profile.id = "embedded.ferret".into();
+        profile.name = "Ferret".into();
+        let duplicate = DynamicTool::from_parts(
+            "external_agent_discover",
+            "duplicate used to prove external tools are installed",
+            serde_json::json!({"type": "object", "properties": {}}),
+            |_arguments, _resume, _ctx| async {
+                Ok::<_, remi_agentloop::prelude::AgentError>(
+                    remi_agentloop::prelude::ToolResult::Output(futures::stream::empty::<
+                        remi_agentloop::prelude::ToolOutput,
+                    >()),
+                )
+            },
+        );
+
+        let error = ApplicationBuilder::new(data_dir.path())
+            .profile(&profile)
+            .workspace(data_dir.path())
+            .credentials(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                "test-key".to_string(),
+            )]))
+            .discover_hooks(false)
+            .include_default_skills(false)
+            .file_skills(false)
+            .tool(duplicate)
+            .external_agents(registry_root.path())
+            .spawn()
+            .await
+            .err()
+            .expect("spawn should reject the externally installed duplicate tool");
+
+        assert!(
+            error.to_string().contains("external_agent_discover"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_profile_and_application_id_cannot_diverge() {
+        let profile = crate::instance_profile::InstanceProfile::default_instance().manifest;
+        let error = ApplicationBuilder::new("data")
+            .profile(&profile)
+            .app_id("other.application")
+            .spawn()
+            .await
+            .err()
+            .expect("mismatched identities should fail");
+        assert!(error
+            .to_string()
+            .contains("does not match attached profile"));
+    }
+
     #[tokio::test]
     async fn application_agent_tracing_requires_dsn_and_valid_sample_rate() {
         let error = ApplicationBuilder::new("data")
@@ -2428,8 +2611,12 @@ mod tests {
     async fn resolved_sessions_return_and_persist_application_id() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "OPENAI_API_KEY=test-key\n").unwrap();
+        let mut profile = crate::instance_profile::InstanceProfile::default_instance().manifest;
+        profile.id = "embedded-host".into();
+        profile.name = "Embedded Host".into();
+        profile.capabilities.channels = vec!["a2a".into()];
         let application = ApplicationBuilder::new(dir.path())
-            .app_id("embedded-host")
+            .profile(&profile)
             .workspace(dir.path())
             .credentials(std::collections::BTreeMap::from([(
                 "OPENAI_API_KEY".to_string(),
@@ -2441,6 +2628,11 @@ mod tests {
             .spawn()
             .await
             .unwrap();
+        assert_eq!(application.handle().profile().name, "Embedded Host");
+        assert_eq!(
+            application.handle().profile().capabilities.channels,
+            vec!["a2a"]
+        );
         let channel = application
             .handle()
             .channel(ChannelConfig::new("host-channel"));

@@ -3,18 +3,116 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_config::{detect_setup_state, RuntimeConfig, SetupState};
+use crate::runtime_config::{detect_setup_state_at, RuntimeConfig, SetupState};
 
 pub const DEFAULT_DATA_DIR: &str = ".remi-cat";
 pub const TUI_HOME_DATA_DIR: &str = ".remi_cat";
 pub const TUI_HOME_COMPAT_DATA_DIR: &str = ".remi-cat";
 pub const DIAGNOSTIC_PROFILE_NAME: &str = "remi_diagnostics";
 const PROFILES_DIR: &str = "profiles";
+pub const PROFILE_FILE_NAME: &str = "profile.yaml";
+pub const PROFILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileConfigRefs {
+    pub runtime: Option<PathBuf>,
+    pub channels: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileResourceRefs {
+    pub agents: Option<PathBuf>,
+    pub models: Option<PathBuf>,
+    pub skills: Vec<PathBuf>,
+    pub workflows: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileStateRefs {
+    /// Compatibility root for state that has not yet been split into a
+    /// dedicated store. Individual references below take precedence.
+    pub data: Option<PathBuf>,
+    pub sessions: Option<PathBuf>,
+    pub memory: Option<PathBuf>,
+    pub users: Option<PathBuf>,
+    pub tasks: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileCapabilities {
+    pub tags: Vec<String>,
+    pub intents: Vec<String>,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProfileEndpointAuth {
+    Bearer { token_env: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProfileEndpoint {
+    Local {
+        command: String,
+    },
+    Remote {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<ProfileEndpointAuth>,
+    },
+}
+
+/// Serializable resource assembly manifest for a runnable agent application.
+///
+/// A profile references configuration and resources; it neither owns nor
+/// isolates them. Relative paths are resolved from the manifest directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationProfileManifest {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub config: ProfileConfigRefs,
+    #[serde(default)]
+    pub resources: ProfileResourceRefs,
+    #[serde(default)]
+    pub state: ProfileStateRefs,
+    #[serde(default)]
+    pub capabilities: ProfileCapabilities,
+    pub endpoint: ProfileEndpoint,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceProfile {
     pub name: Option<String>,
     pub data_dir: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    pub manifest: ApplicationProfileManifest,
+    pub runtime_config: PathBuf,
+    pub channels_config: PathBuf,
+    pub workspace: Option<PathBuf>,
+    pub agents_dir: PathBuf,
+    pub models_dir: PathBuf,
+    pub skills_dirs: Vec<PathBuf>,
+    pub workflows_dir: PathBuf,
+    pub sessions_path: PathBuf,
+    pub memory_dir: PathBuf,
+    pub users_path: PathBuf,
+    pub tasks_dir: PathBuf,
+    pub endpoint: ProfileEndpoint,
 }
 
 impl InstanceProfile {
@@ -23,26 +121,20 @@ impl InstanceProfile {
     }
 
     pub fn default_in_data_root(data_root: &Path) -> Self {
-        Self {
-            name: None,
-            data_dir: data_root.to_path_buf(),
-        }
+        Self::legacy(None, data_root.to_path_buf())
     }
 
     pub fn named(name: &str) -> Result<Self> {
         validate_profile_name(name)?;
-        Ok(Self {
-            name: Some(name.to_string()),
-            data_dir: profiles_root().join(name),
-        })
+        Self::load_or_legacy(Some(name.to_string()), profiles_root().join(name))
     }
 
     pub fn named_in_data_root(name: &str, data_root: &Path) -> Result<Self> {
         validate_profile_name(name)?;
-        Ok(Self {
-            name: Some(name.to_string()),
-            data_dir: data_root.join(PROFILES_DIR).join(name),
-        })
+        Self::load_or_legacy(
+            Some(name.to_string()),
+            data_root.join(PROFILES_DIR).join(name),
+        )
     }
 
     pub fn from_label(label: &str) -> Result<Self> {
@@ -57,20 +149,116 @@ impl InstanceProfile {
         }
     }
 
+    pub fn from_manifest(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let path = if path.is_dir() {
+            path.join(PROFILE_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        };
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading application profile {}", path.display()))?;
+        let manifest: ApplicationProfileManifest = serde_yaml::from_str(&raw)
+            .with_context(|| format!("parsing application profile {}", path.display()))?;
+        validate_manifest(&manifest)?;
+        Self::resolve_manifest(path, manifest)
+    }
+
+    pub fn builtin_default(data_root: impl Into<PathBuf>) -> Self {
+        Self::legacy(None, data_root.into())
+    }
+
+    pub fn write_manifest(&self) -> Result<PathBuf> {
+        let path = self
+            .manifest_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(PROFILE_FILE_NAME));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut manifest = self.manifest.clone();
+        if self.manifest_path.is_none() {
+            manifest.state.data = Some(PathBuf::from("."));
+        }
+        let raw = serde_yaml::to_string(&manifest).context("serializing application profile")?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("writing application profile {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn apply_resource_env(&self) {
+        set_env_path("REMI_DATA_DIR", &self.data_dir);
+        set_env_path("REMI_RUNTIME_CONFIG", &self.runtime_config);
+        set_env_path("REMI_CHANNELS_CONFIG", &self.channels_config);
+        set_env_path("REMI_AGENTS_DIR", &self.agents_dir);
+        set_env_path("REMI_MODELS_DIR", &self.models_dir);
+        set_env_path("REMI_MEMORY_DIR", &self.memory_dir);
+        set_env_path("REMI_SESSIONS_PATH", &self.sessions_path);
+        set_env_path("REMI_USERS_PATH", &self.users_path);
+        set_env_path("REMI_TASKS_DIR", &self.tasks_dir);
+        set_env_path("REMI_WORKFLOWS_DIR", &self.workflows_dir);
+        if let Ok(value) = serde_json::to_string(&self.skills_dirs) {
+            unsafe { std::env::set_var("REMI_SKILLS_DIRS", value) };
+        }
+        if let Some(workspace) = &self.workspace {
+            set_env_path("REMI_PROFILE_WORKSPACE", workspace);
+        }
+        unsafe {
+            std::env::set_var("REMI_PROFILE_ID", &self.manifest.id);
+            if let Some(path) = &self.manifest_path {
+                std::env::set_var("REMI_PROFILE_PATH", path);
+            } else {
+                std::env::remove_var("REMI_PROFILE_PATH");
+            }
+        }
+    }
+
+    pub fn expanded_local_command(&self) -> Result<String> {
+        self.expanded_local_command_for("default")
+    }
+
+    pub fn expanded_local_command_for(&self, instance: &str) -> Result<String> {
+        let ProfileEndpoint::Local { command } = &self.endpoint else {
+            anyhow::bail!(
+                "REMOTE_AGENT_NOT_IMPLEMENTED: profile `{}` uses a remote A2A endpoint",
+                self.manifest.id
+            );
+        };
+        let profile_path = self
+            .manifest_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let profile_dir = self
+            .manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&self.data_dir)
+            .display()
+            .to_string();
+        Ok(command
+            .replace("${PROFILE}", &profile_path)
+            .replace("${PROFILE_ID}", &self.manifest.id)
+            .replace("${PROFILE_DIR}", &profile_dir)
+            .replace("${INSTANCE}", instance)
+            .replace(
+                "${WORKSPACE}",
+                &self
+                    .workspace
+                    .as_deref()
+                    .unwrap_or(&self.data_dir)
+                    .display()
+                    .to_string(),
+            ))
+    }
+
     pub fn label(&self) -> &str {
         self.name.as_deref().unwrap_or("default")
     }
 
     pub fn is_named(&self) -> bool {
         self.name.is_some()
-    }
-
-    pub fn run_dir(&self) -> PathBuf {
-        self.data_dir.join("run")
-    }
-
-    pub fn pid_file(&self) -> PathBuf {
-        self.run_dir().join("remi-cat.pid.json")
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -80,16 +268,255 @@ impl InstanceProfile {
     pub fn log_file(&self) -> PathBuf {
         self.log_dir().join("remi-cat.log")
     }
+
+    fn load_or_legacy(name: Option<String>, data_dir: PathBuf) -> Result<Self> {
+        let manifest_path = data_dir.join(PROFILE_FILE_NAME);
+        if manifest_path.exists() {
+            let mut profile = Self::from_manifest(manifest_path)?;
+            profile.name = name;
+            return Ok(profile);
+        }
+        Ok(Self::legacy(name, data_dir))
+    }
+
+    fn legacy(name: Option<String>, data_dir: PathBuf) -> Self {
+        let label = name.as_deref().unwrap_or("default");
+        let endpoint = ProfileEndpoint::Local {
+            command: builtin_endpoint_command(name.as_deref()),
+        };
+        let manifest = ApplicationProfileManifest {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            id: if label == "default" {
+                "remi.default".to_string()
+            } else {
+                format!("remi.{label}")
+            },
+            name: if label == "default" {
+                "Remi Cat".to_string()
+            } else {
+                label.to_string()
+            },
+            description: Some("Built-in remi-cat compatible profile".to_string()),
+            version: None,
+            workspace: None,
+            config: ProfileConfigRefs::default(),
+            resources: ProfileResourceRefs::default(),
+            state: ProfileStateRefs {
+                data: Some(data_dir.clone()),
+                ..ProfileStateRefs::default()
+            },
+            capabilities: ProfileCapabilities {
+                tags: vec!["general".to_string()],
+                intents: Vec::new(),
+                channels: vec![
+                    "tui".to_string(),
+                    "web".to_string(),
+                    "feishu".to_string(),
+                    "acp".to_string(),
+                ],
+            },
+            endpoint: endpoint.clone(),
+        };
+        Self::from_parts(name, data_dir, None, manifest, endpoint)
+    }
+
+    fn resolve_manifest(path: PathBuf, manifest: ApplicationProfileManifest) -> Result<Self> {
+        let base = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let data_dir = resolve_optional_path(&base, manifest.state.data.as_deref())
+            .unwrap_or_else(|| base.join(".remi-cat"));
+        let label = Some(manifest.id.clone());
+        let endpoint = manifest.endpoint.clone();
+        Ok(Self::from_parts(
+            label,
+            data_dir,
+            Some(path),
+            manifest,
+            endpoint,
+        ))
+    }
+
+    fn from_parts(
+        name: Option<String>,
+        data_dir: PathBuf,
+        manifest_path: Option<PathBuf>,
+        manifest: ApplicationProfileManifest,
+        endpoint: ProfileEndpoint,
+    ) -> Self {
+        let base = manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&data_dir);
+        let resolve = |value: Option<&Path>, fallback: PathBuf| {
+            resolve_optional_path(base, value).unwrap_or(fallback)
+        };
+        let runtime_config = resolve(
+            manifest.config.runtime.as_deref(),
+            data_dir.join("runtime.yaml"),
+        );
+        let channels_config = resolve(
+            manifest.config.channels.as_deref(),
+            data_dir.join("channels.yaml"),
+        );
+        let agents_dir = resolve(
+            manifest.resources.agents.as_deref(),
+            data_dir.join("agents"),
+        );
+        let models_dir = resolve(
+            manifest.resources.models.as_deref(),
+            data_dir.join("models"),
+        );
+        let skills_dirs = if manifest.resources.skills.is_empty() {
+            vec![data_dir.join("skills")]
+        } else {
+            manifest
+                .resources
+                .skills
+                .iter()
+                .map(|path| resolve_path(base, path))
+                .collect()
+        };
+        let workflows_dir = resolve(
+            manifest.resources.workflows.as_deref(),
+            data_dir.join("workflows"),
+        );
+        let sessions_path = resolve(
+            manifest.state.sessions.as_deref(),
+            data_dir.join("sessions.json"),
+        );
+        let memory_dir = resolve(manifest.state.memory.as_deref(), data_dir.join("memory"));
+        let users_path = resolve(manifest.state.users.as_deref(), data_dir.join("users.json"));
+        let tasks_dir = resolve(manifest.state.tasks.as_deref(), data_dir.join("tool_tasks"));
+        let workspace = manifest
+            .workspace
+            .as_deref()
+            .map(|path| resolve_path(base, path));
+        Self {
+            name,
+            data_dir,
+            manifest_path,
+            manifest,
+            runtime_config,
+            channels_config,
+            workspace,
+            agents_dir,
+            models_dir,
+            skills_dirs,
+            workflows_dir,
+            sessions_path,
+            memory_dir,
+            users_path,
+            tasks_dir,
+            endpoint,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProfileRunMetadata {
-    pub pid: u32,
-    pub profile: String,
-    pub data_dir: String,
-    pub started_at: String,
-    pub command: Vec<String>,
-    pub log_path: String,
+pub(crate) fn validate_manifest(manifest: &ApplicationProfileManifest) -> Result<()> {
+    if manifest.schema_version != PROFILE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported profile schema_version {}; expected {}",
+            manifest.schema_version,
+            PROFILE_SCHEMA_VERSION
+        );
+    }
+    validate_profile_id(&manifest.id)?;
+    if manifest.name.trim().is_empty() {
+        anyhow::bail!("profile name must not be empty");
+    }
+    match &manifest.endpoint {
+        ProfileEndpoint::Local { command } if command.trim().is_empty() => {
+            anyhow::bail!("local profile endpoint command must not be empty")
+        }
+        ProfileEndpoint::Remote { url, .. }
+            if !(url.starts_with("http://") || url.starts_with("https://")) =>
+        {
+            anyhow::bail!("remote profile endpoint URL must use http or https")
+        }
+        ProfileEndpoint::Remote {
+            auth: Some(ProfileEndpointAuth::Bearer { token_env }),
+            ..
+        } if token_env.trim().is_empty() => {
+            anyhow::bail!("remote bearer token_env must not be empty")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_profile_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        anyhow::bail!("invalid profile id `{id}`; use ASCII letters, digits, `.`, `-`, and `_`");
+    }
+    Ok(())
+}
+
+fn resolve_optional_path(base: &Path, value: Option<&Path>) -> Option<PathBuf> {
+    value.map(|path| resolve_path(base, path))
+}
+
+fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+    let expanded = expand_home(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    }
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir_from_env().unwrap_or_else(|| path.to_path_buf());
+    }
+    let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) else {
+        return path.to_path_buf();
+    };
+    home_dir_from_env()
+        .map(|home| home.join(rest))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn set_env_path(key: &str, path: &Path) {
+    unsafe { std::env::set_var(key, path) };
+}
+
+fn builtin_endpoint_command(name: Option<&str>) -> String {
+    let executable = std::env::current_exe()
+        .ok()
+        .map(|path| shell_quote(&path.display().to_string()))
+        .unwrap_or_else(|| "remi-cat".to_string());
+    match name {
+        Some(_) => format!("{executable} --profile \"${{PROFILE}}\" a2a stdio"),
+        None => format!("{executable} a2a stdio"),
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_quote(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'\\' | b'.' | b'-' | b'_' | b':')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'\\' | b'.' | b'-' | b'_' | b':')
+    }) {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 pub fn profiles_root() -> PathBuf {
@@ -206,7 +633,9 @@ pub fn configured_profiles_excluding_in_data_root(
         if same_path(&profile.data_dir, data_dir) {
             continue;
         }
-        if let SetupState::Initialized { config, .. } = detect_setup_state(&profile.data_dir) {
+        if let SetupState::Initialized { config, .. } =
+            detect_setup_state_at(&profile.runtime_config, &profile.data_dir)
+        {
             configs.push(config);
         }
     }
@@ -214,45 +643,16 @@ pub fn configured_profiles_excluding_in_data_root(
 }
 
 pub fn remove_named_profile_in_data_root(name: &str, data_root: &Path) -> Result<PathBuf> {
-    let profile = InstanceProfile::named_in_data_root(name, data_root)?;
-    if !profile.data_dir.exists() {
+    validate_profile_name(name)?;
+    // Remove the registered profile directory, never a state directory that
+    // the manifest may reference outside it.
+    let profile_dir = profiles_root_in_data_root(data_root).join(name);
+    if !profile_dir.exists() {
         anyhow::bail!("profile `{name}` does not exist");
     }
-    std::fs::remove_dir_all(&profile.data_dir).with_context(|| {
-        format!(
-            "removing profile `{name}` at {}",
-            profile.data_dir.display()
-        )
-    })?;
-    Ok(profile.data_dir)
-}
-
-pub fn read_run_metadata(profile: &InstanceProfile) -> Result<Option<ProfileRunMetadata>> {
-    let path = profile.pid_file();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let metadata =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(metadata))
-}
-
-pub fn write_run_metadata(profile: &InstanceProfile, metadata: &ProfileRunMetadata) -> Result<()> {
-    std::fs::create_dir_all(profile.run_dir())
-        .with_context(|| format!("creating {}", profile.run_dir().display()))?;
-    let raw = serde_json::to_string_pretty(metadata).context("serializing profile run metadata")?;
-    std::fs::write(profile.pid_file(), raw)
-        .with_context(|| format!("writing {}", profile.pid_file().display()))
-}
-
-pub fn remove_run_metadata(profile: &InstanceProfile) -> Result<()> {
-    let path = profile.pid_file();
-    if path.exists() {
-        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-    }
-    Ok(())
+    std::fs::remove_dir_all(&profile_dir)
+        .with_context(|| format!("removing profile `{name}` at {}", profile_dir.display()))?;
+    Ok(profile_dir)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -264,9 +664,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::shell_quote;
     use super::{
-        read_run_metadata, remove_run_metadata, tui_home_data_dir, validate_profile_name,
-        write_run_metadata, InstanceProfile, ProfileRunMetadata, TUI_HOME_DATA_DIR,
+        remove_named_profile_in_data_root, tui_home_data_dir, validate_manifest,
+        validate_profile_name, ApplicationProfileManifest, InstanceProfile, ProfileEndpoint,
+        TUI_HOME_DATA_DIR,
     };
     use std::sync::Mutex;
 
@@ -324,29 +727,142 @@ mod tests {
     }
 
     #[test]
-    fn run_metadata_round_trip() {
-        let dir = std::env::temp_dir().join(format!("remi-profile-meta-{}", uuid::Uuid::new_v4()));
-        let profile = InstanceProfile {
-            name: Some("meta".to_string()),
-            data_dir: dir.clone(),
+    fn manifest_resolves_resource_and_state_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.yaml");
+        std::fs::write(
+            &path,
+            r#"schema_version: 1
+id: travel.planner
+name: Travel Planner
+workspace: project
+config:
+  runtime: config/runtime.yaml
+  channels: config/channels.yaml
+resources:
+  agents: definitions/agents
+  models: definitions/models
+  skills:
+    - skills
+    - ../shared-skills
+  workflows: definitions/workflows
+state:
+  data: state
+  sessions: state/chat-sessions.json
+  memory: ../shared-memory
+  users: state/users.json
+  tasks: state/tasks
+capabilities:
+  tags: [travel]
+  channels: [tui, profile]
+endpoint:
+  type: local
+  command: "travel-agent --profile ${PROFILE}"
+"#,
+        )
+        .unwrap();
+
+        let profile = InstanceProfile::from_manifest(&path).unwrap();
+        assert_eq!(profile.manifest.id, "travel.planner");
+        assert_eq!(profile.data_dir, dir.path().join("state"));
+        assert_eq!(profile.workspace, Some(dir.path().join("project")));
+        assert_eq!(
+            profile.runtime_config,
+            dir.path().join("config/runtime.yaml")
+        );
+        assert_eq!(
+            profile.channels_config,
+            dir.path().join("config/channels.yaml")
+        );
+        assert_eq!(profile.agents_dir, dir.path().join("definitions/agents"));
+        assert_eq!(profile.memory_dir, dir.path().join("../shared-memory"));
+        assert_eq!(
+            profile.sessions_path,
+            dir.path().join("state/chat-sessions.json")
+        );
+        assert!(profile
+            .expanded_local_command()
+            .unwrap()
+            .contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn builtin_default_preserves_legacy_layout() {
+        let root = std::path::PathBuf::from(".remi-cat");
+        let profile = InstanceProfile::builtin_default(&root);
+        assert_eq!(profile.manifest.id, "remi.default");
+        assert!(profile.manifest_path.is_none());
+        assert_eq!(profile.data_dir, root);
+        assert_eq!(profile.agents_dir, root.join("agents"));
+        assert_eq!(profile.models_dir, root.join("models"));
+        assert_eq!(profile.skills_dirs, vec![root.join("skills")]);
+        assert_eq!(profile.sessions_path, root.join("sessions.json"));
+        assert_eq!(profile.memory_dir, root.join("memory"));
+        assert_eq!(profile.users_path, root.join("users.json"));
+        assert_eq!(profile.tasks_dir, root.join("tool_tasks"));
+    }
+
+    #[test]
+    fn persisted_named_profile_endpoint_selects_its_manifest_path() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = InstanceProfile::named_in_data_root("travel", root.path()).unwrap();
+        let manifest_path = profile.write_manifest().unwrap();
+        let reloaded = InstanceProfile::from_manifest(&manifest_path).unwrap();
+        let command = reloaded.expanded_local_command().unwrap();
+
+        assert!(command.contains(&manifest_path.display().to_string()));
+        assert!(!command.contains("--profile travel "));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_quote_uses_cmd_compatible_double_quotes() {
+        assert_eq!(
+            shell_quote(r"C:\Program Files\Remi\remi-cat.exe"),
+            r#""C:\Program Files\Remi\remi-cat.exe""#
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_is_reserved_but_validated() {
+        let valid: ApplicationProfileManifest = serde_yaml::from_str(
+            "schema_version: 1\nid: remote.travel\nname: Remote\nendpoint:\n  type: remote\n  url: https://example.com/a2a\n  auth:\n    type: bearer\n    token_env: TRAVEL_TOKEN\n",
+        )
+        .unwrap();
+        validate_manifest(&valid).unwrap();
+
+        let mut invalid = valid;
+        invalid.endpoint = ProfileEndpoint::Remote {
+            url: "file:///tmp/agent".to_string(),
+            auth: None,
         };
-        let metadata = ProfileRunMetadata {
-            pid: 12345,
-            profile: "meta".to_string(),
-            data_dir: dir.display().to_string(),
-            started_at: "2026-01-01T00:00:00Z".to_string(),
-            command: vec![
-                "remi-cat".to_string(),
-                "--profile".to_string(),
-                "meta".to_string(),
-            ],
-            log_path: profile.log_file().display().to_string(),
-        };
-        write_run_metadata(&profile, &metadata).unwrap();
-        assert_eq!(read_run_metadata(&profile).unwrap(), Some(metadata));
-        remove_run_metadata(&profile).unwrap();
-        assert!(read_run_metadata(&profile).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(validate_manifest(&invalid).is_err());
+    }
+
+    #[test]
+    fn removing_named_profile_does_not_remove_referenced_state() {
+        let root = tempfile::tempdir().unwrap();
+        let external_state = tempfile::tempdir().unwrap();
+        let profile_dir = root.path().join("profiles/travel");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("profile.yaml"),
+            format!(
+                "schema_version: 1\nid: travel\nname: Travel\nstate:\n  data: {}\nendpoint:\n  type: local\n  command: remi-cat\n",
+                external_state.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(external_state.path().join("keep"), "state").unwrap();
+
+        let removed = remove_named_profile_in_data_root("travel", root.path()).unwrap();
+
+        assert_eq!(removed, profile_dir);
+        assert!(!removed.exists());
+        assert_eq!(
+            std::fs::read_to_string(external_state.path().join("keep")).unwrap(),
+            "state"
+        );
     }
 
     unsafe fn restore_env(key: &str, value: Option<std::ffi::OsString>) {

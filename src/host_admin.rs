@@ -32,8 +32,10 @@ const WEB_APP_CSS: &str = include_str!("../web-ui/dist/app.css");
 
 #[derive(Clone)]
 pub struct AdminState {
+    pub data_dir: PathBuf,
     pub agents_dir: PathBuf,
     pub skills_dir: PathBuf,
+    pub tasks_dir: PathBuf,
     pub workspace_dir: PathBuf,
     pub workspace_root_label: String,
     pub secret_store: Arc<Mutex<SecretStore>>,
@@ -117,6 +119,10 @@ pub fn router(state: AdminState) -> Router {
             get(workspace_image_asset),
         )
         .with_state(state)
+}
+
+fn admin_data_dir(state: &AdminState) -> PathBuf {
+    state.data_dir.clone()
 }
 
 async fn index() -> Html<&'static str> {
@@ -800,7 +806,10 @@ async fn list_web_tool_tasks(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Vec<bot_core::ToolTaskRecord>>, AdminError> {
     require_web_session(&state, &id).await?;
-    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
+    if let Some(handle) = state.web_chat.as_ref() {
+        return Ok(Json(handle.list_tool_tasks(id).await?));
+    }
+    let manager = bot_core::ToolTaskManager::load_store_dir(&state.tasks_dir)
         .map_err(|err| AdminError::internal(err.to_string()))?;
     Ok(Json(manager.list(Some(&id)).await))
 }
@@ -809,12 +818,14 @@ async fn get_web_tool_task(
     State(state): State<AdminState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<bot_core::ToolTaskRecord>, AdminError> {
-    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
-        .map_err(|err| AdminError::internal(err.to_string()))?;
-    manager
-        .get(&id)
-        .await
-        .map(Json)
+    let task = if let Some(handle) = state.web_chat.as_ref() {
+        handle.get_tool_task(id).await?
+    } else {
+        let manager = bot_core::ToolTaskManager::load_store_dir(&state.tasks_dir)
+            .map_err(|err| AdminError::internal(err.to_string()))?;
+        manager.get(&id).await
+    };
+    task.map(Json)
         .ok_or_else(|| AdminError::not_found("tool task not found".into()))
 }
 
@@ -822,12 +833,14 @@ async fn cancel_web_tool_task(
     State(state): State<AdminState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<bot_core::ToolTaskRecord>, AdminError> {
-    let manager = bot_core::ToolTaskManager::load(admin_data_dir(&state))
-        .map_err(|err| AdminError::internal(err.to_string()))?;
-    manager
-        .cancel(&id)
-        .await
-        .map(Json)
+    let task = if let Some(handle) = state.web_chat.as_ref() {
+        handle.cancel_tool_task(id).await?
+    } else {
+        let manager = bot_core::ToolTaskManager::load_store_dir(&state.tasks_dir)
+            .map_err(|err| AdminError::internal(err.to_string()))?;
+        manager.cancel(&id).await
+    };
+    task.map(Json)
         .ok_or_else(|| AdminError::not_found("tool task not found".into()))
 }
 
@@ -909,6 +922,7 @@ impl From<WebRuntimeOptionsRequest> for WebRuntimeOptions {
             reasoning_effort: value.reasoning_effort,
             agent_id: value.agent_id,
             async_agent: value.async_agent,
+            platform: None,
         }
     }
 }
@@ -1215,19 +1229,6 @@ fn web_handle(state: &AdminState) -> Result<&WebChatHandle, AdminError> {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "web chat runtime is not available in admin-only mode".into(),
     })
-}
-
-fn admin_data_dir(state: &AdminState) -> PathBuf {
-    match &state.setup_state {
-        SetupState::Initialized { config, .. } => PathBuf::from(&config.data_dir),
-        SetupState::Invalid { config_path, .. } => config_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| state.workspace_dir.clone()),
-        SetupState::LegacyEnvCompatible { data_dir } | SetupState::Uninitialized { data_dir } => {
-            data_dir.clone()
-        }
-    }
 }
 
 fn delete_web_model_inputs_for_session(state: &AdminState, session_id: &str) {

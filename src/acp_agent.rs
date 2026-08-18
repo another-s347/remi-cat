@@ -130,7 +130,11 @@ impl AcpRuntimeFactory {
         let runtime = Rc::new(Runtime {
             bot,
             secret_store: Arc::clone(&self.secret_store),
-            user_store: Arc::new(UserStore::load(self.data_dir.join("users.json"))?),
+            user_store: Arc::new(UserStore::load(
+                std::env::var_os("REMI_USERS_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.data_dir.join("users.json")),
+            )?),
             sessions: Arc::clone(&self.sessions),
             im_bridge: Arc::clone(&bridge),
             root_agent_id: self.root_agent_id.clone(),

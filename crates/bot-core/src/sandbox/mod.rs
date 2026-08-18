@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 
 mod bash;
 mod path;
+#[cfg(feature = "experimental-pty")]
+mod pty;
 use bash::{
     run_command_with_timeout, run_named_bash, shell_command_args, shell_startup_script, user_shell,
     BashSession, BashTaskRegistry,
@@ -20,6 +22,8 @@ use path::{
     resolve_workspace_existing_path, resolve_workspace_writable_dir_path,
     resolve_workspace_writable_file_path,
 };
+#[cfg(feature = "experimental-pty")]
+pub use pty::PtyProcess as SandboxPtyProcess;
 
 pub type SandboxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -170,6 +174,14 @@ pub trait Sandbox: Send + Sync {
     ) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_poll<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput>;
+    #[cfg(feature = "experimental-pty")]
+    fn bash_pty<'a>(
+        &'a self,
+        command: &'a str,
+        rows: u16,
+        cols: u16,
+        cancel: CancellationToken,
+    ) -> SandboxFuture<'a, SandboxPtyProcess>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +399,27 @@ impl Sandbox for NoSandbox {
 
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move { Ok(self.tasks.cancel(pid).await) })
+    }
+
+    #[cfg(feature = "experimental-pty")]
+    fn bash_pty<'a>(
+        &'a self,
+        command: &'a str,
+        rows: u16,
+        cols: u16,
+        cancel: CancellationToken,
+    ) -> SandboxFuture<'a, SandboxPtyProcess> {
+        Box::pin(async move {
+            tokio::fs::create_dir_all(&self.root)
+                .await
+                .context("creating sandbox root")?;
+            let shell = user_shell();
+            let mut cmd = portable_pty::CommandBuilder::new(&shell);
+            cmd.args(shell_command_args(&shell, command));
+            cmd.cwd(&self.root);
+            cmd.env("TERM", "xterm-256color");
+            pty::spawn(cmd, rows, cols, cancel)
+        })
     }
 }
 
@@ -676,6 +709,28 @@ impl Sandbox for DockerSandbox {
 
     fn bash_cancel<'a>(&'a self, pid: &'a str) -> SandboxFuture<'a, SandboxBashOutput> {
         Box::pin(async move { Ok(self.tasks.cancel(pid).await) })
+    }
+
+    #[cfg(feature = "experimental-pty")]
+    fn bash_pty<'a>(
+        &'a self,
+        command: &'a str,
+        rows: u16,
+        cols: u16,
+        cancel: CancellationToken,
+    ) -> SandboxFuture<'a, SandboxPtyProcess> {
+        Box::pin(async move {
+            self.ensure_running().await?;
+            let mut cmd = portable_pty::CommandBuilder::new("docker");
+            cmd.args(["exec", "-it", "-w", &self.config.container_dir]);
+            if let Some(user) = self.config.user.as_deref() {
+                cmd.args(["-u", user]);
+            }
+            let command = format!("{}\n{command}", shell_startup_script("bash"));
+            cmd.args([&self.config.container_name, "bash", "-l", "-c", &command]);
+            cmd.env("TERM", "xterm-256color");
+            pty::spawn(cmd, rows, cols, cancel)
+        })
     }
 }
 
