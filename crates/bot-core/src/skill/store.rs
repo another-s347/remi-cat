@@ -133,7 +133,10 @@ impl<S> BuiltinSkillStore<S> {
                 source: "builtin".to_string(),
                 skill_file_path: None,
                 resource_root_path: None,
-                pin: false,
+                pin: skill
+                    .document()
+                    .map(|document| document.pin)
+                    .unwrap_or(false),
             })
             .collect()
     }

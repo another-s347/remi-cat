@@ -927,7 +927,16 @@ pub fn write_channels_config_at(path: &Path, config: &ChannelsConfig) -> Result<
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let raw = serde_yaml::to_string(config).context("serializing channel config")?;
-    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("yaml"),
+        std::process::id()
+    ));
+    std::fs::write(&temporary, raw).with_context(|| format!("writing {}", temporary.display()))?;
+    crate::atomic_file::replace(&temporary, path)
+        .with_context(|| format!("replacing {}", path.display()))?;
     Ok(path.to_path_buf())
 }
 

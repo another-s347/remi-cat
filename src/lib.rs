@@ -15,6 +15,7 @@ mod host_admin;
 mod instance_profile;
 mod model_input_store;
 mod profile_command;
+mod profile_instance;
 mod profile_registry;
 mod runtime_config;
 mod secret_store;

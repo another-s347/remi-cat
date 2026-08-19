@@ -8,6 +8,7 @@ const BUILTIN_REMI_SKILL_DESCRIPTION: &str =
 const BUILTIN_REMI_SKILL_TEMPLATE: &str = r#"---
 name: remi
 description: Builtin guide for using Remi to inspect and manage its own profiles, agents, workflows, and runtime settings.
+pin: true
 ---
 
 # Remi Self-Management
@@ -19,19 +20,21 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 
 ## Safety
 
-- Prefer read-only commands first: `profile list`, `profile show`, `profile status`, `profile agent list`, and `profile workflow list`.
-- Do not delete or overwrite profiles, agents, or workflows unless the user explicitly asks for that destructive change.
-- For profile deletion, require `--force` only when the user clearly requested deletion.
-- For background instances, use `profile status <name>` before `profile stop`, `profile restart`, or `profile delete`.
+- Prefer read-only commands first: `profile list`, `profile show`, `profile status`, `profile channel list`, `profile agent list`, and `workflow list`.
+- Do not remove or overwrite profiles, channels, agents, or workflows unless the user explicitly asks for that destructive change.
+- `profile unregister` removes only the global registry entry; it preserves the manifest and all referenced resources/state.
+- For background instances, use `profile status <reference>` before `profile stop`, `profile restart`, or `profile unregister`.
 - Use `manage_yourself` for Remi CLI commands. It only supports one argument shape: `{"command":"profile list"}`.
 - Telemetry for the active profile can be inspected or changed with `{"command":"telemetry status"}`, `telemetry enable`, and `telemetry disable`.
-- Use help through `manage_yourself` when unsure about syntax, for example `{"command":"help"}` or `{"command":"profile agent --help"}`.
+- Use help through `manage_yourself` when unsure about syntax, for example `{"command":"help"}`, `{"command":"profile --help"}`, or `{"command":"profile channel --help"}`.
 - Current-session runtime settings use slash commands in chat. To change reasoning strength for the active session, tell the user or runtime to run `/model reasoning set <auto|none|minimal|low|medium|high|xhigh|max>`; use `/model reasoning reset` to return to the model profile default.
 - Use `{"command":"tools --json"}` before adding tools to an agent profile. It lists all runtime-known tools, ignores the active allowlist, and includes configuration warnings/errors.
 - The `command` value is the arguments after `remi-cat`; do not include the binary name and do not wrap it in another `arguments` field.
 - `manage_yourself` runs the current host `remi-cat` binary directly, so it works even when sandboxed shell commands cannot see the binary.
-- Profile commands resolve `.remi-cat/profiles` relative to the Remi host process current directory.
+- Registered profiles use the process-global registry at `~/.remi-cat/profile-registry.json`, independent of the current directory and profile state directory.
+- Prefer registered references such as `@travel` for every command after initialization.
 - When a command may affect a different profile, include the profile name explicitly.
+- Preserve an explicit destination path exactly as the user supplied it. Do not shorten an absolute path to a workspace-relative path. After `profile init`, use `profile show @alias --sources --format yaml` and confirm that `manifest` and `workspace` resolve beneath the intended destination before making further changes.
 - Feishu/Lark chat channels are normally resolved from incoming IM events. For local CLI testing, use `cli --channel <id>` to reuse a persistent local session.
 
 ## Profile Commands
@@ -53,27 +56,56 @@ profile status <profile>
 profile status --all
 ```
 
-Create or update runtime configuration:
+Create, register, and edit a profile manifest:
 
 ```bash
-profile create <profile> admin.enabled=false sandbox.kind=no_sandbox shell.mode=local
---profile <profile> config set admin.port=8790
---profile <profile> sandbox set kind=no_sandbox
---profile <profile> acp setup --client codex
+profile init ./profiles/travel --id travel.planner --name "Travel Planner" --template remi-cat --with-runtime --register travel
+profile set @travel description "Plans and manages travel"
+profile set @travel capabilities.tags travel,planner
+profile set @travel capabilities.intents plan-travel,manage-itinerary
+profile check @travel --strict
 ```
+
+Use an absolute or workspace-relative destination with `profile init`; it writes a manifest and referenced resources there. `profile set` edits only typed manifest fields. Runtime settings use the selected profile:
+
+```bash
+--profile @travel config set admin.enabled=false im.mode=disabled
+--profile @travel sandbox set kind=no_sandbox
+--profile @travel acp setup --client codex
+```
+
+## IM Channel Commands
+
+Concrete channel instances live in the profile's referenced `channels.yaml`; `capabilities.channels` is only discovery metadata.
+
+```bash
+profile channel list @travel
+profile channel upsert-feishu @travel work --transport websocket --app-id-env TRAVEL_FEISHU_APP_ID --app-secret-env TRAVEL_FEISHU_APP_SECRET
+profile channel upsert-feishu @travel webhook --transport event-hook --host 127.0.0.1 --port 8791 --path /feishu/events --verification-token-env TRAVEL_FEISHU_VERIFY_TOKEN
+profile channel disable @travel work
+profile channel enable @travel work
+profile channel remove @travel work --force
+profile set @travel capabilities.channels feishu
+```
+
+Channel commands store credential key references, never secret values. After changing enabled state or connector settings, restart the managed profile instance to apply the configuration.
 
 Manage background instances:
 
 ```bash
 profile start <profile>
+profile status <profile>
 profile stop <profile>
 profile restart <profile>
+profile status --all --format json
 ```
 
-Delete a named profile only when requested:
+Managed instances are persistent host processes used for Web/IM serving. They are different from `profile ask`, which starts an A2A endpoint on demand for one conversation and cleans it up afterward. Start requires a manifest-backed profile. Use `--instance NAME` to run or control independent instances of the same profile.
+
+Unregister a profile only when requested:
 
 ```bash
-profile delete <profile> --force
+profile unregister <profile>
 ```
 
 ## Agent Profile Commands
@@ -91,10 +123,10 @@ Agent files are markdown with YAML frontmatter. `agent upsert` validates the mar
 ## Supervisor Workflow Commands
 
 ```bash
-profile workflow list <profile>
-profile workflow show <profile> <workflow_id>
-profile workflow upsert <profile> ./workflows/<workflow_id>.json
-profile workflow delete <profile> <workflow_id>
+workflow list --profile <profile>
+workflow show --profile <profile> <workflow_id>
+workflow add --profile <profile> ./workflows/<workflow_id>.json
+workflow rm --profile <profile> <workflow_id>
 ```
 
 Workflow files are JSON graph definitions. `workflow upsert` validates the graph and writes `<profile-data-dir>/workflows/<id>.json`. The builtin `goal` workflow can be listed and shown, but it cannot be overwritten or deleted.
@@ -104,8 +136,8 @@ To create or modify a supervisor workflow:
 1. Inspect existing workflows first:
 
 ```bash
-profile workflow list <profile>
-profile workflow show <profile> <workflow_id>
+workflow list --profile <profile>
+workflow show --profile <profile> <workflow_id>
 ```
 
 2. Write or edit a workflow JSON file in the workspace using normal file-editing tools. The workflow shape is:
@@ -134,8 +166,8 @@ profile workflow show <profile> <workflow_id>
 3. Upsert the file, which creates the workflow if it is new or modifies the existing workflow with the same `id`:
 
 ```bash
-profile workflow upsert <profile> ./workflows/review-loop.json
-profile workflow show <profile> review-loop
+workflow add --profile <profile> ./workflows/review-loop.json
+workflow show --profile <profile> review-loop
 ```
 
 4. To use a workflow in the current conversation, send a runtime command in the session. Profile workflows can be started directly as slash commands by id; `/workflow ...` remains the management command:
@@ -149,8 +181,8 @@ profile workflow show <profile> review-loop
 5. Delete only when the user explicitly requested deletion:
 
 ```bash
-profile workflow delete <profile> review-loop
-profile workflow list <profile>
+workflow rm --profile <profile> review-loop
+workflow list --profile <profile>
 ```
 
 ## ACP Client Commands
@@ -218,7 +250,7 @@ Local `SKILL.md` YAML frontmatter supports `pin: true` or `pin: false`. The defa
 
 1. Read this skill with `skill__get` before changing Remi configuration.
 2. Use `manage_yourself` to run the appropriate `remi-cat` command.
-3. Verify the result with a read command such as `profile show`, `profile agent list`, or `profile workflow list`.
+3. Verify the result with a read command such as `profile show`, `profile channel list`, `profile status`, `profile agent list`, or `workflow list`.
 4. Report the exact profile name, changed file or setting, and verification result.
 "#;
 
@@ -241,6 +273,10 @@ mod tests {
 
         let results = store.search("profile workflow").await.unwrap();
         assert!(results.iter().any(|skill| skill.name == "remi"));
+        assert!(store
+            .featured_summaries()
+            .iter()
+            .any(|skill| skill.name == "remi" && skill.pin));
 
         let doc = store.get("remi").await.unwrap().unwrap();
         assert_eq!(doc.name, "remi");
@@ -250,10 +286,11 @@ mod tests {
             .content
             .contains("Use this exact `remi-cat` binary path"));
         assert!(doc.content.contains("profile agent list"));
-        assert!(doc.content.contains("profile workflow upsert"));
+        assert!(doc.content.contains("profile channel upsert-feishu"));
+        assert!(doc.content.contains("profile restart"));
         assert!(doc.content.contains(r#"{"command":"help"}"#));
         assert!(doc
             .content
-            .contains(r#"{"command":"profile agent --help"}"#));
+            .contains(r#"{"command":"profile channel --help"}"#));
     }
 }

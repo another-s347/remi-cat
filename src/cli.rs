@@ -161,6 +161,9 @@ struct RunArgs {
         help = "In one-shot CLI/prompt mode, wait for background tool tasks to finish before exiting"
     )]
     wait_background_tasks: bool,
+
+    #[arg(long, value_parser = ["low", "medium"], help = "Auto-approve tool requests up to this risk level for this one-shot local session")]
+    permissions: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -563,6 +566,8 @@ struct LocalChatArgs {
         help = "When MESSAGE is provided, wait for background tool tasks to finish before exiting"
     )]
     wait_background_tasks: bool,
+    #[arg(long, value_parser = ["low", "medium"], help = "Auto-approve tool requests up to this risk level for this local session")]
+    permissions: Option<String>,
     #[arg(trailing_var_arg = true, value_name = "MESSAGE")]
     message: Vec<String>,
 }
@@ -576,6 +581,8 @@ struct PromptArgs {
         help = "Wait for background tool tasks to finish before exiting"
     )]
     wait_background_tasks: bool,
+    #[arg(long, value_parser = ["low", "medium"], help = "Auto-approve tool requests up to this risk level for this prompt session; use medium only for explicitly authorized automation")]
+    permissions: Option<String>,
     #[arg(required = true, trailing_var_arg = true, value_name = "PROMPT")]
     prompt: Vec<String>,
 }
@@ -682,6 +689,19 @@ enum ProfileCliCommand {
     Unset(ProfileUnsetArgs),
     #[command(about = "Start a local profile on demand and ask it through A2A")]
     Ask(ProfileAskArgs),
+    #[command(about = "Start a persistent managed runtime instance for a profile")]
+    Start(ProfileLaunchArgs),
+    #[command(about = "Stop a persistent managed runtime instance")]
+    Stop(ProfileControlArgs),
+    #[command(about = "Restart a persistent managed runtime instance")]
+    Restart(ProfileControlArgs),
+    #[command(about = "Show persistent managed runtime instance state")]
+    Status(ProfileStatusArgs),
+    #[command(about = "Configure concrete IM channel instances for a profile")]
+    Channel {
+        #[command(subcommand)]
+        command: ProfileChannelCliCommand,
+    },
     #[command(about = "Inspect referenced profile resources")]
     Resource {
         #[command(subcommand)]
@@ -855,8 +875,6 @@ struct ProfileLaunchArgs {
         help = "Independent runtime instance name"
     )]
     instance: String,
-    #[arg(long, help = "Channel capability to assign and expose to the process")]
-    channel: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -865,7 +883,7 @@ struct ProfileControlArgs {
     reference: String,
     #[arg(long, default_value = "default", help = "Runtime instance name")]
     instance: String,
-    #[arg(long, help = "Send SIGKILL instead of graceful SIGTERM")]
+    #[arg(long, help = "Force termination instead of requesting a graceful stop")]
     force: bool,
 }
 
@@ -886,10 +904,15 @@ struct ProfileCreateArgs {
 struct ProfileStatusArgs {
     #[arg(
         value_name = "PROFILE_REF",
-        help = "Target profile; defaults to the selected/current profile"
+        conflicts_with = "all",
+        help = "Target profile; required unless --all is used"
     )]
     reference: Option<String>,
-    #[arg(long, help = "Show instances for all discoverable profiles")]
+    #[arg(
+        long,
+        conflicts_with = "reference",
+        help = "Show all managed instances"
+    )]
     all: bool,
     #[arg(long, help = "Filter to one instance name")]
     instance: Option<String>,
@@ -897,21 +920,47 @@ struct ProfileStatusArgs {
     format: String,
 }
 
-#[derive(Debug, Args)]
-struct ProfileLogsArgs {
-    #[arg(help = "Profile containing the instance")]
-    reference: String,
-    #[arg(long, default_value = "default", help = "Runtime instance name")]
-    instance: String,
-    #[arg(
-        short = 'n',
-        long,
-        default_value_t = 100,
-        help = "Number of trailing lines to print"
-    )]
-    lines: usize,
-    #[arg(short = 'f', long, help = "Continue following appended log output")]
-    follow: bool,
+#[derive(Debug, Subcommand)]
+enum ProfileChannelCliCommand {
+    #[command(about = "List concrete channel instances and their effective state")]
+    List {
+        reference: String,
+        #[arg(long, default_value = "plain", value_parser = ["plain", "json", "yaml"])]
+        format: String,
+    },
+    #[command(about = "Create or replace a Feishu/Lark channel instance")]
+    UpsertFeishu {
+        reference: String,
+        #[arg(value_name = "INSTANCE_ID")]
+        id: String,
+        #[arg(long, help = "Create the channel disabled")]
+        disabled: bool,
+        #[arg(long, default_value = "websocket", value_parser = ["websocket", "event-hook"])]
+        transport: String,
+        #[arg(long, default_value = "FEISHU_APP_ID")]
+        app_id_env: String,
+        #[arg(long, default_value = "FEISHU_APP_SECRET")]
+        app_secret_env: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        #[arg(long, default_value = "/feishu/events")]
+        path: String,
+        #[arg(long)]
+        verification_token_env: Option<String>,
+    },
+    #[command(about = "Enable one configured channel instance")]
+    Enable { reference: String, id: String },
+    #[command(about = "Disable one configured channel instance without deleting it")]
+    Disable { reference: String, id: String },
+    #[command(about = "Remove one configured channel instance")]
+    Remove {
+        reference: String,
+        id: String,
+        #[arg(long, help = "Confirm destructive removal")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1141,6 +1190,7 @@ pub(crate) struct CliConfig {
     pub(crate) username: String,
     pub(crate) wait_background_tasks: bool,
     pub(crate) async_agent: bool,
+    pub(crate) permissions: Option<String>,
 }
 
 impl CliConfig {
@@ -1161,6 +1211,7 @@ impl CliConfig {
         let mut user_id = CLI_USER_ID.to_string();
         let mut username = CLI_USERNAME.to_string();
         let mut wait_background_tasks = false;
+        let mut permissions = None;
         // TUI defaults to async-agent mode unless --sync is provided.
         let mut async_agent = tui;
         let mut sync = false;
@@ -1231,6 +1282,14 @@ impl CliConfig {
                 "--wait-background-tasks" => {
                     wait_background_tasks = true;
                 }
+                "--permissions" => {
+                    let value = next_arg(args, i)?;
+                    if !matches!(value.as_str(), "low" | "medium") {
+                        anyhow::bail!("--permissions must be low or medium");
+                    }
+                    permissions = Some(value);
+                    i += 1;
+                }
                 "--async" => {
                     async_agent = true;
                     sync = false;
@@ -1265,6 +1324,7 @@ impl CliConfig {
             username,
             wait_background_tasks,
             async_agent,
+            permissions,
         })
     }
 }
@@ -1435,6 +1495,7 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             username: CLI_USERNAME.to_string(),
             wait_background_tasks: false,
             async_agent: false,
+            permissions: None,
         })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
     }
@@ -1613,6 +1674,73 @@ fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileC
             named: args.named,
             agent_id: args.agent_id,
         }),
+        ProfileCliCommand::Start(args) => Ok(ProfileCommand::Start {
+            reference: args.reference,
+            instance: args.instance,
+        }),
+        ProfileCliCommand::Stop(args) => Ok(ProfileCommand::Stop {
+            reference: args.reference,
+            instance: args.instance,
+            force: args.force,
+        }),
+        ProfileCliCommand::Restart(args) => Ok(ProfileCommand::Restart {
+            reference: args.reference,
+            instance: args.instance,
+            force: args.force,
+        }),
+        ProfileCliCommand::Status(args) => Ok(ProfileCommand::Status {
+            reference: args.reference,
+            all: args.all,
+            instance: args.instance,
+            format: args.format,
+        }),
+        ProfileCliCommand::Channel { command } => Ok(ProfileCommand::Channel(match command {
+            ProfileChannelCliCommand::List { reference, format } => {
+                profile_command::ProfileChannelCommand::List { reference, format }
+            }
+            ProfileChannelCliCommand::UpsertFeishu {
+                reference,
+                id,
+                disabled,
+                transport,
+                app_id_env,
+                app_secret_env,
+                host,
+                port,
+                path,
+                verification_token_env,
+            } => profile_command::ProfileChannelCommand::UpsertFeishu {
+                reference,
+                id,
+                enabled: !disabled,
+                transport: match transport.as_str() {
+                    "websocket" => crate::runtime_config::FeishuTransport::WebSocket,
+                    "event-hook" => crate::runtime_config::FeishuTransport::EventHook,
+                    _ => unreachable!("validated by clap"),
+                },
+                app_id_env,
+                app_secret_env,
+                host,
+                port,
+                path,
+                verification_token_env,
+            },
+            ProfileChannelCliCommand::Enable { reference, id } => {
+                profile_command::ProfileChannelCommand::Enable { reference, id }
+            }
+            ProfileChannelCliCommand::Disable { reference, id } => {
+                profile_command::ProfileChannelCommand::Disable { reference, id }
+            }
+            ProfileChannelCliCommand::Remove {
+                reference,
+                id,
+                force,
+            } => profile_command::ProfileChannelCommand::Remove {
+                reference,
+                id,
+                force,
+            },
+        })),
         ProfileCliCommand::Resource { command } => Ok(ProfileCommand::Resource(match command {
             ProfileResourceCliCommand::List { reference } => {
                 profile_command::ProfileResourceCommand::List { reference }
@@ -1728,6 +1856,7 @@ fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
         username: args.common.username,
         wait_background_tasks: args.wait_background_tasks,
         async_agent: false,
+        permissions: args.permissions,
     }
 }
 
@@ -1770,6 +1899,7 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         username,
         wait_background_tasks: false,
         async_agent,
+        permissions: None,
     }
 }
 
@@ -1787,6 +1917,7 @@ fn prompt_args_to_config(args: PromptArgs) -> CliConfig {
         username: args.common.username,
         wait_background_tasks: args.wait_background_tasks,
         async_agent: false,
+        permissions: args.permissions,
     }
 }
 
@@ -1813,6 +1944,7 @@ fn run_args_to_config(args: RunArgs) -> anyhow::Result<CliConfig> {
         username: args.username,
         wait_background_tasks: args.wait_background_tasks,
         async_agent: false,
+        permissions: args.permissions,
     })
 }
 

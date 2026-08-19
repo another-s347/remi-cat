@@ -6519,11 +6519,12 @@ mod tests {
         };
 
         let bot = build_bot();
-        assert_eq!(bot.pinned_skill_summaries.len(), 1);
-        assert_eq!(
-            bot.pinned_skill_summaries[0].description,
-            "Original pinned skill"
-        );
+        let pinned = bot
+            .pinned_skill_summaries
+            .iter()
+            .find(|summary| summary.name == "pinned")
+            .expect("workspace pinned skill");
+        assert_eq!(pinned.description, "Original pinned skill");
 
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -6531,13 +6532,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            bot.pinned_skill_summaries[0].description,
+            bot.pinned_skill_summaries
+                .iter()
+                .find(|summary| summary.name == "pinned")
+                .expect("cached workspace pinned skill")
+                .description,
             "Original pinned skill"
         );
 
         let rebuilt = build_bot();
         assert_eq!(
-            rebuilt.pinned_skill_summaries[0].description,
+            rebuilt
+                .pinned_skill_summaries
+                .iter()
+                .find(|summary| summary.name == "pinned")
+                .expect("rebuilt workspace pinned skill")
+                .description,
             "Updated pinned skill"
         );
     }

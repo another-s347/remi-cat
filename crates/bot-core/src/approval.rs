@@ -884,6 +884,35 @@ fn classify_manage_yourself_risk(args: &serde_json::Value) -> ToolRiskLevel {
     let Some(words) = shlex::split(command) else {
         return ToolRiskLevel::Medium;
     };
+    if matches!(words.first().map(String::as_str), Some("profile")) {
+        match words.get(1).map(String::as_str) {
+            Some("current" | "list" | "find" | "show" | "check" | "status") => {
+                return ToolRiskLevel::Low;
+            }
+            Some("registry")
+                if matches!(words.get(2).map(String::as_str), Some("info" | "list")) =>
+            {
+                return ToolRiskLevel::Low;
+            }
+            Some("resource")
+                if matches!(
+                    words.get(2).map(String::as_str),
+                    Some("list" | "show" | "check")
+                ) =>
+            {
+                return ToolRiskLevel::Low;
+            }
+            Some("channel") if matches!(words.get(2).map(String::as_str), Some("list")) => {
+                return ToolRiskLevel::Low;
+            }
+            Some("agent" | "workflow")
+                if matches!(words.get(2).map(String::as_str), Some("list" | "show")) =>
+            {
+                return ToolRiskLevel::Low;
+            }
+            _ => {}
+        }
+    }
     match words.as_slice() {
         [top] if top == "tools" => ToolRiskLevel::Low,
         [top, flag] if top == "tools" && flag == "--json" => ToolRiskLevel::Low,
@@ -1350,6 +1379,11 @@ mod tests {
             "profile show default",
             "profile status default",
             "profile status --all",
+            "profile find --tag travel --channel feishu",
+            "profile check @travel --strict",
+            "profile channel list @travel --format json",
+            "profile registry info",
+            "profile resource check @travel",
             "profile agent list default",
             "profile agent show default coder",
             "profile workflow list default",
@@ -1376,6 +1410,7 @@ mod tests {
             "profile create dev",
             "profile delete dev --force",
             "profile restart default",
+            "profile channel disable @travel work",
             "profile agent upsert default /tmp/a.md",
             "profile workflow delete default foo",
         ] {

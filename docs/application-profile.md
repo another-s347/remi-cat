@@ -146,7 +146,49 @@ remi-cat profile unset @travel description
 remi-cat profile unregister @travel
 ```
 
+Configure concrete IM connector instances in the profile's referenced
+`channels.yaml`. These commands store environment-variable names, not secret
+values; `capabilities.channels` remains discovery metadata rather than runtime
+configuration:
+
+```sh
+remi-cat profile channel list @travel
+remi-cat profile channel upsert-feishu @travel work \
+  --transport websocket \
+  --app-id-env TRAVEL_FEISHU_APP_ID \
+  --app-secret-env TRAVEL_FEISHU_APP_SECRET
+remi-cat profile channel disable @travel work
+remi-cat profile channel enable @travel work
+remi-cat profile channel remove @travel work --force
+```
+
+Run a profile as a persistent Web/IM-serving process. Named instances allow
+multiple independently controlled processes for the same profile:
+
+```sh
+remi-cat profile start @travel --instance work
+remi-cat profile status @travel --instance work
+remi-cat profile restart @travel --instance work
+remi-cat profile stop @travel --instance work
+remi-cat profile status --all --format json
+```
+
+Instance records and logs live under
+`<registry-root>/profile-instances/<profile-id>/`. A channel configuration
+change takes effect after restarting the corresponding managed instance.
+
 `register` and `unregister` only update the registry. They never copy or delete a manifest, resource, state file, or credential. Registry writes use a cross-process lock and atomic file replacement. Use `profile registry info`, `list`, and `repair` to inspect it.
+
+The registry is process-global by default and lives beneath the user's remi-cat home directory (`~/.remi-cat`), independently of the current working directory and the selected profile's state directory. Set `REMI_PROFILE_REGISTRY_ROOT` only when an embedding host or isolated test needs an explicit registry location.
+
+For explicitly authorized non-interactive self-management, local prompt and
+CLI entrypoints accept `--permissions medium`. This auto-approves low- and
+medium-risk tools for that session while high-risk operations remain blocked:
+
+```sh
+remi-cat prompt --permissions medium \
+  "Create and validate a travel profile, then configure its Feishu channel"
+```
 
 ## Local discovery and conversation
 

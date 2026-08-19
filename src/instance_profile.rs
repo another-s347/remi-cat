@@ -543,6 +543,16 @@ pub fn tui_home_data_dir() -> PathBuf {
     }
 }
 
+/// Returns the process-global profile registry root.
+///
+/// Unlike the TUI state directory, this path is deliberately stable and does
+/// not participate in the legacy `.remi_cat` compatibility lookup.
+pub fn profile_registry_home_dir() -> PathBuf {
+    home_dir_from_env()
+        .map(|home| home.join(DEFAULT_DATA_DIR))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR))
+}
+
 fn home_dir_from_env() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -667,9 +677,9 @@ mod tests {
     #[cfg(windows)]
     use super::shell_quote;
     use super::{
-        remove_named_profile_in_data_root, tui_home_data_dir, validate_manifest,
-        validate_profile_name, ApplicationProfileManifest, InstanceProfile, ProfileEndpoint,
-        TUI_HOME_DATA_DIR,
+        profile_registry_home_dir, remove_named_profile_in_data_root, tui_home_data_dir,
+        validate_manifest, validate_profile_name, ApplicationProfileManifest, InstanceProfile,
+        ProfileEndpoint, DEFAULT_DATA_DIR, TUI_HOME_DATA_DIR,
     };
     use std::sync::Mutex;
 
@@ -717,6 +727,35 @@ mod tests {
         }
 
         assert_eq!(tui_home_data_dir(), temp_home.join(TUI_HOME_DATA_DIR));
+
+        unsafe {
+            restore_env("HOME", old_home);
+            restore_env("USERPROFILE", old_userprofile);
+            restore_env("HOMEDRIVE", old_homedrive);
+            restore_env("HOMEPATH", old_homepath);
+        }
+    }
+
+    #[test]
+    fn profile_registry_home_uses_the_stable_hyphenated_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let old_homedrive = std::env::var_os("HOMEDRIVE");
+        let old_homepath = std::env::var_os("HOMEPATH");
+        let temp_home =
+            std::env::temp_dir().join(format!("remi-registry-home-{}", uuid::Uuid::new_v4()));
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("USERPROFILE", &temp_home);
+            std::env::remove_var("HOMEDRIVE");
+            std::env::remove_var("HOMEPATH");
+        }
+
+        assert_eq!(
+            profile_registry_home_dir(),
+            temp_home.join(DEFAULT_DATA_DIR)
+        );
 
         unsafe {
             restore_env("HOME", old_home);

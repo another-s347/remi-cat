@@ -84,6 +84,18 @@ pub(crate) async fn process_prompt_message(
         &cli.channel_id,
         &runtime.root_agent_id,
     )?;
+    if let Some(policy) = cli.permissions.as_deref() {
+        let policy = match policy {
+            "low" => bot_core::approval::ApprovalSessionPolicy::Low,
+            "medium" => bot_core::approval::ApprovalSessionPolicy::Medium,
+            _ => anyhow::bail!("unsupported permission policy `{policy}`"),
+        };
+        runtime
+            .bot
+            .approval_manager()
+            .set_session_policy(&session_id, policy)
+            .await;
+    }
     let request = ChatRequest::text(session_id, ChatChannel::Cli, text)
         .with_async_agent(cli.async_agent || cli.wait_background_tasks || async_agent_enabled());
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));

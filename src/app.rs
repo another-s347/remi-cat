@@ -48,7 +48,9 @@ use crate::config::{
     ChannelsConfig, RuntimeConfig, SetupState,
 };
 use crate::core::Runtime;
-use crate::instance_profile::{tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
+use crate::instance_profile::{
+    profile_registry_home_dir, tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME,
+};
 #[cfg(test)]
 pub(crate) use crate::profile_command::first_available_port;
 #[cfg(test)]
@@ -139,8 +141,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     } else {
         std::env::var_os("REMI_DATA_DIR").map(PathBuf::from)
     };
-    let profile_registry_root =
-        resolve_profile_registry_root(explicit_data_dir.clone(), tui_mode || acp_agent_mode);
+    let profile_registry_root = resolve_profile_registry_root();
     let selected_profile = resolve_instance_profile(
         parsed.profile,
         explicit_data_dir.clone(),
@@ -573,6 +574,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             username: CLI_USERNAME.to_string(),
             wait_background_tasks: false,
             async_agent: false,
+            permissions: None,
         },
         AppCommand::A2a(_) => unreachable!(),
         _ => unreachable!(),
@@ -880,26 +882,16 @@ fn resolve_profile_selector(selector: &str, data_root: &Path) -> anyhow::Result<
     if selector.starts_with('@') || selector.starts_with("id:") {
         let registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| data_root.to_path_buf());
+            .unwrap_or_else(profile_registry_home_dir);
         return ProfileRegistry::load(registry_root)?.resolve(selector);
     }
     InstanceProfile::from_label_in_data_root(selector, data_root)
 }
 
-fn resolve_profile_registry_root(
-    explicit_data_dir: Option<PathBuf>,
-    home_default: bool,
-) -> PathBuf {
+fn resolve_profile_registry_root() -> PathBuf {
     std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
         .map(PathBuf::from)
-        .or(explicit_data_dir)
-        .unwrap_or_else(|| {
-            if home_default {
-                tui_home_data_dir()
-            } else {
-                PathBuf::from(crate::instance_profile::DEFAULT_DATA_DIR)
-            }
-        })
+        .unwrap_or_else(profile_registry_home_dir)
 }
 
 fn looks_like_profile_path(value: &str) -> bool {
@@ -1157,7 +1149,9 @@ mod cli_tests {
     #[cfg(unix)]
     use super::{run_streaming_command, run_streaming_command_with_stdin};
     use crate::direct_workflow_options;
-    use crate::profile_command::{ProfileAgentCommand, ProfileWorkflowCommand};
+    use crate::profile_command::{
+        ProfileAgentCommand, ProfileChannelCommand, ProfileWorkflowCommand,
+    };
     use bot_core::{GoalMaxRounds, PrettyToolCall};
     use clap::error::ErrorKind;
     use im_feishu::FeishuMessage;
@@ -1199,14 +1193,14 @@ mod cli_tests {
     }
 
     #[test]
-    fn tui_registry_defaults_to_the_same_home_root_as_profile_selection() {
+    fn registry_defaults_to_the_user_home_root_for_every_entrypoint() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT");
         unsafe { std::env::remove_var("REMI_PROFILE_REGISTRY_ROOT") };
 
         assert_eq!(
-            resolve_profile_registry_root(None, true),
-            crate::instance_profile::tui_home_data_dir()
+            resolve_profile_registry_root(),
+            crate::instance_profile::profile_registry_home_dir()
         );
 
         unsafe {
@@ -1366,7 +1360,8 @@ mod cli_tests {
     #[test]
     fn registered_alias_is_a_valid_global_profile_selector() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let data_root = tempfile::tempdir().unwrap();
+        let registry_root = tempfile::tempdir().unwrap();
+        let unrelated_data_root = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let manifest = project.path().join("profile.yaml");
         std::fs::write(
@@ -1375,17 +1370,25 @@ mod cli_tests {
         )
         .unwrap();
         let mut registry =
-            crate::profile_registry::ProfileRegistry::load(data_root.path()).unwrap();
+            crate::profile_registry::ProfileRegistry::load(registry_root.path()).unwrap();
         registry.register(&manifest, Some("travel"), false).unwrap();
+        let old_registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT");
+        unsafe { std::env::set_var("REMI_PROFILE_REGISTRY_ROOT", registry_root.path()) };
 
         let profile = super::resolve_instance_profile(
             Some("@travel".to_string()),
-            Some(data_root.path().to_path_buf()),
+            Some(unrelated_data_root.path().to_path_buf()),
             false,
             false,
         )
         .unwrap();
         assert_eq!(profile.manifest.id, "travel.planner");
+        unsafe {
+            match old_registry_root {
+                Some(value) => std::env::set_var("REMI_PROFILE_REGISTRY_ROOT", value),
+                None => std::env::remove_var("REMI_PROFILE_REGISTRY_ROOT"),
+            }
+        }
     }
 
     #[test]
@@ -1642,8 +1645,26 @@ mod cli_tests {
         assert!(
             parse_command(&args(&["profile", "delete", "remi_diagnostics", "--force"])).is_err()
         );
-        assert!(parse_command(&args(&["profile", "start", "default"])).is_err());
-        assert!(parse_command(&args(&["profile", "status", "--all"])).is_err());
+        assert!(matches!(
+            parse_command(&args(&["profile", "start", "@travel", "--instance", "work"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Start { reference, instance })
+                if reference == "@travel" && instance == "work"
+        ));
+        assert!(matches!(
+            parse_command(&args(&["profile", "status", "--all", "--format", "json"])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Status { reference, all, instance, format })
+                if reference.is_none() && all && instance.is_none() && format == "json"
+        ));
+        assert!(matches!(
+            parse_command(&args(&[
+                "profile", "channel", "upsert-feishu", "@travel", "work",
+                "--transport", "event-hook", "--port", "8791", "--disabled"
+            ])).unwrap(),
+            AppCommand::Profile(ProfileCommand::Channel(ProfileChannelCommand::UpsertFeishu {
+                reference, id, enabled, transport: crate::runtime_config::FeishuTransport::EventHook,
+                port: 8791, ..
+            })) if reference == "@travel" && id == "work" && !enabled
+        ));
         assert!(matches!(
             parse_command(&args(&["profile", "ask", "@travel", "plan", "a", "trip"])).unwrap(),
             AppCommand::Profile(ProfileCommand::Ask { reference, task, named, agent_id })
@@ -2280,6 +2301,8 @@ mod cli_tests {
         let parsed = parse_cli_args(&args(&[
             "prompt",
             "--wait-background-tasks",
+            "--permissions",
+            "medium",
             "--session",
             "s1",
             "hello",
@@ -2289,6 +2312,7 @@ mod cli_tests {
             panic!("expected run command");
         };
         assert!(config.wait_background_tasks);
+        assert_eq!(config.permissions.as_deref(), Some("medium"));
         assert_eq!(config.channel_id, "s1");
         assert_eq!(config.once.as_deref(), Some("hello"));
     }

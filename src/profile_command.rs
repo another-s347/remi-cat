@@ -19,8 +19,9 @@ use crate::instance_profile::{
 
 use crate::profile_registry::ProfileRegistry;
 use crate::runtime_config::{
-    detect_setup_state, AcpClient, AcpMode, FeishuTransport, ImMode, RuntimeConfig,
-    RuntimeSandboxKind, SetupState, ShellMode,
+    detect_setup_state, AcpClient, AcpMode, ChannelInstanceConfig, FeishuChannelEventHookConfig,
+    FeishuCredentialRefs, FeishuTransport, ImMode, RuntimeConfig, RuntimeSandboxKind, SetupState,
+    ShellMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,27 @@ pub enum ProfileCommand {
         named: String,
         agent_id: Option<String>,
     },
+    Start {
+        reference: String,
+        instance: String,
+    },
+    Stop {
+        reference: String,
+        instance: String,
+        force: bool,
+    },
+    Restart {
+        reference: String,
+        instance: String,
+        force: bool,
+    },
+    Status {
+        reference: Option<String>,
+        all: bool,
+        instance: Option<String>,
+        format: String,
+    },
+    Channel(ProfileChannelCommand),
     Create {
         name: String,
         entries: Vec<String>,
@@ -91,6 +113,39 @@ pub enum ProfileCommand {
     Registry(ProfileRegistryCommand),
     Agent(ProfileAgentCommand),
     Workflow(ProfileWorkflowCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileChannelCommand {
+    List {
+        reference: String,
+        format: String,
+    },
+    UpsertFeishu {
+        reference: String,
+        id: String,
+        enabled: bool,
+        transport: FeishuTransport,
+        app_id_env: String,
+        app_secret_env: String,
+        host: String,
+        port: u16,
+        path: String,
+        verification_token_env: Option<String>,
+    },
+    Enable {
+        reference: String,
+        id: String,
+    },
+    Disable {
+        reference: String,
+        id: String,
+    },
+    Remove {
+        reference: String,
+        id: String,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +322,48 @@ pub async fn run_profile_command(
             .await?;
             println!("{answer}");
         }
+        ProfileCommand::Start {
+            reference,
+            instance,
+        } => {
+            let status = crate::profile_instance::start(data_root, &registry, reference, instance)?;
+            print_instance_status(&status);
+        }
+        ProfileCommand::Stop {
+            reference,
+            instance,
+            force,
+        } => {
+            let status =
+                crate::profile_instance::stop(data_root, &registry, reference, instance, *force)?;
+            print_instance_status(&status);
+        }
+        ProfileCommand::Restart {
+            reference,
+            instance,
+            force,
+        } => {
+            let status = crate::profile_instance::restart(
+                data_root, &registry, reference, instance, *force,
+            )?;
+            print_instance_status(&status);
+        }
+        ProfileCommand::Status {
+            reference,
+            all,
+            instance,
+            format,
+        } => {
+            let statuses = crate::profile_instance::status(
+                data_root,
+                &registry,
+                reference.as_deref(),
+                instance.as_deref(),
+                *all,
+            )?;
+            print_instance_statuses(&statuses, format)?;
+        }
+        ProfileCommand::Channel(command) => run_profile_channel_command(command, &registry)?,
         ProfileCommand::Create { name, entries } => {
             eprintln!("Warning: `profile create` is deprecated; use `profile init`, `profile register`, and `setup --profile`.");
             let profile = InstanceProfile::named_in_data_root(name, data_root)?;
@@ -301,6 +398,196 @@ pub async fn run_profile_command(
             run_profile_workflow_command(command, data_root)?
         }
     }
+    Ok(())
+}
+
+fn print_instance_status(status: &crate::profile_instance::ProfileInstanceStatus) {
+    println!("Profile:  {}", status.profile_id);
+    println!("Instance: {}", status.instance);
+    println!("State:    {}", status.state);
+    println!("PID:      {}", status.pid);
+    println!("Started:  {}", status.started_at);
+    println!("Log:      {}", status.log_path.display());
+}
+
+fn print_instance_statuses(
+    statuses: &[crate::profile_instance::ProfileInstanceStatus],
+    format: &str,
+) -> anyhow::Result<()> {
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(statuses)?);
+        return Ok(());
+    }
+    if statuses.is_empty() {
+        println!("No managed profile instances.");
+        return Ok(());
+    }
+    println!("PROFILE\tINSTANCE\tSTATE\tPID\tSTARTED\tLOG");
+    for status in statuses {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            status.profile_id,
+            status.instance,
+            status.state,
+            status.pid,
+            status.started_at,
+            status.log_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_profile_channel_command(
+    command: &ProfileChannelCommand,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<()> {
+    let reference = match command {
+        ProfileChannelCommand::List { reference, .. }
+        | ProfileChannelCommand::UpsertFeishu { reference, .. }
+        | ProfileChannelCommand::Enable { reference, .. }
+        | ProfileChannelCommand::Disable { reference, .. }
+        | ProfileChannelCommand::Remove { reference, .. } => reference,
+    };
+    let profile = registry.resolve(reference)?;
+    match command {
+        ProfileChannelCommand::List { format, .. } => {
+            let config = crate::runtime_config::load_channels_config_at(&profile.channels_config)?
+                .unwrap_or_default();
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&config)?),
+                "yaml" => print!("{}", serde_yaml::to_string(&config)?),
+                _ if config.channels.is_empty() => println!("No configured channel instances."),
+                _ => {
+                    println!("ID\tKIND\tENABLED\tTRANSPORT\tCREDENTIALS");
+                    for channel in config.channels {
+                        match channel {
+                            ChannelInstanceConfig::Feishu {
+                                id,
+                                enabled,
+                                transport,
+                                credentials,
+                                ..
+                            } => println!(
+                                "{id}\tfeishu\t{enabled}\t{}\t{}/{}",
+                                transport.as_env_value(),
+                                credentials.app_id_env,
+                                credentials.app_secret_env
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        ProfileChannelCommand::UpsertFeishu {
+            id,
+            enabled,
+            transport,
+            app_id_env,
+            app_secret_env,
+            host,
+            port,
+            path,
+            verification_token_env,
+            ..
+        } => {
+            let mut config =
+                crate::runtime_config::load_channels_config_at(&profile.channels_config)?
+                    .unwrap_or_default();
+            let replacement = ChannelInstanceConfig::Feishu {
+                id: id.clone(),
+                enabled: *enabled,
+                transport: transport.clone(),
+                event_hook: FeishuChannelEventHookConfig {
+                    host: host.clone(),
+                    port: *port,
+                    path: path.clone(),
+                    verification_token_env: verification_token_env.clone(),
+                },
+                credentials: FeishuCredentialRefs {
+                    app_id_env: app_id_env.clone(),
+                    app_secret_env: app_secret_env.clone(),
+                },
+            };
+            if let Some(existing) = config
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id() == id)
+            {
+                *existing = replacement;
+            } else {
+                config.channels.push(replacement);
+            }
+            crate::runtime_config::write_channels_config_at(&profile.channels_config, &config)?;
+            println!(
+                "Saved Feishu channel `{id}` for {} at {} (enabled={enabled}, transport={}).",
+                profile.manifest.id,
+                profile.channels_config.display(),
+                transport.as_env_value()
+            );
+            if !profile
+                .manifest
+                .capabilities
+                .channels
+                .iter()
+                .any(|channel| channel == "feishu")
+            {
+                println!(
+                    "Next: declare discovery metadata with `profile set {reference} capabilities.channels feishu`."
+                );
+            }
+        }
+        ProfileChannelCommand::Enable { id, .. } => {
+            set_channel_enabled(&profile, id, true)?;
+        }
+        ProfileChannelCommand::Disable { id, .. } => {
+            set_channel_enabled(&profile, id, false)?;
+        }
+        ProfileChannelCommand::Remove { id, force, .. } => {
+            if !force {
+                anyhow::bail!("refusing to remove channel `{id}` without --force")
+            }
+            let mut config =
+                crate::runtime_config::load_channels_config_at(&profile.channels_config)?
+                    .unwrap_or_default();
+            let before = config.channels.len();
+            config.channels.retain(|channel| channel.id() != id);
+            if config.channels.len() == before {
+                anyhow::bail!(
+                    "channel `{id}` is not configured for {}",
+                    profile.manifest.id
+                )
+            }
+            crate::runtime_config::write_channels_config_at(&profile.channels_config, &config)?;
+            println!("Removed channel `{id}` from {}.", profile.manifest.id);
+        }
+    }
+    Ok(())
+}
+
+fn set_channel_enabled(profile: &InstanceProfile, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let mut config = crate::runtime_config::load_channels_config_at(&profile.channels_config)?
+        .unwrap_or_default();
+    let channel = config
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id() == id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "channel `{id}` is not configured for {}",
+                profile.manifest.id
+            )
+        })?;
+    match channel {
+        ChannelInstanceConfig::Feishu {
+            enabled: current, ..
+        } => *current = enabled,
+    }
+    crate::runtime_config::write_channels_config_at(&profile.channels_config, &config)?;
+    println!(
+        "{} channel `{id}` for {}. Restart its managed instance to apply the change.",
+        if enabled { "Enabled" } else { "Disabled" },
+        profile.manifest.id
+    );
     Ok(())
 }
 

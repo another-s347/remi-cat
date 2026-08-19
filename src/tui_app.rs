@@ -6663,6 +6663,7 @@ mod tests {
             username: "Alice".to_string(),
             wait_background_tasks: false,
             async_agent: false,
+            permissions: None,
         }
     }
 
