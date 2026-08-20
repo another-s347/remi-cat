@@ -130,22 +130,104 @@ impl LlmCompressor {
         let stream = inner
             .chat(bot_runtime_core::chat_ctx_from_input(&input, None), input)
             .await?;
-        let mut stream = std::pin::pin!(stream);
-
-        let mut result = String::new();
-        while let Some(ev) = stream.next().await {
-            if let AgentEvent::TextDelta(delta) = ev {
-                result.push_str(&delta);
-            }
-        }
-
-        if result.trim().is_empty() {
-            return Err(AgentError::Io(
-                "LlmCompressor: model returned empty summary".to_string(),
-            ));
-        }
-        Ok(result)
+        collect_compression_output(stream).await
     }
+}
+
+async fn collect_compression_output(
+    stream: impl futures::Stream<Item = AgentEvent>,
+) -> Result<String, AgentError> {
+    let mut stream = std::pin::pin!(stream);
+    let mut result = String::new();
+    let mut saw_done = false;
+    let mut saw_reasoning = false;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            AgentEvent::TextDelta(delta) => result.push_str(&delta),
+            AgentEvent::ThinkingStart => {}
+            AgentEvent::ThinkingDelta(delta) => {
+                saw_reasoning |= !delta.is_empty();
+            }
+            AgentEvent::ThinkingEnd { content } => {
+                saw_reasoning |= !content.is_empty();
+            }
+            // Preserve the original error variant and message. Turning this
+            // into an "empty summary" hides transport, provider, and parsing
+            // failures that callers need in order to diagnose the request.
+            AgentEvent::Error(error) => return Err(error),
+            AgentEvent::Cancelled => {
+                return Err(AgentError::other(
+                    "LlmCompressor: compression request was cancelled before completion",
+                ));
+            }
+            AgentEvent::Done => {
+                saw_done = true;
+                break;
+            }
+            AgentEvent::ToolCallStart { id, name } => {
+                return Err(AgentError::other(format!(
+                    "LlmCompressor: model unexpectedly requested tool `{name}` (call id `{id}`); compression runs without tools"
+                )));
+            }
+            AgentEvent::ToolCallArgumentsDelta { id, .. } => {
+                return Err(AgentError::other(format!(
+                    "LlmCompressor: received tool arguments for unexpected call `{id}`; compression runs without tools"
+                )));
+            }
+            AgentEvent::ToolDelta { id, name, .. } | AgentEvent::ToolResult { id, name, .. } => {
+                return Err(AgentError::other(format!(
+                    "LlmCompressor: received unexpected tool event for `{name}` (call id `{id}`); compression runs without tools"
+                )));
+            }
+            AgentEvent::NeedToolExecution { tool_calls, .. } => {
+                let names = tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AgentError::other(format!(
+                    "LlmCompressor: model requested unexpected tool execution ({names}); compression runs without tools"
+                )));
+            }
+            AgentEvent::Interrupt { interrupts } => {
+                return Err(AgentError::other(format!(
+                    "LlmCompressor: compression was interrupted with {} pending interrupt(s)",
+                    interrupts.len()
+                )));
+            }
+            AgentEvent::SubSession(_) => {
+                return Err(AgentError::other(
+                    "LlmCompressor: received an unexpected sub-session event",
+                ));
+            }
+            // Lifecycle, accounting, checkpoint, and extension events do not
+            // contain summary text and are valid alongside TextDelta/Done.
+            AgentEvent::RunStart { .. }
+            | AgentEvent::TurnStart { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::Custom { .. }
+            | AgentEvent::Checkpoint(_) => {}
+        }
+    }
+
+    if !saw_done {
+        return Err(AgentError::other(format!(
+            "LlmCompressor: model event stream ended without a Done event (received {} summary character(s))",
+            result.chars().count()
+        )));
+    }
+    if result.trim().is_empty() {
+        let detail = if saw_reasoning {
+            "model completed with reasoning output but no final summary text"
+        } else if result.is_empty() {
+            "model completed with a Done event but produced no summary text"
+        } else {
+            "model completed with only whitespace in the summary text"
+        };
+        return Err(AgentError::other(format!("LlmCompressor: {detail}")));
+    }
+    Ok(result)
 }
 
 fn compression_input_text(messages: &[Message]) -> String {
@@ -203,6 +285,7 @@ fn truncate_tool_body(role: &str, text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
 
     #[test]
     fn compression_prompt_allows_free_form_output() {
@@ -236,5 +319,90 @@ mod tests {
             serde_json::Map::new(),
         );
         assert!(!compressor.input_fits(&[Message::user("x".repeat(40_000))]));
+    }
+
+    #[tokio::test]
+    async fn compression_output_propagates_the_original_model_error() {
+        let error = collect_compression_output(stream::iter(vec![AgentEvent::Error(
+            AgentError::model("provider rejected the request"),
+        )]))
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AgentError::Model(_)));
+        assert_eq!(
+            error.to_string(),
+            "Model error: provider rejected the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_output_reports_cancellation_explicitly() {
+        let error = collect_compression_output(stream::iter(vec![AgentEvent::Cancelled]))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled before completion"));
+        assert!(!error.to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn compression_output_rejects_reasoning_without_final_text() {
+        let error = collect_compression_output(stream::iter(vec![
+            AgentEvent::ThinkingStart,
+            AgentEvent::ThinkingDelta("internal reasoning".to_string()),
+            AgentEvent::ThinkingEnd {
+                content: "internal reasoning".to_string(),
+            },
+            AgentEvent::Done,
+        ]))
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reasoning output but no final summary text"));
+    }
+
+    #[tokio::test]
+    async fn compression_output_rejects_done_without_text() {
+        let error = collect_compression_output(stream::iter(vec![
+            AgentEvent::Usage {
+                prompt_tokens: 42,
+                completion_tokens: 0,
+            },
+            AgentEvent::Done,
+        ]))
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Done event but produced no summary text"));
+    }
+
+    #[tokio::test]
+    async fn compression_output_rejects_truncated_stream_with_partial_text() {
+        let error = collect_compression_output(stream::iter(vec![AgentEvent::TextDelta(
+            "partial summary".to_string(),
+        )]))
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ended without a Done event"));
+        assert!(error.to_string().contains("15 summary character(s)"));
+    }
+
+    #[tokio::test]
+    async fn compression_output_accepts_text_followed_by_done() {
+        let output = collect_compression_output(stream::iter(vec![
+            AgentEvent::TextDelta("compact ".to_string()),
+            AgentEvent::TextDelta("summary".to_string()),
+            AgentEvent::Done,
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(output, "compact summary");
     }
 }

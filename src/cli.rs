@@ -895,7 +895,7 @@ struct ProfileCreateArgs {
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "KEY=VALUE",
-        help = "Runtime config override, for example admin.enabled=false or acp.client=codex"
+        help = "Runtime config override, for example admin.enabled=true or acp.client=codex"
     )]
     entries: Vec<String>,
 }

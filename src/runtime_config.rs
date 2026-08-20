@@ -488,7 +488,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             host: "127.0.0.1".to_string(),
             port: 8787,
         }
@@ -1119,6 +1119,7 @@ model_profile: default
 
         assert_eq!(cfg.tool_output.overflow_bytes, None);
         assert_eq!(cfg.tool_output.foreground_timeout_ms, None);
+        assert!(!cfg.admin.enabled);
         assert!(cfg.telemetry.enabled);
         assert!(!cfg.telemetry.agent_tracing);
         assert_eq!(cfg.telemetry.agent_trace_sample_rate_percent, 10);

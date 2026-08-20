@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -88,6 +89,10 @@ const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+fn spawn_tui_task(task: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(task);
+}
 
 #[derive(Clone)]
 struct CachedHistoryCell {
@@ -1028,7 +1033,7 @@ impl TuiApp {
         self.git_refresh_in_flight = true;
         let workspace_dir = self.workspace_dir.clone();
         let tx = self.git_status_tx.clone();
-        tokio::spawn(async move {
+        spawn_tui_task(async move {
             let status = tokio::task::spawn_blocking(move || current_git_status(&workspace_dir))
                 .await
                 .ok()
@@ -1469,7 +1474,7 @@ impl TuiApp {
         let channel = self.channel.clone();
         let session_id = self.session_id.clone();
         let tx = self.bot_tx.clone();
-        tokio::task::spawn_local(async move {
+        spawn_tui_task(async move {
             let result = async { channel.compact(&session_id).await }.await;
             let (status, compacted_messages, error) = match result {
                 Ok(count) => (ContextCompactionStatus::Completed, count, None),
@@ -1501,7 +1506,7 @@ impl TuiApp {
         let session_id = self.session_id.clone();
         let cli = self.cli.clone();
         let tx = self.bot_tx.clone();
-        tokio::task::spawn_local(async move {
+        spawn_tui_task(async move {
             run_tui_fork_command(channel, session_id, cli, tx).await;
         });
     }
@@ -1519,7 +1524,7 @@ impl TuiApp {
         let channel = self.channel.clone();
         let cli = self.cli.clone();
         let tx = self.bot_tx.clone();
-        tokio::task::spawn_local(async move {
+        spawn_tui_task(async move {
             run_tui_new_command(channel, cli, tx).await;
         });
     }
@@ -4860,6 +4865,16 @@ fn recall_input_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tui_background_tasks_do_not_require_a_local_set() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_tui_task(async move {
+            let _ = tx.send("completed");
+        });
+
+        assert_eq!(rx.await.unwrap(), "completed");
+    }
 
     #[test]
     fn composer_visual_lines_wrap_to_available_width() {
