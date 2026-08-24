@@ -29,9 +29,9 @@ Deferred:
 ## Runtime boundary
 
 The Axum server cannot own the local `Rc<Runtime>`. The A2A executor therefore
-uses a thread-safe handle to enqueue runs into the existing local Web Chat
-dispatcher. A2A supplies an explicit `a2a` platform override, so session and
-tool context remain distinct from browser Web Chat.
+uses a thread-safe handle to enqueue runs into the existing local execution
+dispatcher. A2A supplies an explicit `a2a` platform override, so its session
+and tool context remain distinct from other channels.
 
 An A2A `contextId` maps to a persisted remi-cat channel session. An A2A
 `taskId` maps to a single run and is also the cancellation key. Task snapshots

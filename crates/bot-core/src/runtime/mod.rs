@@ -27,7 +27,8 @@ use crate::{
     acp, api_key_from_env, embedded_agent_profile, goal, install_embedded_agent_profiles,
     install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
     sandbox, skill, supervisor_workflow, todo, AccountUsage, AgentModelBindings, AgentProfile,
-    AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart, FileSkillStore,
+    AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
+    ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, FileSkillStore,
     GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument, ImFileBridge,
     MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
     SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SteerQueuedEvent,
@@ -363,14 +364,19 @@ fn background_task_completion_content(task: &crate::ToolTaskRecord) -> Content {
     if let Some(message) = task.message.as_deref() {
         text.push_str(&format!("message: {message}\n"));
     }
-    if !task.recent_output.is_empty() {
-        text.push_str("recent_output:\n");
-        text.push_str(&task.recent_output.join("\n"));
-        text.push('\n');
-    }
-    if let Some(result) = task.result_preview.as_deref() {
+    if let Some(result) = task
+        .result_preview
+        .as_deref()
+        .filter(|result| !result.is_empty())
+    {
         text.push_str("result:\n");
         text.push_str(result);
+    } else if !task.recent_output.is_empty() {
+        // A terminal result is authoritative and has already passed through
+        // tool-output overflow handling. Recent output is only a fallback for
+        // legacy/incomplete task records; never inject both copies.
+        text.push_str("recent_output:\n");
+        text.push_str(&task.recent_output.join("\n"));
     }
     Content::text(text)
 }
@@ -2934,9 +2940,29 @@ impl CatBot {
                         )));
                         return;
                     }
+                    let compaction_id = uuid::Uuid::new_v4().to_string();
+                    yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                        id: compaction_id.clone(),
+                        thread_id: thread_id_owned.clone(),
+                        status: ContextCompactionStatus::Started,
+                        source: ContextCompactionSource::Auto,
+                        compacted_messages: 0,
+                        remaining_messages: 0,
+                        error: None,
+                    });
                     let compacted = match self.memory.compact_for_request(&thread_id_owned).await {
                         Ok(count) if count > 0 => count,
                         Ok(_) => {
+                            let error = "no complete older exchange is eligible for compression";
+                            yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                                id: compaction_id,
+                                thread_id: thread_id_owned.clone(),
+                                status: ContextCompactionStatus::Failed,
+                                source: ContextCompactionSource::Auto,
+                                compacted_messages: 0,
+                                remaining_messages: 0,
+                                error: Some(error.to_string()),
+                            });
                             let _ = self
                                 .memory
                                 .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
@@ -2948,6 +2974,15 @@ impl CatBot {
                             return;
                         }
                         Err(err) => {
+                            yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                                id: compaction_id,
+                                thread_id: thread_id_owned.clone(),
+                                status: ContextCompactionStatus::Failed,
+                                source: ContextCompactionSource::Auto,
+                                compacted_messages: 0,
+                                remaining_messages: 0,
+                                error: Some(err.to_string()),
+                            });
                             let _ = self
                                 .memory
                                 .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
@@ -2970,6 +3005,17 @@ impl CatBot {
                     let mut refreshed = match self.memory.load_context(&thread_id_owned).await {
                         Ok(value) => value,
                         Err(err) => {
+                            yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                                id: compaction_id,
+                                thread_id: thread_id_owned.clone(),
+                                status: ContextCompactionStatus::Failed,
+                                source: ContextCompactionSource::Auto,
+                                compacted_messages: compacted,
+                                remaining_messages: 0,
+                                error: Some(format!(
+                                    "reload memory after pre-request compression: {err}"
+                                )),
+                            });
                             let _ = self
                                 .memory
                                 .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
@@ -2980,6 +3026,15 @@ impl CatBot {
                             return;
                         }
                     };
+                    yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                        id: compaction_id,
+                        thread_id: thread_id_owned.clone(),
+                        status: ContextCompactionStatus::Completed,
+                        source: ContextCompactionSource::Auto,
+                        compacted_messages: compacted,
+                        remaining_messages: refreshed.short_term.len(),
+                        error: None,
+                    });
                     refreshed.user_state = initial_user_state.clone();
                     let mut rebuilt = build_injected_history(&refreshed);
                     rebuilt.insert(0, Message::system(effective_agent.profile.system_prompt.clone()));
@@ -5885,7 +5940,10 @@ mod tests {
     use crate::supervisor_workflow;
     use crate::todo::tools::TodoItem;
     use crate::user_question::{UserQuestionResponse, UserQuestionStatus};
-    use crate::{estimate_model_input_tokens, ModelInputSegmentCategory};
+    use crate::{
+        estimate_model_input_tokens, ContextCompactionEvent, ContextCompactionSource,
+        ContextCompactionStatus, ModelInputSegmentCategory,
+    };
     use futures::StreamExt as _;
     use remi_agentloop::prelude::CancellationToken;
     use remi_agentloop::prelude::Role;
@@ -5996,6 +6054,24 @@ mod tests {
         supports_images: bool,
         max_turns: usize,
     ) -> super::CatBot {
+        build_mock_bot_with_tools(
+            data_dir,
+            base_url,
+            supports_images,
+            max_turns,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn build_mock_bot_with_tools(
+        data_dir: &tempfile::TempDir,
+        base_url: String,
+        supports_images: bool,
+        max_turns: usize,
+        host_tools: Vec<bot_runtime_core::DynamicTool>,
+        overflow_bytes: Option<usize>,
+    ) -> super::CatBot {
         let skills_dir = data_dir.path().join("skills");
         let agents_dir = data_dir.path().join("agents");
         let models_dir = data_dir.path().join("models");
@@ -6005,7 +6081,10 @@ mod tests {
         model_profile.model = "mock-model".to_string();
         model_profile.supports_images = supports_images;
         CatBotBuilder {
-            api_keys: None,
+            api_keys: Some(Arc::new(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                "test".to_string(),
+            )]))),
             agent_tracing: AgentTracingOptions::default(),
             api_key: "test".to_string(),
             model_profile,
@@ -6015,7 +6094,7 @@ mod tests {
             data_dir: data_dir.path().to_path_buf(),
             memory_dir: data_dir.path().join("memory"),
             agent_md_path: None,
-            overflow_bytes: None,
+            overflow_bytes,
             memory_days: 7,
             sandbox_config: SandboxConfig::Disabled {
                 host_dir: data_dir.path().to_path_buf(),
@@ -6031,7 +6110,7 @@ mod tests {
             max_turns: Some(max_turns),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
             acp_client_tools: None,
-            host_tools: Vec::new(),
+            host_tools,
             builtin_skills: Vec::new(),
             include_default_skills: true,
             file_skills: true,
@@ -6040,6 +6119,70 @@ mod tests {
         }
         .build()
         .unwrap()
+    }
+
+    #[test]
+    fn background_tool_chunk_summary_reaches_follow_up_model_request() {
+        run_large_stack_local_test(|| async {
+            let responses = vec![
+                sse_text("waiting for the background result"),
+                sse_text("observed chunked background result"),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot(&data_dir, base_url, false, 4);
+            let thread_id = "background-chunk-e2e";
+            let chunk_summary =
+                "[Output too large (128 bytes) — split into 4 chunk files under /tmp/tool_out_test]";
+            let task_id = bot
+                .tool_tasks
+                .start(
+                    thread_id.to_string(),
+                    "run-stream".to_string(),
+                    "call-stream".to_string(),
+                    "streaming_tool".to_string(),
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            bot.tool_tasks
+                .promote_to_background(&task_id, true)
+                .await
+                .expect("task should be promoted");
+            bot.tool_tasks
+                .replace_output(&task_id, vec![chunk_summary.to_string()])
+                .await;
+            bot.tool_tasks
+                .finish(&task_id, true, 50, chunk_summary.to_string())
+                .await
+                .expect("task should finish");
+            let events = collect_stream(bot.stream_with_options(
+                thread_id,
+                Content::text("continue after the background result"),
+                StreamOptions {
+                    async_agent: true,
+                    ..StreamOptions::default()
+                },
+            ))
+            .await;
+
+            let completed = events.iter().find_map(|event| match event {
+                CatEvent::ToolTaskCompleted(task) => Some(task),
+                _ => None,
+            });
+            let completed = completed.expect("background tool should complete");
+            let result = completed
+                .result_preview
+                .as_deref()
+                .expect("background task should expose its normalized result");
+            assert_eq!(result, chunk_summary);
+
+            let requests = requests.lock().expect("request lock poisoned");
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].contains(chunk_summary));
+            assert!(!requests[1].contains(&"x".repeat(128)));
+        });
     }
 
     #[test]
@@ -6282,8 +6425,11 @@ mod tests {
         assert!(text.contains("task_id: task-1"));
         assert!(text.contains("args: {\"command\":\"sleep 60\"}"));
         assert!(text.contains("elapsed_ms: 60000"));
-        assert!(text.contains("last line"));
         assert!(text.contains("done"));
+        assert!(
+            !text.contains("last line"),
+            "the normalized final result must replace raw recent output"
+        );
         assert_eq!(
             steer
                 .message_metadata
@@ -6293,6 +6439,67 @@ mod tests {
             Some("{\"command\":\"sleep 60\"}")
         );
         assert_eq!(steer.user_name, None);
+    }
+
+    #[test]
+    fn background_task_completion_uses_recent_output_only_without_final_result() {
+        let task = crate::ToolTaskRecord {
+            task_id: "task-legacy".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            app_id: None,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "legacy".to_string(),
+            args: json!({}),
+            status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            background: true,
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-09T00:01:00Z".to_string()),
+            elapsed_ms: Some(60_000),
+            success: Some(true),
+            result_preview: None,
+            recent_output: vec!["legacy output".to_string()],
+            message: None,
+            notify_on_finish: true,
+            notification_delivered: false,
+        };
+
+        let text = background_task_completion_steer_input(&task)
+            .content
+            .text_content();
+        assert!(text.contains("recent_output:\nlegacy output"));
+    }
+
+    #[test]
+    fn background_task_completion_exposes_chunk_summary_to_model() {
+        let chunk_summary =
+            "[Output too large (64000 bytes) — split into 3 chunk files under /tmp/tool_out_test]";
+        let task = crate::ToolTaskRecord {
+            task_id: "task-chunked".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            app_id: None,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "streaming_tool".to_string(),
+            args: json!({}),
+            status: crate::tool_tasks::TOOL_TASK_COMPLETED.to_string(),
+            background: true,
+            started_at: "2026-07-09T00:00:00Z".to_string(),
+            completed_at: Some("2026-07-09T00:01:00Z".to_string()),
+            elapsed_ms: Some(60_000),
+            success: Some(true),
+            result_preview: Some(chunk_summary.to_string()),
+            recent_output: vec!["raw output must not be injected".to_string()],
+            message: None,
+            notify_on_finish: true,
+            notification_delivered: false,
+        };
+
+        let text = background_task_completion_steer_input(&task)
+            .content
+            .text_content();
+        assert!(text.contains(chunk_summary));
+        assert!(!text.contains("raw output must not be injected"));
     }
 
     #[test]
@@ -8586,6 +8793,15 @@ You are Remi.
                 .await
                 .unwrap();
             let events = collect_stream(bot.stream(thread, "final continuity check")).await;
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CatEvent::ContextCompaction(ContextCompactionEvent {
+                    status: ContextCompactionStatus::Completed,
+                    source: ContextCompactionSource::Auto,
+                    compacted_messages,
+                    ..
+                }) if *compacted_messages > 0
+            )));
             assert!(events.iter().any(
                 |event| matches!(event, CatEvent::Text(text) if text.contains("automatic compaction"))
             ));

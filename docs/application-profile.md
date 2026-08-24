@@ -214,4 +214,39 @@ The stdio binding uses a four-byte big-endian payload length followed by an A2A 
 
 `ApplicationBuilder::profile(&manifest)` attaches a stable profile descriptor to an embedded application. `ApplicationBuilder::external_agents(registry_root)` installs the same `external_agent_discover` and `external_agent_ask` tools used by the CLI runtime, with the attached profile ID as the caller identity. `ApplicationHandle::profile()` exposes its identity, description, version, declared capabilities, and endpoint; `ApplicationHandle::catalog()` separately exposes the resolved model, agent, skill, and workflow catalog.
 
+## Profile Hub discovery
+
+Remi Cat can consume multiple named Profile Hub directories concurrently. Hub
+replication, registration, leases, device identity, and topology are owned
+entirely by the remote service; the runtime only performs authenticated,
+read-only discovery. Configure the selected application's `runtime.yaml`:
+
+```yaml
+profile_hubs:
+  - id: office
+    enabled: true
+    url: http://office-profile-hub.lan:8790
+    token_env: OFFICE_PROFILE_HUB_TOKEN
+    request_timeout_ms: 5000
+  - id: home
+    enabled: true
+    url: http://home-profile-hub.lan:8790
+    token_env: HOME_PROFILE_HUB_TOKEN
+    request_timeout_ms: 5000
+```
+
+Token values stay in the existing environment or secret store. Each URL is a
+logical Hub entrypoint, regardless of whether that service is standalone,
+primary, or a manually configured replica. IDs must be unique within the
+runtime and URLs must be absolute HTTP(S) origins without paths. Connections
+are queried concurrently; a failed Hub does not suppress results from healthy
+Hubs or the local registry, while failure of every configured Hub is reported.
+
+`external_agent_discover` merges matching local registry entries with online
+Hub profiles. Remote results use opaque
+`hub:<hub-id>/<hub_profile_id>` references and include their Hub ID, device ID,
+and `source: profile_hub`. Remote A2A invocation is not enabled in this phase;
+passing a Hub reference to `external_agent_ask` returns
+`REMOTE_AGENT_NOT_IMPLEMENTED` rather than falling back to a local profile.
+
 `serve_application_a2a_stdio(handle)` serves an embedded application through the framed stdio binding. Both HTTP and stdio A2A Agent Cards are generated from the handle descriptor, so embedded and CLI-started applications publish the same profile identity.

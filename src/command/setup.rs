@@ -188,14 +188,6 @@ pub(crate) async fn run_setup(
             config.sandbox.host_dir = data_dir.display().to_string();
         }
     }
-    config.admin.enabled = prompt_bool_with_default("Admin enabled", config.admin.enabled)?;
-    if config.admin.enabled {
-        config.admin.host = prompt_with_default("Admin listen host", &config.admin.host)?;
-        config.admin.port =
-            prompt_with_default("Admin listen port", &config.admin.port.to_string())?
-                .parse()
-                .context("invalid Admin listen port")?;
-    }
     config.im.transport = match feishu_transport.as_str() {
         "event_hook" | "event-hook" | "hook" => FeishuTransport::EventHook,
         _ => FeishuTransport::WebSocket,
@@ -218,13 +210,7 @@ pub(crate) async fn run_setup(
         )?;
     }
 
-    let mut reserved_ports = configured_ports(data_dir)?;
-    if config.admin.enabled {
-        let requested = config.admin.port;
-        config.admin.port = first_available_port(&config.admin.host, requested, &reserved_ports)?;
-        print_port_adjustment("Admin", requested, config.admin.port);
-        reserved_ports.insert(config.admin.port);
-    }
+    let reserved_ports = configured_ports(data_dir)?;
     if matches!(config.im.transport, FeishuTransport::EventHook) {
         let requested = config.im.event_hook.port;
         config.im.event_hook.port =
@@ -344,10 +330,6 @@ fn choose_from_list(label: &str, options: &[String], default_id: &str) -> anyhow
         .position(|option| option_id(option) == default_id)
         .unwrap_or(0);
     crate::tui_form::select(label, options, default_index).map(|selected| option_id(&selected))
-}
-
-fn prompt_bool_with_default(label: &str, default: bool) -> anyhow::Result<bool> {
-    crate::tui_form::bool_input(label, default)
 }
 
 fn option_id(option: &str) -> String {

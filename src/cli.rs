@@ -50,8 +50,8 @@ pub(crate) struct GlobalArgs {
 #[command(
     name = "remi-cat",
     version,
-    about = "Single-process AI agent runtime for Feishu/Lark, Web Chat, and local CLI",
-    long_about = "remi-cat runs IM ingress, Web Chat, session routing, agent execution, ACP support, and local tooling in one host process."
+    about = "Single-process AI agent runtime for Feishu/Lark and local CLI",
+    long_about = "remi-cat runs IM ingress, session routing, agent execution, ACP support, and local tooling in one host process."
 )]
 pub(crate) struct CliArgs {
     #[arg(
@@ -105,9 +105,6 @@ struct RunArgs {
         help = "Send one local CLI message and exit"
     )]
     cli_message: Vec<String>,
-
-    #[arg(long = "admin-only", help = "Serve only the local management API")]
-    admin_only: bool,
 
     #[arg(
         short = 'p',
@@ -244,8 +241,6 @@ enum CliCommand {
     Tui(TuiArgs),
     #[command(about = "Send one prompt-style local message and exit")]
     Prompt(PromptArgs),
-    #[command(about = "Serve only the local management API")]
-    Admin,
 }
 
 #[derive(Debug, Args)]
@@ -895,7 +890,7 @@ struct ProfileCreateArgs {
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "KEY=VALUE",
-        help = "Runtime config override, for example admin.enabled=true or acp.client=codex"
+        help = "Runtime config override, for example im.mode=disabled or acp.client=codex"
     )]
     entries: Vec<String>,
 }
@@ -1184,7 +1179,6 @@ pub(crate) struct CliConfig {
     pub(crate) resume_session_id: Option<String>,
     pub(crate) once: Option<String>,
     pub(crate) pure_prompt: bool,
-    pub(crate) admin_only: bool,
     pub(crate) channel_id: String,
     pub(crate) user_id: String,
     pub(crate) username: String,
@@ -1204,9 +1198,6 @@ impl CliConfig {
         let mut resume_session_id = None;
         let mut once = None;
         let mut pure_prompt = false;
-        let mut admin_only = args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--admin-only" | "admin"));
         let mut channel_id = CLI_CHAT_ID.to_string();
         let mut user_id = CLI_USER_ID.to_string();
         let mut username = CLI_USERNAME.to_string();
@@ -1239,9 +1230,6 @@ impl CliConfig {
                 "prompt" => {
                     enabled = true;
                     pure_prompt = true;
-                }
-                "admin" | "--admin-only" => {
-                    admin_only = true;
                 }
                 "-p" | "--prompt" => {
                     enabled = true;
@@ -1318,7 +1306,6 @@ impl CliConfig {
             resume_session_id,
             once,
             pure_prompt,
-            admin_only,
             channel_id,
             user_id,
             username,
@@ -1482,21 +1469,6 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
         Some(CliCommand::Cli(args)) => Ok(AppCommand::Run(local_chat_args_to_config(args))),
         Some(CliCommand::Tui(args)) => Ok(AppCommand::Run(tui_args_to_config(args))),
         Some(CliCommand::Prompt(args)) => Ok(AppCommand::Run(prompt_args_to_config(args))),
-        Some(CliCommand::Admin) => Ok(AppCommand::Run(CliConfig {
-            enabled: false,
-            tui: false,
-            resume: false,
-            resume_session_id: None,
-            once: None,
-            pure_prompt: false,
-            admin_only: true,
-            channel_id: CLI_CHAT_ID.to_string(),
-            user_id: CLI_USER_ID.to_string(),
-            username: CLI_USERNAME.to_string(),
-            wait_background_tasks: false,
-            async_agent: false,
-            permissions: None,
-        })),
         None => Ok(AppCommand::Run(run_args_to_config(run)?)),
     }
 }
@@ -1850,7 +1822,6 @@ fn local_chat_args_to_config(args: LocalChatArgs) -> CliConfig {
         resume_session_id: None,
         once: (!args.message.is_empty()).then(|| args.message.join(" ")),
         pure_prompt: false,
-        admin_only: false,
         channel_id: args.common.channel_id,
         user_id: args.common.user_id,
         username: args.common.username,
@@ -1893,7 +1864,6 @@ fn tui_args_to_config(args: TuiArgs) -> CliConfig {
         resume_session_id,
         once: None,
         pure_prompt: false,
-        admin_only: false,
         channel_id,
         user_id,
         username,
@@ -1911,7 +1881,6 @@ fn prompt_args_to_config(args: PromptArgs) -> CliConfig {
         resume_session_id: None,
         once: Some(args.prompt.join(" ")),
         pure_prompt: true,
-        admin_only: false,
         channel_id: args.common.channel_id,
         user_id: args.common.user_id,
         username: args.common.username,
@@ -1938,7 +1907,6 @@ fn run_args_to_config(args: RunArgs) -> anyhow::Result<CliConfig> {
         resume_session_id: args.resume.flatten(),
         once,
         pure_prompt,
-        admin_only: args.admin_only,
         channel_id: args.channel_id,
         user_id: args.user_id,
         username: args.username,

@@ -576,6 +576,7 @@ impl ApplicationBuilder {
             tools.extend(crate::external_agent::external_agent_tools_for(
                 registry_root,
                 info.profile.id.clone(),
+                Vec::new(),
             ));
         }
         let builtin_skills = self.builtin_skills;

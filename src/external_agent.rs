@@ -5,7 +5,7 @@ use std::time::Duration;
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest, StreamResponse, TaskState};
 use anyhow::Context;
 use bot_core::{DynamicTool, DynamicToolRisk};
-use futures::stream;
+use futures::{future::join_all, stream};
 use remi_agentloop::prelude::{AgentError, ToolOutput, ToolResult};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -14,6 +14,7 @@ use tokio::time::Instant;
 
 use crate::a2a_stdio::{read_frame, write_frame, StdioA2aRequest, StdioA2aResponse};
 use crate::instance_profile::{InstanceProfile, ProfileEndpoint};
+use crate::profile_hub::ProfileHubClient;
 use crate::profile_registry::ProfileRegistry;
 
 const AGENT_CARD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -280,6 +281,11 @@ pub(crate) async fn ask_profile(
     named: &str,
     agent_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    if reference.starts_with("hub:") {
+        anyhow::bail!(
+            "REMOTE_AGENT_NOT_IMPLEMENTED: Profile Hub discovery is enabled, but remote A2A invocation is deferred to the next phase"
+        );
+    }
     let registry = ProfileRegistry::load(registry_root)?;
     let profile = registry.resolve(reference)?;
     if profile.manifest.id == caller_profile_id {
@@ -311,21 +317,25 @@ pub(crate) async fn ask_profile(
     }
 }
 
-pub(crate) fn external_agent_tools(registry_root: PathBuf) -> Vec<DynamicTool> {
+pub(crate) fn external_agent_tools(
+    registry_root: PathBuf,
+    profile_hubs: Vec<ProfileHubClient>,
+) -> Vec<DynamicTool> {
     let caller_profile_id =
         std::env::var("REMI_PROFILE_ID").unwrap_or_else(|_| "remi.default".to_string());
-    external_agent_tools_for(registry_root, caller_profile_id)
+    external_agent_tools_for(registry_root, caller_profile_id, profile_hubs)
 }
 
 pub(crate) fn external_agent_tools_for(
     registry_root: PathBuf,
     caller_profile_id: String,
+    profile_hubs: Vec<ProfileHubClient>,
 ) -> Vec<DynamicTool> {
     let discover_root = registry_root.clone();
     let discover_caller_profile_id = caller_profile_id.clone();
     let discover = DynamicTool::from_parts(
         "external_agent_discover",
-        "Discover registered external-agent profiles by declared tags and intents. Local agents need not already be running.",
+        "Discover local registered profiles and online remote profiles from the configured Profile Hub by declared tags and intents.",
         json!({
             "type": "object",
             "properties": {
@@ -337,36 +347,19 @@ pub(crate) fn external_agent_tools_for(
         move |arguments, _resume, _ctx| {
             let registry_root = discover_root.clone();
             let caller_profile_id = discover_caller_profile_id.clone();
+            let profile_hubs = profile_hubs.clone();
             async move {
                 let tags = string_array(&arguments, "tags");
                 let intents = string_array(&arguments, "intents");
-                let registry = ProfileRegistry::load(&registry_root)
-                    .map_err(|error| AgentError::tool("external-agent", error.to_string()))?;
-                let mut matches = Vec::new();
-                for entry in registry.entries() {
-                    let Ok(profile) = InstanceProfile::from_manifest(&entry.manifest_path) else {
-                        continue;
-                    };
-                    if profile.manifest.id == caller_profile_id {
-                        continue;
-                    }
-                    if !tags.iter().all(|tag| profile.manifest.capabilities.tags.contains(tag))
-                        || !intents
-                            .iter()
-                            .all(|intent| profile.manifest.capabilities.intents.contains(intent))
-                    {
-                        continue;
-                    }
-                    matches.push(json!({
-                        "reference": format!("@{}", entry.alias),
-                        "id": profile.manifest.id,
-                        "name": profile.manifest.name,
-                        "description": profile.manifest.description,
-                        "endpoint_type": match profile.endpoint { ProfileEndpoint::Local { .. } => "local", ProfileEndpoint::Remote { .. } => "remote" },
-                        "tags": profile.manifest.capabilities.tags,
-                        "intents": profile.manifest.capabilities.intents,
-                    }));
-                }
+                let matches = discover_profiles(
+                    &registry_root,
+                    &caller_profile_id,
+                    &tags,
+                    &intents,
+                    &profile_hubs,
+                )
+                .await
+                .map_err(|error| AgentError::tool("external-agent", error.to_string()))?;
                 let text = serde_json::to_string_pretty(&matches)
                     .map_err(|error| AgentError::tool("external-agent", error.to_string()))?;
                 Ok::<_, AgentError>(ToolResult::Output(stream::iter(vec![ToolOutput::text(text)])))
@@ -381,7 +374,7 @@ pub(crate) fn external_agent_tools_for(
         json!({
             "type": "object",
             "properties": {
-                "profile": {"type": "string", "description": "Registered profile reference such as @travel"},
+                "profile": {"type": "string", "description": "Local registered profile reference such as @travel. hub:<hub-id>/<profile-id> references are discoverable but not invokable in this phase."},
                 "task": {"type": "string"},
                 "named": {"type": "string", "default": "default"},
                 "agent_id": {"type": "string"}
@@ -426,6 +419,74 @@ pub(crate) fn external_agent_tools_for(
     vec![discover, ask]
 }
 
+async fn discover_profiles(
+    registry_root: &Path,
+    caller_profile_id: &str,
+    tags: &[String],
+    intents: &[String],
+    profile_hubs: &[ProfileHubClient],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let registry = ProfileRegistry::load(registry_root)?;
+    let mut matches = Vec::new();
+    for entry in registry.entries() {
+        let Ok(profile) = InstanceProfile::from_manifest(&entry.manifest_path) else {
+            continue;
+        };
+        if profile.manifest.id == caller_profile_id {
+            continue;
+        }
+        if !tags
+            .iter()
+            .all(|tag| profile.manifest.capabilities.tags.contains(tag))
+            || !intents
+                .iter()
+                .all(|intent| profile.manifest.capabilities.intents.contains(intent))
+        {
+            continue;
+        }
+        matches.push(json!({
+            "reference": format!("@{}", entry.alias),
+            "source": "local_registry",
+            "id": profile.manifest.id,
+            "name": profile.manifest.name,
+            "description": profile.manifest.description,
+            "endpoint_type": match profile.endpoint { ProfileEndpoint::Local { .. } => "local", ProfileEndpoint::Remote { .. } => "remote" },
+            "status": "available",
+            "tags": profile.manifest.capabilities.tags,
+            "intents": profile.manifest.capabilities.intents,
+        }));
+    }
+    let remote_results = join_all(
+        profile_hubs
+            .iter()
+            .map(|hub| async move { (hub.id().to_string(), hub.discover(tags, intents).await) }),
+    )
+    .await;
+    let mut successful_hubs = 0usize;
+    let mut failures = Vec::new();
+    for (hub_id, result) in remote_results {
+        match result {
+            Ok(remote) => {
+                successful_hubs += 1;
+                matches.extend(remote.iter().map(|profile| profile.tool_value(&hub_id)));
+            }
+            Err(error) => failures.push((hub_id, error)),
+        }
+    }
+    if successful_hubs == 0 && !profile_hubs.is_empty() {
+        let details = failures
+            .iter()
+            .map(|(hub_id, error)| format!("{hub_id}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("all configured Profile Hubs failed: {details}");
+    }
+    for (hub_id, error) in failures {
+        tracing::warn!(hub_id, error = %error, "Profile Hub discovery failed; returning results from other sources");
+    }
+    Ok(matches)
+}
+
 fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
     value
         .get(key)
@@ -450,6 +511,8 @@ fn required_string(value: &serde_json::Value, key: &str) -> Result<String, Agent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::get;
+    use axum::{Json, Router};
     use remi_agentloop::prelude::Tool;
 
     #[cfg(windows)]
@@ -457,7 +520,7 @@ mod tests {
 
     #[test]
     fn external_tool_names_are_explicit_and_stable() {
-        let tools = external_agent_tools(PathBuf::from("registry"));
+        let tools = external_agent_tools(PathBuf::from("registry"), Vec::new());
         let names = tools
             .iter()
             .map(|tool| tool.name().to_string())
@@ -483,6 +546,150 @@ mod tests {
             stable_context_id("a", "b", "summer", Some("planner")),
             stable_context_id("a", "b", "summer", Some("accounting"))
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_combines_local_registry_and_logical_hub() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let manifest = profile_root.path().join("profile.yaml");
+        std::fs::write(
+            &manifest,
+            "schema_version: 1\nid: local.travel\nname: Local Travel\ncapabilities:\n  tags: [travel]\n  intents: [plan-trip]\nendpoint:\n  type: local\n  command: exit 0\n",
+        )
+        .unwrap();
+        ProfileRegistry::load(registry_root.path())
+            .unwrap()
+            .register(&manifest, Some("local-travel"), false)
+            .unwrap();
+
+        let app = Router::new().route(
+            "/api/v1/profiles",
+            get(|| async {
+                Json(json!({"items":[{
+                    "hub_profile_id":"remote-1",
+                    "device_id":"device-2",
+                    "profile_id":"remote.travel",
+                    "alias":"travel",
+                    "name":"Remote Travel",
+                    "description":null,
+                    "version":null,
+                    "tags":["travel"],
+                    "intents":["plan-trip"],
+                    "status":"online"
+                }]}))
+            }),
+        );
+        let office_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let office_address = office_listener.local_addr().unwrap();
+        let home_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let home_address = home_listener.local_addr().unwrap();
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+        let home_app = app.clone();
+        tokio::spawn(async move { axum::serve(office_listener, app).await.unwrap() });
+        tokio::spawn(async move { axum::serve(home_listener, home_app).await.unwrap() });
+        let office =
+            ProfileHubClient::for_test("office", format!("http://{office_address}"), "token");
+        let home = ProfileHubClient::for_test("home", format!("http://{home_address}"), "token");
+        let unavailable =
+            ProfileHubClient::for_test("offline", format!("http://{unavailable_address}"), "token");
+
+        let found = discover_profiles(
+            registry_root.path(),
+            "caller",
+            &["travel".to_string()],
+            &["plan-trip".to_string()],
+            &[office, home, unavailable],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0]["reference"], "@local-travel");
+        assert_eq!(found[0]["source"], "local_registry");
+        assert_eq!(found[1]["reference"], "hub:office/remote-1");
+        assert_eq!(found[1]["source"], "profile_hub");
+        assert_eq!(found[2]["reference"], "hub:home/remote-1");
+        assert_eq!(found[2]["hub_id"], "home");
+    }
+
+    #[tokio::test]
+    async fn hub_reference_is_rejected_before_local_resolution() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let error = ask_profile(
+            registry_root.path(),
+            "caller",
+            "hub:office/remote-1",
+            "delegate this",
+            "default",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("REMOTE_AGENT_NOT_IMPLEMENTED"));
+    }
+
+    #[tokio::test]
+    async fn live_profile_hubs_from_env() {
+        let Ok(entries) = std::env::var("REMI_PROFILE_HUB_E2E_ENDPOINTS") else {
+            return;
+        };
+        let expected = std::env::var("REMI_PROFILE_HUB_E2E_EXPECT_REFERENCES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let clients = entries
+            .split(',')
+            .map(|entry| {
+                let (id, url) = entry.split_once('=').expect("expected hub-id=url");
+                crate::profile_hub::ProfileHubClient::from_config(
+                    &crate::runtime_config::ProfileHubConfig {
+                        id: id.to_string(),
+                        enabled: true,
+                        url: url.to_string(),
+                        token_env: "REMI_PROFILE_HUB_E2E_TOKEN".to_string(),
+                        request_timeout_ms: 1_000,
+                    },
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let registry_root = tempfile::tempdir().unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let manifest = profile_root.path().join("profile.yaml");
+        std::fs::write(
+            &manifest,
+            "schema_version: 1\nid: local.e2e\nname: Local E2E\ncapabilities:\n  tags: [e2e]\n  intents: [verify]\nendpoint:\n  type: local\n  command: exit 0\n",
+        )
+        .unwrap();
+        ProfileRegistry::load(registry_root.path())
+            .unwrap()
+            .register(&manifest, Some("local-e2e"), false)
+            .unwrap();
+
+        let found = discover_profiles(
+            registry_root.path(),
+            "caller",
+            &["e2e".to_string()],
+            &["verify".to_string()],
+            &clients,
+        )
+        .await
+        .unwrap();
+        let references = found
+            .iter()
+            .filter_map(|item| item["reference"].as_str())
+            .collect::<Vec<_>>();
+        assert!(references.contains(&"@local-e2e"));
+        for reference in &expected {
+            assert!(references.contains(&reference.as_str()), "{references:?}");
+        }
+        assert_eq!(references.len(), expected.len() + 1, "{references:?}");
     }
 
     #[tokio::test]

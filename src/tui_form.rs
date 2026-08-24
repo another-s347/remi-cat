@@ -99,12 +99,6 @@ pub(crate) fn text_input(label: &str, default: &str, secret: bool) -> anyhow::Re
     }
 }
 
-pub(crate) fn bool_input(label: &str, default: bool) -> anyhow::Result<bool> {
-    let default_index = if default { 0 } else { 1 };
-    let selected = select(label, &["yes".to_string(), "no".to_string()], default_index)?;
-    Ok(selected == "yes")
-}
-
 pub(crate) fn select(
     label: &str,
     options: &[String],

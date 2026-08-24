@@ -2120,12 +2120,31 @@ struct CollectedToolResult {
 
 impl CollectedToolResult {
     fn text(text: impl Into<String>) -> Self {
-        let text = text.into();
+        Self::from_content(Content::text(text.into()), Vec::new())
+    }
+
+    fn from_content(content: Content, side_events: Vec<CatEvent>) -> Self {
         Self {
-            content: Content::text(text.clone()),
-            preview: text,
-            side_events: Vec::new(),
+            preview: preview_text_for_content(&content),
+            content,
+            side_events,
         }
+    }
+
+    fn replace_content(self, content: Content) -> Self {
+        Self::from_content(content, self.side_events)
+    }
+
+    fn completion_output_lines(&self, max_lines: usize) -> Vec<String> {
+        self.preview
+            .lines()
+            .rev()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -2314,7 +2333,10 @@ fn collect_tool_result_futures_with_timeout(
                 };
                 let (completed_tx, mut completed_rx) =
                     oneshot::channel::<(String, CollectedToolResult)>();
-                spawn_background_tool_result(
+                // The same tracked collector serves both modes. The caller
+                // receives its result while it is still foreground, or
+                // promotes the very same task after the wait threshold.
+                spawn_tracked_tool_result(
                     task_id.clone(),
                     tool_name,
                     Arc::clone(&tool_tasks),
@@ -2351,7 +2373,7 @@ fn collect_tool_result_futures_with_timeout(
         .collect()
 }
 
-fn spawn_background_tool_result(
+fn spawn_tracked_tool_result(
     task_id: String,
     tool_name: String,
     tool_tasks: Arc<crate::tool_tasks::ToolTaskManager>,
@@ -2365,17 +2387,13 @@ fn spawn_background_tool_result(
         let (call_id, collected) = future.await;
         let success = crate::tool_pretty::tool_success(&collected.preview);
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        for line in collected
-            .preview
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            tool_tasks.append_output(&task_id, line.to_string()).await;
-        }
+        let completed_output = collected.completion_output_lines(20);
+        // Live deltas are useful while the task is running, but once it has
+        // completed the overflow-normalized final result is authoritative.
+        // Replacing rather than appending also prevents completion
+        // notifications from carrying both the raw deltas and the final
+        // result.
+        tool_tasks.replace_output(&task_id, completed_output).await;
         tracing::info!(
             task_id = %task_id,
             tool_name = %tool_name,
@@ -2423,12 +2441,18 @@ async fn collect_result(
         Ok(ToolResult::Interrupt(_)) => CollectedToolResult::text("interrupted"),
         Ok(ToolResult::Output(s)) => {
             let mut s = std::pin::pin!(s);
-            let mut last = Content::text(String::new());
+            let mut last = None;
+            let mut delta_fallback = String::new();
             let mut side_events = Vec::new();
             while let Some(out) = s.next().await {
                 match out {
-                    ToolOutput::Result(c) => last = c,
+                    ToolOutput::Result(c) => last = Some(c),
                     ToolOutput::Delta(delta) => {
+                        // Some asynchronous tools only stream deltas and do
+                        // not emit a terminal Result item. Preserve those
+                        // deltas as the final tool result so the common
+                        // overflow/chunking path below still applies.
+                        delta_fallback.push_str(&delta);
                         if let Some((manager, task_id)) = output_task.as_ref() {
                             for line in delta.lines() {
                                 if !line.is_empty() {
@@ -2498,11 +2522,8 @@ async fn collect_result(
                     }
                 }
             }
-            CollectedToolResult {
-                preview: preview_text_for_content(&last),
-                content: last,
-                side_events,
-            }
+            let last = last.unwrap_or_else(|| Content::text(delta_fallback));
+            CollectedToolResult::from_content(last, side_events)
         }
     }
 }
@@ -2521,27 +2542,23 @@ async fn collect_result_with_overflow(
         return collected;
     }
 
-    let side_events = collected.side_events.clone();
     let text = collected.content.text_content();
     if text.len() <= overflow_bytes {
-        return CollectedToolResult {
-            side_events,
-            ..CollectedToolResult::text(text)
-        };
+        return collected.replace_content(Content::text(text));
     }
 
     let total = text.len();
     if tool_name == "fs_read" {
-        let mut result = CollectedToolResult::text(fs_read_overflow_summary(total, overflow_bytes));
-        result.side_events = side_events;
-        return result;
+        return collected.replace_content(Content::text(fs_read_overflow_summary(
+            total,
+            overflow_bytes,
+        )));
     }
-    let mut result = match spill_tool_output_chunks(data_dir, &text, overflow_bytes).await {
-        Ok(spill) => CollectedToolResult::text(spill.summary(total)),
-        Err(_) => CollectedToolResult::text(text),
+    let content = match spill_tool_output_chunks(data_dir, &text, overflow_bytes).await {
+        Ok(spill) => Content::text(spill.summary(total)),
+        Err(_) => Content::text(text),
     };
-    result.side_events = side_events;
-    result
+    collected.replace_content(content)
 }
 
 fn fs_read_overflow_summary(total: usize, overflow_bytes: usize) -> String {
@@ -3247,6 +3264,32 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(CatEvent::Text(text)) if text == "part 2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delta_only_background_result_uses_overflow_chunking() {
+        let root = test_root();
+        let output = futures::stream::iter(vec![
+            ToolOutput::Delta("x".repeat(32)),
+            ToolOutput::Delta("y".repeat(32)),
+        ]);
+        let collected = collect_result_with_overflow(
+            Ok(ToolResult::Output(output)),
+            &root,
+            8,
+            None,
+            Some("call"),
+            "agent__worker",
+            None,
+        )
+        .await;
+
+        assert!(collected.preview.contains("[Output too large (64 bytes)"));
+        assert!(collected.preview.contains("split into 64 chunk files"));
+        assert!(matches!(
+            collected.content,
+            Content::Text(ref text) if text == &collected.preview
         ));
     }
 
@@ -3983,6 +4026,64 @@ mod tests {
                 assert_eq!(completed.app_id.as_deref(), Some("embedded-host"));
                 assert_eq!(completed.recent_output, vec!["slow".to_string()]);
                 assert!(!tool_tasks.is_thread_running("thread-1").await);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_delta_only_result_is_chunked_before_completion_notification() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let root = test_root();
+                let tool_tasks = test_tool_tasks();
+                let mut completed_rx = tool_tasks.subscribe_completed("thread-1").await;
+                let calls = vec![ParsedToolCall {
+                    id: "slow-call".to_string(),
+                    name: "streaming_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                }];
+                let output: BoxedToolStream = Box::pin(async_stream::stream! {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    yield ToolOutput::Delta("x".repeat(32));
+                    yield ToolOutput::Delta("y".repeat(32));
+                });
+                let mut pending = collect_tool_result_futures_with_timeout(
+                    vec![("slow-call".to_string(), Ok(ToolResult::Output(output)))],
+                    &calls,
+                    &HashMap::from([("slow-call".to_string(), "streaming_tool".to_string())]),
+                    &root,
+                    8,
+                    None,
+                    Arc::clone(&tool_tasks),
+                    "thread-1".to_string(),
+                    "run-1".to_string(),
+                    None,
+                    HashMap::new(),
+                    Duration::from_millis(5),
+                    true,
+                );
+
+                let ForegroundToolOutcome::TimedOut { .. } = pending
+                    .next()
+                    .await
+                    .expect("tool result future should produce an outcome")
+                else {
+                    panic!("expected streaming tool to move to background");
+                };
+                let completed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                    .await
+                    .expect("background completion should notify")
+                    .expect("completion channel should stay open");
+
+                let result = completed
+                    .result_preview
+                    .as_deref()
+                    .expect("completed task should store a normalized result");
+                assert!(result.contains("[Output too large (64 bytes)"));
+                assert!(result.contains("split into 64 chunk files"));
+                assert_eq!(completed.recent_output.join("\n"), result);
+                assert!(!completed.recent_output.join("\n").contains(&"x".repeat(32)));
             })
             .await;
     }

@@ -38,14 +38,6 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
                     .unwrap_or_else(|| "10000".to_string())
             );
             println!("async_agent: {}", config.tool_output.async_agent);
-            println!(
-                "admin: {}",
-                if config.admin.enabled {
-                    format!("http://{}:{}", config.admin.host, config.admin.port)
-                } else {
-                    "disabled".to_string()
-                }
-            );
             println!("sandbox_container: {}", config.sandbox.container_name);
             println!("feishu_transport: {}", config.im.transport.as_env_value());
             println!("im_mode: {}", config.im.mode.as_env_value());
@@ -233,7 +225,6 @@ async fn run_acp_setup(
             }
         });
     let mut entries = vec![
-        "admin.enabled=false".to_string(),
         "im.mode=disabled".to_string(),
         format!("acp.mode={mode}"),
         format!("acp.client={client}"),

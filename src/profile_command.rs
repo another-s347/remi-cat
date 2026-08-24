@@ -1731,12 +1731,6 @@ pub fn ensure_builtin_diagnostic_profile_in_data_root(data_root: &Path) -> anyho
     config.sandbox.host_dir = ".".to_string();
     config.shell.mode = ShellMode::Local;
     config.im.mode = ImMode::Disabled;
-    config.admin.enabled = true;
-    config.admin.port = first_available_port(
-        &config.admin.host,
-        config.admin.port,
-        &configured_ports_in_data_root(&profile.data_dir, data_root)?,
-    )?;
     crate::runtime_config::write_runtime_config_at(&profile.runtime_config, &config)?;
     Ok(())
 }
@@ -1926,7 +1920,6 @@ pub async fn apply_runtime_config_entries(
         profile.label(),
         path.display()
     );
-    println!("admin: {}", format_admin_addr(&config));
     println!("sandbox_kind: {}", config.sandbox.kind.as_env_value());
     println!("sandbox_container: {}", config.sandbox.container_name);
     Ok(())
@@ -1967,9 +1960,6 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "async_agent" | "tool_output.async_agent" => {
             config.tool_output.async_agent = parse_bool(value)?
         }
-        "admin_enabled" | "admin.enabled" => config.admin.enabled = parse_bool(value)?,
-        "admin_host" | "admin.host" => config.admin.host = value.to_string(),
-        "admin_port" | "admin.port" => config.admin.port = parse_port(value)?,
         "telemetry_enabled" | "telemetry.enabled" | "telemetry" => {
             config.telemetry.enabled = parse_bool(value)?
         }
@@ -2082,13 +2072,7 @@ fn normalize_runtime_config(
             )?;
         }
     }
-    let mut reserved_ports = configured_ports_in_data_root(data_dir, data_root)?;
-    if config.admin.enabled {
-        let requested = config.admin.port;
-        config.admin.port = first_available_port(&config.admin.host, requested, &reserved_ports)?;
-        print_port_adjustment("Admin", requested, config.admin.port);
-        reserved_ports.insert(config.admin.port);
-    }
+    let reserved_ports = configured_ports_in_data_root(data_dir, data_root)?;
     if matches!(config.im.mode, ImMode::Feishu)
         && matches!(config.im.transport, FeishuTransport::EventHook)
     {
@@ -2199,14 +2183,6 @@ fn nonempty_optional(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-pub fn format_admin_addr(config: &RuntimeConfig) -> String {
-    if config.admin.enabled {
-        format!("http://{}:{}", config.admin.host, config.admin.port)
-    } else {
-        "disabled".to_string()
-    }
-}
-
 pub fn configured_ports(data_dir: &Path) -> anyhow::Result<HashSet<u16>> {
     configured_ports_in_data_root(
         data_dir,
@@ -2220,9 +2196,6 @@ pub fn configured_ports_in_data_root(
 ) -> anyhow::Result<HashSet<u16>> {
     let mut ports = HashSet::new();
     for config in configured_profiles_excluding_in_data_root(data_dir, data_root)? {
-        if config.admin.enabled {
-            ports.insert(config.admin.port);
-        }
         if matches!(config.im.mode, ImMode::Feishu)
             && matches!(config.im.transport, FeishuTransport::EventHook)
         {

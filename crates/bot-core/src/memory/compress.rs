@@ -71,10 +71,32 @@ impl LlmCompressor {
             .config(agent_config)
             .system(COMPRESSION_SYSTEM)
             .max_turns(1);
-        if !self.extra_options.is_empty() {
-            builder = builder.extra_options(self.extra_options.clone());
+        let extra_options = self.compression_extra_options();
+        if !extra_options.is_empty() {
+            builder = builder.extra_options(extra_options);
         }
         builder.build_loop()
+    }
+
+    fn compression_extra_options(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut options = self.extra_options.clone();
+        let model = self.model.trim().to_ascii_lowercase();
+
+        // MiMo 2.5 enables deep thinking by default and counts reasoning tokens
+        // against max_completion_tokens. Compression needs a short visible
+        // summary, so allowing the default can exhaust the output budget with
+        // reasoning and produce a valid Done event without any final text.
+        // This override is local to the one-shot compressor and does not alter
+        // the model profile used by ordinary agent turns.
+        if matches!(model.as_str(), "mimo-v2.5" | "mimo-v2.5-pro") {
+            options.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+            options.remove("reasoning_effort");
+        }
+
+        options
     }
 
     fn output_budget(&self, source_tokens: u32) -> u32 {
@@ -309,6 +331,58 @@ mod tests {
     }
 
     #[test]
+    fn mimo_compression_disables_default_thinking() {
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "thinking".to_string(),
+            serde_json::json!({ "type": "enabled" }),
+        );
+        options.insert("reasoning_effort".to_string(), serde_json::json!("high"));
+        options.insert(
+            "response_format".to_string(),
+            serde_json::json!({ "type": "text" }),
+        );
+        let compressor = LlmCompressor::new(
+            "key".to_string(),
+            Some("https://api.xiaomimimo.com/v1".to_string()),
+            "mimo-v2.5".to_string(),
+            1_000_000,
+            32_768,
+            options,
+        );
+
+        let options = compressor.compression_extra_options();
+        assert_eq!(
+            options.get("thinking"),
+            Some(&serde_json::json!({ "type": "disabled" }))
+        );
+        assert!(!options.contains_key("reasoning_effort"));
+        assert_eq!(
+            options.get("response_format"),
+            Some(&serde_json::json!({ "type": "text" }))
+        );
+    }
+
+    #[test]
+    fn non_mimo_compression_preserves_reasoning_options() {
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "thinking".to_string(),
+            serde_json::json!({ "type": "enabled" }),
+        );
+        let compressor = LlmCompressor::new(
+            "key".to_string(),
+            None,
+            "deepseek-v4-flash".to_string(),
+            1_000_000,
+            32_768,
+            options.clone(),
+        );
+
+        assert_eq!(compressor.compression_extra_options(), options);
+    }
+
+    #[test]
     fn compressor_preflight_rejects_source_that_cannot_fit() {
         let compressor = LlmCompressor::new(
             "key".to_string(),
@@ -404,5 +478,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, "compact summary");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MIMO_API_KEY and calls the live Xiaomi MiMo API"]
+    async fn live_mimo_compression_returns_visible_summary_text() {
+        let api_key = std::env::var("MIMO_API_KEY").expect("MIMO_API_KEY must be set");
+        let compressor = LlmCompressor::new(
+            api_key,
+            Some("https://api.xiaomimimo.com/v1".to_string()),
+            "mimo-v2.5".to_string(),
+            1_000_000,
+            32_768,
+            serde_json::Map::new(),
+        );
+        let messages = vec![
+            Message::user("The deployment target is staging and the release is blocked."),
+            Message::assistant(
+                "Recorded: deploy to staging only; do not release until verification passes.",
+            ),
+        ];
+
+        let summary = compressor.compress(&messages).await.unwrap();
+
+        assert!(!summary.trim().is_empty());
+        assert!(summary.to_ascii_lowercase().contains("staging"));
     }
 }

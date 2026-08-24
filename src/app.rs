@@ -62,7 +62,7 @@ use crate::profile_command::{
 use crate::profile_registry::ProfileRegistry;
 use crate::secret_store::{apply_entries_to_env, redaction_entries, SecretStore};
 use crate::session::SessionRuntime;
-use crate::{host_admin, web_chat};
+use crate::web_chat;
 use bot_core::im_tools::ImFileBridge;
 use bot_core::{install_embedded_agent_profiles, install_embedded_model_profiles, CatBotBuilder};
 use im_feishu::FeishuGateway;
@@ -116,6 +116,26 @@ fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
         }
         Err(err) => tracing::warn!(error = %err, "failed to resolve runtime config"),
     }
+}
+
+fn load_profile_hub_clients(
+    runtime_config_path: &Path,
+    data_dir: &Path,
+) -> anyhow::Result<Vec<crate::profile_hub::ProfileHubClient>> {
+    let config_path = std::env::var_os("REMI_RUNTIME_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_config_path.to_path_buf());
+    Ok(match load_runtime_config_at(&config_path, data_dir)? {
+        Some(config) => config
+            .profile_hubs
+            .iter()
+            .map(crate::profile_hub::ProfileHubClient::from_config)
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+        None => Vec::new(),
+    })
 }
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -459,8 +479,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     );
                 }
             }
-            if !matches!(cli.admin_only, true)
-                && !matches!(
+            if !matches!(
                     detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
                     SetupState::Initialized { .. }
                 )
@@ -521,6 +540,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all(&selected_profile.workflows_dir)?;
 
     if matches!(&command, AppCommand::A2a(crate::cli::A2aCommand::Stdio)) {
+        let profile_hub_clients =
+            load_profile_hub_clients(&selected_profile.runtime_config, &data_dir)?;
         let root_agent_id =
             std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
         let workspace = selected_profile
@@ -537,7 +558,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .credentials(credentials)
             .secret_store(application_secret_store)
             .default_agent(root_agent_id);
-        for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+        for tool in crate::external_agent::external_agent_tools(
+            profile_registry_root.clone(),
+            profile_hub_clients.clone(),
+        ) {
             builder = builder.tool(tool);
         }
         let application = builder.spawn().await?;
@@ -568,7 +592,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             resume_session_id: None,
             once: None,
             pure_prompt: false,
-            admin_only: false,
             channel_id: CLI_CHAT_ID.to_string(),
             user_id: CLI_USER_ID.to_string(),
             username: CLI_USERNAME.to_string(),
@@ -579,37 +602,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         AppCommand::A2a(_) => unreachable!(),
         _ => unreachable!(),
     };
+    let profile_hub_clients =
+        load_profile_hub_clients(&selected_profile.runtime_config, &data_dir)?;
     let root_agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| "default".to_string());
-    let agents_dir = selected_profile.agents_dir.clone();
-    let primary_skills_dir = selected_profile
-        .skills_dirs
-        .first()
-        .cloned()
-        .unwrap_or_else(|| data_dir.join("skills"));
-
-    if cli.admin_only {
-        let workspace_dir = current_workspace_dir(&data_dir);
-        let sessions = Arc::new(Mutex::new(SessionRuntime::load_path(
-            selected_profile.sessions_path.clone(),
-        )?));
-        maybe_start_admin(host_admin::AdminState {
-            data_dir: data_dir.clone(),
-            agents_dir,
-            skills_dir: primary_skills_dir.clone(),
-            tasks_dir: selected_profile.tasks_dir.clone(),
-            workspace_root_label: current_workspace_root_label(&workspace_dir),
-            workspace_dir,
-            secret_store: Arc::clone(&secret_store),
-            sessions,
-            root_agent_id,
-            setup_state: detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
-            web_chat: None,
-        })
-        .await?;
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
-    }
-
     if cli.tui {
         let workspace = std::env::current_dir().context("resolving TUI workspace")?;
         let (credentials, application_secret_store) = {
@@ -635,7 +630,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .with_content_capture(profile_telemetry.capture_agent_content),
             );
         }
-        for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+        for tool in crate::external_agent::external_agent_tools(
+            profile_registry_root.clone(),
+            profile_hub_clients.clone(),
+        ) {
             builder = builder.tool(tool);
         }
         let application = builder.spawn().await?;
@@ -729,7 +727,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 bot_core::AgentTracingOptions::default()
             })
             .im_bridge(Arc::clone(&bridge));
-    for tool in crate::external_agent::external_agent_tools(profile_registry_root.clone()) {
+    for tool in crate::external_agent::external_agent_tools(
+        profile_registry_root.clone(),
+        profile_hub_clients.clone(),
+    ) {
         bot_builder = bot_builder.enabled_tool(tool);
     }
     let bot = Rc::new(bot_builder.build()?);
@@ -752,23 +753,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
-    if !cli.pure_prompt && !cli.tui {
-        let workspace_dir = current_workspace_dir(&data_dir);
-        maybe_start_admin(host_admin::AdminState {
-            data_dir: data_dir.clone(),
-            agents_dir,
-            skills_dir: primary_skills_dir,
-            tasks_dir: selected_profile.tasks_dir.clone(),
-            workspace_root_label: current_workspace_root_label(&workspace_dir),
-            workspace_dir,
-            secret_store: Arc::clone(&runtime.secret_store),
-            sessions: Arc::clone(&runtime.sessions),
-            root_agent_id: runtime.root_agent_id.clone(),
-            setup_state: detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
-            web_chat: Some(web_chat.clone()),
-        })
-        .await?;
-    }
     crate::a2a_channel::maybe_start(
         web_chat.clone(),
         Arc::clone(&runtime.sessions),
@@ -804,7 +788,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     }
                 });
             }
-            info!("Web Chat and configured IM channels ready; waiting for shutdown");
+            info!("configured IM channels ready; waiting for shutdown");
             tokio::signal::ctrl_c().await?;
             Ok(())
         })
@@ -908,29 +892,6 @@ fn absolute_env_path(key: &str) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
-async fn maybe_start_admin(state: host_admin::AdminState) -> anyhow::Result<()> {
-    let enabled = std::env::var("REMI_ADMIN_ENABLED")
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"))
-        .unwrap_or(true);
-    if !enabled {
-        return Ok(());
-    }
-
-    let host = std::env::var("REMI_ADMIN_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = std::env::var("REMI_ADMIN_PORT").unwrap_or_else(|_| "8787".to_string());
-    let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let local_addr = listener.local_addr()?;
-    let app = host_admin::router(state);
-    tokio::spawn(async move {
-        info!("remi-cat admin listening on http://{local_addr}");
-        if let Err(err) = axum::serve(listener, app).await {
-            warn!("admin server stopped: {err:#}");
-        }
-    });
-    Ok(())
-}
-
 async fn wait_for_cli_background_tasks(runtime: Rc<Runtime>, cli: &CliConfig) {
     if !cli.wait_background_tasks {
         return;
@@ -1003,27 +964,6 @@ async fn run_tasks_command(tasks_dir: &Path, command: &TasksCommand) -> anyhow::
         }
     }
     Ok(())
-}
-
-fn current_workspace_dir(data_dir: &Path) -> PathBuf {
-    std::env::var_os("REMI_SANDBOX_HOST_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| data_dir.to_path_buf())
-}
-
-fn current_workspace_root_label(workspace_dir: &Path) -> String {
-    let kind = std::env::var("REMI_SANDBOX_KIND")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase());
-    if matches!(kind.as_deref(), Some("docker")) {
-        std::env::var("REMI_SANDBOX_CONTAINER_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "/workspace".to_string())
-    } else {
-        workspace_dir.display().to_string()
-    }
 }
 
 fn init_observability(
@@ -1539,10 +1479,48 @@ mod cli_tests {
     }
 
     #[test]
-    fn admin_command_serves_management_api_only() {
-        let config = CliConfig::from_args(&args(&["admin"])).unwrap();
-        assert!(config.admin_only);
-        assert!(!config.enabled);
+    fn profile_hub_loader_uses_effective_runtime_config_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let selected_config = root.path().join("selected-runtime.yaml");
+        let override_config = root.path().join("override-runtime.yaml");
+        std::fs::write(
+            &selected_config,
+            "model_profile: default\nprofile_hubs:\n  - id: unavailable\n    url: https://profile-hub.example\n    token_env: REMI_TEST_MISSING_PROFILE_HUB_TOKEN\n    request_timeout_ms: 5000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &override_config,
+            "model_profile: default\nprofile_hubs: []\n",
+        )
+        .unwrap();
+        let previous_override = std::env::var_os("REMI_RUNTIME_CONFIG");
+        let previous_token = std::env::var_os("REMI_TEST_MISSING_PROFILE_HUB_TOKEN");
+        unsafe {
+            std::env::remove_var("REMI_RUNTIME_CONFIG");
+            std::env::remove_var("REMI_TEST_MISSING_PROFILE_HUB_TOKEN");
+        }
+
+        assert!(super::load_profile_hub_clients(&selected_config, root.path()).is_err());
+        unsafe {
+            std::env::set_var("REMI_RUNTIME_CONFIG", &override_config);
+        }
+        assert!(
+            super::load_profile_hub_clients(&selected_config, root.path())
+                .unwrap()
+                .is_empty()
+        );
+
+        unsafe {
+            match previous_override {
+                Some(value) => std::env::set_var("REMI_RUNTIME_CONFIG", value),
+                None => std::env::remove_var("REMI_RUNTIME_CONFIG"),
+            }
+            match previous_token {
+                Some(value) => std::env::set_var("REMI_TEST_MISSING_PROFILE_HUB_TOKEN", value),
+                None => std::env::remove_var("REMI_TEST_MISSING_PROFILE_HUB_TOKEN"),
+            }
+        }
     }
 
     #[test]
@@ -1567,6 +1545,12 @@ mod cli_tests {
                 .kind(),
             ErrorKind::DisplayHelp
         );
+    }
+
+    #[test]
+    fn removed_admin_command_is_rejected() {
+        assert!(try_parse_cli_args(&args(&["admin"])).is_err());
+        assert!(try_parse_cli_args(&args(&["--admin-only"])).is_err());
     }
 
     #[test]
@@ -1637,9 +1621,9 @@ mod cli_tests {
         ));
         assert!(parse_command(&args(&["profile", "delete", "default", "--force"])).is_err());
         assert!(matches!(
-            parse_command(&args(&["profile", "create", "dev", "admin.port=8790"])).unwrap(),
+            parse_command(&args(&["profile", "create", "dev", "im.mode=disabled"])).unwrap(),
             AppCommand::Profile(ProfileCommand::Create { name, entries })
-                if name == "dev" && entries == args(&["admin.port=8790"])
+                if name == "dev" && entries == args(&["im.mode=disabled"])
         ));
         assert!(parse_command(&args(&["profile", "create", "remi_diagnostics"])).is_err());
         assert!(
@@ -1727,8 +1711,8 @@ mod cli_tests {
         ));
         assert!(parse_command(&args(&["workflow", "rm", "goal"])).is_err());
         assert!(matches!(
-            parse_command(&args(&["config", "set", "admin.port=8790"])).unwrap(),
-            AppCommand::ConfigSet(entries) if entries == args(&["admin.port=8790"])
+            parse_command(&args(&["config", "set", "im.mode=disabled"])).unwrap(),
+            AppCommand::ConfigSet(entries) if entries == args(&["im.mode=disabled"])
         ));
         assert!(matches!(
             parse_command(&args(&["config", "set", "shell.mode=local"])).unwrap(),

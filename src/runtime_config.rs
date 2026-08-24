@@ -24,8 +24,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub sandbox: RuntimeSandboxConfig,
     #[serde(default)]
-    pub admin: AdminConfig,
-    #[serde(default)]
     pub im: ImConfig,
     #[serde(default)]
     pub shell: ShellConfig,
@@ -33,6 +31,76 @@ pub struct RuntimeConfig {
     pub acp: AcpConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub profile_hubs: Vec<ProfileHubConfig>,
+}
+
+/// Read-only access to one named Profile Hub used by this runtime.
+///
+/// Hub replication and profile registration are server-side concerns. Remi Cat
+/// only consumes the directory exposed by the configured Hub.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileHubConfig {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub url: String,
+    pub token_env: String,
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ProfileHubConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            url: String::new(),
+            token_env: "REMI_PROFILE_HUB_TOKEN".to_string(),
+            request_timeout_ms: 5_000,
+        }
+    }
+}
+
+impl ProfileHubConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.is_empty()
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            anyhow::bail!("invalid profile_hubs id `{}`", self.id);
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(&self.url).context("profile_hubs[].url is invalid")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            anyhow::bail!("profile_hubs[].url must be an absolute http or https URL");
+        }
+        if !url.path().is_empty() && url.path() != "/" {
+            anyhow::bail!("profile_hubs[].url must not contain a path");
+        }
+        if self.token_env.trim().is_empty() {
+            anyhow::bail!("profile_hubs[].token_env must not be empty");
+        }
+        if self.request_timeout_ms == 0 {
+            anyhow::bail!("profile_hubs[].request_timeout_ms must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+fn validate_profile_hubs(hubs: &[ProfileHubConfig]) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    for hub in hubs {
+        hub.validate()?;
+        if !ids.insert(hub.id.as_str()) {
+            anyhow::bail!("duplicate profile_hubs id `{}`", hub.id);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,11 +161,11 @@ impl RuntimeConfig {
             model_profile: "default".to_string(),
             tool_output: ToolOutputConfig::default(),
             sandbox: RuntimeSandboxConfig::default_for(data_dir),
-            admin: AdminConfig::default(),
             im: ImConfig::default(),
             shell: ShellConfig::default(),
             acp: AcpConfig::default(),
             telemetry: TelemetryConfig::default(),
+            profile_hubs: Vec::new(),
         }
     }
 
@@ -146,12 +214,6 @@ impl RuntimeConfig {
         set_env_if_absent("REMI_SANDBOX_CONTAINER_DIR", &self.sandbox.container_dir);
         set_env_if_absent("REMI_SANDBOX_IMAGE", &self.sandbox.image);
         set_env_if_absent("REMI_SANDBOX_CONTAINER_NAME", &self.sandbox.container_name);
-        set_env_if_absent(
-            "REMI_ADMIN_ENABLED",
-            if self.admin.enabled { "true" } else { "false" },
-        );
-        set_env_if_absent("REMI_ADMIN_HOST", &self.admin.host);
-        set_env_if_absent("REMI_ADMIN_PORT", &self.admin.port.to_string());
         set_env_if_absent("REMI_IM_MODE", self.im.mode.as_env_value());
         set_env_if_absent("REMI_FEISHU_TRANSPORT", self.im.transport.as_env_value());
         set_env_if_absent("REMI_FEISHU_HOOK_HOST", &self.im.event_hook.host);
@@ -258,12 +320,6 @@ impl RuntimeConfig {
         set_env("REMI_SANDBOX_CONTAINER_DIR", &self.sandbox.container_dir);
         set_env("REMI_SANDBOX_IMAGE", &self.sandbox.image);
         set_env("REMI_SANDBOX_CONTAINER_NAME", &self.sandbox.container_name);
-        set_env(
-            "REMI_ADMIN_ENABLED",
-            if self.admin.enabled { "true" } else { "false" },
-        );
-        set_env("REMI_ADMIN_HOST", &self.admin.host);
-        set_env("REMI_ADMIN_PORT", &self.admin.port.to_string());
         set_env("REMI_IM_MODE", self.im.mode.as_env_value());
         set_env("REMI_FEISHU_TRANSPORT", self.im.transport.as_env_value());
         set_env("REMI_FEISHU_HOOK_HOST", &self.im.event_hook.host);
@@ -476,23 +532,6 @@ fn default_sandbox_image() -> String {
 
 fn default_container_name() -> String {
     "remi-cat-sandbox".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdminConfig {
-    pub enabled: bool,
-    pub host: String,
-    pub port: u16,
-}
-
-impl Default for AdminConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            host: "127.0.0.1".to_string(),
-            port: 8787,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -905,6 +944,7 @@ pub fn load_runtime_config_at(path: &Path, data_dir: &Path) -> Result<Option<Run
             .extract()
             .with_context(|| format!("loading runtime config {}", path.display()))?;
     config.telemetry.validate()?;
+    validate_profile_hubs(&config.profile_hubs)?;
     Ok(Some(config))
 }
 
@@ -946,6 +986,7 @@ pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<P
 
 pub fn write_runtime_config_at(path: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
     config.telemetry.validate()?;
+    validate_profile_hubs(&config.profile_hubs)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -1074,8 +1115,8 @@ fn set_env_json_array(key: &str, values: &[String]) {
 mod tests {
     use super::{
         detect_setup_state, load_runtime_config, resolve_runtime_config_for_run,
-        runtime_config_path, write_runtime_config, AcpClient, AdminConfig, ImMode, RuntimeConfig,
-        RuntimeConfigResolutionSource, SetupState,
+        runtime_config_path, validate_profile_hubs, write_runtime_config, AcpClient, ImMode,
+        RuntimeConfig, RuntimeConfigResolutionSource, SetupState,
     };
     use std::sync::Mutex;
 
@@ -1095,11 +1136,11 @@ mod tests {
                 async_agent: true,
             },
             sandbox: super::RuntimeSandboxConfig::default_for(&dir),
-            admin: AdminConfig::default(),
             im: Default::default(),
             shell: Default::default(),
             acp: Default::default(),
             telemetry: Default::default(),
+            profile_hubs: Default::default(),
         };
         cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
         write_runtime_config(&dir, &cfg).unwrap();
@@ -1119,11 +1160,59 @@ model_profile: default
 
         assert_eq!(cfg.tool_output.overflow_bytes, None);
         assert_eq!(cfg.tool_output.foreground_timeout_ms, None);
-        assert!(!cfg.admin.enabled);
         assert!(cfg.telemetry.enabled);
         assert!(!cfg.telemetry.agent_tracing);
         assert_eq!(cfg.telemetry.agent_trace_sample_rate_percent, 10);
         assert!(!cfg.telemetry.capture_agent_content);
+        assert!(cfg.profile_hubs.is_empty());
+    }
+
+    #[test]
+    fn legacy_admin_config_is_ignored_and_not_serialized() {
+        let raw = r#"
+data_dir: .remi-cat
+root_agent_id: default
+model_profile: default
+admin:
+  enabled: true
+  host: 0.0.0.0
+  port: 8787
+"#;
+        let cfg: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
+        let serialized = serde_yaml::to_string(&cfg).unwrap();
+        assert!(!serialized.contains("admin:"));
+        assert!(!serialized.contains("8787"));
+    }
+
+    #[test]
+    fn profile_hub_config_is_read_only_and_validated() {
+        let raw = r#"
+data_dir: .remi-cat
+root_agent_id: default
+model_profile: default
+profile_hubs:
+  - id: office
+    url: http://hub.lan:8790
+    token_env: OFFICE_PROFILE_HUB_TOKEN
+    request_timeout_ms: 2500
+  - id: home
+    enabled: false
+    url: http://home-hub.lan:8790
+    token_env: HOME_PROFILE_HUB_TOKEN
+"#;
+        let cfg: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
+        validate_profile_hubs(&cfg.profile_hubs).unwrap();
+        assert_eq!(cfg.profile_hubs.len(), 2);
+        assert_eq!(cfg.profile_hubs[0].id, "office");
+        assert_eq!(cfg.profile_hubs[0].url, "http://hub.lan:8790");
+        assert_eq!(cfg.profile_hubs[0].token_env, "OFFICE_PROFILE_HUB_TOKEN");
+
+        let mut invalid = cfg.profile_hubs[0].clone();
+        invalid.url = "http://hub.lan:8790/api/v1".to_string();
+        assert!(invalid.validate().is_err());
+
+        let duplicate = vec![cfg.profile_hubs[0].clone(), cfg.profile_hubs[0].clone()];
+        assert!(validate_profile_hubs(&duplicate).is_err());
     }
 
     #[test]

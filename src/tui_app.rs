@@ -6672,7 +6672,6 @@ mod tests {
             resume_session_id: None,
             once: None,
             pure_prompt: false,
-            admin_only: false,
             channel_id: "desk".to_string(),
             user_id: "u1".to_string(),
             username: "Alice".to_string(),

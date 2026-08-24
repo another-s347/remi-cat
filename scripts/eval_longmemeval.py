@@ -47,7 +47,6 @@ def main() -> int:
 
     env = os.environ.copy()
     env["REMI_DATA_DIR"] = str(run_data_dir)
-    env["REMI_ADMIN_ENABLED"] = "false"
     env["REMI_EVAL_MODE"] = args.mode
     env.setdefault("RUST_LOG", "error")
 
@@ -240,8 +239,6 @@ def patch_runtime_yaml(raw: str, data_dir: Path) -> str:
         stripped = line.strip()
         if stripped.startswith("data_dir:"):
             out.append(f"data_dir: {quote_yaml(str(data_dir))}")
-        elif stripped.startswith("enabled:") and is_under_admin(out):
-            out.append(re.sub(r"enabled:\s+\S+", "enabled: false", line))
         elif stripped.startswith("host_dir:"):
             out.append(re.sub(r"host_dir:\s+.*", f"host_dir: {quote_yaml(str(data_dir))}", line))
         elif stripped.startswith("container_name:"):
@@ -259,14 +256,6 @@ def patch_runtime_yaml(raw: str, data_dir: Path) -> str:
 
 def quote_yaml(value: str) -> str:
     return json.dumps(value)
-
-
-def is_under_admin(lines: list[str]) -> bool:
-    for line in reversed(lines):
-        if not line or line.startswith(" "):
-            continue
-        return line.strip() == "admin:"
-    return False
 
 
 def has_legacy_model_env() -> bool:

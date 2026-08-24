@@ -49,7 +49,7 @@ Use synchronous tool handling instead:
 cargo run -- tui --sync
 ```
 
-Start the default Web Chat and IM runtime:
+Start the configured IM runtime:
 
 ```bash
 cargo run --release

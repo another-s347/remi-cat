@@ -11,10 +11,10 @@ mod command;
 mod config;
 mod core;
 mod external_agent;
-mod host_admin;
 mod instance_profile;
 mod model_input_store;
 mod profile_command;
+mod profile_hub;
 mod profile_instance;
 mod profile_registry;
 mod runtime_config;
@@ -50,7 +50,7 @@ pub use instance_profile::{
 pub use profile_registry::{ProfileRegistry, RegisteredProfile};
 pub use runtime_config::{
     ChannelInstanceConfig, ChannelsConfig, FeishuChannelEventHookConfig, FeishuCredentialRefs,
-    FeishuEventHookRuntimeConfig, FeishuTransport,
+    FeishuEventHookRuntimeConfig, FeishuTransport, ProfileHubConfig,
 };
 pub use session::{ChannelBinding, Session, SubSession, SubSessionKind};
 

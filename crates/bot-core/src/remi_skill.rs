@@ -69,7 +69,7 @@ profile check @travel --strict
 Use an absolute or workspace-relative destination with `profile init`; it writes a manifest and referenced resources there. `profile set` edits only typed manifest fields. Runtime settings use the selected profile:
 
 ```bash
---profile @travel config set admin.enabled=false im.mode=disabled
+--profile @travel config set im.mode=disabled
 --profile @travel sandbox set kind=no_sandbox
 --profile @travel acp setup --client codex
 ```
