@@ -236,9 +236,11 @@ fn collect_event(event: StreamResponse, answer: &mut String, terminal: &mut Opti
         StreamResponse::ArtifactUpdate(update) => append_parts(&update.artifact.parts, answer),
         StreamResponse::Task(task) => {
             *terminal = Some(task.status.state);
-            if let Some(artifacts) = task.artifacts {
-                for artifact in artifacts {
-                    append_parts(&artifact.parts, answer);
+            if answer.is_empty() {
+                if let Some(artifacts) = task.artifacts {
+                    for artifact in artifacts {
+                        append_parts(&artifact.parts, answer);
+                    }
                 }
             }
         }
@@ -280,11 +282,59 @@ pub(crate) async fn ask_profile(
     task: &str,
     named: &str,
     agent_id: Option<&str>,
+    profile_hubs: &[ProfileHubClient],
 ) -> anyhow::Result<String> {
-    if reference.starts_with("hub:") {
-        anyhow::bail!(
-            "REMOTE_AGENT_NOT_IMPLEMENTED: Profile Hub discovery is enabled, but remote A2A invocation is deferred to the next phase"
+    if let Some(remote) = reference.strip_prefix("hub:") {
+        let (hub_id, hub_profile_id) = remote
+            .split_once('/')
+            .filter(|(hub_id, profile_id)| !hub_id.is_empty() && !profile_id.is_empty())
+            .context("invalid Profile Hub reference; expected hub:<hub-id>/<profile-id>")?;
+        let hub = profile_hubs
+            .iter()
+            .find(|hub| hub.id() == hub_id)
+            .with_context(|| format!("Profile Hub `{hub_id}` is not configured"))?;
+        let context_id = stable_context_id(caller_profile_id, reference, named, agent_id);
+        let invocation = "urn:remi:a2a:invocation-context:v1".to_string();
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            invocation.clone(),
+            json!({
+                "callerProfile": caller_profile_id,
+                "targetProfile": reference,
+                "agentId": agent_id,
+                "namedSession": named,
+                "chain": [caller_profile_id, reference],
+            }),
         );
+        let request = SendMessageRequest {
+            message: Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                context_id: Some(context_id),
+                task_id: None,
+                role: Role::User,
+                parts: vec![Part::text(task)],
+                metadata: Some(metadata),
+                extensions: Some(vec![invocation]),
+                reference_task_ids: None,
+            },
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let mut answer = String::new();
+        let mut terminal = None;
+        for event in hub.invoke(hub_profile_id, &request).await? {
+            collect_event(event, &mut answer, &mut terminal);
+        }
+        match terminal {
+            Some(TaskState::Completed) => {}
+            Some(state) => anyhow::bail!("remote external agent task ended in state {state:?}"),
+            None => anyhow::bail!("remote external agent stream ended without terminal state"),
+        }
+        if answer.is_empty() {
+            anyhow::bail!("remote external agent completed without an answer artifact");
+        }
+        return Ok(answer);
     }
     let registry = ProfileRegistry::load(registry_root)?;
     let profile = registry.resolve(reference)?;
@@ -333,6 +383,7 @@ pub(crate) fn external_agent_tools_for(
 ) -> Vec<DynamicTool> {
     let discover_root = registry_root.clone();
     let discover_caller_profile_id = caller_profile_id.clone();
+    let discover_profile_hubs = profile_hubs.clone();
     let discover = DynamicTool::from_parts(
         "external_agent_discover",
         "Discover local registered profiles and online remote profiles from the configured Profile Hub by declared tags and intents.",
@@ -347,7 +398,7 @@ pub(crate) fn external_agent_tools_for(
         move |arguments, _resume, _ctx| {
             let registry_root = discover_root.clone();
             let caller_profile_id = discover_caller_profile_id.clone();
-            let profile_hubs = profile_hubs.clone();
+            let profile_hubs = discover_profile_hubs.clone();
             async move {
                 let tags = string_array(&arguments, "tags");
                 let intents = string_array(&arguments, "intents");
@@ -370,11 +421,11 @@ pub(crate) fn external_agent_tools_for(
 
     let ask = DynamicTool::from_parts(
         "external_agent_ask",
-        "Start a registered local external agent on demand and communicate with it using A2A over stdio.",
+        "Communicate with a discovered local or Profile Hub external agent over A2A.",
         json!({
             "type": "object",
             "properties": {
-                "profile": {"type": "string", "description": "Local registered profile reference such as @travel. hub:<hub-id>/<profile-id> references are discoverable but not invokable in this phase."},
+                "profile": {"type": "string", "description": "A local registered profile such as @travel or a discovered hub:<hub-id>/<profile-id> reference."},
                 "task": {"type": "string"},
                 "named": {"type": "string", "default": "default"},
                 "agent_id": {"type": "string"}
@@ -385,6 +436,7 @@ pub(crate) fn external_agent_tools_for(
         move |arguments, _resume, _ctx| {
             let registry_root = registry_root.clone();
             let caller_profile_id = caller_profile_id.clone();
+            let profile_hubs = profile_hubs.clone();
             async move {
                 let reference = required_string(&arguments, "profile")?;
                 let task = required_string(&arguments, "task")?;
@@ -404,6 +456,7 @@ pub(crate) fn external_agent_tools_for(
                     &task,
                     &named,
                     agent_id.as_deref(),
+                    &profile_hubs,
                 )
                 .await
                 .map_err(|error| AgentError::tool("external-agent", error.to_string()))?;
@@ -616,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_reference_is_rejected_before_local_resolution() {
+    async fn hub_reference_requires_configured_hub() {
         let registry_root = tempfile::tempdir().unwrap();
         let error = ask_profile(
             registry_root.path(),
@@ -625,15 +678,18 @@ mod tests {
             "delegate this",
             "default",
             None,
+            &[],
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("REMOTE_AGENT_NOT_IMPLEMENTED"));
+        assert!(error
+            .to_string()
+            .contains("Profile Hub `office` is not configured"));
     }
 
     #[tokio::test]
     async fn live_profile_hubs_from_env() {
-        let Ok(entries) = std::env::var("REMI_PROFILE_HUB_E2E_ENDPOINTS") else {
+        let Ok(config_path) = std::env::var("REMI_PROFILE_HUB_E2E_RUNTIME_CONFIG") else {
             return;
         };
         let expected = std::env::var("REMI_PROFILE_HUB_E2E_EXPECT_REFERENCES")
@@ -642,23 +698,14 @@ mod tests {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let clients = entries
-            .split(',')
-            .map(|entry| {
-                let (id, url) = entry.split_once('=').expect("expected hub-id=url");
-                crate::profile_hub::ProfileHubClient::from_config(
-                    &crate::runtime_config::ProfileHubConfig {
-                        id: id.to_string(),
-                        enabled: true,
-                        url: url.to_string(),
-                        token_env: "REMI_PROFILE_HUB_E2E_TOKEN".to_string(),
-                        request_timeout_ms: 1_000,
-                    },
-                )
-                .unwrap()
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let config_path = std::path::PathBuf::from(config_path);
+        let data_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let config = crate::runtime_config::load_runtime_config_at(&config_path, data_dir)
+            .unwrap()
+            .expect("E2E runtime config exists");
+        let clients = crate::profile_hub::clients_from_runtime(&config, &config_path).unwrap();
         let registry_root = tempfile::tempdir().unwrap();
         let profile_root = tempfile::tempdir().unwrap();
         let manifest = profile_root.path().join("profile.yaml");
@@ -729,6 +776,7 @@ mod tests {
             "delegate this",
             "default",
             None,
+            &[],
         )
         .await
         .unwrap_err();

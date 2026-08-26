@@ -26,6 +26,7 @@ mod tui_form;
 mod tui_markdown;
 mod tui_text;
 mod tui_theme;
+mod weaver_http;
 mod web_chat;
 mod workspace_files;
 
@@ -50,7 +51,7 @@ pub use instance_profile::{
 pub use profile_registry::{ProfileRegistry, RegisteredProfile};
 pub use runtime_config::{
     ChannelInstanceConfig, ChannelsConfig, FeishuChannelEventHookConfig, FeishuCredentialRefs,
-    FeishuEventHookRuntimeConfig, FeishuTransport, ProfileHubConfig,
+    FeishuEventHookRuntimeConfig, FeishuTransport, ProfileHubConfig, WeaverNetworkConfig,
 };
 pub use session::{ChannelBinding, Session, SubSession, SubSessionKind};
 

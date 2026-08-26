@@ -49,7 +49,7 @@ HTTP/SSE subagent matrix. Its release gate is:
 | Cross-process named context | A second call with `trip-001`, after the first B process exits, recalls and returns `A_TO_B_OK`. |
 | Model tool chain | A calls `external_agent_discover`, selects `@travel`, then calls `external_agent_ask`; the real B response is `DISCOVER_THEN_ASK_OK`. |
 | Child cleanup | No `remi-cat` process remains after the call completes. |
-| Remote reservation | Asking a valid remote endpoint fails locally with `REMOTE_AGENT_NOT_IMPLEMENTED`; no network request is attempted. |
+| Direct remote-manifest reservation | Asking a direct `endpoint.type: remote` profile fails locally with `REMOTE_AGENT_NOT_IMPLEMENTED`; Profile Hub references use the Weaver-backed A2A proxy path. |
 
 The dotenv or keyring source is process-level. A local child receives the
 absolute `REMI_SECRET_DOTENV_PATH` or the shared keyring configuration rather

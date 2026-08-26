@@ -32,7 +32,58 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
+    pub weaver_networks: Vec<WeaverNetworkConfig>,
+    #[serde(default)]
     pub profile_hubs: Vec<ProfileHubConfig>,
+}
+
+/// One already-provisioned Weaver membership shared by any number of Hub entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WeaverNetworkConfig {
+    pub id: String,
+    pub data_dir: String,
+    pub master_key_file: String,
+    pub root_public_key: String,
+    pub app_addr: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub relay_only: bool,
+}
+
+impl Default for WeaverNetworkConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            data_dir: String::new(),
+            master_key_file: String::new(),
+            root_public_key: String::new(),
+            app_addr: String::new(),
+            device_id: String::new(),
+            relay_only: false,
+        }
+    }
+}
+
+impl WeaverNetworkConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_named_id("weaver_networks", &self.id)?;
+        if self.data_dir.trim().is_empty() || self.master_key_file.trim().is_empty() {
+            anyhow::bail!("weaver_networks[].data_dir and master_key_file must not be empty");
+        }
+        let root = hex::decode(&self.root_public_key)
+            .context("weaver_networks[].root_public_key must be hexadecimal")?;
+        if root.len() != 32 {
+            anyhow::bail!("weaver_networks[].root_public_key must contain exactly 32 bytes");
+        }
+        self.app_addr
+            .parse::<weaver_core::AppAddr>()
+            .context("weaver_networks[].app_addr is invalid")?;
+        self.device_id
+            .parse::<weaver_core::DeviceId>()
+            .context("weaver_networks[].device_id is invalid")?;
+        Ok(())
+    }
 }
 
 /// Read-only access to one named Profile Hub used by this runtime.
@@ -46,6 +97,7 @@ pub struct ProfileHubConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub url: String,
+    pub weaver_network: String,
     pub token_env: String,
     pub request_timeout_ms: u64,
 }
@@ -56,6 +108,7 @@ impl Default for ProfileHubConfig {
             id: String::new(),
             enabled: true,
             url: String::new(),
+            weaver_network: String::new(),
             token_env: "REMI_PROFILE_HUB_TOKEN".to_string(),
             request_timeout_ms: 5_000,
         }
@@ -64,23 +117,25 @@ impl Default for ProfileHubConfig {
 
 impl ProfileHubConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_empty()
-            || !self
-                .id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-        {
-            anyhow::bail!("invalid profile_hubs id `{}`", self.id);
-        }
+        validate_named_id("profile_hubs", &self.id)?;
         if !self.enabled {
             return Ok(());
         }
         let url = reqwest::Url::parse(&self.url).context("profile_hubs[].url is invalid")?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            anyhow::bail!("profile_hubs[].url must be an absolute http or https URL");
+        if url.scheme() != "http" || url.host_str().is_none() {
+            anyhow::bail!("profile_hubs[].url must be an absolute http URL");
         }
         if !url.path().is_empty() && url.path() != "/" {
             anyhow::bail!("profile_hubs[].url must not contain a path");
+        }
+        if url.port().is_some() {
+            anyhow::bail!("profile_hubs[].url must not contain a TCP port");
+        }
+        let host = url.host_str().unwrap_or_default();
+        host.parse::<weaver_core::VirtualName>()
+            .context("profile_hubs[].url host must be a lowercase .virtual name")?;
+        if self.weaver_network.trim().is_empty() {
+            anyhow::bail!("profile_hubs[].weaver_network must not be empty");
         }
         if self.token_env.trim().is_empty() {
             anyhow::bail!("profile_hubs[].token_env must not be empty");
@@ -92,12 +147,52 @@ impl ProfileHubConfig {
     }
 }
 
+fn validate_named_id(kind: &str, id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        anyhow::bail!("invalid {kind} id `{id}`");
+    }
+    Ok(())
+}
+
+fn validate_weaver_networks(networks: &[WeaverNetworkConfig]) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    for network in networks {
+        network.validate()?;
+        if !ids.insert(network.id.as_str()) {
+            anyhow::bail!("duplicate weaver_networks id `{}`", network.id);
+        }
+    }
+    Ok(())
+}
+
 fn validate_profile_hubs(hubs: &[ProfileHubConfig]) -> Result<()> {
     let mut ids = std::collections::HashSet::new();
     for hub in hubs {
         hub.validate()?;
         if !ids.insert(hub.id.as_str()) {
             anyhow::bail!("duplicate profile_hubs id `{}`", hub.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_profile_hub_network_refs(config: &RuntimeConfig) -> Result<()> {
+    let network_ids = config
+        .weaver_networks
+        .iter()
+        .map(|network| network.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for hub in config.profile_hubs.iter().filter(|hub| hub.enabled) {
+        if !network_ids.contains(hub.weaver_network.as_str()) {
+            anyhow::bail!(
+                "profile_hubs `{}` references unknown Weaver network `{}`",
+                hub.id,
+                hub.weaver_network
+            );
         }
     }
     Ok(())
@@ -165,6 +260,7 @@ impl RuntimeConfig {
             shell: ShellConfig::default(),
             acp: AcpConfig::default(),
             telemetry: TelemetryConfig::default(),
+            weaver_networks: Vec::new(),
             profile_hubs: Vec::new(),
         }
     }
@@ -944,7 +1040,9 @@ pub fn load_runtime_config_at(path: &Path, data_dir: &Path) -> Result<Option<Run
             .extract()
             .with_context(|| format!("loading runtime config {}", path.display()))?;
     config.telemetry.validate()?;
+    validate_weaver_networks(&config.weaver_networks)?;
     validate_profile_hubs(&config.profile_hubs)?;
+    validate_profile_hub_network_refs(&config)?;
     Ok(Some(config))
 }
 
@@ -986,7 +1084,9 @@ pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<P
 
 pub fn write_runtime_config_at(path: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
     config.telemetry.validate()?;
+    validate_weaver_networks(&config.weaver_networks)?;
     validate_profile_hubs(&config.profile_hubs)?;
+    validate_profile_hub_network_refs(config)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -1115,8 +1215,8 @@ fn set_env_json_array(key: &str, values: &[String]) {
 mod tests {
     use super::{
         detect_setup_state, load_runtime_config, resolve_runtime_config_for_run,
-        runtime_config_path, validate_profile_hubs, write_runtime_config, AcpClient, ImMode,
-        RuntimeConfig, RuntimeConfigResolutionSource, SetupState,
+        runtime_config_path, validate_profile_hubs, validate_weaver_networks, write_runtime_config,
+        AcpClient, ImMode, RuntimeConfig, RuntimeConfigResolutionSource, SetupState,
     };
     use std::sync::Mutex;
 
@@ -1140,6 +1240,7 @@ mod tests {
             shell: Default::default(),
             acp: Default::default(),
             telemetry: Default::default(),
+            weaver_networks: Default::default(),
             profile_hubs: Default::default(),
         };
         cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
@@ -1164,6 +1265,7 @@ model_profile: default
         assert!(!cfg.telemetry.agent_tracing);
         assert_eq!(cfg.telemetry.agent_trace_sample_rate_percent, 10);
         assert!(!cfg.telemetry.capture_agent_content);
+        assert!(cfg.weaver_networks.is_empty());
         assert!(cfg.profile_hubs.is_empty());
     }
 
@@ -1190,25 +1292,35 @@ admin:
 data_dir: .remi-cat
 root_agent_id: default
 model_profile: default
+weaver_networks:
+  - id: office-net
+    data_dir: weaver/office
+    master_key_file: secrets/office.key
+    root_public_key: "0000000000000000000000000000000000000000000000000000000000000000"
+    app_addr: "1111111111111111111111111111111111111111111111111111111111111111"
+    device_id: "2222222222222222222222222222222222222222222222222222222222222222"
 profile_hubs:
   - id: office
-    url: http://hub.lan:8790
+    url: http://office-hub.virtual
+    weaver_network: office-net
     token_env: OFFICE_PROFILE_HUB_TOKEN
     request_timeout_ms: 2500
   - id: home
     enabled: false
-    url: http://home-hub.lan:8790
+    url: http://home-hub.virtual
     token_env: HOME_PROFILE_HUB_TOKEN
 "#;
         let cfg: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
+        validate_weaver_networks(&cfg.weaver_networks).unwrap();
         validate_profile_hubs(&cfg.profile_hubs).unwrap();
         assert_eq!(cfg.profile_hubs.len(), 2);
         assert_eq!(cfg.profile_hubs[0].id, "office");
-        assert_eq!(cfg.profile_hubs[0].url, "http://hub.lan:8790");
+        assert_eq!(cfg.profile_hubs[0].url, "http://office-hub.virtual");
+        assert_eq!(cfg.profile_hubs[0].weaver_network, "office-net");
         assert_eq!(cfg.profile_hubs[0].token_env, "OFFICE_PROFILE_HUB_TOKEN");
 
         let mut invalid = cfg.profile_hubs[0].clone();
-        invalid.url = "http://hub.lan:8790/api/v1".to_string();
+        invalid.url = "http://office-hub.virtual/api/v1".to_string();
         assert!(invalid.validate().is_err());
 
         let duplicate = vec![cfg.profile_hubs[0].clone(), cfg.profile_hubs[0].clone()];

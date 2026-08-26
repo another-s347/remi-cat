@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.36"
+version = "0.2.37"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -48,6 +48,7 @@ anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dotenvy = "0.15"
@@ -55,6 +56,11 @@ figment = { version = "0.10", features = ["yaml"] }
 flate2 = "1"
 futures = "0.3"
 git2 = "0.21"
+hex = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 notify = "8.2"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
@@ -86,7 +92,13 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+weaver-core = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
+weaver-crypto = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
+weaver-net = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
+weaver-store = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
 zip = { version = "4", default-features = false, features = ["deflate"] }
+zeroize = "1"
+tower = "0.5"
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

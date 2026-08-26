@@ -208,7 +208,7 @@ Registering a local profile is the execution trust boundary. Both tools are low-
 
 The caller passes a stable named conversation key so repeated A-to-B requests map to the same A2A context and the target's cross-session state. A child receives `REMI_PROFILE_*` identity, resolved resource/state paths, `REMI_PROFILE_REGISTRY_ROOT`, and the same process-level secret backend or absolute dotenv source, so it can discover and call another local profile in turn without introducing profile-scoped credentials.
 
-The stdio binding uses a four-byte big-endian payload length followed by an A2A JSON message. Agent Card, streaming message, cancellation, and shutdown operations are represented explicitly. Remote endpoint transport and authentication remain protocol reservations and currently return `REMOTE_AGENT_NOT_IMPLEMENTED`.
+The stdio binding uses a four-byte big-endian payload length followed by an A2A JSON message. Agent Card, streaming message, cancellation, and shutdown operations are represented explicitly. Direct `endpoint.type: remote` manifests remain protocol reservations and currently return `REMOTE_AGENT_NOT_IMPLEMENTED`; remotely discovered Profile Hub references use the authenticated Weaver transport described below.
 
 ## Embedded application API
 
@@ -225,28 +225,57 @@ read-only discovery. Configure the selected application's `runtime.yaml`:
 profile_hubs:
   - id: office
     enabled: true
-    url: http://office-profile-hub.lan:8790
+    url: http://office-profile-hub.virtual
+    weaver_network: office
     token_env: OFFICE_PROFILE_HUB_TOKEN
     request_timeout_ms: 5000
   - id: home
     enabled: true
-    url: http://home-profile-hub.lan:8790
+    url: http://home-profile-hub.virtual
+    weaver_network: home
     token_env: HOME_PROFILE_HUB_TOKEN
     request_timeout_ms: 5000
 ```
 
+Each Hub references one already-provisioned Weaver membership. Multiple Hubs
+may share a membership and its single live `NetworkHandle`; Hubs on different
+Weaver networks remain cryptographically isolated:
+
+```yaml
+weaver_networks:
+  - id: office
+    data_dir: weaver/office
+    master_key_file: secrets/office.member-key
+    root_public_key: <64 lowercase hex characters>
+    app_addr: <client AppAddr from the signed application binding>
+    device_id: <DeviceId from the signed client binding>
+    relay_only: false
+```
+
+Relative paths are resolved from `runtime.yaml`. Provision the membership and
+application binding with `weaver-cli prepare-join`, `join`, `app-prepare`, and
+`app-bind`; Remi Cat only opens the resulting membership and never creates or
+modifies the virtual network.
+
+Set `relay_only: true` for diagnostics or deployments that must disable direct
+IP/LAN candidates and force all Weaver traffic through the signed relay.
+
 Token values stay in the existing environment or secret store. Each URL is a
 logical Hub entrypoint, regardless of whether that service is standalone,
 primary, or a manually configured replica. IDs must be unique within the
-runtime and URLs must be absolute HTTP(S) origins without paths. Connections
+runtime and URLs must be absolute, port-free `http://*.virtual` origins without
+paths. Names resolve only through the selected Weaver network's signed Virtual
+DNS zone and are never sent to system DNS. Connections
 are queried concurrently; a failed Hub does not suppress results from healthy
 Hubs or the local registry, while failure of every configured Hub is reported.
 
 `external_agent_discover` merges matching local registry entries with online
 Hub profiles. Remote results use opaque
 `hub:<hub-id>/<hub_profile_id>` references and include their Hub ID, device ID,
-and `source: profile_hub`. Remote A2A invocation is not enabled in this phase;
-passing a Hub reference to `external_agent_ask` returns
-`REMOTE_AGENT_NOT_IMPLEMENTED` rather than falling back to a local profile.
+and `source: profile_hub`. Passing one of these references to
+`external_agent_ask` or `remi-cat profile ask` fetches its Agent Card through
+the selected Hub and proxies the streaming A2A conversation through the same
+authenticated Weaver network. Direct remote manifest endpoints remain
+unsupported and never receive fallback local execution.
 
 `serve_application_a2a_stdio(handle)` serves an embedded application through the framed stdio binding. Both HTTP and stdio A2A Agent Cards are generated from the handle descriptor, so embedded and CLI-started applications publish the same profile identity.

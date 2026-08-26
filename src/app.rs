@@ -126,14 +126,7 @@ fn load_profile_hub_clients(
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_config_path.to_path_buf());
     Ok(match load_runtime_config_at(&config_path, data_dir)? {
-        Some(config) => config
-            .profile_hubs
-            .iter()
-            .map(crate::profile_hub::ProfileHubClient::from_config)
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect(),
+        Some(config) => crate::profile_hub::clients_from_runtime(&config, &config_path)?,
         None => Vec::new(),
     })
 }
@@ -154,6 +147,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let tui_mode = matches!(&command, AppCommand::Run(cli) if cli.tui);
     let acp_agent_mode = matches!(&command, AppCommand::Acp(AcpCommand::Agent));
     let a2a_stdio_mode = matches!(&command, AppCommand::A2a(crate::cli::A2aCommand::Stdio));
+    let explicit_runtime_config = std::env::var_os("REMI_RUNTIME_CONFIG").map(PathBuf::from);
     let explicit_data_dir = if tui_mode {
         None
     } else if acp_agent_mode {
@@ -169,6 +163,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         acp_agent_mode,
     )?;
     selected_profile.apply_resource_env();
+    if let Some(path) = explicit_runtime_config {
+        unsafe { std::env::set_var("REMI_RUNTIME_CONFIG", path) };
+    }
     if selected_profile.label() == DIAGNOSTIC_PROFILE_NAME {
         ensure_builtin_diagnostic_profile()?;
     }
@@ -274,10 +271,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     );
 
     if let AppCommand::Profile(profile_command) = &command {
+        let profile_hub_clients =
+            if matches!(profile_command, crate::profile_command::ProfileCommand::Ask { .. }) {
+            load_profile_hub_clients(&selected_profile.runtime_config, &data_dir)?
+            } else {
+                Vec::new()
+            };
         run_profile_command(
             profile_command,
             &profile_registry_root,
             &selected_profile,
+            &profile_hub_clients,
         )
         .await?;
         return Ok(());

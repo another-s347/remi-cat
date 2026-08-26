@@ -682,7 +682,7 @@ enum ProfileCliCommand {
     Set(ProfileSetArgs),
     #[command(about = "Remove one optional manifest field")]
     Unset(ProfileUnsetArgs),
-    #[command(about = "Start a local profile on demand and ask it through A2A")]
+    #[command(about = "Ask a local or Profile Hub profile through A2A")]
     Ask(ProfileAskArgs),
     #[command(about = "Start a persistent managed runtime instance for a profile")]
     Start(ProfileLaunchArgs),

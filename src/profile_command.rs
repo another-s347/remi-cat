@@ -215,6 +215,7 @@ pub async fn run_profile_command(
     command: &ProfileCommand,
     data_root: &Path,
     current: &InstanceProfile,
+    profile_hubs: &[crate::profile_hub::ProfileHubClient],
 ) -> anyhow::Result<()> {
     let mut registry = ProfileRegistry::load(data_root)?;
     match command {
@@ -318,6 +319,7 @@ pub async fn run_profile_command(
                 task,
                 named,
                 agent_id.as_deref(),
+                profile_hubs,
             )
             .await?;
             println!("{answer}");
