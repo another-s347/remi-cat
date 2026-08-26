@@ -40,16 +40,16 @@ multiple tasks.
 
 ## Configuration
 
-- `REMI_A2A_ENABLED`: enable the inbound server explicitly. The loopback
-  server also starts automatically when the active agent catalog contains a
-  delegate because subagents are A2A-only.
+- `REMI_A2A_ENABLED`: enable the inbound server explicitly. Managed local
+  delegates use the in-process A2A transport and do not start a listener.
 - `REMI_A2A_HOST`: listen host; defaults to `127.0.0.1`.
 - `REMI_A2A_PORT`: listen port; defaults to `8788`.
 - `REMI_A2A_PUBLIC_URL`: externally visible base URL advertised by the Agent
   Card; defaults to the listen URL.
 - `REMI_A2A_TOKEN`: optional bearer token. A non-loopback listener is rejected
   when this is empty.
-- `REMI_A2A_DELEGATE_URL`: optional global outbound delegate endpoint.
+- `REMI_A2A_DELEGATE_URL`: optional global outbound delegate endpoint. Setting
+  it selects HTTP instead of the in-process transport.
 - `REMI_A2A_DELEGATE_ENDPOINTS`: optional JSON map from delegate ID to a remote
   endpoint and token environment-variable reference.
 

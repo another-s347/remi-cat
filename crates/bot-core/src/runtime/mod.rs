@@ -3945,6 +3945,7 @@ struct LocalToolDeps {
     overflow_bytes: usize,
     acp_client_tools: Option<(acp::AcpClientToolProvider, acp::AcpClientToolSupport)>,
     host_tools: Vec<bot_runtime_core::DynamicTool>,
+    a2a_delegate_transport: Option<Arc<dyn crate::A2aDelegateTransport>>,
 }
 
 impl LocalToolDeps {
@@ -4016,6 +4017,7 @@ impl LocalToolDeps {
             overflow_bytes: self.overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
             host_tools: self.host_tools.clone(),
+            a2a_delegate_transport: self.a2a_delegate_transport.clone(),
         }
     }
 
@@ -4093,6 +4095,7 @@ pub struct CatBotBuilder {
     hook_manager: Option<Arc<HookManager>>,
     api_keys: Option<Arc<std::collections::BTreeMap<String, String>>>,
     agent_tracing: AgentTracingOptions,
+    a2a_delegate_transport: Option<Arc<dyn crate::A2aDelegateTransport>>,
 }
 
 impl CatBotBuilder {
@@ -4166,6 +4169,7 @@ impl CatBotBuilder {
                 enabled: env_flag("REMI_SENTRY_AGENT_TRACING"),
                 capture_content: env_flag("REMI_SENTRY_CAPTURE_AGENT_CONTENT"),
             },
+            a2a_delegate_transport: None,
         };
         let agent_id = std::env::var("REMI_AGENT_ID").unwrap_or_else(|_| DEFAULT_AGENT_ID.into());
         let agents_dir = std::env::var("REMI_AGENTS_DIR")
@@ -4282,6 +4286,7 @@ impl CatBotBuilder {
             hook_manager: None,
             api_keys: api_keys.map(|values| Arc::new(values.clone())),
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
         })
     }
 
@@ -4304,6 +4309,14 @@ impl CatBotBuilder {
 
     pub fn memory_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.memory_dir = dir.into();
+        self
+    }
+
+    pub fn a2a_delegate_transport(
+        mut self,
+        transport: Arc<dyn crate::A2aDelegateTransport>,
+    ) -> Self {
+        self.a2a_delegate_transport = Some(transport);
         self
     }
 
@@ -4626,6 +4639,7 @@ impl CatBotBuilder {
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
             host_tools: self.host_tools.clone(),
+            a2a_delegate_transport: self.a2a_delegate_transport.clone(),
         };
         let mut acp_local_tools = DefaultToolRegistry::new();
         skill::register_skill_tools(&mut acp_local_tools, Arc::clone(&skill_store));
@@ -4693,6 +4707,7 @@ impl CatBotBuilder {
             overflow_bytes,
             acp_client_tools: self.acp_client_tools.clone(),
             host_tools: self.host_tools.clone(),
+            a2a_delegate_transport: self.a2a_delegate_transport.clone(),
         };
         tool_deps.validate_host_tools(true)?;
         for tool in &self.host_tools {
@@ -4841,6 +4856,7 @@ impl CatBotBuilder {
                 overflow_bytes,
                 acp_client_tools: self.acp_client_tools.clone(),
                 host_tools: self.host_tools.clone(),
+                a2a_delegate_transport: self.a2a_delegate_transport.clone(),
             };
             agent_tool_deps.validate_host_tools(true)?;
             let agent_static_tools = Arc::new(agent_tool_deps.build_static_tools(true));
@@ -5124,6 +5140,7 @@ struct RemiSubAgentTool {
     hook_manager: Arc<HookManager>,
     workspace_root: PathBuf,
     model_name: String,
+    a2a_delegate_transport: Option<Arc<dyn crate::A2aDelegateTransport>>,
 }
 
 #[derive(Default)]
@@ -5262,8 +5279,11 @@ impl RemiSubAgentTool {
         title: Option<String>,
         ctx: ToolContext,
     ) -> Result<ToolResult<remi_agentloop::tool::BoxedToolStream>, AgentError> {
-        let client = crate::a2a_delegate::A2aDelegateClient::from_env(&self.agent_name)
-            .map_err(|error| AgentError::tool("sub-agent", error))?;
+        let client = crate::a2a_delegate::A2aDelegateClient::from_env(
+            &self.agent_name,
+            self.a2a_delegate_transport.clone(),
+        )
+        .map_err(|error| AgentError::tool("sub-agent", error))?;
         let agent_name = self.agent_name.clone();
         let sub_thread_id = ThreadId(format!("subagent:{agent_name}:{named}"));
         let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
@@ -5914,6 +5934,7 @@ fn register_delegate_agent_tools(
             hook_manager: Arc::clone(&deps.hook_manager),
             workspace_root: deps.workspace_root.clone(),
             model_name,
+            a2a_delegate_transport: deps.a2a_delegate_transport.clone(),
         });
     }
 }
@@ -6086,6 +6107,7 @@ mod tests {
                 "test".to_string(),
             )]))),
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -6232,6 +6254,7 @@ mod tests {
                         let bot = CatBotBuilder {
                             api_keys: None,
                             agent_tracing: AgentTracingOptions::enabled(false),
+                            a2a_delegate_transport: None,
                             api_key: "test".to_string(),
                             model_profile,
                             runtime_model_locked: false,
@@ -6629,6 +6652,7 @@ mod tests {
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -6690,6 +6714,7 @@ mod tests {
             CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile: test_model_profile(),
                 runtime_model_locked: false,
@@ -6799,6 +6824,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -7270,6 +7296,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7355,6 +7382,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7450,6 +7478,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7572,6 +7601,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -7777,6 +7807,7 @@ You are Remi.
         let builder = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -7833,6 +7864,7 @@ You are Remi.
         let builder = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile: ModelProfileConfig {
                 id: "deepseek-v4-flash".to_string(),
@@ -7899,6 +7931,7 @@ You are Remi.
         let builder = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile: test_model_profile(),
             runtime_model_locked: false,
@@ -8164,6 +8197,7 @@ You are Remi.
             let bot = CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -8252,6 +8286,7 @@ You are Remi.
             let bot = CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -8390,6 +8425,7 @@ You are Remi.
         let bot = CatBotBuilder {
             api_keys: None,
             agent_tracing: AgentTracingOptions::default(),
+            a2a_delegate_transport: None,
             api_key: "test".to_string(),
             model_profile,
             runtime_model_locked: false,
@@ -8518,6 +8554,7 @@ You are Remi.
             let bot = CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile,
                 runtime_model_locked: false,
@@ -8663,6 +8700,7 @@ You are Remi.
             let bot = CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,
@@ -8746,6 +8784,7 @@ You are Remi.
             let bot = CatBotBuilder {
                 api_keys: None,
                 agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
                 api_key: "test".to_string(),
                 model_profile: profile,
                 runtime_model_locked: false,

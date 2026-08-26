@@ -4,13 +4,13 @@
 
 Keep the model-facing `agent__<delegate>` tool contract and the existing
 `SubSessionEvent` UI contract, but replace the execution and control path
-behind them with A2A. There is no local/in-process subagent backend, fallback,
-or long-lived dual-stack mode after this change.
+behind them with A2A. Managed local delegates use an in-process memory
+transport; explicitly configured remote delegates use HTTP.
 
 Every delegate is an A2A agent. A managed local delegate is addressed through
-the current remi-cat A2A service with an explicit agent-profile extension; a
-remote delegate is addressed through its configured Agent Card. Both paths use
-the A2A wire protocol and identical task semantics. The parent runtime never
+the current Application executor without opening a socket; a remote delegate
+is addressed through its configured Agent Card. Both paths use the same A2A
+messages, task states, activity artifacts, and control semantics. The parent runtime never
 constructs a delegate `AgentBuilder` or drives a delegate loop directly.
 
 The replacement lands atomically: the A2A implementation must pass the parity
@@ -119,7 +119,7 @@ must not silently reuse an old context.
 ## Delegate configuration
 
 Keep the existing agent-profile string syntax, but change its meaning to a
-managed local A2A delegate. Remote endpoint selection is host configuration,
+managed local in-memory A2A delegate. Remote endpoint selection is host configuration,
 not model-visible agent-profile data:
 
 ```json
@@ -131,8 +131,8 @@ not model-visible agent-profile data:
 }
 ```
 
-Legacy strings resolve to the current profile's A2A endpoint plus the delegate
-agent ID; they never select an in-process executor. Tokens are secret
+Legacy strings resolve to the current Application's in-process A2A transport
+plus the delegate agent ID. Tokens are secret
 references, never serialized token values. The JSON is supplied through
 `REMI_A2A_DELEGATE_ENDPOINTS`; the global `REMI_A2A_DELEGATE_URL` remains a
 single-endpoint override for test and embedded deployments. Tool

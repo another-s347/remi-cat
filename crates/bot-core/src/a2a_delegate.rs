@@ -4,6 +4,7 @@ use a2a::{Message, Part, PartContent, Role, SendMessageRequest, StreamResponse, 
 use futures::{StreamExt, TryStreamExt};
 use remi_agentloop::prelude::CancellationToken;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 pub(crate) const ACTIVITY_ARTIFACT_ID: &str = "remi-activity";
 pub(crate) const ACTIVITY_EXTENSION: &str = "urn:remi:a2a:activity-stream:v1";
@@ -12,7 +13,7 @@ pub(crate) const HANDOFF_EXTENSION: &str = "urn:remi:a2a:handoff:v1";
 pub(crate) const INVOCATION_EXTENSION: &str = "urn:remi:a2a:invocation-context:v1";
 
 #[derive(Debug)]
-pub(crate) enum DelegateWireEvent {
+pub enum DelegateWireEvent {
     TaskAssigned {
         task_id: String,
         context_id: String,
@@ -24,11 +25,34 @@ pub(crate) enum DelegateWireEvent {
     },
 }
 
+#[async_trait::async_trait]
+pub trait A2aDelegateTransport: Send + Sync {
+    async fn invoke(
+        &self,
+        request: SendMessageRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamResponse, String>>, String>;
+    async fn cancel(&self, task_id: &str) -> Result<(), String>;
+    async fn steer(&self, task_id: &str, content: bot_runtime_core::Content) -> Result<(), String>;
+    async fn decide_approval(
+        &self,
+        task_id: &str,
+        approval_id: &str,
+        decision: crate::ToolApprovalDecision,
+    ) -> Result<(), String>;
+    async fn answer_question(
+        &self,
+        task_id: &str,
+        question_id: &str,
+        response: crate::UserQuestionResponse,
+    ) -> Result<(), String>;
+}
+
 #[derive(Clone)]
 pub(crate) struct A2aDelegateClient {
     client: reqwest::Client,
     endpoint: String,
     token: Option<String>,
+    memory: Option<std::sync::Arc<dyn A2aDelegateTransport>>,
 }
 
 impl A2aDelegateClient {
@@ -38,10 +62,14 @@ impl A2aDelegateClient {
             client: reqwest::Client::new(),
             endpoint,
             token: None,
+            memory: None,
         }
     }
 
-    pub(crate) fn from_env(agent_id: &str) -> Result<Self, String> {
+    pub(crate) fn from_env(
+        agent_id: &str,
+        memory: Option<std::sync::Arc<dyn A2aDelegateTransport>>,
+    ) -> Result<Self, String> {
         let configured = std::env::var("REMI_A2A_DELEGATE_ENDPOINTS")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -59,12 +87,22 @@ impl A2aDelegateClient {
                     .map(str::to_string)
             })
         });
-        let endpoint = configured_endpoint
-            .or_else(|| {
-                std::env::var("REMI_A2A_DELEGATE_URL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
+        let explicit_endpoint = configured_endpoint.or_else(|| {
+            std::env::var("REMI_A2A_DELEGATE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+        if explicit_endpoint.is_none() {
+            if let Some(memory) = memory {
+                return Ok(Self {
+                    client: reqwest::Client::new(),
+                    endpoint: "memory://local-application".to_string(),
+                    token: None,
+                    memory: Some(memory),
+                });
+            }
+        }
+        let endpoint = explicit_endpoint
             .or_else(|| std::env::var("REMI_A2A_PUBLIC_URL").ok())
             .unwrap_or_else(|| {
                 let host =
@@ -98,6 +136,7 @@ impl A2aDelegateClient {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token,
+            memory: None,
         })
     }
 
@@ -144,7 +183,6 @@ impl A2aDelegateClient {
     where
         F: FnMut(DelegateWireEvent) -> Result<(), String>,
     {
-        self.discover().await?;
         let context_id = uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_URL,
             format!("remi:a2a:subsession:{sub_session_id}").as_bytes(),
@@ -177,6 +215,26 @@ impl A2aDelegateClient {
             metadata: None,
             tenant: None,
         };
+        if let Some(memory) = &self.memory {
+            let mut responses = memory.invoke(request).await?;
+            let mut task_id = None;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if let Some(task_id) = task_id.as_deref() {
+                            memory.cancel(task_id).await?;
+                        }
+                        return Err("A2A delegate task canceled".to_string());
+                    }
+                    response = responses.recv() => {
+                        let Some(response) = response else { break; };
+                        emit_stream_response(response?, &mut task_id, &mut emit)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.discover().await?;
         let mut builder = self
             .client
             .post(format!("{}/message:stream", self.endpoint))
@@ -229,57 +287,7 @@ impl A2aDelegateClient {
                         for line in frame.lines().filter_map(|line| line.strip_prefix("data:")) {
                             let response: StreamResponse = serde_json::from_str(line.trim())
                                 .map_err(|error| format!("invalid A2A stream event: {error}"))?;
-                            match response {
-                                StreamResponse::StatusUpdate(update) => {
-                                    if task_id.is_none() {
-                                        task_id = Some(update.task_id.clone());
-                                        emit(DelegateWireEvent::TaskAssigned {
-                                            task_id: update.task_id.clone(),
-                                            context_id: update.context_id.clone(),
-                                        })?;
-                                    }
-                                    if update.status.state.is_terminal() {
-                                        let message = update.status.message.as_ref().and_then(message_text);
-                                        emit(DelegateWireEvent::Terminal {
-                                            state: update.status.state,
-                                            message,
-                                        })?;
-                                    }
-                                }
-                                StreamResponse::ArtifactUpdate(update) => {
-                                    if task_id.is_none() {
-                                        task_id = Some(update.task_id.clone());
-                                        emit(DelegateWireEvent::TaskAssigned {
-                                            task_id: update.task_id.clone(),
-                                            context_id: update.context_id.clone(),
-                                        })?;
-                                    }
-                                    if update.artifact.artifact_id == ACTIVITY_ARTIFACT_ID {
-                                        for part in update.artifact.parts {
-                                            if let PartContent::Data(value) = part.content {
-                                                emit(DelegateWireEvent::Activity(value))?;
-                                            }
-                                        }
-                                    }
-                                }
-                                StreamResponse::Task(task) => {
-                                    if task_id.is_none() {
-                                        task_id = Some(task.id.clone());
-                                        emit(DelegateWireEvent::TaskAssigned {
-                                            task_id: task.id.clone(),
-                                            context_id: task.context_id.clone(),
-                                        })?;
-                                    }
-                                    if task.status.state.is_terminal() {
-                                        let message = task.status.message.as_ref().and_then(message_text);
-                                        emit(DelegateWireEvent::Terminal {
-                                            state: task.status.state,
-                                            message,
-                                        })?;
-                                    }
-                                }
-                                _ => {}
-                            }
+                            emit_stream_response(response, &mut task_id, &mut emit)?;
                         }
                     }
                 }
@@ -289,6 +297,9 @@ impl A2aDelegateClient {
     }
 
     pub(crate) async fn cancel(&self, task_id: &str) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            return memory.cancel(task_id).await;
+        }
         let mut request = self
             .client
             .post(format!("{}/tasks/{task_id}:cancel", self.endpoint))
@@ -309,6 +320,9 @@ impl A2aDelegateClient {
         task_id: &str,
         content: bot_runtime_core::Content,
     ) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            return memory.steer(task_id, content).await;
+        }
         let mut request = self
             .client
             .post(format!("{}/tasks/{task_id}/remi:steer", self.endpoint))
@@ -333,6 +347,9 @@ impl A2aDelegateClient {
         approval_id: &str,
         decision: crate::ToolApprovalDecision,
     ) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            return memory.decide_approval(task_id, approval_id, decision).await;
+        }
         self.post_control(
             task_id,
             "approval",
@@ -347,6 +364,9 @@ impl A2aDelegateClient {
         question_id: &str,
         response: crate::UserQuestionResponse,
     ) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            return memory.answer_question(task_id, question_id, response).await;
+        }
         self.post_control(
             task_id,
             "question",
@@ -373,6 +393,66 @@ impl A2aDelegateClient {
             Err(format!("A2A {action} returned HTTP {status}: {body}"))
         }
     }
+}
+
+fn emit_stream_response<F>(
+    response: StreamResponse,
+    task_id: &mut Option<String>,
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(DelegateWireEvent) -> Result<(), String>,
+{
+    match response {
+        StreamResponse::StatusUpdate(update) => {
+            if task_id.is_none() {
+                *task_id = Some(update.task_id.clone());
+                emit(DelegateWireEvent::TaskAssigned {
+                    task_id: update.task_id.clone(),
+                    context_id: update.context_id.clone(),
+                })?;
+            }
+            if update.status.state.is_terminal() {
+                emit(DelegateWireEvent::Terminal {
+                    state: update.status.state,
+                    message: update.status.message.as_ref().and_then(message_text),
+                })?;
+            }
+        }
+        StreamResponse::ArtifactUpdate(update) => {
+            if task_id.is_none() {
+                *task_id = Some(update.task_id.clone());
+                emit(DelegateWireEvent::TaskAssigned {
+                    task_id: update.task_id.clone(),
+                    context_id: update.context_id.clone(),
+                })?;
+            }
+            if update.artifact.artifact_id == ACTIVITY_ARTIFACT_ID {
+                for part in update.artifact.parts {
+                    if let PartContent::Data(value) = part.content {
+                        emit(DelegateWireEvent::Activity(value))?;
+                    }
+                }
+            }
+        }
+        StreamResponse::Task(task) => {
+            if task_id.is_none() {
+                *task_id = Some(task.id.clone());
+                emit(DelegateWireEvent::TaskAssigned {
+                    task_id: task.id.clone(),
+                    context_id: task.context_id.clone(),
+                })?;
+            }
+            if task.status.state.is_terminal() {
+                emit(DelegateWireEvent::Terminal {
+                    state: task.status.state,
+                    message: task.status.message.as_ref().and_then(message_text),
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn message_text(message: &Message) -> Option<String> {
@@ -403,14 +483,10 @@ mod tests {
         request: Arc<Mutex<Option<SendMessageRequest>>>,
     }
 
-    async fn receive_message(
-        State(state): State<TestState>,
-        Json(request): Json<SendMessageRequest>,
-    ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
-        *state.request.lock().unwrap() = Some(request);
+    fn test_stream_events() -> [StreamResponse; 3] {
         let task_id = "server-task".to_string();
         let context_id = "server-context".to_string();
-        let events = [
+        [
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
@@ -449,8 +525,15 @@ mod tests {
                 },
                 metadata: None,
             }),
-        ];
-        let body = events
+        ]
+    }
+
+    async fn receive_message(
+        State(state): State<TestState>,
+        Json(request): Json<SendMessageRequest>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+        *state.request.lock().unwrap() = Some(request);
+        let body = test_stream_events()
             .into_iter()
             .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).unwrap()))
             .collect::<String>();
@@ -458,6 +541,93 @@ mod tests {
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
             body,
         )
+    }
+
+    #[derive(Clone)]
+    struct TestMemoryTransport {
+        request: Arc<Mutex<Option<SendMessageRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl A2aDelegateTransport for TestMemoryTransport {
+        async fn invoke(
+            &self,
+            request: SendMessageRequest,
+        ) -> Result<mpsc::Receiver<Result<StreamResponse, String>>, String> {
+            *self.request.lock().unwrap() = Some(request);
+            let (tx, rx) = mpsc::channel(8);
+            for event in test_stream_events() {
+                tx.try_send(Ok(event)).unwrap();
+            }
+            Ok(rx)
+        }
+
+        async fn cancel(&self, _task_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn steer(
+            &self,
+            _task_id: &str,
+            _content: bot_runtime_core::Content,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn decide_approval(
+            &self,
+            _task_id: &str,
+            _approval_id: &str,
+            _decision: crate::ToolApprovalDecision,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn answer_question(
+            &self,
+            _task_id: &str,
+            _question_id: &str,
+            _response: crate::UserQuestionResponse,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_maps_in_memory_a2a_stream_without_http() {
+        let request = Arc::new(Mutex::new(None));
+        let client = A2aDelegateClient {
+            client: reqwest::Client::new(),
+            endpoint: "memory://test".to_string(),
+            token: None,
+            memory: Some(Arc::new(TestMemoryTransport {
+                request: Arc::clone(&request),
+            })),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        client
+            .invoke(
+                "explorer",
+                "subagent:explorer:memory",
+                "parent-thread",
+                "inspect".to_string(),
+                CancellationToken::new(),
+                move |event| {
+                    captured.lock().unwrap().push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(&events[0], DelegateWireEvent::TaskAssigned { task_id, .. } if task_id == "server-task")
+        );
+        assert!(events.iter().any(|event| matches!(event, DelegateWireEvent::Activity(value) if value["event"] == "tool_call_result")));
+        assert!(events.iter().any(|event| matches!(event, DelegateWireEvent::Terminal { state, .. } if *state == TaskState::Completed)));
+        assert_eq!(
+            request.lock().unwrap().as_ref().unwrap().message.parts[0].as_text(),
+            Some("inspect")
+        );
     }
 
     #[tokio::test]
@@ -517,6 +687,7 @@ mod tests {
             client: reqwest::Client::new(),
             endpoint: format!("http://{address}"),
             token: None,
+            memory: None,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);

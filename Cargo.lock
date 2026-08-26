@@ -837,6 +837,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "base64",
  "bot-runtime-core",
@@ -5014,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",

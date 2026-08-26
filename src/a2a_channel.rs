@@ -5,8 +5,8 @@ use std::sync::Arc;
 use a2a::{
     A2AError, AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill, Artifact,
     HttpAuthSecurityScheme, ListTasksRequest, ListTasksResponse, Message, Part, PartContent, Role,
-    SecurityScheme, StreamResponse, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
-    TaskStatusUpdateEvent, TRANSPORT_PROTOCOL_HTTP_JSON,
+    SecurityScheme, SendMessageRequest, StreamResponse, Task, TaskArtifactUpdateEvent, TaskState,
+    TaskStatus, TaskStatusUpdateEvent, TRANSPORT_PROTOCOL_HTTP_JSON,
 };
 use a2a_server::{AgentExecutor, DefaultRequestHandler, ExecutorContext, TaskStore};
 use async_stream::try_stream;
@@ -52,6 +52,138 @@ struct RemiA2aExecutor {
 pub(crate) struct ApplicationA2aExecutor {
     channel: ChannelHandle,
     active: Arc<RwLock<HashMap<String, (String, RunControl)>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ApplicationMemoryA2aTransport {
+    executor: ApplicationA2aExecutor,
+}
+
+impl ApplicationMemoryA2aTransport {
+    pub(crate) fn new(application: ApplicationHandle) -> Self {
+        Self {
+            executor: ApplicationA2aExecutor::new(application),
+        }
+    }
+
+    fn control_context(task_id: &str) -> ExecutorContext {
+        ExecutorContext {
+            message: None,
+            task_id: task_id.to_string(),
+            stored_task: None,
+            context_id: String::new(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        }
+    }
+}
+
+#[async_trait]
+impl bot_core::A2aDelegateTransport for ApplicationMemoryA2aTransport {
+    async fn invoke(
+        &self,
+        request: SendMessageRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamResponse, String>>, String> {
+        let message = request.message;
+        let context_id = message
+            .context_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let task_id = message
+            .task_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let context = ExecutorContext {
+            message: Some(message),
+            task_id,
+            stored_task: None,
+            context_id,
+            metadata: request.metadata,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: request.tenant,
+        };
+        let mut stream = self.executor.execute(context);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                if tx
+                    .send(event.map_err(|error| error.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    async fn cancel(&self, task_id: &str) -> Result<(), String> {
+        use futures::StreamExt;
+        let mut stream = self.executor.cancel(Self::control_context(task_id));
+        match stream.next().await {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(error)) => Err(error.to_string()),
+            None => Err("in-memory A2A cancel returned no response".to_string()),
+        }
+    }
+
+    async fn steer(&self, task_id: &str, content: bot_core::Content) -> Result<(), String> {
+        let session_id = self
+            .executor
+            .active
+            .read()
+            .await
+            .get(task_id)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| "A2A task is not active".to_string())?;
+        self.executor
+            .channel
+            .steer(RunRequest::new(session_id, content))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn decide_approval(
+        &self,
+        task_id: &str,
+        approval_id: &str,
+        decision: bot_core::ToolApprovalDecision,
+    ) -> Result<(), String> {
+        if !self.executor.active.read().await.contains_key(task_id) {
+            return Err("A2A task is not active".to_string());
+        }
+        self.executor
+            .channel
+            .decide_approval(approval_id, decision)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|_| ())
+            .ok_or_else(|| "approval is not pending".to_string())
+    }
+
+    async fn answer_question(
+        &self,
+        task_id: &str,
+        question_id: &str,
+        response: bot_core::UserQuestionResponse,
+    ) -> Result<(), String> {
+        if !self.executor.active.read().await.contains_key(task_id) {
+            return Err("A2A task is not active".to_string());
+        }
+        self.executor
+            .channel
+            .answer_user_question(question_id, response)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|_| ())
+            .ok_or_else(|| "question is not pending".to_string())
+    }
 }
 
 impl ApplicationA2aExecutor {
@@ -1123,12 +1255,11 @@ pub(crate) async fn maybe_start(
 pub(crate) async fn maybe_start_application(
     application: ApplicationHandle,
     data_dir: PathBuf,
-    required_for_delegates: bool,
 ) -> anyhow::Result<()> {
     let enabled = std::env::var("REMI_A2A_ENABLED")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "on"));
-    if !enabled && !required_for_delegates {
+    if !enabled {
         return Ok(());
     }
     let host = std::env::var("REMI_A2A_HOST").unwrap_or_else(|_| DEFAULT_A2A_HOST.to_string());

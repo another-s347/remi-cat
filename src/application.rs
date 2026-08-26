@@ -566,6 +566,13 @@ impl ApplicationBuilder {
             telemetry_enabled: telemetry.is_some(),
             agent_tracing_enabled: sentry_agent_tracing.is_some(),
         });
+        let handle = ApplicationHandle {
+            commands: tx.clone(),
+            info: Arc::clone(&info),
+        };
+        let a2a_delegate_transport: Arc<dyn bot_core::A2aDelegateTransport> = Arc::new(
+            crate::a2a_channel::ApplicationMemoryA2aTransport::new(handle.clone()),
+        );
         let data_dir = self.data_dir;
         let workspace = self.workspace;
         let root_agent_id = self.root_agent_id;
@@ -646,6 +653,7 @@ impl ApplicationBuilder {
                             credentials,
                             secret_store,
                             agent_tracing,
+                            a2a_delegate_transport,
                         )
                         .await
                         {
@@ -683,7 +691,6 @@ impl ApplicationBuilder {
         ready_rx
             .await
             .context("application thread exited during startup")??;
-        let handle = ApplicationHandle { commands: tx, info };
         Ok(Application {
             handle,
             thread: Arc::new(StdMutex::new(Some(thread))),
@@ -1468,6 +1475,7 @@ async fn build_runtime(
     credentials: Option<std::collections::BTreeMap<String, String>>,
     configured_secret_store: Option<SecretStore>,
     agent_tracing: bot_core::AgentTracingOptions,
+    a2a_delegate_transport: Arc<dyn bot_core::A2aDelegateTransport>,
 ) -> anyhow::Result<Rc<Runtime>> {
     std::fs::create_dir_all(&data_dir)?;
     let bridge: Arc<dyn ImFileBridge> = Arc::new(LocalImFileBridge::new(None));
@@ -1514,6 +1522,7 @@ async fn build_runtime(
     )
     .workspace(workspace)
     .agent_tracing(agent_tracing)
+    .a2a_delegate_transport(a2a_delegate_transport)
     .hook_manager(hook_manager);
     let agents_dir = std::env::var_os("REMI_AGENTS_DIR")
         .map(PathBuf::from)
@@ -2380,6 +2389,58 @@ async fn read_sub_session_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Clone)]
+    struct ApplicationE2eModel {
+        responses: Arc<StdMutex<VecDeque<String>>>,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    async fn application_e2e_model_response(
+        axum::extract::State(state): axum::extract::State<ApplicationE2eModel>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&body).to_string());
+        let response = state.responses.lock().unwrap().pop_front().unwrap();
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(response))
+            .unwrap()
+    }
+
+    fn application_e2e_sse_text(content: &str) -> String {
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
+
+    fn application_e2e_sse_tool_call() -> String {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-memory-worker",
+                    "type": "function",
+                    "function": {
+                        "name": "agent__worker",
+                        "arguments": serde_json::json!({
+                            "task": "Return MEMORY_A2A_CHILD_OK exactly.",
+                            "named": "memory-e2e"
+                        }).to_string()
+                    }
+                }]},
+                "finish_reason": null
+            }]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
     fn assert_send_sync<T: Send + Sync>() {}
     #[test]
     fn handles_are_send_sync() {
@@ -2707,6 +2768,163 @@ mod tests {
         let parent = channel.session(&session.id).await.unwrap().unwrap();
         assert_eq!(parent.sub_sessions[0].status, "done");
         application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_subagent_runs_end_to_end_over_in_memory_a2a_with_http_port_occupied() {
+        use axum::routing::post;
+
+        let reserved_a2a_port = std::net::TcpListener::bind("127.0.0.1:8788")
+            .expect("test requires the default A2A port to be available for reservation");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let state = ApplicationE2eModel {
+            responses: Arc::new(StdMutex::new(VecDeque::from([
+                application_e2e_sse_tool_call(),
+                application_e2e_sse_text("MEMORY_A2A_CHILD_OK"),
+                application_e2e_sse_text("MEMORY_A2A_E2E_OK"),
+            ]))),
+            requests: Arc::clone(&requests),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/v1/chat/completions", post(application_e2e_model_response))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let model = bot_core::ModelProfileConfig {
+            id: "memory-e2e".into(),
+            name: "Memory A2A E2E".into(),
+            model: "mock-model".into(),
+            base_url: Some(format!("http://{address}/v1")),
+            thinking: None,
+            reasoning_effort: None,
+            max_output_tokens: 1024,
+            context_tokens: 16_384,
+            supports_images: false,
+            legacy_short_term_tokens: None,
+            overflow_bytes: 16_384,
+            auto_compress: false,
+            description: None,
+            provider: Some("openai".into()),
+            extra_options: serde_json::Map::new(),
+        };
+        let root = bot_core::AgentProfile {
+            id: "default".into(),
+            name: "Default".into(),
+            description: "E2E parent".into(),
+            model: Some("mock-model".into()),
+            base_url: None,
+            models: bot_core::AgentModelBindings::default(),
+            tools: vec!["agent__worker".into()],
+            delegates: vec!["worker".into()],
+            max_turns: Some(4),
+            persistent_sessions: true,
+            system_prompt: "Use the worker, then report its result.".into(),
+        };
+        let worker = bot_core::AgentProfile {
+            id: "worker".into(),
+            name: "Worker".into(),
+            description: "E2E child".into(),
+            model: Some("mock-model".into()),
+            base_url: None,
+            models: bot_core::AgentModelBindings::default(),
+            tools: Vec::new(),
+            delegates: Vec::new(),
+            max_turns: Some(2),
+            persistent_sessions: true,
+            system_prompt: "Return the requested marker.".into(),
+        };
+        let application = ApplicationBuilder::new(data_dir.path())
+            .workspace(data_dir.path())
+            .default_model("memory-e2e")
+            .model_profile(model)
+            .agent_profile(root)
+            .agent_profile(worker)
+            .credentials(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                "test-key".to_string(),
+            )]))
+            .discover_hooks(false)
+            .include_default_skills(false)
+            .file_skills(false)
+            .spawn()
+            .await
+            .unwrap();
+        let channel = application
+            .handle()
+            .channel(ChannelConfig::new("memory-a2a-e2e"));
+        let session = channel.resolve_session("conversation").await.unwrap();
+        let parent_session_id = session.id.clone();
+        let mut run = channel
+            .run(RunRequest::text(
+                session.id,
+                "Ask the worker for the marker.",
+            ))
+            .await
+            .unwrap();
+        let mut final_text = String::new();
+        let mut saw_child_output = false;
+        while let Some(event) = tokio::time::timeout(std::time::Duration::from_secs(10), run.recv())
+            .await
+            .expect("in-memory A2A run timed out")
+        {
+            match event {
+                ApplicationEvent::Prefix(text) | ApplicationEvent::Reply(text) => {
+                    final_text.push_str(&text)
+                }
+                ApplicationEvent::Cat(bot_core::CatEvent::Text(text)) => final_text.push_str(&text),
+                ApplicationEvent::Cat(bot_core::CatEvent::SubSession(event)) => {
+                    saw_child_output |= serde_json::to_string(&event)
+                        .unwrap()
+                        .contains("MEMORY_A2A_CHILD_OK");
+                    channel
+                        .record_sub_session(&parent_session_id, event)
+                        .await
+                        .unwrap();
+                }
+                ApplicationEvent::Done => break,
+                _ => {}
+            }
+        }
+
+        assert!(final_text.contains("MEMORY_A2A_E2E_OK"), "{final_text}");
+        assert!(
+            saw_child_output,
+            "child output did not cross the A2A event stream"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("Return MEMORY_A2A_CHILD_OK exactly."));
+        assert!(requests[2].contains("MEMORY_A2A_CHILD_OK"));
+        drop(requests);
+        let persisted_parent = channel.session(&parent_session_id).await.unwrap().unwrap();
+        let persisted_child = persisted_parent
+            .sub_sessions
+            .iter()
+            .find(|child| child.target == "worker")
+            .expect("worker sub-session should be persisted");
+        assert_eq!(persisted_child.status, "done");
+        let persisted_child_session = channel.resolve_session(&persisted_child.id).await.unwrap();
+        let persisted_events = channel
+            .sub_session_events(&persisted_child_session.id, 0, 256)
+            .await
+            .unwrap();
+        let persisted_events_json = serde_json::to_string(&persisted_events.events).unwrap();
+        assert!(
+            persisted_events_json.contains("MEMORY_A2A_CHILD_OK"),
+            "{persisted_events_json}"
+        );
+        application.shutdown().await.unwrap();
+        server.abort();
+        drop(reserved_a2a_port);
     }
 
     #[test]

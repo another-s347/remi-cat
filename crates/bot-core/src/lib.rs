@@ -45,6 +45,7 @@ pub mod tool_tasks;
 pub mod tools;
 pub mod user_question;
 
+pub use a2a_delegate::A2aDelegateTransport;
 pub use acp::{AcpClientToolProvider, AcpClientToolSupport};
 pub use agent::CatAgent;
 pub use approval::{

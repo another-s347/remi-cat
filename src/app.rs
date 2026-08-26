@@ -642,19 +642,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
         let application = builder.spawn().await?;
         let application_handle = application.handle();
-        let a2a_required_for_delegates = application_handle
-            .channel(crate::application::ChannelConfig::new("a2a-bootstrap"))
-            .catalog()
-            .await?
-            .agents
-            .iter()
-            .any(|agent| !agent.delegates.is_empty());
-        crate::a2a_channel::maybe_start_application(
-            application_handle,
-            data_dir.clone(),
-            a2a_required_for_delegates,
-        )
-        .await?;
+        crate::a2a_channel::maybe_start_application(application_handle, data_dir.clone()).await?;
         return crate::channel::tui::TuiChannel::new(cli)
             .run_once(application)
             .await;
