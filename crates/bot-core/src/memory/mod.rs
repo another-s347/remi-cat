@@ -34,7 +34,7 @@ pub use store::{
     MemoryContext, MemoryRecallResult, MemoryStore, NamedMemoryWrite, ThreadHistoryMessage,
 };
 pub use tier::{build_tier_msg, make_preview, MemoryEntry, MemoryIndex};
-pub use tool::{MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
+pub use tool::{ContextManageTool, MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
 
 use remi_agentloop::prelude::Message;
 
@@ -61,13 +61,17 @@ pub fn build_injected_history(ctx: &MemoryContext) -> Vec<Message> {
         msgs.push(build_tier_msg("MID-TERM", &ctx.mid_term.entries));
     }
     if let Some(summary) = &ctx.latest_summary {
-        msgs.push(Message::system(format!(
-            "[LATEST COMPRESSED MEMORY]\n{summary}\n\n\
-             If this summary overlaps raw messages below, treat the newer raw messages as authoritative. \
-             When a question depends on prior facts that are absent or uncertain here, search local memory \
-             before concluding that the information is unavailable."
-        )));
+        msgs.push(latest_summary_message(summary));
     }
     msgs.extend(ctx.short_term.clone());
     msgs
+}
+
+pub fn latest_summary_message(summary: &str) -> Message {
+    Message::system(format!(
+        "[LATEST COMPRESSED MEMORY]\n{summary}\n\n\
+         If this summary overlaps raw messages below, treat the newer raw messages as authoritative. \
+         When a question depends on prior facts that are absent or uncertain here, search local memory \
+         before concluding that the information is unavailable."
+    ))
 }

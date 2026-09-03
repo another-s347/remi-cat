@@ -266,44 +266,65 @@ pub(crate) fn model_input_snapshot_from_loop_input(
     model_profile_id: &str,
     model: &str,
 ) -> Option<ModelInputSnapshot> {
-    let LoopInput::Start {
-        message,
-        history,
-        metadata,
-        user_state,
-        ..
-    } = input
-    else {
-        return None;
-    };
-
     let mut segments = Vec::new();
-    for (index, message) in history.iter().enumerate() {
-        append_message_model_input_segments(&mut segments, index, message);
-    }
-    append_segment(
-        &mut segments,
-        ModelInputSegmentCategory::CurrentUser,
-        Some("user".to_string()),
-        "Current user input".to_string(),
-        content_to_model_input_text(&message.content),
-    );
-    if let Some(metadata) = metadata {
-        append_json_segment(
-            &mut segments,
-            ModelInputSegmentCategory::Metadata,
-            "Request metadata",
+    let user_state = match input {
+        LoopInput::Start {
+            message,
+            history,
             metadata,
-        );
-    }
-    if let Some(message_metadata) = &message.metadata {
-        append_json_segment(
-            &mut segments,
-            ModelInputSegmentCategory::Metadata,
-            "Message metadata",
-            message_metadata,
-        );
-    }
+            user_state,
+            ..
+        } => {
+            for (index, message) in history.iter().enumerate() {
+                append_message_model_input_segments(&mut segments, index, message);
+            }
+            append_segment(
+                &mut segments,
+                ModelInputSegmentCategory::CurrentUser,
+                Some("user".to_string()),
+                "Current user input".to_string(),
+                content_to_model_input_text(&message.content),
+            );
+            if let Some(metadata) = metadata {
+                append_json_segment(
+                    &mut segments,
+                    ModelInputSegmentCategory::Metadata,
+                    "Request metadata",
+                    metadata,
+                );
+            }
+            if let Some(message_metadata) = &message.metadata {
+                append_json_segment(
+                    &mut segments,
+                    ModelInputSegmentCategory::Metadata,
+                    "Message metadata",
+                    message_metadata,
+                );
+            }
+            user_state.as_ref()
+        }
+        LoopInput::Resume { state, results, .. } => {
+            for (index, message) in state.messages.iter().enumerate() {
+                append_message_model_input_segments(&mut segments, index, message);
+            }
+            for result in results {
+                let tool_call_id = match result {
+                    remi_agentloop::prelude::ToolCallOutcome::Result { tool_call_id, .. }
+                    | remi_agentloop::prelude::ToolCallOutcome::Error { tool_call_id, .. } => {
+                        tool_call_id
+                    }
+                };
+                append_segment(
+                    &mut segments,
+                    ModelInputSegmentCategory::ToolOutput,
+                    Some("tool".to_string()),
+                    format!("Pending tool result: {tool_call_id}"),
+                    serde_json::to_string(result).unwrap_or_else(|_| format!("{result:?}")),
+                );
+            }
+            Some(&state.user_state)
+        }
+    };
     if let Some(user_state) = user_state {
         append_json_segment(
             &mut segments,

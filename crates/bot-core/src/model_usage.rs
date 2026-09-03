@@ -214,7 +214,7 @@ mod tests {
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 1,
-            auto_compress: true,
+            context_compaction: crate::ContextCompactionMode::Hard,
             description: None,
             provider: provider.map(ToOwned::to_owned),
             extra_options: serde_json::Map::new(),

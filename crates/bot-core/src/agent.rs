@@ -25,8 +25,9 @@ use bot_runtime_core::{
     CoreDriveEvent, CoreSteerBatch, CoreSteerBehavior, CoreStreamOptions, CoreUsageStats,
 };
 use remi_agentloop::prelude::{
-    AgentError, AgentState, CancellationToken, Content, ContentPart, LoopInput, Message,
-    ParsedToolCall, ToolCallOutcome, ToolDefinition, ToolDefinitionContext, ToolOutput, ToolResult,
+    AgentError, AgentState, CancellationToken, Content, ContentPart, ContextOperation, LoopInput,
+    Message, ParsedToolCall, ToolCallOutcome, ToolDefinition, ToolDefinitionContext, ToolOutput,
+    ToolResult,
 };
 use remi_agentloop::tool::registry::{DefaultToolRegistry, ToolRegistry};
 use remi_agentloop::tool::BoxedToolResult;
@@ -185,6 +186,9 @@ pub struct CatAgent<I> {
     /// Tool-output byte threshold above which output is spilled to a temp file.
     /// Configured from the model profile; can be overridden per-builder.
     pub overflow_bytes: usize,
+    /// Hard request ceiling enforced between agent tool rounds. Present for
+    /// agent-managed context compaction sessions.
+    pub context_absolute_budget_tokens: Option<u32>,
     /// Optional daemon-mediated IM bridge used for per-platform upload/download tools.
     pub im_bridge: Option<Arc<dyn ImFileBridge>>,
     /// Optional explicit tool allowlist from the active agent profile.
@@ -338,6 +342,30 @@ where
 
             loop {
                 let run_input = inject_extra_tools(current, extra_defs.clone());
+                if let Some(absolute_budget) = self.context_absolute_budget_tokens {
+                    if matches!(run_input, LoopInput::Resume { .. }) {
+                        let model = match &run_input {
+                            LoopInput::Resume { state, .. } => state.config.model.as_str(),
+                            LoopInput::Start { .. } => "",
+                        };
+                        let estimated = crate::runtime::model_input_snapshot_from_loop_input(
+                            &run_input,
+                            &extra_defs,
+                            &log_thread_id,
+                            Some(&log_run_id),
+                            "",
+                            model,
+                        )
+                        .map(|snapshot| snapshot.totals.estimated_tokens)
+                        .unwrap_or(0);
+                        if estimated >= absolute_budget {
+                            yield CatEvent::Error(AgentError::other(format!(
+                                "model request became too large after tool execution: estimated {estimated} tokens, safe limit {absolute_budget} tokens; run `/compact` to perform manual hard compression"
+                            )));
+                            return;
+                        }
+                    }
+                }
                 let handoff_fallback = handoff_history_from_input(&run_input);
                 let run_ctx = chat_ctx_from_input(&run_input, cancel_signal.clone());
                 let inner_stream = match self.inner.chat(run_ctx, run_input).await {
@@ -475,6 +503,7 @@ where
                             let tool_ctx =
                                 tool_ctx_from_state_with_cancel(&state, cancel_signal.clone());
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
+                            let mut context_operation: Option<ContextOperation> = None;
 
                             if !local.is_empty() {
                                 let mut approved_local = Vec::new();
@@ -873,6 +902,14 @@ where
                                                 yield side_ev;
                                             }
 
+                                            if let Some(operation) = collected.context_operation.take() {
+                                                if context_operation.replace(operation).is_some() {
+                                                    yield CatEvent::Error(AgentError::other(
+                                                        "multiple context operations in one tool batch are not allowed"
+                                                    ));
+                                                    return;
+                                                }
+                                            }
                                             completed_contents.insert(call_id, collected.content);
                                         }
                                         _ = async {
@@ -1316,6 +1353,14 @@ where
                                                 yield side_ev;
                                             }
 
+                                            if let Some(operation) = collected.context_operation.take() {
+                                                if context_operation.replace(operation).is_some() {
+                                                    yield CatEvent::Error(AgentError::other(
+                                                        "multiple context operations in one tool batch are not allowed"
+                                                    ));
+                                                    return;
+                                                }
+                                            }
                                             completed_contents.insert(call_id, collected.content);
                                         }
                                         _ = async {
@@ -1405,6 +1450,13 @@ where
                                         tool_name: tc.name.clone(),
                                         error: result,
                                     });
+                                }
+                            }
+
+                            if let Some(operation) = context_operation {
+                                if let Err(error) = state.apply_context_operation(operation) {
+                                    yield CatEvent::Error(error);
+                                    return;
                                 }
                             }
 
@@ -2116,6 +2168,7 @@ struct CollectedToolResult {
     content: Content,
     preview: String,
     side_events: Vec<CatEvent>,
+    context_operation: Option<ContextOperation>,
 }
 
 impl CollectedToolResult {
@@ -2128,11 +2181,14 @@ impl CollectedToolResult {
             preview: preview_text_for_content(&content),
             content,
             side_events,
+            context_operation: None,
         }
     }
 
     fn replace_content(self, content: Content) -> Self {
-        Self::from_content(content, self.side_events)
+        let mut next = Self::from_content(content, self.side_events);
+        next.context_operation = self.context_operation;
+        next
     }
 
     fn completion_output_lines(&self, max_lines: usize) -> Vec<String> {
@@ -2444,6 +2500,7 @@ async fn collect_result(
             let mut last = None;
             let mut delta_fallback = String::new();
             let mut side_events = Vec::new();
+            let mut context_operation = None;
             while let Some(out) = s.next().await {
                 match out {
                     ToolOutput::Result(c) => last = Some(c),
@@ -2518,12 +2575,25 @@ async fn collect_result(
                                     )
                                     .await;
                             }
+                        } else if event_type == "remi.context_compaction" {
+                            if let Ok(event) = serde_json::from_value(extra) {
+                                side_events.push(CatEvent::ContextCompaction(event));
+                            }
+                        }
+                    }
+                    ToolOutput::ContextOperation(operation) => {
+                        if context_operation.replace(operation).is_some() {
+                            return CollectedToolResult::text(
+                                "error: multiple context operations emitted by one tool",
+                            );
                         }
                     }
                 }
             }
             let last = last.unwrap_or_else(|| Content::text(delta_fallback));
-            CollectedToolResult::from_content(last, side_events)
+            let mut collected = CollectedToolResult::from_content(last, side_events);
+            collected.context_operation = context_operation;
+            collected
         }
     }
 }
@@ -3809,6 +3879,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
@@ -3854,6 +3925,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
@@ -3901,6 +3973,7 @@ mod tests {
                     workspace_root_label: "/workspace".to_string(),
                     allow_host_absolute_paths: true,
                     overflow_bytes: 8_192,
+                    context_absolute_budget_tokens: None,
                     im_bridge: None,
                     tool_allowlist: None,
                     approval_manager: ToolApprovalManager::new(),
@@ -3940,6 +4013,7 @@ mod tests {
                     workspace_root_label: "/workspace".to_string(),
                     allow_host_absolute_paths: true,
                     overflow_bytes: 8_192,
+                    context_absolute_budget_tokens: None,
                     im_bridge: None,
                     tool_allowlist: None,
                     approval_manager: ToolApprovalManager::new(),
@@ -4606,6 +4680,7 @@ mod tests {
                     workspace_root_label: "/workspace".to_string(),
                     allow_host_absolute_paths: true,
                     overflow_bytes: 8_192,
+                    context_absolute_budget_tokens: None,
                     im_bridge: None,
                     tool_allowlist: None,
                     approval_manager: ToolApprovalManager::new(),
@@ -4699,6 +4774,7 @@ mod tests {
                     workspace_root_label: "/workspace".to_string(),
                     allow_host_absolute_paths: true,
                     overflow_bytes: 8_192,
+                    context_absolute_budget_tokens: None,
                     im_bridge: None,
                     tool_allowlist: None,
                     approval_manager: ToolApprovalManager::new(),
@@ -4748,6 +4824,7 @@ mod tests {
                     workspace_root_label: "/workspace".to_string(),
                     allow_host_absolute_paths: true,
                     overflow_bytes: 8_192,
+                    context_absolute_budget_tokens: None,
                     im_bridge: None,
                     tool_allowlist: None,
                     approval_manager: ToolApprovalManager::new(),
@@ -4792,6 +4869,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
@@ -4835,6 +4913,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_context_budget_stops_an_oversized_post_tool_resume() {
+        let agent = CatAgent {
+            inner: MissingToolInnerAgent,
+            local_tools: Arc::new(DefaultToolRegistry::new()),
+            model_tools: None,
+            data_dir: test_root(),
+            workspace_root: test_root(),
+            workspace_root_label: "/workspace".to_string(),
+            allow_host_absolute_paths: true,
+            overflow_bytes: 8_192,
+            context_absolute_budget_tokens: Some(1),
+            im_bridge: None,
+            tool_allowlist: None,
+            approval_manager: ToolApprovalManager::new(),
+            approval_reviewer: None,
+            user_question_manager: UserQuestionManager::new(),
+            hook_manager: test_hook_manager(),
+            tool_tasks: test_tool_tasks(),
+        };
+
+        let events = agent
+            .stream_with_input(LoopInput::start("call read"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CatEvent::Error(error) if error.to_string().contains("run `/compact`")
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CatEvent::Text(_))));
+    }
+
+    #[tokio::test]
     async fn disallowed_tool_emits_precise_failed_tool_result_and_resumes() {
         let mut local_tools = DefaultToolRegistry::new();
         local_tools.register(InstantTool);
@@ -4847,6 +4959,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: Some(vec!["rg".to_string()]),
             approval_manager: ToolApprovalManager::new(),
@@ -4902,6 +5015,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
@@ -4955,6 +5069,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),
@@ -5045,6 +5160,7 @@ mod tests {
             workspace_root_label: "/workspace".to_string(),
             allow_host_absolute_paths: true,
             overflow_bytes: 8_192,
+            context_absolute_budget_tokens: None,
             im_bridge: None,
             tool_allowlist: None,
             approval_manager: ToolApprovalManager::new(),

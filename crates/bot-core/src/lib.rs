@@ -69,8 +69,8 @@ pub use memory::{MemoryStore, ThreadHistoryMessage};
 pub use model_profile::{
     api_key_from_env, api_key_from_values, install_embedded_model_profiles,
     model_profile_key_status, resolve_model_profile_from_env, validate_model_profile_api_key,
-    ModelProfileConfig, ModelProfileKeyStatus, ModelProfileRegistry, ModelProfileSource,
-    ReasoningEffort, ThinkingMode,
+    ContextCompactionMode, ModelProfileConfig, ModelProfileKeyStatus, ModelProfileRegistry,
+    ModelProfileSource, ReasoningEffort, ThinkingMode,
 };
 pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{

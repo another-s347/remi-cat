@@ -207,6 +207,7 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
                 "搜索当前会话与命名记忆".to_string(),
             )
         }
+        "context__manage" => ("整理上下文".to_string(), describe_content_bytes(args)),
         value if value.starts_with("todo__") => describe_todo(value, args),
         "tool_tasks" => describe_tool_tasks(args),
         "ask_user_question" => {

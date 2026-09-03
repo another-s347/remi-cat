@@ -2811,7 +2811,7 @@ mod tests {
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 16_384,
-            auto_compress: false,
+            context_compaction: bot_core::ContextCompactionMode::Off,
             description: None,
             provider: Some("openai".into()),
             extra_options: serde_json::Map::new(),

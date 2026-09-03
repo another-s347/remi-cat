@@ -13,7 +13,15 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::latest_summary_message;
 use super::store::MemoryStore;
+use crate::{ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus};
+use remi_agentloop::prelude::ContextOperation;
+
+pub struct ContextManageTool {
+    pub store: Arc<MemoryStore>,
+    pub agent_id: String,
+}
 
 pub struct MemoryGetDetailTool {
     pub store: Arc<MemoryStore>,
@@ -29,6 +37,145 @@ pub struct MemoryUpsertNamedTool {
 pub struct MemoryRecallTool {
     pub store: Arc<MemoryStore>,
     pub agent_id: String,
+}
+
+impl Tool for ContextManageTool {
+    fn name(&self) -> &str {
+        "context__manage"
+    }
+
+    fn description(&self) -> &str {
+        "Manage the conversation context. Use operation=replace_prior when earlier information has \
+         become overly complex, stale, redundant, or when the user asks you to organize/compact the \
+         context. Write the summary yourself and call this tool alone. Preserve the conversation's \
+         primary language; latest user intent, constraints, confirmed facts and decisions; completed \
+         work and evidence; current state and pending work; failures, uncertainties, paths, IDs, exact \
+         values, commands, and errors. Resolve superseded facts chronologically and omit genuinely \
+         obsolete or irrelevant detail. The operation replaces prior conversational messages while \
+         retaining standing system instructions and the current run."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["replace_prior"],
+                    "description": "Replace prior conversational context with the supplied summary"
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Complete, information-dense replacement summary authored by the agent"
+                }
+            },
+            "required": ["operation", "summary"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        ctx: ToolContext,
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
+        let operation = args.get("operation").and_then(serde_json::Value::as_str);
+        if operation != Some("replace_prior") {
+            return Err(AgentError::tool(
+                "context__manage",
+                "operation must be replace_prior",
+            ));
+        }
+        let summary = args
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if summary.is_empty() {
+            return Err(AgentError::tool(
+                "context__manage",
+                "summary must not be empty",
+            ));
+        }
+        let thread_id =
+            memory_thread_id_from_args_or_context(&args, ctx, &self.agent_id, "context__manage")?;
+        let store = Arc::clone(&self.store);
+        let operation_id = uuid::Uuid::new_v4().to_string();
+
+        Ok(ToolResult::Output(stream! {
+            let started = ContextCompactionEvent {
+                id: operation_id.clone(),
+                thread_id: thread_id.clone(),
+                status: ContextCompactionStatus::Started,
+                source: ContextCompactionSource::Agent,
+                compacted_messages: 0,
+                remaining_messages: 0,
+                error: None,
+            };
+            yield ToolOutput::custom(
+                "remi.context_compaction",
+                serde_json::to_value(started).unwrap_or_default(),
+            );
+            match store.commit_agent_summary(&thread_id, &summary).await {
+                Ok(0) => {
+                    let error = "no prior persisted conversation is available to replace";
+                    let failed = ContextCompactionEvent {
+                        id: operation_id,
+                        thread_id,
+                        status: ContextCompactionStatus::Failed,
+                        source: ContextCompactionSource::Agent,
+                        compacted_messages: 0,
+                        remaining_messages: 0,
+                        error: Some(error.to_string()),
+                    };
+                    yield ToolOutput::custom(
+                        "remi.context_compaction",
+                        serde_json::to_value(failed).unwrap_or_default(),
+                    );
+                    yield ToolOutput::text(format!("Error: {error}"));
+                }
+                Ok(compacted_messages) => {
+                    yield ToolOutput::ContextOperation(ContextOperation::ReplacePriorContext {
+                        messages: vec![latest_summary_message(&summary)],
+                    });
+                    let completed = ContextCompactionEvent {
+                        id: operation_id,
+                        thread_id,
+                        status: ContextCompactionStatus::Completed,
+                        source: ContextCompactionSource::Agent,
+                        compacted_messages,
+                        remaining_messages: 0,
+                        error: None,
+                    };
+                    yield ToolOutput::custom(
+                        "remi.context_compaction",
+                        serde_json::to_value(completed).unwrap_or_default(),
+                    );
+                    yield ToolOutput::text(format!(
+                        "Context replaced with the supplied summary; covered {compacted_messages} persisted message(s)."
+                    ));
+                }
+                Err(err) => {
+                    let failed = ContextCompactionEvent {
+                        id: operation_id,
+                        thread_id,
+                        status: ContextCompactionStatus::Failed,
+                        source: ContextCompactionSource::Agent,
+                        compacted_messages: 0,
+                        remaining_messages: 0,
+                        error: Some(err.to_string()),
+                    };
+                    yield ToolOutput::custom(
+                        "remi.context_compaction",
+                        serde_json::to_value(failed).unwrap_or_default(),
+                    );
+                    yield ToolOutput::text(format!("Error: {err}"));
+                }
+            }
+        }))
+    }
 }
 
 impl Tool for MemoryGetDetailTool {
@@ -448,6 +595,72 @@ mod tests {
                 text
             }
         }
+    }
+
+    #[tokio::test]
+    async fn context_manage_commits_summary_without_deleting_ledger_and_emits_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        store
+            .save_turn(
+                "thread-1",
+                vec![
+                    Message::user("old request"),
+                    Message::assistant("old answer"),
+                ],
+            )
+            .await
+            .unwrap();
+        let tool = ContextManageTool {
+            store: Arc::clone(&store),
+            agent_id: "default".to_string(),
+        };
+        let result = <ContextManageTool as Tool>::execute(
+            &tool,
+            json!({
+                "operation": "replace_prior",
+                "summary": "Keep the confirmed decision and pending task."
+            }),
+            None,
+            tool_context(Some("thread-1")),
+        )
+        .await
+        .unwrap();
+
+        let ToolResult::Output(output) = result else {
+            panic!("context management must complete without interrupting");
+        };
+        let outputs = output.collect::<Vec<_>>().await;
+        let operations = outputs
+            .iter()
+            .filter_map(|output| match output {
+                ToolOutput::ContextOperation(operation) => Some(operation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 1);
+        let ContextOperation::ReplacePriorContext { messages } = operations[0];
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .content
+            .text_content()
+            .contains("Keep the confirmed decision and pending task."));
+
+        let context = store.load_context("thread-1").await.unwrap();
+        assert!(context
+            .latest_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Keep the confirmed decision and pending task."));
+        let ledger = tokio::fs::read_to_string(
+            tmp.path()
+                .join("memory")
+                .join("thread-1")
+                .join("short_term.jsonl"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ledger.lines().count(), 2);
     }
 
     #[tokio::test]

@@ -8,4 +8,4 @@ max_output_tokens: 16384
 context_tokens: 128000
 supports_images: true
 overflow_bytes: 32000
-auto_compress: true
+context_compaction: hard

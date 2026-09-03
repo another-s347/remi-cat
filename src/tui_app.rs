@@ -5012,7 +5012,7 @@ mod tests {
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 32_000,
-            auto_compress: true,
+            context_compaction: bot_core::ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
         let profile_command = CommandEntry {
@@ -6519,7 +6519,7 @@ mod tests {
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 1024,
-            auto_compress: true,
+            context_compaction: bot_core::ContextCompactionMode::Hard,
             description: None,
             provider: None,
             extra_options: serde_json::Map::new(),

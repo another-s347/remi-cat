@@ -4,7 +4,9 @@ use remi_agentloop::prelude::Tool;
 use remi_agentloop::tool::registry::DefaultToolRegistry;
 
 use crate::im_tools::register_fetch_tool;
-use crate::memory::{MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool};
+use crate::memory::{
+    ContextManageTool, MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool,
+};
 use crate::search::SearchTool;
 use crate::tool_tasks::ToolTasksTool;
 use crate::tools::{
@@ -130,4 +132,22 @@ pub(super) fn register_runtime_tools(
             &deps.user_question_manager,
         )));
     }
+}
+
+pub(super) fn register_context_manage_tool(
+    tools: &mut DefaultToolRegistry,
+    deps: &LocalToolDeps,
+    agent_id: &str,
+) {
+    if deps
+        .host_tools
+        .iter()
+        .any(|tool| tool.name() == "context__manage" && tool.allows_builtin_override())
+    {
+        return;
+    }
+    tools.register(ContextManageTool {
+        store: Arc::clone(&deps.memory),
+        agent_id: agent_id.to_string(),
+    });
 }

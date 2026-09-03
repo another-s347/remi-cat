@@ -1,29 +1,40 @@
 use std::collections::HashMap;
 
 use remi_agentloop::prelude::Message;
+use remi_agentloop::prelude::MessageId;
 
 use crate::{CatEvent, MemoryStore};
 
 /// Save new turn messages and user_state to the memory store.
 ///
-/// Strips the first `skip_count` messages (the injected history prefix) from
-/// `history` before persisting, so only the new user + assistant messages are
-/// appended to short-term storage.
+/// Finds the user message that started this run and persists it plus every
+/// later message. This remains correct when a tool replaces earlier context.
 pub(super) async fn persist_turn(
     memory: &MemoryStore,
     thread_id: &str,
     history: Option<Vec<Message>>,
     user_state: Option<serde_json::Value>,
-    skip_count: usize,
+    current_run_message_id: &MessageId,
     tool_elapsed_ms: &HashMap<String, u64>,
 ) -> Vec<CatEvent> {
     let mut events = Vec::new();
     if let Some(all_msgs) = history {
-        let mut new_msgs: Vec<Message> = all_msgs.into_iter().skip(skip_count).collect();
+        let Some(start) = all_msgs
+            .iter()
+            .position(|message| &message.id == current_run_message_id)
+        else {
+            tracing::warn!(
+                thread_id,
+                message_id = %current_run_message_id,
+                "persist_turn: current run boundary is missing"
+            );
+            return events;
+        };
+        let mut new_msgs: Vec<Message> = all_msgs.into_iter().skip(start).collect();
         annotate_tool_elapsed_ms(&mut new_msgs, tool_elapsed_ms);
         tracing::debug!(
             thread_id,
-            skip_count,
+            start,
             total_msgs = new_msgs.len(),
             msgs_with_metadata = new_msgs.iter().filter(|m| m.metadata.is_some()).count(),
             "persist_turn: saving messages"

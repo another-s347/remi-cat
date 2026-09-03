@@ -17,6 +17,7 @@ pub enum ContextCompactionStatus {
 pub enum ContextCompactionSource {
     Auto,
     Manual,
+    Agent,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -317,7 +317,7 @@ mod tests {
             supports_images: true,
             legacy_short_term_tokens: None,
             overflow_bytes: 16_384,
-            auto_compress: true,
+            context_compaction: crate::ContextCompactionMode::Hard,
             description: None,
             provider: provider.map(str::to_string),
             extra_options: serde_json::Map::new(),

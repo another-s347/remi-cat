@@ -4883,7 +4883,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "chrono",
@@ -4903,7 +4903,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-core"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "base64",
@@ -4927,7 +4927,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-deepagent"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "futures",
@@ -4947,7 +4947,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-eval"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-trait",
  "futures",
@@ -4960,7 +4960,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-macros"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4971,7 +4971,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-model"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "futures",
@@ -4986,7 +4986,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-tool"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "futures",
@@ -5000,7 +5000,7 @@ dependencies = [
 [[package]]
 name = "remi-agentloop-transport"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-agentloop.git?rev=889866c6edb33ca7a928bf83eac11bc7057870ac#889866c6edb33ca7a928bf83eac11bc7057870ac"
+source = "git+https://github.com/another-s347/remi-agentloop.git?rev=eb2f30f5ff07845ee9e44427f32e8b8cec582ffa#eb2f30f5ff07845ee9e44427f32e8b8cec582ffa"
 dependencies = [
  "async-stream",
  "futures",

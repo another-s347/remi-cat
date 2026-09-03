@@ -33,6 +33,10 @@ pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] 
         ("memory__get_detail", "Read a stored memory detail."),
         ("memory__recall", "Search memory directly."),
         ("memory__upsert_named", "Save or update a named memory."),
+        (
+            "context__manage",
+            "Replace prior conversation context with an agent-authored summary.",
+        ),
         ("now", "Return the current time."),
         ("rg", "Search workspace files with ripgrep."),
         ("search", "Search local memory/skills or web results."),

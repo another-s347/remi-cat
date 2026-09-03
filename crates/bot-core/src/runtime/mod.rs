@@ -28,12 +28,13 @@ use crate::{
     install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
     sandbox, skill, supervisor_workflow, todo, AccountUsage, AgentModelBindings, AgentProfile,
     AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
-    ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, FileSkillStore,
-    GoalMaxRounds, GoalState, HookEventName, HookManager, ImAttachment, ImDocument, ImFileBridge,
-    MemoryStore, Message, ModelProfileConfig, ModelProfileRegistry, ReasoningEffort,
-    SharedRedactor, SkillDocument, SkillLoadDiagnostic, SkillSummary, SteerQueuedEvent,
-    SupervisorTraceEvent, ThreadHistoryMessage, ToolApprovalManager, UserQuestionManager,
-    WorkflowDefinition, WorkflowInstance, WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
+    ContextCompactionEvent, ContextCompactionMode, ContextCompactionSource,
+    ContextCompactionStatus, FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager,
+    ImAttachment, ImDocument, ImFileBridge, MemoryStore, Message, ModelProfileConfig,
+    ModelProfileRegistry, ReasoningEffort, SharedRedactor, SkillDocument, SkillLoadDiagnostic,
+    SkillSummary, SteerQueuedEvent, SupervisorTraceEvent, ThreadHistoryMessage,
+    ToolApprovalManager, UserQuestionManager, WorkflowDefinition, WorkflowInstance,
+    WorkflowMaxRounds, WorkflowReport, WorkflowStatus,
 };
 
 mod approval_markers;
@@ -72,7 +73,7 @@ use supervisor_agent::{
     hook_context_message, workflow_round_allows_continue, SupervisorNodeOutcome,
     WorkflowRoundOutcome,
 };
-use tool_registry::register_runtime_tools;
+use tool_registry::{register_context_manage_tool, register_runtime_tools};
 pub(crate) use tool_status::{
     builtin_tool_catalog, tool_errors, tool_runtime_errors, tool_warnings,
 };
@@ -84,6 +85,13 @@ const DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_CONTEXT_PERCENT: usize = 80;
 const SUPERVISOR_PROMPT_MARGIN_TOKENS: u32 = 4_096;
 const MODEL_PROTOCOL_MARGIN_TOKENS: u32 = 512;
+const AGENT_CONTEXT_COMPACTION_REMINDER: &str = "[CONTEXT MANAGEMENT REQUIRED]\n\
+The conversation context is above its compaction threshold. Before doing more tool work, call \
+context__manage with operation=replace_prior and an information-dense summary of the prior \
+conversation. Preserve current user intent, constraints, confirmed facts and decisions, completed \
+work and evidence, pending work, failures, uncertainties, paths, IDs, commands, exact values, and \
+errors. Resolve superseded facts chronologically and omit only genuinely obsolete or irrelevant \
+detail. This reminder is temporary and must not be copied into the summary.";
 const AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE: &str =
     "Agent.md exists in the current working directory; read it before substantive work and follow any applicable project instructions.";
 
@@ -183,6 +191,37 @@ fn model_request_budget_tokens(profile: &ModelProfileConfig, context_percent: us
                 .saturating_sub(safety_margin),
         )
         .max(1)
+}
+
+fn model_absolute_request_budget_tokens(profile: &ModelProfileConfig) -> u32 {
+    let safety_margin = profile.context_tokens.saturating_mul(5).div_ceil(100);
+    profile
+        .context_tokens
+        .saturating_sub(profile.max_output_tokens)
+        .saturating_sub(safety_margin)
+        .saturating_sub(MODEL_PROTOCOL_MARGIN_TOKENS)
+        .max(1)
+}
+
+fn protected_context_message_ids(history: &[Message]) -> Vec<MessageId> {
+    history
+        .iter()
+        .filter(|message| {
+            matches!(message.role, Role::System)
+                && !message
+                    .content
+                    .text_content()
+                    .starts_with("[LATEST COMPRESSED MEMORY]")
+                && message.content.text_content() != AGENT_CONTEXT_COMPACTION_REMINDER
+        })
+        .map(|message| message.id.clone())
+        .collect()
+}
+
+fn push_start_history_message(input: &mut LoopInput, message: Message) {
+    if let LoopInput::Start { history, .. } = input {
+        history.push(message);
+    }
 }
 
 fn system_prompt_with_agent_md_notice_for_current_dir(system_prompt: String) -> String {
@@ -605,10 +644,12 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
             history.insert(0, Message::system(self.system_prompt.clone()));
             insert_environment_context_prompt(&mut history, 1, environment_context.prompt.clone());
             append_thread_todo_system_prompt(&mut history, &ctx.user_state);
-            let mut skip_count = history.len();
             let user_state = ctx.user_state.clone();
-            let mut input = LoopInput::start(message)
+            let current_user_message = Message::user(message);
+            let protected_message_ids = protected_context_message_ids(&history);
+            let mut input = LoopInput::start_message(current_user_message.clone())
                 .history(history)
+                .protected_message_ids(protected_message_ids)
                 .metadata(serde_json::json!({ "thread_id": &thread_id }))
                 .user_state(user_state.clone());
             let budget = model_request_budget_tokens(
@@ -630,6 +671,24 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
                 if estimated <= budget {
                     break;
                 }
+                if self.model_profile.context_compaction == ContextCompactionMode::Agent {
+                    let absolute_budget = model_absolute_request_budget_tokens(&self.model_profile);
+                    if estimated >= absolute_budget {
+                        anyhow::bail!(
+                            "ACP request is too large to ask the agent to organize context ({estimated} >= {absolute_budget}); run `/compact` for this session"
+                        );
+                    }
+                    push_start_history_message(
+                        &mut input,
+                        Message::system(AGENT_CONTEXT_COMPACTION_REMINDER),
+                    );
+                    break;
+                }
+                if self.model_profile.context_compaction == ContextCompactionMode::Off {
+                    anyhow::bail!(
+                        "ACP request exceeds context budget ({estimated} > {budget}); context compaction is disabled"
+                    );
+                }
                 self.memory.compact_for_request(&thread_id).await.map_err(|err| {
                     anyhow::anyhow!(
                         "ACP request exceeds context budget ({estimated} > {budget}) and compression failed: {err}"
@@ -645,9 +704,10 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
                     environment_context.prompt.clone(),
                 );
                 append_thread_todo_system_prompt(&mut rebuilt, &refreshed.user_state);
-                skip_count = rebuilt.len();
-                input = LoopInput::start(message)
+                let protected_message_ids = protected_context_message_ids(&rebuilt);
+                input = LoopInput::start_message(current_user_message.clone())
                     .history(rebuilt)
+                    .protected_message_ids(protected_message_ids)
                     .metadata(serde_json::json!({ "thread_id": &thread_id }))
                     .user_state(user_state.clone());
             }
@@ -677,7 +737,7 @@ impl acp::AcpLocalRunner for LocalAcpAgentRunner {
                 &thread_id,
                 raw_history,
                 raw_user_state,
-                skip_count,
+                &current_user_message.id,
                 &HashMap::new(),
             )
             .await;
@@ -1177,7 +1237,7 @@ impl CatBot {
     /// | `REMI_KIMI_THINKING`      | Legacy thinking override for supported Kimi profiles  |
     /// | `REMI_REASONING_EFFORT`   | Optional reasoning effort override (`auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
     /// | `REMI_MEMORY_DAYS`        | Days before mid-term → long-term (default: 7)         |
-    /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers auto compression (default: 80) |
+    /// | `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` | Context usage percent that triggers configured compaction handling (default: 80) |
     pub fn from_env() -> anyhow::Result<Self> {
         CatBotBuilder::from_env()?.build()
     }
@@ -2712,7 +2772,6 @@ impl CatBot {
                     .is_some_and(|instance| instance.status == WorkflowStatus::Active);
                 let initial_supervisor_todo_prompt =
                     route_thread_todo_prompt(&mut history, &ctx.user_state, active_supervisor);
-                let mut skip_count;
 
                 // 3. Build request-level metadata (thread_id for tools);
                 //    build per-message metadata (sender identity + message id).
@@ -2843,7 +2902,6 @@ impl CatBot {
                     }
                 }
                 let hook_messages = history[pre_hook_history_len..].to_vec();
-                skip_count = history.len();
 
                 let should_log_media_input = content.is_multimodal()
                     || !round_opts.im_attachments.is_empty()
@@ -2863,7 +2921,6 @@ impl CatBot {
 
                 tracing::debug!(
                     thread_id = %thread_id_owned,
-                    skip_count,
                     has_message_metadata = message_metadata.is_some(),
                     has_single_chat_sender_prompt = is_direct_chat(opts.chat_type.as_deref()) && (requested_user_name.is_some() || opts.sender_user_id.as_deref().is_some_and(|value| !value.trim().is_empty())),
                     requested_user_name = requested_user_name.as_deref().unwrap_or(""),
@@ -2899,8 +2956,10 @@ impl CatBot {
                 partial_base_history.push(current_user_message.clone());
                 let mut partial_turn = PartialTurnRecorder::new(partial_base_history);
 
-                let mut input = LoopInput::start_content(content.clone())
+                let protected_message_ids = protected_context_message_ids(&history);
+                let mut input = LoopInput::start_message(current_user_message.clone())
                     .history(history)
+                    .protected_message_ids(protected_message_ids)
                     .metadata(meta.clone())
                     .user_state(ctx.user_state);
                 if let Some(user_name) = injected_user_name.clone() {
@@ -2929,13 +2988,54 @@ impl CatBot {
                     if snapshot.totals.estimated_tokens <= request_budget {
                         break Some(snapshot);
                     }
-                    if !self.memory.auto_compress {
+                    if effective_model.profile.context_compaction == ContextCompactionMode::Agent {
+                        let absolute_budget =
+                            model_absolute_request_budget_tokens(&effective_model.profile);
+                        if snapshot.totals.estimated_tokens >= absolute_budget {
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(AgentError::other(format!(
+                                "model request is too large to ask the agent to organize context: estimated {} tokens, safe limit {} tokens; run `/compact` to perform manual hard compression",
+                                snapshot.totals.estimated_tokens, absolute_budget
+                            )));
+                            return;
+                        }
+                        push_start_history_message(
+                            &mut input,
+                            Message::system(AGENT_CONTEXT_COMPACTION_REMINDER),
+                        );
+                        let definitions = active_agent.tool_definitions_for_input(&input, None);
+                        let reminded = model_input_snapshot_from_loop_input(
+                            &input,
+                            &definitions,
+                            &thread_id_owned,
+                            round_opts.message_id.as_deref(),
+                            &effective_model.profile.id,
+                            &effective_model.profile.model,
+                        );
+                        if reminded.as_ref().is_some_and(|value| {
+                            value.totals.estimated_tokens >= absolute_budget
+                        }) {
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(AgentError::other(
+                                "context compaction reminder does not fit safely; run `/compact` to perform manual hard compression"
+                            ));
+                            return;
+                        }
+                        break reminded;
+                    }
+                    if effective_model.profile.context_compaction == ContextCompactionMode::Off {
                         let _ = self
                             .memory
                             .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
                             .await;
                         yield CatEvent::Error(AgentError::other(format!(
-                            "model request exceeds context budget: estimated {} tokens, limit {} tokens; automatic compression is disabled",
+                            "model request exceeds context budget: estimated {} tokens, limit {} tokens; context compaction is disabled",
                             snapshot.totals.estimated_tokens, request_budget
                         )));
                         return;
@@ -3067,9 +3167,10 @@ impl CatBot {
                     );
                     route_thread_todo_prompt(&mut rebuilt, &refreshed.user_state, active_supervisor);
                     rebuilt.extend(hook_messages.clone());
-                    skip_count = rebuilt.len();
-                    input = LoopInput::start_content(content.clone())
+                    let protected_message_ids = protected_context_message_ids(&rebuilt);
+                    input = LoopInput::start_message(current_user_message.clone())
                         .history(rebuilt)
+                        .protected_message_ids(protected_message_ids)
                         .metadata(meta.clone())
                         .user_state(initial_user_state.clone());
                     if let Some(user_name) = injected_user_name.clone() {
@@ -3182,7 +3283,7 @@ impl CatBot {
                                     .take()
                                     .or_else(|| partial_turn.synthesize_cancelled_history()),
                                 raw_user_state.take().or_else(|| Some(initial_user_state.clone())),
-                                skip_count, &tool_elapsed_ms,
+                                &current_user_message.id, &tool_elapsed_ms,
                             ).await {
                                 yield event;
                             }
@@ -3405,7 +3506,7 @@ impl CatBot {
                                 };
                                 for event in persist_turn(
                                     &self.memory, &thread_id_owned,
-                                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                                    raw_history.take(), raw_user_state.take(), &current_user_message.id, &tool_elapsed_ms,
                                 ).await {
                                     yield event;
                                 }
@@ -3779,7 +3880,7 @@ impl CatBot {
                                     raw_user_state
                                         .take()
                                         .or_else(|| Some(initial_user_state.clone())),
-                                    skip_count,
+                                    &current_user_message.id,
                                     &tool_elapsed_ms,
                                 ).await {
                                     yield event;
@@ -3804,7 +3905,7 @@ impl CatBot {
                 // Fallback: stream ended without Done (shouldn't normally happen).
                 for event in persist_turn(
                     &self.memory, &thread_id_owned,
-                    raw_history.take(), raw_user_state.take(), skip_count, &tool_elapsed_ms,
+                    raw_history.take(), raw_user_state.take(), &current_user_message.id, &tool_elapsed_ms,
                 ).await {
                     yield event;
                 }
@@ -4055,6 +4156,9 @@ impl LocalToolDeps {
             extra_options,
             self.overflow_bytes,
         );
+        if profile.context_compaction == ContextCompactionMode::Agent {
+            register_context_manage_tool(&mut local_tools, self, &self.active_agent_id);
+        }
         local_tools
     }
 }
@@ -4535,7 +4639,7 @@ impl CatBotBuilder {
             agent_md_path: self.agent_md_path,
             compressor,
             short_term_tokens,
-            auto_compress: profile.auto_compress,
+            auto_compress: profile.context_compaction == ContextCompactionMode::Hard,
             memory_days: self.memory_days,
         });
 
@@ -4655,6 +4759,9 @@ impl CatBotBuilder {
             overflow_bytes,
         );
         register_runtime_tools(&mut acp_local_tools, &acp_tool_deps, &active_agent_id, true);
+        if profile.context_compaction == ContextCompactionMode::Agent {
+            register_context_manage_tool(&mut acp_local_tools, &acp_tool_deps, &active_agent_id);
+        }
         let run_locks: ThreadRunLocks = Arc::new(AsyncMutex::new(HashMap::new()));
         let active_steers: ActiveSteerQueues = Arc::new(StdMutex::new(HashMap::new()));
         acp_backend.set_local_runner(Arc::new(LocalAcpAgentRunner {
@@ -4667,6 +4774,9 @@ impl CatBotBuilder {
                 workspace_root_label: sandbox.workspace_root_label(),
                 allow_host_absolute_paths: sandbox.kind() != "docker",
                 overflow_bytes,
+                context_absolute_budget_tokens: (profile.context_compaction
+                    == ContextCompactionMode::Agent)
+                    .then(|| model_absolute_request_budget_tokens(&profile)),
                 im_bridge: self.im_bridge.clone(),
                 tool_allowlist: self.tool_allowlist.clone(),
                 approval_manager: Arc::clone(&approval_manager),
@@ -4757,6 +4867,9 @@ impl CatBotBuilder {
                         workspace_root_label: sandbox.workspace_root_label(),
                         allow_host_absolute_paths: sandbox.kind() != "docker",
                         overflow_bytes: model_overflow_bytes,
+                        context_absolute_budget_tokens: (variant.profile.context_compaction
+                            == ContextCompactionMode::Agent)
+                            .then(|| model_absolute_request_budget_tokens(&variant.profile)),
                         im_bridge: self.im_bridge.clone(),
                         tool_allowlist: self.tool_allowlist.clone(),
                         approval_manager: Arc::clone(&approval_manager),
@@ -4893,6 +5006,9 @@ impl CatBotBuilder {
                             workspace_root_label: sandbox.workspace_root_label(),
                             allow_host_absolute_paths: sandbox.kind() != "docker",
                             overflow_bytes: model_overflow_bytes,
+                            context_absolute_budget_tokens: (variant.profile.context_compaction
+                                == ContextCompactionMode::Agent)
+                                .then(|| model_absolute_request_budget_tokens(&variant.profile)),
                             im_bridge: self.im_bridge.clone(),
                             tool_allowlist: Some(agent_tool_allowlist),
                             approval_manager: Arc::clone(&approval_manager),
@@ -4917,6 +5033,9 @@ impl CatBotBuilder {
                 workspace_root_label: sandbox.workspace_root_label(),
                 allow_host_absolute_paths: sandbox.kind() != "docker",
                 overflow_bytes,
+                context_absolute_budget_tokens: (profile.context_compaction
+                    == ContextCompactionMode::Agent)
+                    .then(|| model_absolute_request_budget_tokens(&profile)),
                 im_bridge: self.im_bridge,
                 tool_allowlist: self.tool_allowlist,
                 approval_manager: Arc::clone(&approval_manager),
@@ -5957,7 +6076,7 @@ mod tests {
         DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
-    use crate::model_profile::ModelProfileConfig;
+    use crate::model_profile::{ContextCompactionMode, ModelProfileConfig};
     use crate::supervisor_workflow;
     use crate::todo::tools::TodoItem;
     use crate::user_question::{UserQuestionResponse, UserQuestionStatus};
@@ -6064,7 +6183,7 @@ mod tests {
             supports_images: true,
             legacy_short_term_tokens: None,
             overflow_bytes: 16384,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         }
     }
@@ -6093,6 +6212,28 @@ mod tests {
         host_tools: Vec<bot_runtime_core::DynamicTool>,
         overflow_bytes: Option<usize>,
     ) -> super::CatBot {
+        build_mock_bot_with_mode(
+            data_dir,
+            base_url,
+            supports_images,
+            max_turns,
+            host_tools,
+            overflow_bytes,
+            ContextCompactionMode::Hard,
+            None,
+        )
+    }
+
+    fn build_mock_bot_with_mode(
+        data_dir: &tempfile::TempDir,
+        base_url: String,
+        supports_images: bool,
+        max_turns: usize,
+        host_tools: Vec<bot_runtime_core::DynamicTool>,
+        overflow_bytes: Option<usize>,
+        context_compaction: ContextCompactionMode,
+        context_tokens: Option<u32>,
+    ) -> super::CatBot {
         let skills_dir = data_dir.path().join("skills");
         let agents_dir = data_dir.path().join("agents");
         let models_dir = data_dir.path().join("models");
@@ -6101,6 +6242,10 @@ mod tests {
         model_profile.base_url = Some(base_url);
         model_profile.model = "mock-model".to_string();
         model_profile.supports_images = supports_images;
+        model_profile.context_compaction = context_compaction;
+        if let Some(context_tokens) = context_tokens {
+            model_profile.context_tokens = context_tokens;
+        }
         CatBotBuilder {
             api_keys: Some(Arc::new(std::collections::BTreeMap::from([(
                 "OPENAI_API_KEY".to_string(),
@@ -6141,6 +6286,233 @@ mod tests {
         }
         .build()
         .unwrap()
+    }
+
+    #[test]
+    fn context_manage_tool_is_registered_only_for_agent_mode() {
+        let hard_dir = tempfile::tempdir().unwrap();
+        let hard = build_mock_bot_with_mode(
+            &hard_dir,
+            "http://127.0.0.1:1".to_string(),
+            false,
+            1,
+            Vec::new(),
+            None,
+            ContextCompactionMode::Hard,
+            None,
+        );
+        assert!(!super::cat_agent_contains_tool(
+            &hard.inner,
+            "context__manage"
+        ));
+
+        let agent_dir = tempfile::tempdir().unwrap();
+        let agent = build_mock_bot_with_mode(
+            &agent_dir,
+            "http://127.0.0.1:1".to_string(),
+            false,
+            1,
+            Vec::new(),
+            None,
+            ContextCompactionMode::Agent,
+            None,
+        );
+        assert!(super::cat_agent_contains_tool(
+            &agent.inner,
+            "context__manage"
+        ));
+    }
+
+    #[test]
+    fn agent_mode_reminds_then_replaces_prior_context_end_to_end() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "55");
+            let summary = "confirmed choice retained; pending verification remains";
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_tool_call(
+                    "call-compact",
+                    "context__manage",
+                    json!({ "operation": "replace_prior", "summary": summary }),
+                ),
+                sse_text("continued after agent compaction"),
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot_with_mode(
+                &data_dir,
+                base_url,
+                false,
+                4,
+                Vec::new(),
+                None,
+                ContextCompactionMode::Agent,
+                Some(40_000),
+            );
+            let thread = "agent-context-compaction-e2e";
+            let old_marker = "OLD_RAW_CONTEXT_MUST_DISAPPEAR";
+            let messages = (1..=8)
+                .flat_map(|i| {
+                    vec![
+                        Message::user(format!(
+                            "{old_marker} exchange {i}: {}",
+                            "context ".repeat(700)
+                        )),
+                        Message::assistant(format!("answer {i}: {}", "evidence ".repeat(500))),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            bot.memory
+                .append_failed_turn(thread, messages)
+                .await
+                .unwrap();
+
+            let events = collect_stream(bot.stream(thread, "continue the current task")).await;
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CatEvent::ContextCompaction(ContextCompactionEvent {
+                    status: ContextCompactionStatus::Completed,
+                    source: ContextCompactionSource::Agent,
+                    ..
+                })
+            )));
+            assert!(events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text.contains("continued after"))
+            ));
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[0].contains("The conversation context is above its compaction threshold.")
+            );
+            assert!(requests[0].contains(old_marker));
+            assert!(requests[1].contains(summary));
+            assert!(requests[1].contains("continue the current task"));
+            assert!(!requests[1].contains(old_marker));
+            assert!(!requests[1]
+                .contains("The conversation context is above its compaction threshold."));
+            assert_eq!(bot.memory.thread_history(thread).await.len(), 20);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires KIMI_API_KEY and calls the live Moonshot API"]
+    fn live_agent_mode_compacts_context_and_continues() {
+        run_large_stack_local_test(|| async {
+            let api_key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY must be set");
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "55");
+            let data_dir = tempfile::tempdir().unwrap();
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let profile = ModelProfileConfig {
+                id: "live-agent-compaction".to_string(),
+                name: "Live Agent Compaction".to_string(),
+                description: None,
+                provider: Some("kimi".to_string()),
+                model: "kimi-k2.7-code".to_string(),
+                base_url: Some("https://api.moonshot.cn/v1".to_string()),
+                thinking: None,
+                reasoning_effort: None,
+                max_output_tokens: 1_024,
+                context_tokens: 40_000,
+                supports_images: false,
+                legacy_short_term_tokens: None,
+                overflow_bytes: 32_000,
+                context_compaction: ContextCompactionMode::Agent,
+                extra_options: serde_json::Map::new(),
+            };
+            let bot = CatBotBuilder {
+                api_keys: None,
+                agent_tracing: AgentTracingOptions::default(),
+                a2a_delegate_transport: None,
+                api_key,
+                model_profile: profile,
+                runtime_model_locked: true,
+                system: default_system_prompt(),
+                skills_dir: data_dir.path().join("skills"),
+                data_dir: data_dir.path().to_path_buf(),
+                memory_dir: data_dir.path().join("memory"),
+                agent_md_path: None,
+                overflow_bytes: None,
+                memory_days: 7,
+                sandbox_config: SandboxConfig::Disabled {
+                    host_dir: data_dir.path().to_path_buf(),
+                },
+                im_bridge: None,
+                extra_options: serde_json::Map::new(),
+                tool_allowlist: None,
+                delegate_ids: Vec::new(),
+                active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                model_bindings: AgentModelBindings::default(),
+                approval_model_profile_id: None,
+                agents_dir: data_dir.path().join("agents"),
+                max_turns: Some(4),
+                model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
+                acp_client_tools: None,
+                host_tools: Vec::new(),
+                builtin_skills: Vec::new(),
+                include_default_skills: true,
+                file_skills: true,
+                include_default_agents: true,
+                hook_manager: None,
+            }
+            .build()
+            .unwrap();
+            let thread = "live-agent-context-compaction";
+            let old_marker = "LIVE_OLD_RAW_CONTEXT_MUST_DISAPPEAR";
+            let old_messages = (1..=8)
+                .flat_map(|i| {
+                    vec![
+                        Message::user(format!(
+                            "{old_marker} exchange {i}: {}",
+                            "context ".repeat(700)
+                        )),
+                        Message::assistant(format!("answer {i}: {}", "evidence ".repeat(500))),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            bot.memory
+                .append_failed_turn(thread, old_messages)
+                .await
+                .unwrap();
+
+            let events = collect_stream(bot.stream(
+                thread,
+                "继续当前任务。遵循系统中的上下文管理提醒，完成后只简短确认已继续。",
+            ))
+            .await;
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CatEvent::ToolCall { name, .. } if name == "context__manage"
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CatEvent::ContextCompaction(ContextCompactionEvent {
+                    status: ContextCompactionStatus::Completed,
+                    source: ContextCompactionSource::Agent,
+                    ..
+                })
+            )));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, CatEvent::Text(text) if !text.trim().is_empty())));
+            let reloaded = bot.memory.load_context(thread).await.unwrap();
+            let summary = reloaded
+                .latest_summary
+                .as_deref()
+                .expect("agent-authored summary must reload after the run");
+            assert!(!summary.trim().is_empty());
+            let ledger = bot.memory.thread_history(thread).await;
+            assert!(ledger
+                .iter()
+                .any(|message| message.text.contains(old_marker)));
+            assert!(ledger.len() > 16, "current live turn must be persisted");
+            eprintln!(
+                "live agent compaction verified: summary_bytes={}, ledger_messages={}",
+                summary.len(),
+                ledger.len()
+            );
+        });
     }
 
     #[test]
@@ -7880,7 +8252,7 @@ You are Remi.
                 supports_images: false,
                 legacy_short_term_tokens: None,
                 overflow_bytes: 24000,
-                auto_compress: true,
+                context_compaction: ContextCompactionMode::Hard,
                 extra_options: serde_json::Map::new(),
             },
             runtime_model_locked: true,

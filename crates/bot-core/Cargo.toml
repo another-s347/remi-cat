@@ -13,11 +13,11 @@ experimental-pty = ["dep:portable-pty", "dep:vt100"]
 [dependencies]
 bot-runtime-core = { path = "../bot-runtime-core" }
 agent-client-protocol = "1.0.1"
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "889866c6edb33ca7a928bf83eac11bc7057870ac", features = [
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "eb2f30f5ff07845ee9e44427f32e8b8cec582ffa", features = [
     "http-client",
     "tracing-sentry",
 ] }
-remi-agentloop-deepagent = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop-deepagent", rev = "889866c6edb33ca7a928bf83eac11bc7057870ac" }
+remi-agentloop-deepagent = { git = "https://github.com/another-s347/remi-agentloop.git", package = "remi-agentloop-deepagent", rev = "eb2f30f5ff07845ee9e44427f32e8b8cec582ffa" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"

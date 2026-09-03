@@ -840,6 +840,58 @@ impl MemoryStore {
             .await
     }
 
+    /// Commit a summary authored by the running agent. The append-only ledger
+    /// remains intact; the summary covers every ledger message that predates
+    /// the active run and replaces the current mid-term summary.
+    pub async fn commit_agent_summary(
+        &self,
+        thread_id: &str,
+        summary: &str,
+    ) -> Result<usize, AgentError> {
+        if summary.trim().is_empty() {
+            return Err(AgentError::other("agent context summary must not be empty"));
+        }
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
+        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        if ledger.is_empty() {
+            return Ok(0);
+        }
+
+        let mid_dir = self.mid_term_dir(thread_id);
+        let old_index = Self::read_index(&mid_dir).await;
+        let uuid = Uuid::new_v4().to_string();
+        tokio::fs::create_dir_all(&mid_dir)
+            .await
+            .map_err(|error| AgentError::Io(error.to_string()))?;
+        let body = format!(
+            "<!-- created: {} -->\n\n{}",
+            Utc::now().to_rfc3339(),
+            summary.trim()
+        );
+        atomic_write(&mid_dir.join(format!("{uuid}.md")), body.as_bytes()).await?;
+
+        let index = MemoryIndex {
+            entries: vec![MemoryEntry {
+                uuid: uuid.clone(),
+                created_at: Utc::now(),
+                preview: make_preview(summary.trim(), 100),
+                first_message_id: ledger.first().map(|message| message.id.to_string()),
+                last_message_id: ledger.last().map(|message| message.id.to_string()),
+                message_count: Some(ledger.len()),
+                status: Some("committed".to_string()),
+            }],
+        };
+        Self::write_index(&mid_dir, &index).await?;
+        for entry in old_index.entries {
+            if entry.uuid != uuid {
+                let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
+            }
+        }
+        remove_thread_caches(&self.token_cache_key(thread_id));
+        Ok(ledger.len())
+    }
+
     /// Compact using the model selected for the active session rather than
     /// the process-wide default compressor.
     pub async fn compact_now_with_compressor(

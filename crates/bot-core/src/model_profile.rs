@@ -228,13 +228,57 @@ pub struct ModelProfileConfig {
     #[serde(default, rename = "short_term_tokens", skip_serializing)]
     pub legacy_short_term_tokens: Option<usize>,
     pub overflow_bytes: usize,
-    pub auto_compress: bool,
+    /// Context compaction policy. Legacy `auto_compress: true/false` values
+    /// deserialize as `hard/off` through the field alias.
+    #[serde(default, alias = "auto_compress")]
+    pub context_compaction: ContextCompactionMode,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub extra_options: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionMode {
+    Hard,
+    Agent,
+    Off,
+}
+
+impl Default for ContextCompactionMode {
+    fn default() -> Self {
+        Self::Hard
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextCompactionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Name(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(Self::Hard),
+            Repr::Bool(false) => Ok(Self::Off),
+            Repr::Name(name) => match name.trim().to_ascii_lowercase().as_str() {
+                "hard" => Ok(Self::Hard),
+                "agent" => Ok(Self::Agent),
+                "off" => Ok(Self::Off),
+                _ => Err(serde::de::Error::custom(
+                    "context_compaction must be one of: hard, agent, off",
+                )),
+            },
+        }
+    }
 }
 
 impl ModelProfileConfig {
@@ -870,7 +914,7 @@ fn legacy_profile_from_env() -> Result<ModelProfileConfig> {
         ),
         legacy_short_term_tokens: None,
         overflow_bytes,
-        auto_compress: true,
+        context_compaction: ContextCompactionMode::Hard,
         extra_options: serde_json::Map::new(),
     };
     profile.validate()?;
@@ -947,7 +991,7 @@ mod tests {
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 16384,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         }
     }
@@ -967,7 +1011,7 @@ max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
 overflow_bytes: 16384
-auto_compress: true
+context_compaction: hard
 "#,
         );
         write_profile(
@@ -982,7 +1026,7 @@ max_output_tokens: 8192
 context_tokens: 128000
 supports_images: false
 overflow_bytes: 24000
-auto_compress: false
+context_compaction: off
 "#,
         );
 
@@ -990,6 +1034,24 @@ auto_compress: false
         assert_eq!(registry.list().len(), 2);
         assert!(registry.get("default").is_some());
         assert!(registry.get("deepseek-v4-flash").is_some());
+    }
+
+    #[test]
+    fn context_compaction_accepts_agent_and_legacy_boolean_values() {
+        let parse = |line: &str| {
+            serde_yaml::from_str::<ModelProfileConfig>(&format!(
+                "id: test\nname: Test\nmodel: test\nmax_output_tokens: 1024\ncontext_tokens: 8192\nsupports_images: false\noverflow_bytes: 1024\n{line}\n"
+            ))
+            .unwrap()
+            .context_compaction
+        };
+
+        assert_eq!(
+            parse("context_compaction: agent"),
+            ContextCompactionMode::Agent
+        );
+        assert_eq!(parse("auto_compress: true"), ContextCompactionMode::Hard);
+        assert_eq!(parse("auto_compress: false"), ContextCompactionMode::Off);
     }
 
     #[test]
@@ -1004,7 +1066,7 @@ context_tokens: 128000
 supports_images: true
 short_term_tokens: 16000
 overflow_bytes: 16384
-auto_compress: true
+context_compaction: hard
 "#,
         )
         .expect("retired field remains configuration-compatible");
@@ -1027,7 +1089,7 @@ max_output_tokens: 1
 context_tokens: 1
 supports_images: false
 overflow_bytes: 1
-auto_compress: true
+context_compaction: hard
 "#,
         );
         write_profile(
@@ -1041,7 +1103,7 @@ max_output_tokens: 1
 context_tokens: 1
 supports_images: false
 overflow_bytes: 1
-auto_compress: true
+context_compaction: hard
 "#,
         );
 
@@ -1063,7 +1125,7 @@ max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
 overflow_bytes: 16384
-auto_compress: true
+context_compaction: hard
 "#,
         );
         let err = ModelProfileRegistry::load(temp.path()).unwrap_err();
@@ -1090,7 +1152,7 @@ max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
 overflow_bytes: 16384
-auto_compress: true
+context_compaction: hard
 "#,
         );
         write_profile(
@@ -1105,7 +1167,7 @@ max_output_tokens: 8192
 context_tokens: 128000
 supports_images: false
 overflow_bytes: 24000
-auto_compress: false
+context_compaction: off
 "#,
         );
         unsafe {
@@ -1139,7 +1201,7 @@ max_output_tokens: 4096
 context_tokens: 128000
 supports_images: true
 overflow_bytes: 16384
-auto_compress: true
+context_compaction: hard
 "#,
         );
         unsafe {
@@ -1199,7 +1261,7 @@ auto_compress: true
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 16384,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
 
@@ -1321,7 +1383,7 @@ auto_compress: true
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 32000,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
 
@@ -1351,7 +1413,7 @@ auto_compress: true
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 32000,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
 
@@ -1381,7 +1443,7 @@ auto_compress: true
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 32000,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
 
@@ -1417,7 +1479,7 @@ auto_compress: true
             supports_images: false,
             legacy_short_term_tokens: None,
             overflow_bytes: 32000,
-            auto_compress: true,
+            context_compaction: ContextCompactionMode::Hard,
             extra_options: serde_json::Map::new(),
         };
 

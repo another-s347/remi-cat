@@ -274,6 +274,7 @@ pub fn inject_extra_tools(input: LoopInput, extra: Vec<ToolDefinition>) -> LoopI
         LoopInput::Start {
             message,
             history,
+            protected_message_ids,
             mut extra_tools,
             model,
             temperature,
@@ -285,6 +286,7 @@ pub fn inject_extra_tools(input: LoopInput, extra: Vec<ToolDefinition>) -> LoopI
             LoopInput::Start {
                 message,
                 history,
+                protected_message_ids,
                 extra_tools,
                 model,
                 temperature,
@@ -306,6 +308,7 @@ pub fn apply_profile_to_input(
         LoopInput::Start {
             message,
             mut history,
+            mut protected_message_ids,
             extra_tools,
             model,
             temperature,
@@ -316,12 +319,15 @@ pub fn apply_profile_to_input(
             if !profile.system_prompt.trim().is_empty()
                 && !history_contains_system_prompt(&history, &profile.system_prompt)
             {
-                history.insert(0, Message::system(profile.system_prompt.clone()));
+                let message = Message::system(profile.system_prompt.clone());
+                protected_message_ids.push(message.id.clone());
+                history.insert(0, message);
             }
             let model = model.or_else(|| effective_config.model.clone());
             LoopInput::Start {
                 message,
                 history,
+                protected_message_ids,
                 extra_tools,
                 model,
                 temperature,
