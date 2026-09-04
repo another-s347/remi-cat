@@ -92,10 +92,10 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
-weaver-core = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
-weaver-crypto = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
-weaver-net = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
-weaver-store = { git = "https://github.com/another-s347/weaver.git", rev = "7075b7b45f2e344316d0dee0f11c7123cc1d5ecb" }
+weaver-core = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-crypto = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-net = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-store = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 zeroize = "1"
 tower = "0.5"

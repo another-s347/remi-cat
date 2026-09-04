@@ -7194,7 +7194,7 @@ dependencies = [
 [[package]]
 name = "weaver-config"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "blake3",
  "bytes",
@@ -7211,7 +7211,7 @@ dependencies = [
 [[package]]
 name = "weaver-core"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "hex",
  "serde",
@@ -7221,7 +7221,7 @@ dependencies = [
 [[package]]
 name = "weaver-crypto"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "blake3",
  "bytes",
@@ -7234,7 +7234,7 @@ dependencies = [
 [[package]]
 name = "weaver-discovery"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "blake3",
  "bytes",
@@ -7255,7 +7255,7 @@ dependencies = [
 [[package]]
 name = "weaver-net"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -7281,8 +7281,9 @@ dependencies = [
 [[package]]
 name = "weaver-relay-core"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
+ "base64",
  "blake3",
  "bytes",
  "getrandom 0.4.3",
@@ -7298,7 +7299,7 @@ dependencies = [
 [[package]]
 name = "weaver-store"
 version = "0.1.0"
-source = "git+https://github.com/another-s347/weaver.git?rev=7075b7b45f2e344316d0dee0f11c7123cc1d5ecb#7075b7b45f2e344316d0dee0f11c7123cc1d5ecb"
+source = "git+https://github.com/another-s347/weaver.git?rev=3aa187501f20e68196cb403867950c3bdb2938b1#3aa187501f20e68196cb403867950c3bdb2938b1"
 dependencies = [
  "aes-gcm",
  "async-trait",
