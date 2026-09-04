@@ -52,7 +52,9 @@ impl Tool for ContextManageTool {
          work and evidence; current state and pending work; failures, uncertainties, paths, IDs, exact \
          values, commands, and errors. Resolve superseded facts chronologically and omit genuinely \
          obsolete or irrelevant detail. The operation replaces prior conversational messages while \
-         retaining standing system instructions and the current run."
+         retaining standing system instructions and the current run. Replaced messages will be absent \
+         from subsequent model requests, and the submitted summary will be their only replacement, so \
+         include every detail needed to continue correctly before calling the tool."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -66,7 +68,7 @@ impl Tool for ContextManageTool {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Complete, information-dense replacement summary authored by the agent"
+                    "description": "Complete, information-dense summary authored by the agent. This becomes the only replacement for prior mutable conversation messages in subsequent model requests."
                 }
             },
             "required": ["operation", "summary"],

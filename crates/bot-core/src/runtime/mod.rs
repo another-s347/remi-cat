@@ -88,7 +88,9 @@ const MODEL_PROTOCOL_MARGIN_TOKENS: u32 = 512;
 const AGENT_CONTEXT_COMPACTION_REMINDER: &str = "[CONTEXT MANAGEMENT REQUIRED]\n\
 The conversation context is above its compaction threshold. Before doing more tool work, call \
 context__manage with operation=replace_prior and an information-dense summary of the prior \
-conversation. Preserve current user intent, constraints, confirmed facts and decisions, completed \
+conversation. After the call, all replaceable prior conversation messages will be absent from the \
+next model request; this summary will be their only replacement. Before submitting it, ensure it \
+contains every detail needed to continue correctly. Preserve current user intent, constraints, confirmed facts and decisions, completed \
 work and evidence, pending work, failures, uncertainties, paths, IDs, commands, exact values, and \
 errors. Resolve superseded facts chronologically and omit only genuinely obsolete or irrelevant \
 detail. This reminder is temporary and must not be copied into the summary.";

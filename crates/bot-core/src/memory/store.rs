@@ -1184,7 +1184,17 @@ impl MemoryStore {
         query: &TokenizedSearchQuery,
         results: &mut Vec<MemoryRecallResult>,
     ) -> Result<(), AgentError> {
-        for msg in Self::read_short_term(&self.short_term_path(thread_id)).await {
+        let messages = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let excluded_tool_results = recursive_memory_search_result_ids(&messages);
+        for msg in messages {
+            if msg.role == Role::Tool
+                && msg
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| excluded_tool_results.contains(id))
+            {
+                continue;
+            }
             let text = msg.content.text_content();
             let score = match_score(&text, query);
             if score == 0 {
@@ -1238,6 +1248,35 @@ impl MemoryStore {
         }
         Ok(())
     }
+}
+
+/// Tool results from memory retrieval must not become retrieval candidates
+/// themselves. Otherwise each recall can embed the previous recall payload,
+/// causing recursive growth and eventually outranking the original memory.
+fn recursive_memory_search_result_ids(messages: &[Message]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| {
+            if call.function.name == "memory__recall" {
+                return true;
+            }
+            if call.function.name != "search" {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .get("scope")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("memory"))
+        })
+        .map(|call| call.id.clone())
+        .collect()
 }
 
 fn tool_elapsed_ms(message: &Message) -> Option<u64> {
@@ -2283,6 +2322,75 @@ mod tests {
         assert!(sources.contains("short_term"));
         assert!(sources.contains("mid_term"));
         assert!(sources.contains("long_term"));
+    }
+
+    #[tokio::test]
+    async fn recall_excludes_recursive_memory_search_tool_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let tool_call = |id: &str, name: &str, arguments: serde_json::Value| {
+            let mut message = Message::assistant("");
+            message.tool_calls = Some(vec![ToolCallMessage {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            }]);
+            message
+        };
+
+        let original = Message::user("recursive-target original user fact");
+        let recall_result =
+            Message::tool_result("recall-1", "recursive-target nested memory__recall payload");
+        let recall_result_id = recall_result.id.to_string();
+        let search_result =
+            Message::tool_result("search-1", "recursive-target nested search payload");
+        let search_result_id = search_result.id.to_string();
+        let ordinary_result =
+            Message::tool_result("search-2", "recursive-target ordinary skills payload");
+        let ordinary_result_id = ordinary_result.id.to_string();
+
+        store
+            .save_turn(
+                "thread-1",
+                vec![
+                    original,
+                    tool_call("recall-1", "memory__recall", json!({"query": "target"})),
+                    recall_result,
+                    tool_call(
+                        "search-1",
+                        "search",
+                        json!({"query": "target", "scope": "memory"}),
+                    ),
+                    search_result,
+                    tool_call(
+                        "search-2",
+                        "search",
+                        json!({"query": "target", "scope": "skills"}),
+                    ),
+                    ordinary_result,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .recall("default", "thread-1", "recursive-target", 20)
+            .await
+            .unwrap();
+        let ids = results
+            .iter()
+            .filter_map(|result| result.uuid.as_deref())
+            .collect::<HashSet<_>>();
+
+        assert!(!ids.contains(recall_result_id.as_str()));
+        assert!(!ids.contains(search_result_id.as_str()));
+        assert!(ids.contains(ordinary_result_id.as_str()));
+        assert!(results
+            .iter()
+            .any(|result| result.name.as_deref() == Some("User")));
     }
 
     #[tokio::test]
