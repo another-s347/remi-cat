@@ -207,13 +207,18 @@ impl AgentExecutor for ApplicationA2aExecutor {
             let text = message_text(message)?;
             let input_message = message.clone();
             let agent_id = target_agent_id(message);
+            let output_context = a2a_output_context(message);
             let session = channel
                 .resolve_session(ctx.context_id.clone())
                 .await
                 .map_err(|error| A2AError::internal(error.to_string()))?;
             let options = agent_id.map_or_else(RunOptions::default, |agent| RunOptions::default().agent(agent));
             let mut run = channel
-                .run(RunRequest::text(session.id.clone(), text).options(options))
+                .run(
+                    RunRequest::text(session.id.clone(), text)
+                        .options(options)
+                        .with_optional_output_context(output_context),
+                )
                 .await
                 .map_err(|error| A2AError::internal(error.to_string()))?;
             active.write().await.insert(ctx.task_id.clone(), (session.id, run.control()));
@@ -241,6 +246,9 @@ impl AgentExecutor for ApplicationA2aExecutor {
                             }
                             yield activity_event(&ctx, activity_value(kind, data));
                         }
+                    }
+                    ApplicationEvent::ResponseCompleted { text, .. } => {
+                        final_output = text;
                     }
                     ApplicationEvent::Done => break,
                     ApplicationEvent::SupervisorStarted => {}
@@ -276,6 +284,16 @@ fn target_agent_id(message: &Message) -> Option<String> {
         .and_then(|value| value.get("agentId"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+fn a2a_output_context(message: &Message) -> Option<crate::OutputProtocolContext> {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(INVOCATION_EXTENSION))
+        .and_then(|value| value.get("outputContext"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn activity_value(kind: &str, data: serde_json::Value) -> serde_json::Value {
@@ -379,6 +397,7 @@ impl AgentExecutor for RemiA2aExecutor {
                 .and_then(|value| value.get("agentId"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
+            let output_context = a2a_output_context(message);
             let session_id = sessions
                 .lock()
                 .await
@@ -399,6 +418,7 @@ impl AgentExecutor for RemiA2aExecutor {
                     WebRuntimeOptions {
                         agent_id: target_agent_id,
                         platform: Some(A2A_CHANNEL.to_string()),
+                        output_context,
                         ..WebRuntimeOptions::default()
                     },
                     None,

@@ -1,10 +1,12 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -63,9 +65,10 @@ use crate::workspace_files::{
     default_file_search_limit, search_workspace_files, WorkspaceFileMatch,
 };
 use crate::{
-    Application, ApplicationCatalog, ApplicationEvent, ChannelConfig, ChannelHandle, CliConfig,
-    CommandPreprocessResult, RunControl, RunOptions, RunRequest, SessionPatch,
-    SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
+    A2aConversationContext, Application, ApplicationCatalog, ApplicationEvent, ChannelConfig,
+    ChannelHandle, CliConfig, CommandPreprocessResult, OutputCapabilities, OutputCapability,
+    OutputEntity, OutputEntityKind, OutputProtocolContext, RunControl, RunOptions, RunRequest,
+    SessionPatch, SESSION_AGENT_ID_METADATA_KEY, SESSION_INPUT_HISTORY_METADATA_KEY,
     SESSION_MODEL_PROFILE_METADATA_KEY,
 };
 
@@ -790,6 +793,8 @@ struct TuiApp {
     interrupt_requested: bool,
     exit_after_run: bool,
     run_control: Option<RunControl>,
+    handoff_cancel: Option<HandoffCancellation>,
+    handoff_active: bool,
     queued_inputs: VecDeque<SubmittedInput>,
     pending_steers: VecDeque<PendingSteer>,
     input_history: Vec<String>,
@@ -836,6 +841,98 @@ struct PendingSteer {
     display_text: String,
     content: Content,
     next_turn: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TuiMentionAgent {
+    reference: String,
+    profile_reference: Option<String>,
+    profile_id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct TuiOutputProtocol {
+    context: OutputProtocolContext,
+    agents: HashMap<String, TuiMentionAgent>,
+    workspace: PathBuf,
+}
+
+impl TuiOutputProtocol {
+    fn render(&self, text: &str) -> String {
+        let document = crate::parse_output(text, &self.context);
+        let with_resources = document.render_resources(|path, image, label| {
+            Some(
+                match crate::resolve_resource_path(path, &self.workspace, &[]) {
+                    Ok(path) if image => {
+                        format!("![{}](<{}>)", markdown_label(label), path.display())
+                    }
+                    Ok(path) => format!("[{}](<{}>)", markdown_label(label), path.display()),
+                    Err(_) => format!("**⚠ 资源不可用：{}**", markdown_label(label)),
+                },
+            )
+        });
+        crate::parse_output(&with_resources, &self.context).render_mentions(
+            |reference, kind, _| {
+                let label = self
+                    .context
+                    .entity(reference)
+                    .map(|entity| entity.label.as_str())
+                    .unwrap_or(reference);
+                Some(match kind {
+                    OutputEntityKind::User => format!("**@{}**", markdown_label(label)),
+                    OutputEntityKind::Agent => format!("`@{}`", markdown_code(label)),
+                })
+            },
+            |_| Some("**@所有人**".into()),
+        )
+    }
+}
+
+fn markdown_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn markdown_code(value: &str) -> String {
+    value.replace('`', "'")
+}
+
+#[derive(Debug, Clone)]
+struct PendingAgentHandoff {
+    handoff_id: String,
+    parent_handoff_id: Option<String>,
+    sequence: u64,
+    caller_reference: String,
+    target_reference: String,
+    source_message_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HandoffCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl HandoffCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
 }
 
 /// Update the terminal window title with the current workspace and agent state.
@@ -913,6 +1010,8 @@ impl TuiApp {
             interrupt_requested: false,
             exit_after_run: false,
             run_control: None,
+            handoff_cancel: None,
+            handoff_active: false,
             queued_inputs: VecDeque::new(),
             pending_steers: VecDeque::new(),
             input_history: Vec::new(),
@@ -1662,6 +1761,8 @@ impl TuiApp {
         let sender_username = self.cli.username.clone();
         let async_agent = self.cli.async_agent;
         let tx = self.bot_tx.clone();
+        let handoff_cancel = HandoffCancellation::default();
+        self.handoff_cancel = Some(handoff_cancel.clone());
         tokio::spawn(async move {
             run_bot_turn(
                 channel,
@@ -1670,6 +1771,7 @@ impl TuiApp {
                 sender_user_id,
                 sender_username,
                 async_agent,
+                handoff_cancel,
                 tx,
             )
             .await;
@@ -1699,6 +1801,39 @@ impl TuiApp {
             BotEvent::Text(delta) => {
                 self.awaiting_background_tasks = false;
                 self.push_assistant_delta(&delta);
+            }
+            BotEvent::ResponseCompleted { message_id, text } => {
+                let _ = message_id;
+                if let Some(cell) = self
+                    .cells
+                    .iter_mut()
+                    .rev()
+                    .find(|cell| matches!(cell.kind, CellKind::Assistant))
+                {
+                    cell.body = text;
+                }
+            }
+            BotEvent::HandoffStarted { agent, queued } => {
+                self.handoff_active = true;
+                self.cells.push(HistoryCell::system(format!(
+                    "A2A → {agent}{}",
+                    if queued == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {queued} queued")
+                    }
+                )));
+                self.status.state = format!("handoff:{agent}");
+                set_terminal_title(&self.workspace_dir, &format!("handoff {agent}"));
+            }
+            BotEvent::HandoffReply { agent, text } => {
+                self.cells
+                    .push(HistoryCell::assistant(format!("**{agent}**\n\n{text}")));
+            }
+            BotEvent::HandoffFailed { agent, error } => {
+                self.cells.push(HistoryCell::error(format!(
+                    "A2A handoff to {agent} failed: {error}"
+                )));
             }
             BotEvent::Thinking(delta) => {
                 self.awaiting_background_tasks = false;
@@ -2183,6 +2318,8 @@ impl TuiApp {
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.run_control = None;
+                self.handoff_cancel = None;
+                self.handoff_active = false;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2203,6 +2340,8 @@ impl TuiApp {
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.run_control = None;
+                self.handoff_cancel = None;
+                self.handoff_active = false;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2220,6 +2359,8 @@ impl TuiApp {
                 self.background_task_count = 0;
                 self.interrupt_requested = false;
                 self.run_control = None;
+                self.handoff_cancel = None;
+                self.handoff_active = false;
                 self.sub_tool_args.clear();
                 self.sub_tool_names.clear();
                 self.sub_sessions.clear();
@@ -2500,6 +2641,18 @@ impl TuiApp {
     }
 
     fn request_cancel_current_run(&mut self) {
+        if let Some(cancel) = self.handoff_cancel.as_ref() {
+            cancel.cancel();
+        }
+        if self.handoff_active {
+            let _ = push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells);
+            if let Some(control) = self.run_control.take() {
+                tokio::spawn(async move {
+                    let _ = control.terminate().await;
+                });
+            }
+            return;
+        }
         if !push_interrupt_requested_once(&mut self.interrupt_requested, &mut self.cells) {
             if let Some(control) = self.run_control.take() {
                 tokio::spawn(async move {
@@ -3904,14 +4057,18 @@ async fn run_bot_turn(
     channel: ChannelHandle,
     session_id: String,
     content: Content,
-    _sender_user_id: String,
-    _sender_username: String,
+    sender_user_id: String,
+    sender_username: String,
     async_agent: bool,
+    handoff_cancel: HandoffCancellation,
     tx: mpsc::UnboundedSender<BotEvent>,
 ) {
     let is_clear_command = content.text_content().trim() == "/clear";
-    let request = RunRequest::new(session_id, content)
-        .options(RunOptions::default().async_agent(async_agent));
+    let output_protocol =
+        build_tui_output_protocol(&channel, &session_id, &sender_user_id, &sender_username);
+    let request = RunRequest::new(&session_id, content)
+        .options(RunOptions::default().async_agent(async_agent))
+        .output_context(output_protocol.context.clone());
     let mut handle = match channel.run(request).await {
         Ok(handle) => handle,
         Err(error) => {
@@ -3921,12 +4078,285 @@ async fn run_bot_turn(
         }
     };
     let _ = tx.send(BotEvent::RunStarted(handle.control()));
+    let mut completed = None;
     while let Some(event) = handle.recv().await {
+        if let ApplicationEvent::ResponseCompleted { message_id, text } = &event {
+            completed = Some((message_id.clone(), text.clone()));
+            let _ = tx.send(BotEvent::ResponseCompleted {
+                message_id: message_id.clone(),
+                text: output_protocol.render(text),
+            });
+            continue;
+        }
         if forward_application_event_to_tui(event, &tx, is_clear_command) {
             break;
         }
     }
+    if let Some((message_id, text)) = completed {
+        run_tui_agent_handoffs(
+            &channel,
+            &session_id,
+            &output_protocol,
+            "a0",
+            message_id,
+            text,
+            &handoff_cancel,
+            &tx,
+        )
+        .await;
+    }
     let _ = tx.send(BotEvent::Done);
+}
+
+fn build_tui_output_protocol(
+    channel: &ChannelHandle,
+    session_id: &str,
+    _sender_user_id: &str,
+    sender_username: &str,
+) -> TuiOutputProtocol {
+    let info = channel.application_info();
+    let mut context = OutputProtocolContext::new("tui", session_id, "p2p", "a0");
+    let mut agents = HashMap::new();
+    let self_agent = TuiMentionAgent {
+        reference: "a0".into(),
+        profile_reference: None,
+        profile_id: info.profile.id.clone(),
+        label: info.profile.name.clone(),
+    };
+    context.entities.push(OutputEntity::new(
+        "a0",
+        OutputEntityKind::Agent,
+        &self_agent.label,
+    ));
+    agents.insert("a0".into(), self_agent);
+    context.entities.push(OutputEntity::new(
+        "u0",
+        OutputEntityKind::User,
+        sender_username,
+    ));
+
+    let registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::instance_profile::profile_registry_home_dir);
+    if let Ok(registry) = crate::ProfileRegistry::load(registry_root) {
+        for entry in registry
+            .entries()
+            .iter()
+            .filter(|entry| entry.id != info.profile.id)
+        {
+            let reference = format!("a{}", agents.len());
+            let agent = TuiMentionAgent {
+                reference: reference.clone(),
+                profile_reference: Some(format!("@{}", entry.alias)),
+                profile_id: entry.id.clone(),
+                label: entry.alias.clone(),
+            };
+            context.entities.push(OutputEntity::new(
+                &reference,
+                OutputEntityKind::Agent,
+                &agent.label,
+            ));
+            agents.insert(reference, agent);
+        }
+    }
+    context.capabilities = OutputCapabilities {
+        user_mentions: OutputCapability::Text,
+        agent_mentions: if agents.len() > 1 {
+            OutputCapability::Native
+        } else {
+            OutputCapability::Disabled
+        },
+        broadcast_all: OutputCapability::Text,
+        agent_handoff: agents.len() > 1,
+        images: OutputCapability::Native,
+        files: OutputCapability::Native,
+    };
+    TuiOutputProtocol {
+        context,
+        agents,
+        workspace: info.workspace,
+    }
+}
+
+async fn run_tui_agent_handoffs(
+    channel: &ChannelHandle,
+    session_id: &str,
+    protocol: &TuiOutputProtocol,
+    initial_caller: &str,
+    initial_message_id: String,
+    initial_text: String,
+    cancel: &HandoffCancellation,
+    tx: &mpsc::UnboundedSender<BotEvent>,
+) {
+    let mut queue = VecDeque::new();
+    let mut next_sequence = 1;
+    enqueue_agent_handoffs(
+        &mut queue,
+        protocol,
+        initial_caller,
+        None,
+        &mut next_sequence,
+        initial_message_id,
+        initial_text,
+    );
+
+    while let Some(handoff) = queue.pop_front() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let Some(target) = protocol.agents.get(&handoff.target_reference) else {
+            continue;
+        };
+        let Some(caller) = protocol.agents.get(&handoff.caller_reference) else {
+            continue;
+        };
+        let _ = tx.send(BotEvent::HandoffStarted {
+            agent: target.label.clone(),
+            queued: queue.len(),
+        });
+        let mut target_context = protocol.context.clone();
+        target_context.self_reference = target.reference.clone();
+        target_context.prioritize_entities(Some(&caller.reference));
+        let handoff_context = A2aConversationContext {
+            conversation_id: session_id.to_string(),
+            handoff_id: handoff.handoff_id.clone(),
+            parent_handoff_id: handoff.parent_handoff_id.clone(),
+            sequence: handoff.sequence,
+            source_message_id: handoff.source_message_id.clone(),
+            initiator: "u0".into(),
+            caller: handoff.caller_reference.clone(),
+            recipient: handoff.target_reference.clone(),
+            participants: protocol
+                .context
+                .entities
+                .iter()
+                .map(|entity| entity.reference.clone())
+                .collect(),
+        };
+
+        let result = if target.profile_reference.is_none() {
+            run_local_handoff(
+                channel,
+                session_id,
+                caller,
+                &handoff,
+                target_context,
+                protocol,
+                tx,
+            )
+            .await
+        } else {
+            let task = format!(
+                "Agent {} handed off this completed response to you:\n\n{}",
+                caller.label, handoff.text
+            );
+            let registry_root = std::env::var_os("REMI_PROFILE_REGISTRY_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(crate::instance_profile::profile_registry_home_dir);
+            let ask = crate::external_agent::ask_profile(
+                &registry_root,
+                &caller.profile_id,
+                target.profile_reference.as_deref().unwrap_or_default(),
+                &task,
+                session_id,
+                None,
+                Some(&target_context),
+                Some(&handoff_context),
+                &[],
+            );
+            tokio::select! {
+                result = ask => result.map(|text| (uuid::Uuid::new_v4().to_string(), text)),
+                _ = cancel.cancelled() => return,
+            }
+        };
+
+        match result {
+            Ok((message_id, text)) => {
+                if target.profile_reference.is_some() {
+                    let _ = tx.send(BotEvent::HandoffReply {
+                        agent: target.label.clone(),
+                        text: protocol.render(&text),
+                    });
+                }
+                enqueue_agent_handoffs(
+                    &mut queue,
+                    protocol,
+                    &target.reference,
+                    Some(handoff.handoff_id),
+                    &mut next_sequence,
+                    message_id,
+                    text,
+                );
+            }
+            Err(error) => {
+                let _ = tx.send(BotEvent::HandoffFailed {
+                    agent: target.label.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn enqueue_agent_handoffs(
+    queue: &mut VecDeque<PendingAgentHandoff>,
+    protocol: &TuiOutputProtocol,
+    caller_reference: &str,
+    parent_handoff_id: Option<String>,
+    next_sequence: &mut u64,
+    source_message_id: String,
+    text: String,
+) {
+    let document = crate::parse_output(&text, &protocol.context);
+    for target_reference in document.agent_mentions() {
+        if target_reference == caller_reference || !protocol.agents.contains_key(target_reference) {
+            continue;
+        }
+        queue.push_back(PendingAgentHandoff {
+            handoff_id: uuid::Uuid::new_v4().to_string(),
+            parent_handoff_id: parent_handoff_id.clone(),
+            sequence: *next_sequence,
+            caller_reference: caller_reference.to_string(),
+            target_reference: target_reference.to_string(),
+            source_message_id: source_message_id.clone(),
+            text: text.clone(),
+        });
+        *next_sequence += 1;
+    }
+}
+
+async fn run_local_handoff(
+    channel: &ChannelHandle,
+    session_id: &str,
+    caller: &TuiMentionAgent,
+    handoff: &PendingAgentHandoff,
+    output_context: OutputProtocolContext,
+    protocol: &TuiOutputProtocol,
+    tx: &mpsc::UnboundedSender<BotEvent>,
+) -> anyhow::Result<(String, String)> {
+    let content = Content::text(format!(
+        "Agent {} handed off message {}:\n\n{}",
+        caller.label, handoff.source_message_id, handoff.text
+    ));
+    let mut run = channel
+        .run(RunRequest::new(session_id, content).output_context(output_context))
+        .await?;
+    let _ = tx.send(BotEvent::RunStarted(run.control()));
+    let mut completed = None;
+    while let Some(event) = run.recv().await {
+        if let ApplicationEvent::ResponseCompleted { message_id, text } = &event {
+            completed = Some((message_id.clone(), text.clone()));
+            let _ = tx.send(BotEvent::ResponseCompleted {
+                message_id: message_id.clone(),
+                text: protocol.render(text),
+            });
+            continue;
+        }
+        if forward_application_event_to_tui(event, tx, false) {
+            break;
+        }
+    }
+    completed.context("local handoff completed without a final response")
 }
 
 fn forward_application_event_to_tui(
@@ -3951,6 +4381,10 @@ fn forward_application_event_to_tui(
             false
         }
         ApplicationEvent::Cat(event) => forward_cat_event_to_tui(event, tx),
+        ApplicationEvent::ResponseCompleted { message_id, text } => {
+            let _ = tx.send(BotEvent::ResponseCompleted { message_id, text });
+            false
+        }
         ApplicationEvent::Done => true,
     }
 }
@@ -4062,7 +4496,7 @@ fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent
         CatEvent::Cancelled => {
             let _ = tx.send(BotEvent::Cancelled);
         }
-        CatEvent::Done => return true,
+        CatEvent::Done => {}
         _ => {}
     }
     false
@@ -4343,6 +4777,22 @@ enum BotEvent {
     SupervisorStarted,
     Prefix(String),
     Text(String),
+    ResponseCompleted {
+        message_id: String,
+        text: String,
+    },
+    HandoffStarted {
+        agent: String,
+        queued: usize,
+    },
+    HandoffReply {
+        agent: String,
+        text: String,
+    },
+    HandoffFailed {
+        agent: String,
+        error: String,
+    },
     Thinking(String),
     ToolStart {
         id: String,
@@ -4865,6 +5315,115 @@ fn recall_input_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handoff_protocol() -> TuiOutputProtocol {
+        let mut context = OutputProtocolContext::new("tui", "c1", "p2p", "a0");
+        context.capabilities = OutputCapabilities {
+            user_mentions: OutputCapability::Text,
+            agent_mentions: OutputCapability::Native,
+            broadcast_all: OutputCapability::Text,
+            agent_handoff: true,
+            ..OutputCapabilities::default()
+        };
+        let mut agents = HashMap::new();
+        for (reference, profile_id) in [("a0", "local"), ("a1", "one"), ("a2", "two")] {
+            context.entities.push(OutputEntity::new(
+                reference,
+                OutputEntityKind::Agent,
+                profile_id,
+            ));
+            agents.insert(
+                reference.to_string(),
+                TuiMentionAgent {
+                    reference: reference.to_string(),
+                    profile_reference: (reference != "a0").then(|| format!("@{profile_id}")),
+                    profile_id: profile_id.to_string(),
+                    label: profile_id.to_string(),
+                },
+            );
+        }
+        context
+            .entities
+            .push(OutputEntity::new("u0", OutputEntityKind::User, "user"));
+        TuiOutputProtocol {
+            context,
+            agents,
+            workspace: PathBuf::from("/workspace"),
+        }
+    }
+
+    #[test]
+    fn agent_handoffs_are_fifo_deduplicated_and_exclude_self() {
+        let protocol = handoff_protocol();
+        let mut queue = VecDeque::new();
+        let mut sequence = 1;
+        enqueue_agent_handoffs(
+            &mut queue,
+            &protocol,
+            "a0",
+            None,
+            &mut sequence,
+            "m1".into(),
+            "@[self](remi-mention:a0) @[one](remi-mention:a1) @[two](remi-mention:a2) @[one](remi-mention:a1) @[user](remi-mention:u0)".into(),
+        );
+        assert_eq!(
+            queue
+                .iter()
+                .map(|handoff| handoff.target_reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "a2"]
+        );
+    }
+
+    #[test]
+    fn tui_final_render_distinguishes_mention_kinds() {
+        let protocol = handoff_protocol();
+        assert_eq!(
+            protocol.render(
+                "@[user](remi-mention:u0) @[one](remi-mention:a1) @[所有人](remi-mention:all)"
+            ),
+            "**@user** `@one` **@所有人**"
+        );
+    }
+
+    #[test]
+    fn handoff_queue_has_no_eight_hop_protocol_limit() {
+        let mut protocol = handoff_protocol();
+        for index in 3..=10 {
+            let reference = format!("a{index}");
+            protocol.context.entities.push(OutputEntity::new(
+                &reference,
+                OutputEntityKind::Agent,
+                &reference,
+            ));
+            protocol.agents.insert(
+                reference.clone(),
+                TuiMentionAgent {
+                    reference: reference.clone(),
+                    profile_reference: Some(format!("@{reference}")),
+                    profile_id: reference.clone(),
+                    label: reference,
+                },
+            );
+        }
+        let text = (1..=10)
+            .map(|index| format!("@[a{index}](remi-mention:a{index})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut queue = VecDeque::new();
+        let mut sequence = 1;
+        enqueue_agent_handoffs(
+            &mut queue,
+            &protocol,
+            "a0",
+            None,
+            &mut sequence,
+            "m1".into(),
+            text,
+        );
+        assert_eq!(queue.len(), 10);
+        assert_eq!(queue.back().map(|item| item.sequence), Some(10));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tui_background_tasks_do_not_require_a_local_set() {

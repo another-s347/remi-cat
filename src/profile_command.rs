@@ -319,6 +319,8 @@ pub async fn run_profile_command(
                 task,
                 named,
                 agent_id.as_deref(),
+                None,
+                None,
                 profile_hubs,
             )
             .await?;

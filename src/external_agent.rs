@@ -123,6 +123,8 @@ impl ExternalAgentClient {
         named: &str,
         task: &str,
         agent_id: Option<&str>,
+        output_context: Option<&crate::OutputProtocolContext>,
+        handoff_context: Option<&crate::A2aConversationContext>,
     ) -> anyhow::Result<String> {
         let card = self.agent_card().await?;
         if !card
@@ -143,6 +145,9 @@ impl ExternalAgentClient {
                 "agentId": agent_id,
                 "namedSession": named,
                 "chain": [caller_profile_id, target_profile_id],
+                "conversationId": named,
+                "outputContext": output_context,
+                "handoffContext": handoff_context,
             }),
         );
         let id = uuid::Uuid::new_v4().to_string();
@@ -260,10 +265,10 @@ fn append_parts(parts: &[Part], answer: &mut String) {
     }
 }
 
-fn stable_context_id(caller: &str, target: &str, named: &str, agent_id: Option<&str>) -> String {
+fn stable_context_id(_caller: &str, target: &str, named: &str, agent_id: Option<&str>) -> String {
     let digest = Sha256::digest(
         format!(
-            "remi:a2a:{caller}:{target}:{}:{named}",
+            "remi:a2a:{target}:{}:{named}",
             agent_id.unwrap_or("default")
         )
         .as_bytes(),
@@ -282,6 +287,8 @@ pub(crate) async fn ask_profile(
     task: &str,
     named: &str,
     agent_id: Option<&str>,
+    output_context: Option<&crate::OutputProtocolContext>,
+    handoff_context: Option<&crate::A2aConversationContext>,
     profile_hubs: &[ProfileHubClient],
 ) -> anyhow::Result<String> {
     if let Some(remote) = reference.strip_prefix("hub:") {
@@ -304,6 +311,9 @@ pub(crate) async fn ask_profile(
                 "agentId": agent_id,
                 "namedSession": named,
                 "chain": [caller_profile_id, reference],
+                "conversationId": named,
+                "outputContext": output_context,
+                "handoffContext": handoff_context,
             }),
         );
         let request = SendMessageRequest {
@@ -351,6 +361,8 @@ pub(crate) async fn ask_profile(
                     named,
                     task,
                     agent_id,
+                    output_context,
+                    handoff_context,
                 )
                 .await;
             let shutdown = client.shutdown().await;
@@ -456,6 +468,8 @@ pub(crate) fn external_agent_tools_for(
                     &task,
                     &named,
                     agent_id.as_deref(),
+                    None,
+                    None,
                     &profile_hubs,
                 )
                 .await
@@ -599,6 +613,11 @@ mod tests {
             stable_context_id("a", "b", "summer", Some("planner")),
             stable_context_id("a", "b", "summer", Some("accounting"))
         );
+        assert_eq!(
+            stable_context_id("caller-a", "target", "shared", None),
+            stable_context_id("caller-b", "target", "shared", None),
+            "the target-local A2A session must survive caller changes"
+        );
     }
 
     #[tokio::test]
@@ -677,6 +696,8 @@ mod tests {
             "hub:office/remote-1",
             "delegate this",
             "default",
+            None,
+            None,
             None,
             &[],
         )
@@ -775,6 +796,8 @@ mod tests {
             "@ferret",
             "delegate this",
             "default",
+            None,
+            None,
             None,
             &[],
         )

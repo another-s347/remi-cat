@@ -56,6 +56,7 @@ pub(crate) struct ChatRequest {
     pub(crate) model_profile_id: Option<String>,
     pub(crate) reasoning_effort: Option<bot_core::ReasoningEffort>,
     pub(crate) agent_id: Option<String>,
+    pub(crate) output_protocol_prompt: Option<String>,
 }
 
 impl ChatRequest {
@@ -83,6 +84,7 @@ impl ChatRequest {
             model_profile_id: None,
             reasoning_effort: None,
             agent_id: None,
+            output_protocol_prompt: None,
         }
     }
 
@@ -147,6 +149,11 @@ impl ChatRequest {
         self
     }
 
+    pub(crate) fn with_output_protocol_prompt(mut self, prompt: Option<String>) -> Self {
+        self.output_protocol_prompt = prompt;
+        self
+    }
+
     pub(crate) fn enable_sdk_todo(self) -> Self {
         self
     }
@@ -194,6 +201,12 @@ pub(crate) enum CoreChatEvent {
     /// An active workflow is about to be evaluated by its supervisor.
     SupervisorStarted,
     Bot(CatEvent),
+    /// Authoritative final response. Channel side effects must key off this
+    /// event rather than streamed text deltas.
+    ResponseCompleted {
+        message_id: String,
+        text: String,
+    },
     Done,
 }
 
@@ -207,6 +220,34 @@ impl Runtime {
     }
 
     pub(crate) fn chat(self: Rc<Self>, request: ChatRequest) -> impl Stream<Item = CoreChatEvent> {
+        let response_id = uuid::Uuid::new_v4().to_string();
+        let mut inner = Box::pin(self.chat_inner(request));
+        async_stream::stream! {
+            let mut final_text = String::new();
+            let mut response_completed = false;
+            while let Some(event) = inner.next().await {
+                match &event {
+                    CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
+                        final_text.clear();
+                        final_text.push_str(text);
+                    }
+                    CoreChatEvent::Bot(CatEvent::Text(delta)) => final_text.push_str(delta),
+                    CoreChatEvent::Bot(event) if breaks_final_response(event) => final_text.clear(),
+                    CoreChatEvent::Done if !response_completed => {
+                        response_completed = true;
+                        yield CoreChatEvent::ResponseCompleted {
+                            message_id: response_id.clone(),
+                            text: final_text.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+                yield event;
+            }
+        }
+    }
+
+    fn chat_inner(self: Rc<Self>, request: ChatRequest) -> impl Stream<Item = CoreChatEvent> {
         async_stream::stream! {
             let user_text = request.content.text_content();
             if !user_text.trim_start().starts_with('/') {
@@ -306,6 +347,7 @@ impl Runtime {
                                 model_profile_id,
                                 reasoning_effort,
                                 agent_id,
+                                output_protocol_prompt: request.output_protocol_prompt.clone(),
                                 sender_user_id: request.sender_user_id,
                                 sender_username: request.sender_username,
                                 message_id: request.message_id,
@@ -381,6 +423,7 @@ impl Runtime {
                 reasoning_effort,
                 agent_id,
                 skill_injections,
+                output_protocol_prompt: request.output_protocol_prompt.clone(),
                 sender_user_id: request.sender_user_id,
                 sender_username: request.sender_username,
                 message_id: request.message_id,
@@ -435,6 +478,20 @@ impl Runtime {
             yield CoreChatEvent::Done;
         }
     }
+}
+
+fn breaks_final_response(event: &CatEvent) -> bool {
+    matches!(
+        event,
+        CatEvent::Thinking(_)
+            | CatEvent::ToolCallStart { .. }
+            | CatEvent::ToolCallArgumentsDelta { .. }
+            | CatEvent::ToolCall { .. }
+            | CatEvent::ToolCallResult { .. }
+            | CatEvent::SubSession(_)
+            | CatEvent::Supervisor(_)
+            | CatEvent::SupervisorProgress(_)
+    )
 }
 
 #[cfg(test)]

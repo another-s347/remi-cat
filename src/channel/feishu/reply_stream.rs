@@ -153,6 +153,12 @@ impl FeishuReplyStream {
         self.send_final(&final_text).await;
     }
 
+    pub(super) fn set_pending_final_text(&mut self, text: String) {
+        if !self.final_output_committed {
+            self.pending_final_text = text;
+        }
+    }
+
     pub(super) async fn interrupt_run(&mut self, reason: &str) {
         self.flush_pending_as_process().await;
         self.close_active_narrative().await;
@@ -422,7 +428,16 @@ impl FeishuReplyStream {
             return;
         }
         let mut card = self.gateway.begin_streaming_reply(&self.parent_message_id);
-        card.replace_final(content).await.ok();
+        if let Err(error) = card.replace_final(content).await {
+            warn!("send Feishu final reply failed: {error:#}");
+            if content.contains("<at id=all></at>") {
+                let fallback = content.replace("<at id=all></at>", "**[At 所有人失败]**");
+                let mut fallback_card = self.gateway.begin_streaming_reply(&self.parent_message_id);
+                if let Err(fallback_error) = fallback_card.replace_final(&fallback).await {
+                    warn!("send Feishu broadcast fallback failed: {fallback_error:#}");
+                }
+            }
+        }
     }
 
     pub(super) async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) -> bool {

@@ -13,6 +13,7 @@ mod core;
 mod external_agent;
 mod instance_profile;
 mod model_input_store;
+mod output_protocol;
 mod profile_command;
 mod profile_hub;
 mod profile_instance;
@@ -47,6 +48,11 @@ pub use instance_profile::{
     ApplicationProfileManifest, InstanceProfile as ResolvedApplicationProfile, ProfileCapabilities,
     ProfileConfigRefs, ProfileEndpoint, ProfileEndpointAuth, ProfileResourceRefs, ProfileStateRefs,
     PROFILE_FILE_NAME, PROFILE_SCHEMA_VERSION,
+};
+pub use output_protocol::{
+    parse_output, resolve_resource_path, A2aConversationContext, OutputCapabilities,
+    OutputCapability, OutputDiagnostic, OutputDocument, OutputEntity, OutputEntityKind, OutputNode,
+    OutputNodeKind, OutputProtocolContext, BROADCAST_ALL_REF, OUTPUT_PROTOCOL_VERSION,
 };
 pub use profile_registry::{ProfileRegistry, RegisteredProfile};
 pub use runtime_config::{

@@ -241,6 +241,7 @@ pub struct RunRequest {
     pub session_id: String,
     pub content: Content,
     pub options: RunOptions,
+    pub output_context: Option<crate::OutputProtocolContext>,
 }
 
 impl RunRequest {
@@ -249,6 +250,7 @@ impl RunRequest {
             session_id: session_id.into(),
             content,
             options: RunOptions::default(),
+            output_context: None,
         }
     }
     pub fn text(session_id: impl Into<String>, text: impl Into<String>) -> Self {
@@ -256,6 +258,17 @@ impl RunRequest {
     }
     pub fn options(mut self, options: RunOptions) -> Self {
         self.options = options;
+        self
+    }
+    pub fn output_context(mut self, context: crate::OutputProtocolContext) -> Self {
+        self.output_context = Some(context);
+        self
+    }
+    pub(crate) fn with_optional_output_context(
+        mut self,
+        context: Option<crate::OutputProtocolContext>,
+    ) -> Self {
+        self.output_context = context;
         self
     }
 }
@@ -266,6 +279,7 @@ pub enum ApplicationEvent {
     Reply(String),
     SupervisorStarted,
     Cat(bot_core::CatEvent),
+    ResponseCompleted { message_id: String, text: String },
     Done,
 }
 
@@ -1573,7 +1587,8 @@ fn chat_request(
     let mut result = ChatRequest::text(request.session_id, ChatChannel::Cli, "")
         .with_content(request.content)
         .with_platform(Some(config.id))
-        .with_app_id(app_id);
+        .with_app_id(app_id)
+        .with_output_protocol_prompt(request.output_context.map(|context| context.prompt()));
     if let Some(user_id) = config.sender_user_id {
         result = result.with_sender(user_id, config.sender_username);
     }
@@ -2028,6 +2043,9 @@ async fn dispatch(
                             CoreChatEvent::Reply(v) => ApplicationEvent::Reply(v),
                             CoreChatEvent::SupervisorStarted => ApplicationEvent::SupervisorStarted,
                             CoreChatEvent::Bot(v) => ApplicationEvent::Cat(v),
+                            CoreChatEvent::ResponseCompleted { message_id, text } => {
+                                ApplicationEvent::ResponseCompleted { message_id, text }
+                            }
                             CoreChatEvent::Done => ApplicationEvent::Done,
                         };
                         tokio::select! {

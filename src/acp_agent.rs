@@ -646,6 +646,7 @@ impl AcpEventForwarder {
                 self.send_message_chunk(text)?;
             }
             CoreChatEvent::Done => {}
+            CoreChatEvent::ResponseCompleted { .. } => {}
             CoreChatEvent::Bot(event) => match event {
                 CatEvent::Text(delta) => self.send_message_chunk(delta)?,
                 CatEvent::Thinking(delta) => self.send_thought_chunk(delta)?,

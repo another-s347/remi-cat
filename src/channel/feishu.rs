@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use bot_core::im_tools::{encode_agent_file_key, SubSessionBindingUpsertRequest};
+use bot_core::im_tools::{encode_agent_file_key, ImUploadRequest, SubSessionBindingUpsertRequest};
 use bot_core::{
     CatEvent, Content, ContentPart, ContextMetrics, ImAttachment, ImDocument, TokenUsage,
 };
@@ -22,6 +23,10 @@ use crate::app::{
 use crate::channel::{Channel, ChannelKind};
 use crate::config::FeishuTransport;
 use crate::core::{ChatChannel, ChatRequest, CoreChatEvent, Runtime};
+use crate::{
+    parse_output, OutputCapabilities, OutputCapability, OutputEntity, OutputEntityKind,
+    OutputNodeKind, OutputProtocolContext,
+};
 
 #[path = "feishu/actions.rs"]
 mod actions;
@@ -435,12 +440,22 @@ async fn collect_bot_reply(
     } else {
         ChatChannel::Cli
     };
+    let output_protocol = build_feishu_output_protocol(
+        &runtime,
+        platform,
+        &session_id,
+        &msg,
+        sender_username.as_deref(),
+        gateway,
+    )
+    .await;
     let request = ChatRequest::text(session_id.clone(), channel, prepared.text)
         .with_content(content)
         .with_sender(msg.sender_user_id.clone(), sender_username)
         .with_message(msg.message_id.clone(), msg.chat_type.clone())
         .with_platform(Some(platform.to_string()))
         .with_async_agent(async_agent_enabled())
+        .with_output_protocol_prompt(Some(output_protocol.context.prompt()))
         .enable_sdk_todo()
         .with_im_context(im_attachments, im_documents);
     let debug_enabled = runtime
@@ -465,6 +480,7 @@ async fn collect_bot_reply(
         background_task_count: 0,
         had_visible_event: false,
         supervisor_execution_started: false,
+        output_protocol,
     };
     loop {
         tokio::select! {
@@ -569,6 +585,242 @@ async fn handle_feishu_fork_command(
     }
 }
 
+#[derive(Debug, Clone)]
+struct FeishuOutputProtocol {
+    context: OutputProtocolContext,
+    platform_user_ids: HashMap<String, String>,
+    workspace: PathBuf,
+}
+
+const FEISHU_OUTPUT_PARTICIPANTS_METADATA_KEY: &str = "feishu_output_participants_v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FeishuOutputParticipant {
+    reference: String,
+    user_id: String,
+    label: String,
+}
+
+impl FeishuOutputProtocol {
+    fn render(&self, text: &str) -> String {
+        parse_output(text, &self.context).render_mentions(
+            |reference, kind, label| match kind {
+                OutputEntityKind::User => self
+                    .platform_user_ids
+                    .get(reference)
+                    .map(|user_id| format!("<at id={}></at>", escape_feishu_attribute(user_id))),
+                OutputEntityKind::Agent => Some(format!("@{label}")),
+            },
+            |_| Some("<at id=all></at>".to_string()),
+        )
+    }
+
+    async fn render_final(&self, runtime: &Runtime, msg: &FeishuMessage, text: &str) -> String {
+        let document = parse_output(text, &self.context);
+        let mut rendered = text.to_string();
+        for node in document.nodes.iter().rev() {
+            let OutputNodeKind::Resource { path, label, image } = &node.kind else {
+                continue;
+            };
+            let kind = if *image { "图片" } else { "附件" };
+            let replacement = match crate::resolve_resource_path(path, &self.workspace, &[]) {
+                Ok(path) => match tokio::fs::read(&path).await {
+                    Ok(content) => {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("resource")
+                            .to_string();
+                        let mime_type = resource_mime_type(&path).to_string();
+                        match runtime
+                            .im_bridge
+                            .upload(ImUploadRequest {
+                                platform: self.context.surface.clone(),
+                                message_id: msg.message_id.clone(),
+                                chat_id: msg.chat_id.clone(),
+                                file_name,
+                                mime_type,
+                                content,
+                                file_type: "stream".into(),
+                            })
+                            .await
+                        {
+                            Ok(_) => {
+                                format!("**[{kind}已发送：{}]**", compact_resource_label(label))
+                            }
+                            Err(error) => {
+                                warn!(path = %path.display(), "upload Feishu output resource failed: {error:#}");
+                                format!("**[{kind}发送失败：{}]**", compact_resource_label(label))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(path = %path.display(), "read Feishu output resource failed: {error:#}");
+                        format!("**[{kind}读取失败：{}]**", compact_resource_label(label))
+                    }
+                },
+                Err(error) => {
+                    warn!(resource = path, "reject Feishu output resource: {error:#}");
+                    format!("**[{kind}不可用：{}]**", compact_resource_label(label))
+                }
+            };
+            rendered.replace_range(node.start..node.end, &replacement);
+        }
+        self.render(&rendered)
+    }
+}
+
+fn compact_resource_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|character| !matches!(character, '\n' | '\r' | '[' | ']'))
+        .take(80)
+        .collect::<String>()
+}
+
+fn resource_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "md") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn escape_feishu_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+async fn build_feishu_output_protocol(
+    runtime: &Runtime,
+    platform: &str,
+    session_id: &str,
+    msg: &FeishuMessage,
+    sender_username: Option<&str>,
+    gateway: Option<&FeishuGateway>,
+) -> FeishuOutputProtocol {
+    let mut context = OutputProtocolContext::new(platform, session_id, &msg.chat_type, "a0");
+    context.capabilities = OutputCapabilities {
+        user_mentions: OutputCapability::Native,
+        agent_mentions: OutputCapability::Disabled,
+        broadcast_all: if msg.chat_type == "group" {
+            OutputCapability::Native
+        } else {
+            OutputCapability::Disabled
+        },
+        agent_handoff: false,
+        images: OutputCapability::Native,
+        files: OutputCapability::Native,
+    };
+    context.entities.push(OutputEntity::new(
+        "a0",
+        OutputEntityKind::Agent,
+        runtime.root_agent_id.clone(),
+    ));
+
+    let mut participants = runtime
+        .sessions
+        .lock()
+        .await
+        .metadata_value(session_id, FEISHU_OUTPUT_PARTICIPANTS_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<Vec<FeishuOutputParticipant>>(value).ok())
+        .unwrap_or_default();
+    let sender_label = sender_username
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("当前用户");
+    upsert_feishu_participant(&mut participants, &msg.sender_user_id, sender_label);
+
+    for mention in &msg.mentions {
+        let Some(user_id) = mention
+            .open_id
+            .as_deref()
+            .or(mention.user_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if participants
+            .iter()
+            .any(|participant| participant.user_id == user_id)
+        {
+            continue;
+        }
+        let label = match gateway {
+            Some(gateway) => gateway
+                .get_user_name(user_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty()),
+            None => None,
+        }
+        .unwrap_or_else(|| format!("会话用户{}", participants.len()));
+        upsert_feishu_participant(&mut participants, user_id, &label);
+    }
+
+    let _ = runtime.sessions.lock().await.set_metadata_value(
+        session_id,
+        FEISHU_OUTPUT_PARTICIPANTS_METADATA_KEY,
+        serde_json::to_value(&participants).unwrap_or_default(),
+    );
+    let mut platform_user_ids = HashMap::new();
+    for participant in participants {
+        context.entities.push(OutputEntity::new(
+            &participant.reference,
+            OutputEntityKind::User,
+            &participant.label,
+        ));
+        platform_user_ids.insert(participant.reference, participant.user_id);
+    }
+
+    FeishuOutputProtocol {
+        context,
+        platform_user_ids,
+        workspace: std::env::var_os("REMI_SANDBOX_HOST_DIR")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default(),
+    }
+}
+
+fn upsert_feishu_participant(
+    participants: &mut Vec<FeishuOutputParticipant>,
+    user_id: &str,
+    label: &str,
+) {
+    if let Some(participant) = participants
+        .iter_mut()
+        .find(|participant| participant.user_id == user_id)
+    {
+        if !label.trim().is_empty() {
+            participant.label = label.trim().to_string();
+        }
+        return;
+    }
+    participants.push(FeishuOutputParticipant {
+        reference: format!("u{}", participants.len()),
+        user_id: user_id.to_string(),
+        label: label.trim().to_string(),
+    });
+}
+
 struct FeishuEventForwarder<'a, 'b> {
     runtime: &'a Runtime,
     platform: &'a str,
@@ -583,6 +835,7 @@ struct FeishuEventForwarder<'a, 'b> {
     background_task_count: usize,
     had_visible_event: bool,
     supervisor_execution_started: bool,
+    output_protocol: FeishuOutputProtocol,
 }
 
 impl FeishuEventForwarder<'_, '_> {
@@ -597,6 +850,16 @@ impl FeishuEventForwarder<'_, '_> {
             CoreChatEvent::Done => {
                 self.commit_final_output().await;
                 true
+            }
+            CoreChatEvent::ResponseCompleted { text, .. } => {
+                let rendered = self
+                    .output_protocol
+                    .render_final(self.runtime, self.msg, &text)
+                    .await;
+                if let Some(replies) = self.replies.as_deref_mut() {
+                    replies.set_pending_final_text(rendered);
+                }
+                false
             }
             CoreChatEvent::Bot(event) => self.forward_cat_event(event).await,
         }
@@ -856,8 +1119,6 @@ impl FeishuEventForwarder<'_, '_> {
                     self.background_task_count = 0;
                     self.update_background_status().await;
                 }
-                self.commit_final_output().await;
-                return true;
             }
             _ => {}
         }
@@ -1158,8 +1419,47 @@ mod tests {
 
     use super::{
         build_message_content, compact_preview, format_feishu_todo_state, format_narrative_delta,
-        quoted_reply_text, should_emit_empty_fallback, FeishuReplyKind,
+        quoted_reply_text, should_emit_empty_fallback, FeishuOutputProtocol, FeishuReplyKind,
     };
+    use crate::{
+        OutputCapabilities, OutputCapability, OutputEntity, OutputEntityKind, OutputProtocolContext,
+    };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn feishu_protocol_renders_native_user_and_all_mentions() {
+        let mut context = OutputProtocolContext::new("feishu", "c1", "group", "a0");
+        context.capabilities = OutputCapabilities {
+            user_mentions: OutputCapability::Native,
+            broadcast_all: OutputCapability::Native,
+            ..OutputCapabilities::default()
+        };
+        context
+            .entities
+            .push(OutputEntity::new("u0", OutputEntityKind::User, "Alice"));
+        let protocol = FeishuOutputProtocol {
+            context,
+            platform_user_ids: HashMap::from([("u0".into(), "ou_alice".into())]),
+            workspace: PathBuf::from("/workspace"),
+        };
+        assert_eq!(
+            protocol.render("@[Alice](remi-mention:u0) @[所有人](remi-mention:all) plain @Alice"),
+            "<at id=ou_alice></at> <at id=all></at> plain @Alice"
+        );
+    }
+
+    #[test]
+    fn feishu_protocol_does_not_fake_all_in_p2p() {
+        let context = OutputProtocolContext::new("feishu", "c1", "p2p", "a0");
+        let protocol = FeishuOutputProtocol {
+            context,
+            platform_user_ids: HashMap::new(),
+            workspace: PathBuf::from("/workspace"),
+        };
+        let source = "@[所有人](remi-mention:all)";
+        assert_eq!(protocol.render(source), source);
+    }
 
     #[test]
     fn thinking_deltas_share_one_section() {

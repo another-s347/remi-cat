@@ -53,6 +53,7 @@ pub struct WebRuntimeOptions {
     pub agent_id: Option<String>,
     pub async_agent: Option<bool>,
     pub platform: Option<String>,
+    pub output_context: Option<crate::OutputProtocolContext>,
 }
 
 pub(crate) enum WebChatCommand {
@@ -1482,6 +1483,10 @@ impl WebCoreEventMapper {
                 WebEventMap::Emit("text_delta", serde_json::json!({"text": text}))
             }
             CoreChatEvent::Done => WebEventMap::Finish(self.terminal_status),
+            CoreChatEvent::ResponseCompleted { message_id, text } => WebEventMap::Emit(
+                "response_completed",
+                serde_json::json!({"message_id": message_id, "text": text}),
+            ),
             CoreChatEvent::Bot(event) => self.map_cat_event(runtime, session_id, event),
         }
     }
@@ -1657,7 +1662,7 @@ impl WebCoreEventMapper {
                 self.terminal_status = "error";
                 WebEventMap::Emit("error", serde_json::json!({"message": error.to_string()}))
             }
-            CatEvent::Done => WebEventMap::Finish(self.terminal_status),
+            CatEvent::Done => WebEventMap::Skip,
             CatEvent::History(_, _) => WebEventMap::Skip,
         }
     }
@@ -1826,6 +1831,11 @@ async fn run_turn(
         .with_sender(WEB_USER_ID, Some(WEB_USER_ID.to_string()))
         .with_message(run_id.to_string(), "p2p")
         .with_platform(Some(platform))
+        .with_output_protocol_prompt(
+            runtime_options
+                .output_context
+                .map(|context| context.prompt()),
+        )
         .with_cancel(cancel);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let timeout = tokio::time::sleep(Duration::from_secs(300));

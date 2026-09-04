@@ -519,6 +519,9 @@ pub struct StreamOptions {
     pub agent_id: Option<String>,
     /// Skill documents explicitly loaded by slash-command preprocessing for this turn.
     pub skill_injections: Vec<SkillDocument>,
+    /// Compact channel-authored instructions for rendering the final response.
+    /// This is opaque system context; the runtime performs no channel actions.
+    pub output_protocol_prompt: Option<String>,
     /// UUID of the sender (stored in metadata; injected as a
     /// system annotation in group chats so the LLM can distinguish speakers).
     pub sender_user_id: Option<String>,
@@ -2768,6 +2771,12 @@ impl CatBot {
                     agent_header_count,
                     single_chat_sender_prompt.clone(),
                 );
+                if let Some(prompt) = round_opts.output_protocol_prompt.as_ref() {
+                    history.insert(
+                        agent_header_count.min(history.len()),
+                        Message::system(prompt.clone()),
+                    );
+                }
                 let active_supervisor = self
                     .workflow_status(&thread_id_owned)
                     .await
@@ -3167,6 +3176,12 @@ impl CatBot {
                         agent_header_count,
                         single_chat_sender_prompt.clone(),
                     );
+                    if let Some(prompt) = round_opts.output_protocol_prompt.as_ref() {
+                        rebuilt.insert(
+                            agent_header_count.min(rebuilt.len()),
+                            Message::system(prompt.clone()),
+                        );
+                    }
                     route_thread_todo_prompt(&mut rebuilt, &refreshed.user_state, active_supervisor);
                     rebuilt.extend(hook_messages.clone());
                     let protected_message_ids = protected_context_message_ids(&rebuilt);
