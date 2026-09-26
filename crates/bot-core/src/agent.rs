@@ -52,6 +52,12 @@ use crate::user_question::UserQuestionManager;
 const SUPERVISOR_MAX_TOOL_ROUNDS: usize = 8;
 const INTERRUPTED_TOOL_RESULT_ERROR: &str = "tool execution was interrupted before completion";
 
+fn has_malformed_tool_calls(calls: &[ParsedToolCall]) -> bool {
+    calls
+        .iter()
+        .any(|call| call.id.trim().is_empty() || call.name.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UnavailableToolReason {
     NotFound,
@@ -399,6 +405,7 @@ where
                                             session_id: log_thread_id.clone(),
                                             preview: batch.preview.clone(),
                                             count: batch.count,
+                                            next_turn: batch.has_user_next_turn(),
                                         });
                                         let (messages, user_state) = last_checkpoint_state
                                             .take()
@@ -435,6 +442,7 @@ where
                                         session_id: state.thread_id.0.clone(),
                                         preview: batch.preview.clone(),
                                         count: batch.count,
+                                        next_turn: batch.has_user_next_turn(),
                                     });
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         let mut state = state;
@@ -470,6 +478,19 @@ where
                             stats,
                             ..
                         }) => {
+                            if has_malformed_tool_calls(&tool_calls) {
+                                tracing::warn!(
+                                    thread_id = %state.thread_id.0,
+                                    run_id = %state.run_id.0,
+                                    tool_count = tool_calls.len(),
+                                    "model emitted a tool call without an id or function name"
+                                );
+                                yield CatEvent::Error(AgentError::other(
+                                    "model emitted a malformed tool call; no tools were executed"
+                                        .to_string(),
+                                ));
+                                return;
+                            }
                             let mut local = Vec::new();
                             let mut dynamic = Vec::new();
                             let mut unavailable = Vec::new();
@@ -1475,6 +1496,7 @@ where
                                         session_id: state.thread_id.0.clone(),
                                         preview: batch.preview.clone(),
                                         count: batch.count,
+                                        next_turn: batch.has_user_next_turn(),
                                     });
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         append_tool_results_to_history(&mut state.messages, all_outcomes);
@@ -1504,6 +1526,7 @@ where
                                         session_id: state.thread_id.0.clone(),
                                         preview: batch.preview.clone(),
                                         count: batch.count,
+                                        next_turn: batch.has_user_next_turn(),
                                     });
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         let mut state = state;
@@ -2753,7 +2776,7 @@ mod tests {
         collect_result_with_overflow, collect_tool_result_futures_with_timeout,
         collect_tool_results_parallel, complete_interrupted_tool_results,
         complete_pending_tool_calls_in_state, execute_tools_with_task_cancellation,
-        fs_read_overflow_summary, outer_thread_id_from_metadata,
+        fs_read_overflow_summary, has_malformed_tool_calls, outer_thread_id_from_metadata,
         spawn_background_side_event_forwarder, split_utf8_chunks, steer_start_input,
         steer_start_input_after_tool_results, tool_foreground_timeout, tool_output_chunk_bytes,
         CatAgent, ForegroundToolOutcome, INTERRUPTED_TOOL_RESULT_ERROR,
@@ -2813,6 +2836,21 @@ mod tests {
             name: name.to_string(),
             arguments: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn malformed_model_tool_calls_are_rejected_before_dispatch() {
+        assert!(!has_malformed_tool_calls(&[test_parsed_tool_call(
+            "call-1",
+            "agent__explorer"
+        )]));
+        assert!(has_malformed_tool_calls(&[
+            test_parsed_tool_call("call-1", "agent__explorer"),
+            test_parsed_tool_call("", ""),
+        ]));
+        assert!(has_malformed_tool_calls(&[test_parsed_tool_call(
+            "call-2", "   "
+        )]));
     }
 
     #[test]

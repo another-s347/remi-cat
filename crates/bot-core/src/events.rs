@@ -133,6 +133,8 @@ pub struct SteerInjectedEvent {
     pub session_id: String,
     pub preview: String,
     pub count: usize,
+    #[serde(default)]
+    pub next_turn: bool,
 }
 
 // ── Top-level CatEvent ───────────────────────────────────────────────────────

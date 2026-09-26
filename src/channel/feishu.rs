@@ -726,6 +726,8 @@ async fn build_feishu_output_protocol(
         agent_handoff: false,
         images: OutputCapability::Native,
         files: OutputCapability::Native,
+        math: OutputCapability::Disabled,
+        html: OutputCapability::Disabled,
     };
     context.entities.push(OutputEntity::new(
         "a0",

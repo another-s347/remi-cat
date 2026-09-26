@@ -285,7 +285,6 @@ fn target_agent_id(message: &Message) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
 }
-
 fn a2a_output_context(message: &Message) -> Option<crate::OutputProtocolContext> {
     message
         .metadata
@@ -390,13 +389,7 @@ impl AgentExecutor for RemiA2aExecutor {
                 .ok_or_else(|| A2AError::invalid_request("message is required"))?;
             let text = message_text(&message)?;
             let input_message = message.clone();
-            let target_agent_id = message
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get(INVOCATION_EXTENSION))
-                .and_then(|value| value.get("agentId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
+            let target_agent_id = target_agent_id(message);
             let output_context = a2a_output_context(message);
             let session_id = sessions
                 .lock()

@@ -220,27 +220,15 @@ impl Runtime {
     }
 
     pub(crate) fn chat(self: Rc<Self>, request: ChatRequest) -> impl Stream<Item = CoreChatEvent> {
-        let response_id = uuid::Uuid::new_v4().to_string();
         let mut inner = Box::pin(self.chat_inner(request));
         async_stream::stream! {
-            let mut final_text = String::new();
-            let mut response_completed = false;
+            let mut responses = FinalResponseTracker::default();
             while let Some(event) = inner.next().await {
-                match &event {
-                    CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
-                        final_text.clear();
-                        final_text.push_str(text);
-                    }
-                    CoreChatEvent::Bot(CatEvent::Text(delta)) => final_text.push_str(delta),
-                    CoreChatEvent::Bot(event) if breaks_final_response(event) => final_text.clear(),
-                    CoreChatEvent::Done if !response_completed => {
-                        response_completed = true;
-                        yield CoreChatEvent::ResponseCompleted {
-                            message_id: response_id.clone(),
-                            text: final_text.clone(),
-                        };
-                    }
-                    _ => {}
+                if let Some(text) = responses.observe(&event) {
+                    yield CoreChatEvent::ResponseCompleted {
+                        message_id: uuid::Uuid::new_v4().to_string(),
+                        text,
+                    };
                 }
                 yield event;
             }
@@ -480,6 +468,51 @@ impl Runtime {
     }
 }
 
+#[derive(Default)]
+struct FinalResponseTracker {
+    text: String,
+    failed: bool,
+}
+
+impl FinalResponseTracker {
+    fn observe(&mut self, event: &CoreChatEvent) -> Option<String> {
+        match event {
+            CoreChatEvent::Prefix(text) | CoreChatEvent::Reply(text) => {
+                self.failed = false;
+                self.text.clear();
+                self.text.push_str(text);
+            }
+            CoreChatEvent::Bot(CatEvent::Text(delta)) => {
+                self.failed = false;
+                self.text.push_str(delta);
+            }
+            CoreChatEvent::Bot(CatEvent::BackgroundTasksWaiting { .. }) | CoreChatEvent::Done => {
+                return self.complete()
+            }
+            CoreChatEvent::Bot(CatEvent::Error(_) | CatEvent::Cancelled) => {
+                self.text.clear();
+                self.failed = true;
+            }
+            CoreChatEvent::Bot(CatEvent::SteerInjected(_)) => {
+                self.text.clear();
+                self.failed = false;
+            }
+            CoreChatEvent::Bot(event) if breaks_final_response(event) => self.text.clear(),
+            _ => {}
+        }
+        None
+    }
+
+    fn complete(&mut self) -> Option<String> {
+        if self.failed || self.text.trim().is_empty() {
+            self.text.clear();
+            None
+        } else {
+            Some(std::mem::take(&mut self.text))
+        }
+    }
+}
+
 fn breaks_final_response(event: &CatEvent) -> bool {
     matches!(
         event,
@@ -488,6 +521,8 @@ fn breaks_final_response(event: &CatEvent) -> bool {
             | CatEvent::ToolCallArgumentsDelta { .. }
             | CatEvent::ToolCall { .. }
             | CatEvent::ToolCallResult { .. }
+            | CatEvent::ToolTaskCompleted(_)
+            | CatEvent::SteerInjected(_)
             | CatEvent::SubSession(_)
             | CatEvent::Supervisor(_)
             | CatEvent::SupervisorProgress(_)
@@ -496,8 +531,61 @@ fn breaks_final_response(event: &CatEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_preprocessed_text, ChatChannel, ChatRequest};
-    use bot_core::{Content, ContentPart, ReasoningEffort};
+    use super::{
+        apply_preprocessed_text, ChatChannel, ChatRequest, CoreChatEvent, FinalResponseTracker,
+    };
+    use bot_core::{CatEvent, Content, ContentPart, ReasoningEffort, SteerInjectedEvent};
+
+    #[test]
+    fn foreground_response_completes_once_before_background_and_next_turn() {
+        let mut responses = FinalResponseTracker::default();
+        assert_eq!(
+            responses.observe(&CoreChatEvent::Bot(CatEvent::Text("first".into()))),
+            None
+        );
+        assert_eq!(
+            responses.observe(&CoreChatEvent::Bot(CatEvent::BackgroundTasksWaiting {
+                count: 1
+            })),
+            Some("first".into())
+        );
+        assert_eq!(responses.observe(&CoreChatEvent::Done), None);
+        let injected = SteerInjectedEvent {
+            steer_ids: vec!["next".into()],
+            session_id: "thread".into(),
+            preview: "second question".into(),
+            count: 1,
+            next_turn: true,
+        };
+        assert_eq!(
+            responses.observe(&CoreChatEvent::Bot(CatEvent::SteerInjected(injected))),
+            None
+        );
+        assert_eq!(
+            responses.observe(&CoreChatEvent::Bot(CatEvent::Text("second".into()))),
+            None
+        );
+        assert_eq!(
+            responses.observe(&CoreChatEvent::Done),
+            Some("second".into())
+        );
+        assert_eq!(responses.observe(&CoreChatEvent::Done), None);
+    }
+
+    #[test]
+    fn failed_or_interrupted_response_never_completes() {
+        let mut responses = FinalResponseTracker::default();
+        responses.observe(&CoreChatEvent::Bot(CatEvent::Text("partial".into())));
+        responses.observe(&CoreChatEvent::Bot(CatEvent::Cancelled));
+        assert_eq!(responses.observe(&CoreChatEvent::Done), None);
+
+        responses.observe(&CoreChatEvent::Bot(CatEvent::Text("stale".into())));
+        responses.observe(&CoreChatEvent::Bot(CatEvent::ToolCallStart {
+            id: "tool".into(),
+            name: "agent__explorer".into(),
+        }));
+        assert_eq!(responses.observe(&CoreChatEvent::Done), None);
+    }
 
     #[test]
     fn text_request_enables_user_turn_preprocessing_and_sub_session_routing() {

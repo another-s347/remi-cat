@@ -4170,6 +4170,8 @@ fn build_tui_output_protocol(
         agent_handoff: agents.len() > 1,
         images: OutputCapability::Native,
         files: OutputCapability::Native,
+        math: OutputCapability::Disabled,
+        html: OutputCapability::Disabled,
     };
     TuiOutputProtocol {
         context,

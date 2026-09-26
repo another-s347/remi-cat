@@ -19,6 +19,7 @@ mod a2a_delegate;
 pub mod acp;
 pub mod agent;
 pub mod approval;
+pub mod desktop_html_skill;
 pub mod events;
 pub mod goal;
 pub mod hooks;

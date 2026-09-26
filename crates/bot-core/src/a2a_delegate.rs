@@ -628,6 +628,10 @@ mod tests {
             request.lock().unwrap().as_ref().unwrap().message.parts[0].as_text(),
             Some("inspect")
         );
+        let request = request.lock().unwrap();
+        let invocation =
+            &request.as_ref().unwrap().message.metadata.as_ref().unwrap()[INVOCATION_EXTENSION];
+        assert!(invocation.get("modelProfileId").is_none());
     }
 
     #[tokio::test]

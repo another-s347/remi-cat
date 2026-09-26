@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 pub const OUTPUT_PROTOCOL_VERSION: u8 = 1;
@@ -24,6 +24,10 @@ pub struct OutputCapabilities {
     pub agent_handoff: bool,
     pub images: OutputCapability,
     pub files: OutputCapability,
+    #[serde(default)]
+    pub math: OutputCapability,
+    #[serde(default)]
+    pub html: OutputCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +118,12 @@ impl OutputProtocolContext {
         if self.capabilities.files != OutputCapability::Disabled {
             caps.push("file");
         }
+        if self.capabilities.math != OutputCapability::Disabled {
+            caps.push("math");
+        }
+        if self.capabilities.html != OutputCapability::Disabled {
+            caps.push("html");
+        }
 
         let mut lines = vec![format!(
             "<remi-output v=\"{}\" self=\"{}\" caps=\"{}\">",
@@ -121,24 +131,34 @@ impl OutputProtocolContext {
             self.self_reference,
             caps.join(",")
         )];
-        lines.push("Use Markdown.".into());
+        lines.push("Markdown.".into());
         if self.capabilities.user_mentions != OutputCapability::Disabled
             || self.capabilities.agent_mentions != OutputCapability::Disabled
         {
-            lines.push("Mention: @[name](remi-mention:REF). Use only listed refs.".into());
-        }
-        if self.capabilities.broadcast_all != OutputCapability::Disabled {
-            lines.push("All: @[所有人](remi-mention:all).".into());
+            if self.capabilities.broadcast_all != OutputCapability::Disabled {
+                lines.push(
+                    "@[n](remi-mention:REF); all @[所有人](remi-mention:all); listed refs only."
+                        .into(),
+                );
+            } else {
+                lines.push("@[n](remi-mention:REF); listed refs only.".into());
+            }
+        } else if self.capabilities.broadcast_all != OutputCapability::Disabled {
+            lines.push("All @[所有人](remi-mention:all).".into());
         }
         if self.capabilities.images != OutputCapability::Disabled
             || self.capabilities.files != OutputCapability::Disabled
         {
-            lines.push(
-                "Image/file: ![name](remi-resource:PATH) / [name](remi-resource:PATH).".into(),
-            );
+            lines.push("Resource links/images: remi-resource:PATH.".into());
         }
         if self.capabilities.agent_handoff {
-            lines.push("Mentioning an agent hands off the conversation.".into());
+            lines.push("Agent @ hands off.".into());
+        }
+        if self.capabilities.math != OutputCapability::Disabled {
+            lines.push("Math $x$ / $$x$$.".into());
+        }
+        if self.capabilities.html != OutputCapability::Disabled {
+            lines.push("HTML visual: read `desktop-html` skill.".into());
         }
         if !self.entities.is_empty() {
             lines.push("entities:".into());
@@ -195,6 +215,15 @@ impl OutputProtocolContext {
             .iter()
             .find(|entity| entity.reference == reference)
     }
+
+    /// Output capabilities supplied by the Desktop host. Other channels opt
+    /// in independently instead of inheriting Desktop rendering behavior.
+    pub fn desktop(conversation_id: impl Into<String>, self_reference: impl Into<String>) -> Self {
+        let mut context = Self::new("desktop", conversation_id, "p2p", self_reference);
+        context.capabilities.math = OutputCapability::Native;
+        context.capabilities.html = OutputCapability::Native;
+        context
+    }
 }
 
 fn compact_label(label: &str) -> String {
@@ -236,6 +265,9 @@ pub enum OutputNodeKind {
         label: String,
         image: bool,
     },
+    Html {
+        html: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +285,12 @@ struct PendingLink {
     image: bool,
 }
 
+#[derive(Debug)]
+struct PendingHtml {
+    start: usize,
+    html: String,
+}
+
 pub fn parse_output(text: &str, context: &OutputProtocolContext) -> OutputDocument {
     let entities = context
         .entities
@@ -262,9 +300,18 @@ pub fn parse_output(text: &str, context: &OutputProtocolContext) -> OutputDocume
     let mut nodes = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pending = Vec::<PendingLink>::new();
+    let mut pending_html = None::<PendingHtml>;
 
     for (event, range) in Parser::new_ext(text, Options::all()).into_offset_iter() {
         match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info.trim() == "remi-html" =>
+            {
+                pending_html = Some(PendingHtml {
+                    start: range.start,
+                    html: String::new(),
+                });
+            }
             Event::Start(Tag::Link { dest_url, .. }) => pending.push(PendingLink {
                 start: range.start,
                 destination: dest_url.into_string(),
@@ -278,8 +325,30 @@ pub fn parse_output(text: &str, context: &OutputProtocolContext) -> OutputDocume
                 image: true,
             }),
             Event::Text(value) | Event::Code(value) => {
+                if let Some(block) = pending_html.as_mut() {
+                    block.html.push_str(&value);
+                    continue;
+                }
                 if let Some(link) = pending.last_mut() {
                     link.label.push_str(&value);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                let Some(block) = pending_html.take() else {
+                    continue;
+                };
+                if context.capabilities.html == OutputCapability::Disabled {
+                    diagnostics.push(OutputDiagnostic {
+                        code: "html_not_available",
+                        start: block.start,
+                        end: range.end,
+                    });
+                } else {
+                    nodes.push(OutputNode {
+                        start: block.start,
+                        end: range.end,
+                        kind: OutputNodeKind::Html { html: block.html },
+                    });
                 }
             }
             Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
@@ -454,7 +523,7 @@ impl OutputDocument {
                     label,
                 } => entity(reference, *entity_kind, label),
                 OutputNodeKind::BroadcastAll { label } => all(label),
-                OutputNodeKind::Resource { .. } => None,
+                OutputNodeKind::Resource { .. } | OutputNodeKind::Html { .. } => None,
             };
             if let Some(replacement) = replacement {
                 rendered.replace_range(node.start..node.end, &replacement);
@@ -509,6 +578,8 @@ mod tests {
             agent_handoff: true,
             images: OutputCapability::Native,
             files: OutputCapability::Native,
+            math: OutputCapability::Disabled,
+            html: OutputCapability::Disabled,
         };
         context.entities = vec![
             OutputEntity::new("a0", OutputEntityKind::Agent, "Self"),
@@ -520,11 +591,14 @@ mod tests {
 
     #[test]
     fn prompt_is_compact_and_capability_driven() {
-        let prompt = context().prompt();
+        let mut context = context();
+        context.capabilities.math = OutputCapability::Native;
+        context.capabilities.html = OutputCapability::Native;
+        let prompt = context.prompt();
         let fixed = prompt.split("entities:\n").next().unwrap();
         assert!(fixed.chars().count() <= 300, "{fixed}");
         assert!(prompt.contains("a0|agent|Self"));
-        assert!(prompt.contains("All: @[所有人](remi-mention:all)."));
+        assert!(prompt.contains("all @[所有人](remi-mention:all)"));
     }
 
     #[test]
@@ -536,6 +610,34 @@ mod tests {
         assert_eq!(document.nodes.len(), 5);
         assert_eq!(document.agent_mentions(), vec!["a1"]);
         assert!(document.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn desktop_prompt_advertises_math_and_lazy_html_skill() {
+        let context = OutputProtocolContext::desktop("c1", "a0");
+        let prompt = context.prompt();
+        assert!(prompt.contains("caps=\"math,html\""));
+        assert!(prompt.contains("Math $x$ / $$x$$."));
+        assert!(prompt.contains("read `desktop-html` skill"));
+        assert!(prompt.chars().count() <= 300, "{prompt}");
+    }
+
+    #[test]
+    fn html_blocks_are_protocol_nodes_only_when_enabled() {
+        let source = "```remi-html\n<section>Hello</section>\n```";
+        let desktop = parse_output(source, &OutputProtocolContext::desktop("c1", "a0"));
+        assert_eq!(desktop.nodes.len(), 1);
+        assert!(matches!(
+            &desktop.nodes[0].kind,
+            OutputNodeKind::Html { html } if html == "<section>Hello</section>\n"
+        ));
+
+        let other = parse_output(
+            source,
+            &OutputProtocolContext::new("feishu", "c1", "p2p", "a0"),
+        );
+        assert!(other.nodes.is_empty());
+        assert_eq!(other.diagnostics[0].code, "html_not_available");
     }
 
     #[test]

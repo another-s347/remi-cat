@@ -1,0 +1,4 @@
+interface:
+  display_name: "Desktop HTML"
+  short_description: "Build a self-contained Desktop HTML visualization"
+  default_prompt: "Create a Desktop HTML visualization only when the remi-output context declares html support."

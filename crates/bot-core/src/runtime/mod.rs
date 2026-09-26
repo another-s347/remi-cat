@@ -24,11 +24,11 @@ use crate::sandbox::SandboxConfig;
 use crate::skill::store::SkillStore;
 use crate::tools::{BashMode, SecretRedactor};
 use crate::{
-    acp, api_key_from_env, embedded_agent_profile, goal, install_embedded_agent_profiles,
-    install_embedded_model_profiles, model_usage, remi_skill, resolve_model_profile_from_env,
-    sandbox, skill, supervisor_workflow, todo, AccountUsage, AgentModelBindings, AgentProfile,
-    AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent, Content, ContentPart,
-    ContextCompactionEvent, ContextCompactionMode, ContextCompactionSource,
+    acp, api_key_from_env, desktop_html_skill, embedded_agent_profile, goal,
+    install_embedded_agent_profiles, install_embedded_model_profiles, model_usage, remi_skill,
+    resolve_model_profile_from_env, sandbox, skill, supervisor_workflow, todo, AccountUsage,
+    AgentModelBindings, AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent,
+    Content, ContentPart, ContextCompactionEvent, ContextCompactionMode, ContextCompactionSource,
     ContextCompactionStatus, FileSkillStore, GoalMaxRounds, GoalState, HookEventName, HookManager,
     ImAttachment, ImDocument, ImFileBridge, MemoryStore, Message, ModelProfileConfig,
     ModelProfileRegistry, ReasoningEffort, SharedRedactor, SkillDocument, SkillLoadDiagnostic,
@@ -1773,6 +1773,7 @@ impl CatBot {
                                 session_id: thread_id_owned.clone(),
                                 preview: batch.preview.clone(),
                                 count: batch.count,
+                                next_turn: batch.has_user_next_turn(),
                             });
                             let mut stream = Box::pin(self.stream_with_options(
                                 &thread_id_owned,
@@ -3534,6 +3535,7 @@ impl CatBot {
                                             session_id: thread_id_owned.clone(),
                                             preview: batch.preview.clone(),
                                             count: batch.count,
+                                            next_turn: batch.has_user_next_turn(),
                                         });
                                         continuation_from_background_task = batch.is_background_only();
                                         continuation_from_user_next_turn = batch.has_user_next_turn();
@@ -3596,6 +3598,7 @@ impl CatBot {
                                                             session_id: thread_id_owned.clone(),
                                                             preview: batch.preview.clone(),
                                                             count: batch.count,
+                                                            next_turn: batch.has_user_next_turn(),
                                                         },
                                                     );
                                                     continuation_from_background_task = batch.is_background_only();
@@ -3628,6 +3631,7 @@ impl CatBot {
                                                         session_id: thread_id_owned.clone(),
                                                         preview: batch.preview.clone(),
                                                         count: batch.count,
+                                                        next_turn: batch.has_user_next_turn(),
                                                     },
                                                 );
                                                 continuation_from_background_task = batch.is_background_only();
@@ -3658,6 +3662,7 @@ impl CatBot {
                                                             session_id: thread_id_owned.clone(),
                                                             preview: batch.preview.clone(),
                                                             count: batch.count,
+                                                            next_turn: batch.has_user_next_turn(),
                                                         },
                                                     );
                                                     continuation_from_background_task = batch.is_background_only();
@@ -3740,6 +3745,7 @@ impl CatBot {
                                                                         session_id: thread_id_owned.clone(),
                                                                         preview: batch.preview.clone(),
                                                                         count: batch.count,
+                                                                        next_turn: batch.has_user_next_turn(),
                                                                     },
                                                                 );
                                                                 continuation_from_background_task = batch.is_background_only();
@@ -3872,6 +3878,7 @@ impl CatBot {
                                             session_id: thread_id_owned.clone(),
                                             preview: batch.preview.clone(),
                                             count: batch.count,
+                                            next_turn: batch.has_user_next_turn(),
                                         });
                                         continuation_from_background_task = batch.is_background_only();
                                         continuation_from_user_next_turn = batch.has_user_next_turn();
@@ -4684,6 +4691,7 @@ impl CatBotBuilder {
         let mut builtin_skills = self.builtin_skills;
         if self.include_default_skills {
             builtin_skills.push(remi_skill::builtin_remi_skill());
+            builtin_skills.push(desktop_html_skill::builtin_desktop_html_skill());
         }
         let skill_store = Arc::new(BuiltinSkillStore::new(file_skill_store, builtin_skills));
         let pinned_skill_summaries = skill_store

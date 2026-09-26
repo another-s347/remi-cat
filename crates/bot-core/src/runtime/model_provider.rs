@@ -1,4 +1,4 @@
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
     Agent, AgentBuilder, AgentConfig, AgentError, ChatCtx, ChatResponseChunk, Content, ContentPart,
@@ -58,13 +58,26 @@ impl Agent for ProviderClient {
             }
             match self {
                 Self::OpenAI { client, .. } => client.chat(ctx, req).await.map(|stream| {
-                    Box::pin(stream) as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
+                    Box::pin(stream.filter_map(|chunk| async { valid_tool_call_chunk(chunk) }))
+                        as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
                 }),
                 Self::MiMo { client, .. } => client.chat(ctx, req).await.map(|stream| {
-                    Box::pin(stream) as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
+                    Box::pin(stream.filter_map(|chunk| async { valid_tool_call_chunk(chunk) }))
+                        as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
                 }),
             }
         }
+    }
+}
+
+fn valid_tool_call_chunk(chunk: ChatResponseChunk) -> Option<ChatResponseChunk> {
+    match &chunk {
+        ChatResponseChunk::ToolCallStart { id, name, .. }
+            if id.trim().is_empty() || name.trim().is_empty() =>
+        {
+            None
+        }
+        _ => Some(chunk),
     }
 }
 
@@ -341,6 +354,41 @@ mod tests {
         assert!(matches!(
             build_provider_client("test-key", &profile(None), None),
             ProviderClient::OpenAI { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_provider_tool_call_starts_do_not_replace_the_real_call() {
+        let chunks = vec![
+            ChatResponseChunk::ToolCallStart {
+                index: 0,
+                id: "call-1".to_string(),
+                name: "agent__explorer".to_string(),
+            },
+            ChatResponseChunk::ToolCallStart {
+                index: 0,
+                id: String::new(),
+                name: String::new(),
+            },
+            ChatResponseChunk::ToolCallDelta {
+                index: 0,
+                arguments_delta: "{\"task\":\"hello\"}".to_string(),
+            },
+        ];
+        let kept = chunks
+            .into_iter()
+            .filter_map(valid_tool_call_chunk)
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(
+            &kept[0],
+            ChatResponseChunk::ToolCallStart { id, name, .. }
+                if id == "call-1" && name == "agent__explorer"
+        ));
+        assert!(matches!(
+            &kept[1],
+            ChatResponseChunk::ToolCallDelta { arguments_delta, .. }
+                if arguments_delta == "{\"task\":\"hello\"}"
         ));
     }
 
