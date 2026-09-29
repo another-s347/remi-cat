@@ -2075,7 +2075,7 @@ fn is_token_expired_err(e: &anyhow::Error) -> bool {
     s.contains(&TOKEN_EXPIRED.to_string())
 }
 
-fn is_retryable_cot_error(error: &anyhow::Error) -> bool {
+pub fn is_retryable_cot_error(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
             if let Some(status) = error.status() {
@@ -2296,9 +2296,9 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        build_tool_approval_card, is_retryable_cot_error, log_text_preview,
-        preferred_contact_user_id_types, should_retry_contact_user_lookup, ContactUserIdType,
-        CotEvent, MessageResponse,
+        build_tool_approval_card, build_tool_approval_resolved_card, is_retryable_cot_error,
+        log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
+        ContactUserIdType, CotEvent, MessageResponse,
     };
 
     #[test]
@@ -2318,6 +2318,9 @@ mod tests {
         )));
         assert!(!is_retryable_cot_error(&anyhow!(
             "create_cot error 10003: invalid parameter"
+        )));
+        assert!(!is_retryable_cot_error(&anyhow!(
+            "append_cot_events error 230001: events[3].content too long"
         )));
     }
 
@@ -2374,6 +2377,48 @@ mod tests {
         ] {
             assert!(encoded.contains(&format!(r#""decision":"{decision}""#)));
         }
+        let rows = &card["body"]["elements"];
+        assert_eq!(
+            rows[rows.as_array().unwrap().len() - 2]["tag"],
+            "column_set"
+        );
+        assert_eq!(
+            rows[rows.as_array().unwrap().len() - 1]["tag"],
+            "column_set"
+        );
+        for row in rows.as_array().unwrap().iter().rev().take(2) {
+            assert_eq!(row["columns"].as_array().unwrap().len(), 2);
+            assert!(row["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|column| column["elements"][0]["tag"] == "button"));
+        }
+    }
+
+    #[test]
+    fn resolved_tool_approval_card_is_one_sentence_without_actions_or_details() {
+        for decision in [
+            "deny",
+            "allow_once",
+            "allow_same_command_session",
+            "allow_risk_level_session",
+        ] {
+            let card = build_tool_approval_resolved_card(decision, "medium");
+            assert!(card.get("header").is_none());
+            assert_eq!(card["config"]["width_mode"], "compact");
+            let elements = card["body"]["elements"].as_array().unwrap();
+            assert_eq!(elements.len(), 1);
+            let sentence = elements[0]["content"].as_str().unwrap();
+            assert!(sentence.ends_with('.'));
+            assert!(!sentence.contains('\n'));
+            assert!(!serde_json::to_string(&card).unwrap().contains("button"));
+        }
+        let high_risk = build_tool_approval_resolved_card("allow_risk_level_session", "high");
+        assert!(high_risk["body"]["elements"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("approved once"));
     }
 
     #[test]
@@ -2588,84 +2633,24 @@ pub fn build_tool_approval_card(
     elements.push(serde_json::json!({
         "tag": "hr"
     }));
-    elements.push(serde_json::json!({
-        "tag": "column_set",
-        "flex_mode": "stretch",
-        "columns": [
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Allow once" },
-                    "type": "primary",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "approval_decide",
-                            "approval_id": approval_id,
-                            "decision": "allow_once"
-                        }
-                    }]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Allow same command" },
-                    "type": "default",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "approval_decide",
-                            "approval_id": approval_id,
-                            "decision": "allow_same_command_session"
-                        }
-                    }]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Allow level (low/medium)" },
-                    "type": "default",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "approval_decide",
-                            "approval_id": approval_id,
-                            "decision": "allow_risk_level_session"
-                        }
-                    }]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "Deny" },
-                    "type": "danger",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": "approval_decide",
-                            "approval_id": approval_id,
-                            "decision": "deny"
-                        }
-                    }]
-                }]
-            }
-        ]
-    }));
+    elements.push(approval_button_row(
+        approval_button(approval_id, "Allow once", "primary", "allow_once"),
+        approval_button(
+            approval_id,
+            "Allow same command",
+            "default",
+            "allow_same_command_session",
+        ),
+    ));
+    elements.push(approval_button_row(
+        approval_button(
+            approval_id,
+            "Allow level (low/medium)",
+            "default",
+            "allow_risk_level_session",
+        ),
+        approval_button(approval_id, "Deny", "danger", "deny"),
+    ));
 
     serde_json::json!({
         "schema": "2.0",
@@ -2677,32 +2662,63 @@ pub fn build_tool_approval_card(
     })
 }
 
-pub fn build_tool_approval_resolved_card(
-    tool_name: &str,
-    risk: &str,
-    args_summary: &str,
+fn approval_button(
+    approval_id: &str,
+    label: &str,
+    style: &str,
     decision: &str,
 ) -> serde_json::Value {
-    let template = if decision == "deny" { "red" } else { "green" };
+    serde_json::json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": label },
+        "type": style,
+        "behaviors": [{
+            "type": "callback",
+            "value": {
+                "action": "approval_decide",
+                "approval_id": approval_id,
+                "decision": decision
+            }
+        }]
+    })
+}
+
+fn approval_button_row(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "elements": [left]},
+            {"tag": "column", "width": "weighted", "weight": 1, "elements": [right]}
+        ]
+    })
+}
+
+pub fn build_tool_approval_resolved_card(decision: &str, risk: &str) -> serde_json::Value {
+    let sentence = match (decision, risk) {
+        ("deny", _) => "Tool request denied.",
+        ("allow_once", _) => "Tool request approved once.",
+        ("allow_same_command_session", _) => {
+            "Tool request approved for this command in this session."
+        }
+        ("allow_risk_level_session", "high") => {
+            "Tool request approved once (high-risk session access was not granted)."
+        }
+        ("allow_risk_level_session", _) => {
+            "Tool request approved for this risk level in this session."
+        }
+        _ => "Tool approval resolved.",
+    };
     serde_json::json!({
         "schema": "2.0",
+        "config": { "width_mode": "compact" },
         "body": {
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": format!(
-                        "**Tool:** `{}`\n\n**Risk:** `{}`\n\n**Decision:** `{}`\n\n**Arguments**\n```json\n{}\n```",
-                        tool_name,
-                        risk,
-                        decision,
-                        args_summary
-                    )
+                    "content": sentence
                 }
             ]
-        },
-        "header": {
-            "title": { "tag": "plain_text", "content": "Tool approval resolved" },
-            "template": template
         }
     })
 }

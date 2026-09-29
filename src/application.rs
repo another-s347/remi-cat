@@ -2023,18 +2023,31 @@ async fn dispatch(
             }
             Command::ContextEstimate { session_id, reply } => {
                 let bot = runtime.bot.clone();
-                let agent_id = runtime
+                let (agent_id, model_profile_id) = runtime
                     .sessions
                     .lock()
                     .await
                     .get(&session_id)
-                    .and_then(|session| {
-                        session.metadata.get(SESSION_AGENT_ID_METADATA_KEY).cloned()
+                    .map(|session| {
+                        let value = |key| {
+                            session
+                                .metadata
+                                .get(key)
+                                .and_then(|value| value.as_str().map(str::to_string))
+                        };
+                        (
+                            value(SESSION_AGENT_ID_METADATA_KEY),
+                            value(crate::SESSION_MODEL_PROFILE_METADATA_KEY),
+                        )
                     })
-                    .and_then(|value| value.as_str().map(str::to_string));
+                    .unwrap_or_default();
                 tokio::task::spawn_local(async move {
                     let value = bot
-                        .persisted_context_estimate(&session_id, agent_id.as_deref())
+                        .persisted_context_estimate(
+                            &session_id,
+                            agent_id.as_deref(),
+                            model_profile_id.as_deref(),
+                        )
                         .await
                         .map_err(anyhow::Error::from);
                     let _ = reply.send(value);

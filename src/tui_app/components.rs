@@ -920,7 +920,12 @@ pub(super) fn context_compaction_cell(event: ContextCompactionEvent) -> HistoryC
         ContextCompactionStatus::Failed => ("context compression failed", ToolVisualStatus::Error),
     };
     let body = match event.status {
-        ContextCompactionStatus::Started => "using the current session model".to_string(),
+        ContextCompactionStatus::Started => match event.before_tokens {
+            Some(tokens) => {
+                format!("request estimated at {tokens} tokens; using the current session model")
+            }
+            None => "using the current session model".to_string(),
+        },
         ContextCompactionStatus::Failed => event
             .error
             .unwrap_or_else(|| "context compression failed".to_string()),

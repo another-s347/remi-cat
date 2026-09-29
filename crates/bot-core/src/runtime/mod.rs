@@ -1019,30 +1019,71 @@ impl CatBot {
         ))
     }
 
-    /// Estimate the currently injected persisted context without starting a model turn.
-    /// This is a fallback for sessions created before model-input snapshots existed.
+    /// Estimate the next request from persisted context without starting a model turn.
+    /// A snapshot of the previous request can be much smaller than the next
+    /// request after the previous turn's tool results have been saved.
     pub async fn persisted_context_estimate(
         &self,
         thread_id: &str,
         session_agent_id: Option<&str>,
+        session_model_profile_id: Option<&str>,
     ) -> Result<u32, AgentError> {
+        let workflow_agent_id = self
+            .workflow_status(thread_id)
+            .await
+            .and_then(|instance| self.workflow_node_agent(&instance).map(ToOwned::to_owned));
+        let effective_agent = self
+            .effective_agent_profile_for_workflow(session_agent_id, workflow_agent_id.as_deref());
+        let effective_model = self
+            .effective_model_profile_for_agent(session_model_profile_id, &effective_agent.profile);
         let user_budget = model_request_budget_tokens(
-            &self.model_profile,
+            &effective_model.profile,
             auto_compress_context_percent().unwrap_or(DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT),
         ) / 5;
-        let context = self
+        let mut context = self
             .memory
             .load_context_with_user_budget(thread_id, user_budget.min(20_000))
             .await?;
-        let effective_agent = self.effective_agent_profile(session_agent_id);
-        let history = build_injected_history(&context);
-        let mut tokens = crate::estimate_model_input_tokens(&effective_agent.profile.system_prompt);
-        for message in history {
-            tokens = tokens.saturating_add(crate::estimate_model_input_tokens(
-                &message.content.text_content(),
-            ));
-        }
-        Ok(tokens)
+        let environment =
+            ensure_environment_context(&mut context.user_state, &self.environment_context_source);
+        let mut history = build_injected_history(&context);
+        history.insert(
+            0,
+            Message::system(effective_agent.profile.system_prompt.clone()),
+        );
+        insert_environment_context_prompt(&mut history, 1, environment.prompt);
+        let agent_header_count =
+            2 + usize::from(context.agent_md.is_some()) + usize::from(context.soul_md.is_some());
+        let runtime_model_key = model_runtime_key(&effective_model.profile.id, None);
+        let active_agent =
+            self.runtime_for_agent_and_model(&effective_agent.profile.id, &runtime_model_key);
+        insert_pinned_skill_prompt(
+            &mut history,
+            agent_header_count,
+            &self.pinned_skill_summaries,
+            effective_model.profile.context_tokens,
+            skill_prompt_tool_availability(active_agent),
+        );
+        let active_supervisor = self
+            .workflow_status(thread_id)
+            .await
+            .is_some_and(|instance| instance.status == WorkflowStatus::Active);
+        route_thread_todo_prompt(&mut history, &context.user_state, active_supervisor);
+        let input = LoopInput::start_message(Message::user(""))
+            .history(history)
+            .metadata(serde_json::json!({ "thread_id": thread_id }))
+            .user_state(context.user_state);
+        let definitions = active_agent.tool_definitions_for_input(&input, None);
+        Ok(model_input_snapshot_from_loop_input(
+            &input,
+            &definitions,
+            thread_id,
+            None,
+            &effective_model.profile.id,
+            &effective_model.profile.model,
+        )
+        .map(|snapshot| snapshot.totals.estimated_tokens)
+        .unwrap_or(0))
     }
 
     pub fn approval_manager(&self) -> Arc<ToolApprovalManager> {
@@ -3112,7 +3153,7 @@ impl CatBot {
                     .history(history)
                     .protected_message_ids(protected_message_ids)
                     .metadata(meta.clone())
-                    .user_state(ctx.user_state);
+                    .user_state(ctx.user_state.clone());
                 if let Some(user_name) = injected_user_name.clone() {
                     input = input.user_name(user_name);
                 }
@@ -3167,7 +3208,7 @@ impl CatBot {
                     }
                     rebuilt_input
                 };
-                let final_snapshot = loop {
+                let final_snapshot = 'preflight: loop {
                     let request_tool_definitions =
                         active_agent.tool_definitions_for_input(&input, None);
                     let snapshot = model_input_snapshot_from_loop_input(
@@ -3181,6 +3222,57 @@ impl CatBot {
                     let Some(snapshot) = snapshot else { break None };
                     if snapshot.totals.estimated_tokens <= request_budget {
                         break Some(snapshot);
+                    }
+                    if background_task_continuation {
+                        // A background completion can arrive after a final
+                        // foreground reply has already been delivered. Keep
+                        // the durable memory unchanged until the next user
+                        // request; bound only this follow-up model input.
+                        let mut transient = ctx.clone();
+                        let mut candidate = rebuild_compacted_input(&transient);
+                        let mut candidate_snapshot = snapshot.clone();
+                        loop {
+                            if candidate_snapshot.totals.estimated_tokens <= request_budget {
+                                input = candidate;
+                                break 'preflight Some(candidate_snapshot);
+                            }
+                            if !transient.retained_user_inputs.is_empty() {
+                                transient.retained_user_inputs.remove(0);
+                            } else if !transient.short_term.is_empty() {
+                                let next = (1..transient.short_term.len())
+                                    .find(|&index| matches!(
+                                        transient.short_term[index].role,
+                                        Role::User | Role::System
+                                    ))
+                                    .unwrap_or(transient.short_term.len());
+                                transient.short_term = crate::memory::store::protocol_safe_history(
+                                    &transient.short_term[next..],
+                                );
+                            } else if !transient.long_term.entries.is_empty() {
+                                transient.long_term.entries.clear();
+                            } else if !transient.mid_term.entries.is_empty() {
+                                transient.mid_term.entries.clear();
+                            } else if transient.latest_summary.take().is_none() {
+                                let reason = format!(
+                                    "background continuation exceeds context budget: estimated {} tokens, limit {} tokens",
+                                    candidate_snapshot.totals.estimated_tokens,
+                                    request_budget,
+                                );
+                                let _ = self.memory.append_failed_turn(
+                                    &thread_id_owned,
+                                    vec![current_user_message.clone()],
+                                ).await;
+                                yield CatEvent::Error(AgentError::other(reason));
+                                return;
+                            }
+                            candidate = rebuild_compacted_input(&transient);
+                            let definitions = active_agent.tool_definitions_for_input(&candidate, None);
+                            candidate_snapshot = model_input_snapshot_from_loop_input(
+                                &candidate, &definitions, &thread_id_owned,
+                                round_opts.message_id.as_deref(),
+                                &effective_model.profile.id, &effective_model.profile.model,
+                            ).expect("background continuation contains a current message");
+                        }
                     }
                     if effective_model.profile.context_compaction == ContextCompactionMode::Agent {
                         let absolute_budget =
@@ -3271,7 +3363,7 @@ impl CatBot {
                         source: ContextCompactionSource::Auto,
                         compacted_messages: 0,
                         remaining_messages: 0,
-                        before_tokens: None, after_tokens: None,
+                        before_tokens: Some(snapshot.totals.estimated_tokens), after_tokens: None,
                         error: None,
                     });
                     let compressor = match self.compressor_for_profile(&effective_model.profile) {
@@ -6551,16 +6643,72 @@ mod tests {
                 .await
                 .unwrap();
             let before = first
-                .persisted_context_estimate("restart-context", None)
+                .persisted_context_estimate("restart-context", None, None)
+                .await
+                .unwrap();
+            first
+                .memory
+                .save_turn(
+                    "restart-context",
+                    vec![
+                        Message::user("a later request"),
+                        Message::assistant("large persisted result ".repeat(4_000)),
+                    ],
+                )
+                .await
+                .unwrap();
+            let after_turn = first
+                .persisted_context_estimate("restart-context", None, None)
                 .await
                 .unwrap();
             drop(first);
             let after = make_bot()
-                .persisted_context_estimate("restart-context", None)
+                .persisted_context_estimate("restart-context", None, None)
                 .await
                 .unwrap();
             assert!(before > 0);
-            assert_eq!(after, before);
+            assert!(after_turn > before + 1_000);
+            assert_eq!(after, after_turn);
+        });
+    }
+
+    #[test]
+    fn low_context_after_restart_does_not_trigger_compaction() {
+        run_large_stack_local_test(|| async {
+            let (base_url, requests) =
+                start_openai_mock_server(vec![sse_text("normal reply")]).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let first = build_mock_bot(&data_dir, base_url.clone(), false, 1);
+            let thread = "low-context-after-restart";
+            first
+                .memory
+                .save_turn(
+                    thread,
+                    vec![
+                        Message::user("a short previous question"),
+                        Message::assistant("a short previous answer"),
+                    ],
+                )
+                .await
+                .unwrap();
+            drop(first);
+            let bot = build_mock_bot(&data_dir, base_url, false, 1);
+            let estimate = bot
+                .persisted_context_estimate(thread, None, None)
+                .await
+                .unwrap();
+            assert!(
+                estimate < bot.model_profile.context_tokens / 5,
+                "estimated context is not low: {estimate}"
+            );
+            let events = collect_stream(bot.stream(thread, "another short question")).await;
+            assert!(events.iter().any(
+                |event| matches!(event, CatEvent::Text(text) if text.contains("normal reply"))
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, CatEvent::ContextCompaction(_))));
+            assert_eq!(requests.lock().unwrap().len(), 1);
         });
     }
 
@@ -6916,6 +7064,120 @@ mod tests {
             assert_eq!(requests.len(), 2);
             assert!(requests[1].contains(chunk_summary));
             assert!(!requests[1].contains(&"x".repeat(128)));
+        });
+    }
+
+    #[test]
+    fn background_follow_up_does_not_compact_after_foreground_reply() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "80");
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text("foreground reply complete"),
+                sse_text("background result acknowledged"),
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot_with_mode(
+                &data_dir,
+                base_url,
+                false,
+                4,
+                Vec::new(),
+                None,
+                ContextCompactionMode::Hard,
+                Some(40_000),
+            );
+            let thread = "background-no-post-reply-compaction";
+            bot.memory
+                .append_failed_turn(
+                    thread,
+                    vec![
+                        Message::user(format!("original user input {}", "history ".repeat(4_500))),
+                        Message::assistant(format!("prior answer {}", "history ".repeat(4_500))),
+                    ],
+                )
+                .await
+                .unwrap();
+            let budget = model_request_budget_tokens(&bot.model_profile, 80);
+            let initial = bot
+                .persisted_context_estimate(thread, None, None)
+                .await
+                .unwrap();
+            assert!(
+                initial < budget,
+                "initial request must not compact: {initial} >= {budget}"
+            );
+            let task_id = bot
+                .tool_tasks
+                .start(
+                    thread.to_string(),
+                    "run-bg".to_string(),
+                    "call-bg".to_string(),
+                    "background_tool".to_string(),
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            bot.tool_tasks
+                .promote_to_background(&task_id, true)
+                .await
+                .unwrap();
+            let result = "background result ".repeat(4_500);
+            let mut stream = Box::pin(bot.stream_with_options(
+                thread,
+                Content::text("start the background task"),
+                StreamOptions {
+                    async_agent: true,
+                    ..StreamOptions::default()
+                },
+            ));
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                if matches!(event, CatEvent::BackgroundTasksWaiting { .. }) {
+                    bot.tool_tasks
+                        .finish(&task_id, true, 1, result.clone())
+                        .await
+                        .unwrap();
+                }
+                events.push(event);
+            }
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, CatEvent::BackgroundTasksWaiting { .. })));
+            let observed = events
+                .iter()
+                .filter_map(|event| match event {
+                    CatEvent::Text(text) => Some(format!("text={text}")),
+                    CatEvent::Error(error) => Some(format!("error={error}")),
+                    CatEvent::ContextCompaction(event) => {
+                        Some(format!("compaction={:?}", event.status))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(events.iter().any(|event| matches!(event, CatEvent::Text(text) if text.contains("background result acknowledged"))), "{observed:?}");
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, CatEvent::ContextCompaction(_))));
+            assert!(bot
+                .memory
+                .load_context(thread)
+                .await
+                .unwrap()
+                .latest_summary
+                .is_none());
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "background continuation must not call the compressor"
+            );
+            assert!(requests[1].contains("background result"));
+            assert!(
+                !requests[1].contains("original user input"),
+                "follow-up should trim old history for this request only"
+            );
         });
     }
 
@@ -9808,7 +10070,10 @@ You are Remi.
                     .append_failed_turn(thread, old_messages)
                     .await
                     .unwrap();
-                let before = bot.persisted_context_estimate(thread, None).await.unwrap();
+                let before = bot
+                    .persisted_context_estimate(thread, None, None)
+                    .await
+                    .unwrap();
                 assert!(
                     before > 16_000,
                     "seeded history did not reach the compaction threshold: {before}"
@@ -9826,14 +10091,17 @@ You are Remi.
                 assert!(events
                     .iter()
                     .any(|event| matches!(event, CatEvent::Text(text) if !text.trim().is_empty())));
-                let after = bot.persisted_context_estimate(thread, None).await.unwrap();
+                let after = bot
+                    .persisted_context_estimate(thread, None, None)
+                    .await
+                    .unwrap();
                 assert!(
                     after < before,
                     "compaction did not reduce effective context: {before} -> {after}"
                 );
                 drop(bot);
                 let restored = make_bot()
-                    .persisted_context_estimate(thread, None)
+                    .persisted_context_estimate(thread, None, None)
                     .await
                     .unwrap();
                 assert_eq!(restored, after);

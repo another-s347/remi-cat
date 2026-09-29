@@ -302,6 +302,13 @@ impl PerThreadManager {
         records
     }
 
+    async fn list_timeline(&self) -> Vec<ToolTaskRecord> {
+        let mut records: Vec<ToolTaskRecord> =
+            self.store.lock().await.tasks.values().cloned().collect();
+        records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        records
+    }
+
     async fn get(&self, task_id: &str) -> Option<ToolTaskRecord> {
         self.store.lock().await.tasks.get(task_id).cloned()
     }
@@ -327,10 +334,6 @@ impl PerThreadManager {
 
     async fn remove_foreground(&self, task_id: &str) {
         self.running.lock().await.remove(task_id);
-        let removed = self.store.lock().await.tasks.remove(task_id).is_some();
-        if removed {
-            let _ = self.save().await;
-        }
     }
 
     async fn is_thread_running(&self) -> bool {
@@ -551,7 +554,7 @@ impl ToolTaskManager {
     }
 
     pub async fn remove_foreground(&self, task_id: &str) {
-        let thread_id = self.task_thread_map.lock().await.remove(task_id);
+        let thread_id = self.task_thread_map.lock().await.get(task_id).cloned();
         if let Some(thread_id) = thread_id {
             if let Ok(mgr) = self.get_thread(&thread_id).await {
                 mgr.remove_foreground(task_id).await;
@@ -662,6 +665,13 @@ impl ToolTaskManager {
         }
     }
 
+    pub async fn list_session_timeline(&self, thread_id: &str) -> Vec<ToolTaskRecord> {
+        match self.get_thread(thread_id).await {
+            Ok(mgr) => mgr.list_timeline().await,
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub async fn list_session_background(&self, thread_id: &str) -> Vec<ToolTaskRecord> {
         let records = self.list(Some(thread_id)).await;
         let mut running = records
@@ -704,7 +714,6 @@ fn thread_store_path(store_dir: &Path, thread_id: &str) -> PathBuf {
 }
 
 fn normalize_loaded_store(store: &mut ToolTaskStore) {
-    store.tasks.retain(|_, task| task.background);
     let now = Utc::now().to_rfc3339();
     for task in store.tasks.values_mut() {
         if task.status == TOOL_TASK_RUNNING {
@@ -722,7 +731,7 @@ fn prune_completed_tasks(store: &mut ToolTaskStore) {
     let mut completed = store
         .tasks
         .values()
-        .filter(|task| task.background && task.status != TOOL_TASK_RUNNING)
+        .filter(|task| task.status != TOOL_TASK_RUNNING)
         .map(|task| {
             (
                 task.completed_at.as_deref().unwrap_or_default().to_string(),
@@ -1350,7 +1359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_records_are_hidden_and_removed() {
+    async fn foreground_records_are_hidden_from_background_list_but_restored_in_timeline() {
         let manager = ToolTaskManager::load(temp_data_dir("foreground-cleanup")).unwrap();
         let task_id = manager
             .start(
@@ -1366,7 +1375,14 @@ mod tests {
 
         assert!(manager.list(Some("thread-a")).await.is_empty());
         manager.remove_foreground(&task_id).await;
-        assert!(manager.get(&task_id).await.is_none());
+        manager.finish(&task_id, true, 1, "ok".to_string()).await;
+        assert!(manager.list(Some("thread-a")).await.is_empty());
+        let restored = ToolTaskManager::load_store_dir(manager.store_dir.clone()).unwrap();
+        assert_eq!(restored.list_session_timeline("thread-a").await.len(), 1);
+        assert_eq!(
+            restored.get(&task_id).await.unwrap().status,
+            TOOL_TASK_COMPLETED
+        );
     }
 
     #[tokio::test]

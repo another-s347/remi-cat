@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -56,7 +56,6 @@ impl Tool for ManageYourselfTool {
                 .to_string();
             let args = parse_manage_yourself_command(&command)?;
             Ok(ToolResult::Output(stream! {
-                yield ToolOutput::Delta(format!("remi-cat {}", args.join(" ")));
                 tracing::info!(
                     command = %log_preview(&command, 160),
                     command_len = command.len(),
@@ -73,6 +72,7 @@ impl Tool for ManageYourselfTool {
                             error = %error,
                             "manage_yourself.failed"
                         );
+                        // The tool collector marks an `error:` result as failed.
                         yield ToolOutput::text(format!("error: {error:#}"));
                     }
                 }
@@ -105,20 +105,35 @@ pub(super) fn parse_manage_yourself_command(command: &str) -> Result<Vec<String>
 }
 
 async fn run_manage_yourself_command(args: &[String]) -> anyhow::Result<String> {
-    let exe = std::env::current_exe().context("resolving current remi-cat executable")?;
+    let exe = match std::env::var_os("REMI_CLI_EXE") {
+        Some(override_path) => {
+            let path = PathBuf::from(override_path);
+            anyhow::ensure!(
+                path.is_absolute() && path.is_file(),
+                "REMI_CLI_EXE must name an existing absolute file: {}",
+                path.display()
+            );
+            path
+        }
+        None => std::env::current_exe().context("resolving current remi-cat executable")?,
+    };
     let started = Instant::now();
     tracing::debug!(
         exe = %exe.display(),
         argc = args.len(),
         "manage_yourself.process.start"
     );
-    let output = tokio::task::spawn_blocking({
-        let args = args.to_vec();
-        move || Command::new(&exe).args(args).output()
-    })
-    .await
-    .context("joining manage_yourself command task")?
-    .context("running remi-cat command")?;
+    let mut command = tokio::process::Command::new(&exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x0800_0000);
+    }
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .context("remi-cat command timed out after 90 seconds")?
+        .context("running remi-cat command")?;
     let stdout_bytes = output.stdout.len();
     let stderr_bytes = output.stderr.len();
     let exit_code = output.status.code();
@@ -139,7 +154,9 @@ async fn run_manage_yourself_command(args: &[String]) -> anyhow::Result<String> 
             "manage_yourself.failed"
         );
     }
-    Ok(format_command_output(output))
+    let text = format_command_output(output);
+    anyhow::ensure!(exit_code == Some(0), "remi-cat command failed: {text}");
+    Ok(text)
 }
 
 pub(super) fn format_command_output(output: std::process::Output) -> String {

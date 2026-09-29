@@ -3,10 +3,10 @@ use remi_agentloop::types::SubSessionEvent;
 
 pub(crate) fn format_context_compaction_line(event: &bot_core::ContextCompactionEvent) -> String {
     match event.status {
-        bot_core::ContextCompactionStatus::Started => format!(
-            "🧠 正在压缩上下文：压缩 {} 条，保留 {} 条",
-            event.compacted_messages, event.remaining_messages
-        ),
+        bot_core::ContextCompactionStatus::Started => match event.before_tokens {
+            Some(tokens) => format!("🧠 正在压缩上下文：请求估算 {tokens} token"),
+            None => "🧠 正在压缩上下文".to_string(),
+        },
         bot_core::ContextCompactionStatus::Completed => {
             let mut line = format!(
                 "🧠 上下文已压缩：覆盖 {} 条，当前上下文保留 {} 条原始消息",

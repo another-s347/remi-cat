@@ -7,14 +7,18 @@ use bot_core::{
 };
 use im_feishu::client::{
     build_tool_approval_card, build_tool_approval_resolved_card, build_user_question_card,
-    build_user_question_resolved_card,
+    build_user_question_resolved_card, is_retryable_cot_error,
 };
 use im_feishu::{CotEvent, CotMessage, FeishuGateway};
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::warn;
 
 const COT_FLUSH_INTERVAL: Duration = Duration::from_millis(350);
 const COT_FLUSH_EVENT_LIMIT: usize = 12;
+const COT_TEXT_MAX_CHARS: usize = 100;
+// Feishu does not publish a numeric limit for one event's JSON-string content.
+// Keep each serialized content conservatively small despite that unknown limit.
+const COT_EVENT_CONTENT_MAX_BYTES: usize = 3_500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeishuReplyKind {
@@ -233,9 +237,19 @@ impl FeishuReplyStream {
         if !self.ensure_cot().await {
             return false;
         }
+        let Some(payload) = bounded_cot_payload(content) else {
+            warn!(
+                event_type,
+                "Feishu COT event cannot fit the content limit; skipping it"
+            );
+            return false;
+        };
         let timestamp = self.next_event_timestamp();
         self.pending_events
-            .push(CotEvent::at(event_type, content, timestamp));
+            .push(CotEvent::at(event_type, payload, timestamp));
+        if self.pending_events.len() >= COT_FLUSH_EVENT_LIMIT {
+            self.flush_events().await;
+        }
         true
     }
 
@@ -258,20 +272,29 @@ impl FeishuReplyStream {
     }
 
     async fn flush_events(&mut self) {
-        if self.pending_events.is_empty() {
-            return;
-        }
         let Some(cot) = self.cot.clone() else {
             return;
         };
-        let events = std::mem::take(&mut self.pending_events);
-        match self.gateway.append_cot_events(&cot, &events).await {
-            Ok(()) => self.last_cot_flush = Instant::now(),
-            Err(err) => {
-                warn!("append Feishu COT events failed: {err:#}");
-                let mut retry = events;
-                retry.append(&mut self.pending_events);
-                self.pending_events = retry;
+        while !self.pending_events.is_empty() {
+            let count = self.pending_events.len().min(COT_FLUSH_EVENT_LIMIT);
+            let events: Vec<_> = self.pending_events.drain(..count).collect();
+            match self.gateway.append_cot_events(&cot, &events).await {
+                Ok(()) => self.last_cot_flush = Instant::now(),
+                Err(err) => {
+                    warn!("append Feishu COT events failed: {err:#}");
+                    if is_retryable_cot_error(&err) {
+                        let mut retry = events;
+                        retry.append(&mut self.pending_events);
+                        self.pending_events = retry;
+                        break;
+                    }
+                    // Retrying an invalid payload forever only prevents later events
+                    // (including RUN_FINISHED) from being delivered.
+                    warn!(
+                        discarded_events = events.len(),
+                        "discarding invalid Feishu COT batch"
+                    );
+                }
             }
         }
     }
@@ -584,10 +607,8 @@ impl FeishuReplyStream {
             return;
         };
         let card = build_tool_approval_resolved_card(
-            &request.tool_name,
-            tool_risk_value(request.risk),
-            &request.args_summary,
             tool_approval_decision_value(decision),
+            tool_risk_value(request.risk),
         );
         if let Err(err) = self.gateway.update_card_raw(&message_id, card).await {
             warn!("resolve approval card failed: {err:#}");
@@ -720,9 +741,34 @@ fn approval_review_text(request: &ToolApprovalRequest) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+fn bounded_cot_payload(mut content: Value) -> Option<Value> {
+    // Only shorten display text. IDs and structural AG-UI fields must remain
+    // unchanged so the START / CONTENT / END sequence still refers to one cell.
+    for key in ["content", "title", "message", "reason", "delta"] {
+        let Some(original) = content.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let mut chars = original.chars();
+        let preview: String = chars.by_ref().take(COT_TEXT_MAX_CHARS).collect();
+        if chars.next().is_some() {
+            let shortened: String = preview
+                .chars()
+                .take(COT_TEXT_MAX_CHARS - 1)
+                .chain(std::iter::once('…'))
+                .collect();
+            content[key] = json!(shortened);
+        }
+    }
+    (content.to_string().len() <= COT_EVENT_CONTENT_MAX_BYTES).then_some(content)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{process_title, FeishuReplyKind, NarrativeKind};
+    use super::{
+        bounded_cot_payload, process_title, FeishuReplyKind, NarrativeKind,
+        COT_EVENT_CONTENT_MAX_BYTES, COT_TEXT_MAX_CHARS,
+    };
+    use serde_json::json;
 
     #[test]
     fn reasoning_is_hidden_inside_expanded_cot() {
@@ -754,5 +800,38 @@ mod tests {
             process_title("\n**Running bash** — cargo test\nmore details"),
             "Running bash — cargo test"
         );
+    }
+
+    #[test]
+    fn long_reasoning_keeps_a_hundred_unicode_characters() {
+        let original = "思考\n\"下一步\"\\".repeat(1_000);
+        let payload =
+            bounded_cot_payload(json!({"messageId": "narrative-1", "delta": original})).unwrap();
+        let preview = payload["delta"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), COT_TEXT_MAX_CHARS);
+        assert!(preview.ends_with('…'));
+        assert!(original.starts_with(preview.trim_end_matches('…')));
+        assert!(payload.to_string().len() <= COT_EVENT_CONTENT_MAX_BYTES);
+        assert_eq!(payload["messageId"], "narrative-1");
+    }
+
+    #[test]
+    fn long_tool_result_is_truncated_but_keeps_valid_event_fields() {
+        let payload = bounded_cot_payload(
+            json!({"messageId": "result-1", "toolCallId": "1", "content": "输出".repeat(2_000), "role": "tool"}),
+        ).unwrap();
+        assert!(payload.to_string().len() <= COT_EVENT_CONTENT_MAX_BYTES);
+        assert_eq!(
+            payload["content"].as_str().unwrap().chars().count(),
+            COT_TEXT_MAX_CHARS
+        );
+        assert!(payload["content"].as_str().unwrap().ends_with('…'));
+        assert_eq!(payload["toolCallId"], "1");
+    }
+
+    #[test]
+    fn short_cot_event_is_unchanged() {
+        let content = json!({"messageId": "narrative-1", "delta": "hello"});
+        assert_eq!(bounded_cot_payload(content.clone()), Some(content));
     }
 }

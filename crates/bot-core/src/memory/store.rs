@@ -1574,7 +1574,7 @@ fn tool_protocol_closed(messages: &[Message]) -> bool {
 /// results. Interrupted turns and legacy compression boundaries can leave a
 /// partial chain in durable history. Preserve that evidence as a protocol-
 /// neutral system record instead of repeatedly sending an invalid sequence.
-fn protocol_safe_history(messages: &[Message]) -> Vec<Message> {
+pub(crate) fn protocol_safe_history(messages: &[Message]) -> Vec<Message> {
     let mut safe = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {

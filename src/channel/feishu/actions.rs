@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use bot_core::{ToolApprovalDecision, UserQuestionResponse, UserQuestionStatus};
+use im_feishu::client::build_tool_approval_resolved_card;
 use im_feishu::FeishuGateway;
 use tracing::warn;
 
@@ -95,19 +96,28 @@ pub(super) async fn process_feishu_card_action(
         .approval_manager()
         .decide(approval_id, decision)
         .await;
-    if resolved.is_none() {
+    if let Some(request) = resolved {
+        let decision_value = match decision {
+            ToolApprovalDecision::Deny => "deny",
+            ToolApprovalDecision::AllowOnce => "allow_once",
+            ToolApprovalDecision::AllowSameCommandSession => "allow_same_command_session",
+            ToolApprovalDecision::AllowRiskLevelSession => "allow_risk_level_session",
+        };
+        if let Err(err) = gateway
+            .update_card_raw(
+                &card_message_id,
+                build_tool_approval_resolved_card(decision_value, tool_risk_value(request.risk)),
+            )
+            .await
+        {
+            warn!(approval_id, "update resolved approval card failed: {err:#}");
+        }
+    } else {
         warn!(
             approval_id,
             user = %user_open_id,
             "approval card action did not match a pending request"
         );
-        gateway
-            .update_card_raw(
-                &card_message_id,
-                build_tool_approval_notice_card("Approval is no longer pending."),
-            )
-            .await
-            .ok();
     }
     Ok(())
 }
@@ -123,6 +133,14 @@ fn parse_tool_approval_decision(value: &str) -> Option<ToolApprovalDecision> {
             Some(ToolApprovalDecision::AllowRiskLevelSession)
         }
         _ => None,
+    }
+}
+
+fn tool_risk_value(risk: bot_core::approval::ToolRiskLevel) -> &'static str {
+    match risk {
+        bot_core::approval::ToolRiskLevel::Low => "low",
+        bot_core::approval::ToolRiskLevel::Medium => "medium",
+        bot_core::approval::ToolRiskLevel::High => "high",
     }
 }
 
@@ -154,15 +172,12 @@ fn build_user_question_answer_text(
 fn build_tool_approval_notice_card(message: &str) -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
+        "config": { "width_mode": "compact" },
         "body": {
             "elements": [{
                 "tag": "markdown",
                 "content": message
             }]
-        },
-        "header": {
-            "title": { "tag": "plain_text", "content": "Tool approval" },
-            "template": "grey"
         }
     })
 }
