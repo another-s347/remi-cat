@@ -31,7 +31,7 @@ pub mod streaming;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -58,6 +58,7 @@ const TYPE_PING: &str = "ping";
 const TYPE_PONG: &str = "pong";
 const TYPE_EVENT: &str = "event";
 const TYPE_CARD: &str = "card";
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Public event types ────────────────────────────────────────────────────────
 
@@ -416,7 +417,9 @@ impl FeishuGateway {
         let endpoint = self.client.ws_endpoint().await?;
         info!("connecting Feishu WS: {}", endpoint.url);
 
-        let (ws, _) = connect_async(&endpoint.url).await?;
+        let (ws, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&endpoint.url))
+            .await
+            .context("Feishu WS connection timed out")??;
         info!("WS connected");
 
         let (mut sink, mut stream) = ws.split();

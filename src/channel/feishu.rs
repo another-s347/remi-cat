@@ -3,7 +3,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::Duration;
 
 use base64::Engine as _;
 use bot_core::im_tools::{encode_agent_file_key, ImUploadRequest, SubSessionBindingUpsertRequest};
@@ -464,8 +463,6 @@ async fn collect_bot_reply(
         .await
         .metadata_bool(&session_id, SESSION_DEBUG_METADATA_KEY);
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
-    let timeout = tokio::time::sleep(Duration::from_secs(300));
-    tokio::pin!(timeout);
     let mut forwarder = FeishuEventForwarder {
         runtime: &runtime,
         platform,
@@ -482,20 +479,9 @@ async fn collect_bot_reply(
         supervisor_execution_started: false,
         output_protocol,
     };
-    loop {
-        tokio::select! {
-            event = stream.next() => {
-                let Some(event) = event else { break };
-                if forwarder.forward_core_event(event).await {
-                    break;
-                }
-            }
-            _ = &mut timeout => {
-                forwarder.finish_streaming_tools("reply timed out").await;
-                let chunk = "\n\n---\n**调试信息**\n\n**Timeout** reply timed out";
-                forwarder.append(FeishuReplyKind::Error, chunk).await;
-                break;
-            }
+    while let Some(event) = stream.next().await {
+        if forwarder.forward_core_event(event).await {
+            break;
         }
     }
     if should_emit_empty_fallback(&forwarder.output, forwarder.had_visible_event) {

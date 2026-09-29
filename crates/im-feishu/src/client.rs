@@ -23,6 +23,8 @@ const TOKEN_EXPIRED: i64 = 99991663;
 const COT_MAX_ATTEMPTS: usize = 5;
 const COT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const COT_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// Bound each Feishu HTTP request, without limiting the lifetime of an agent turn.
+const FEISHU_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 const FEISHU_BASE: &str = "https://open.feishu.cn/open-apis";
 /// Base URL for the WebSocket endpoint (NOT under /open-apis/).
@@ -193,7 +195,10 @@ impl FeishuClient {
         Self {
             app_id: app_id.into(),
             app_secret: app_secret.into(),
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(FEISHU_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid Feishu HTTP client configuration"),
             token: Arc::new(RwLock::new(String::new())),
             bot_open_id: Arc::new(RwLock::new(None)),
         }
