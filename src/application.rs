@@ -24,6 +24,7 @@ use crate::secret_store::SecretStore;
 #[cfg(test)]
 use crate::session::ChannelBinding;
 use crate::session::{Session, SessionRuntime, SubSessionKind};
+use crate::SESSION_AGENT_ID_METADATA_KEY;
 use bot_core::tool_tasks::TOOL_TASK_RUNNING;
 use bot_core::{CatBotBuilder, ImFileBridge};
 use user_store::UserStore;
@@ -1030,6 +1031,13 @@ impl ChannelHandle {
         })
         .await
     }
+    pub async fn context_estimate(&self, session_id: impl Into<String>) -> anyhow::Result<u32> {
+        request(&self.commands, |reply| Command::ContextEstimate {
+            session_id: session_id.into(),
+            reply,
+        })
+        .await
+    }
     pub async fn sub_sessions(
         &self,
         parent_id: impl Into<String>,
@@ -1207,6 +1215,10 @@ impl ChannelHandle {
 }
 
 enum Command {
+    ContextEstimate {
+        session_id: String,
+        reply: oneshot::Sender<anyhow::Result<u32>>,
+    },
     Catalog {
         reply: oneshot::Sender<anyhow::Result<ApplicationCatalog>>,
     },
@@ -1651,11 +1663,46 @@ async fn dispatch(
             Command::Compact { id, reply } => {
                 let bot = runtime.bot.clone();
                 let app_id = app_id.clone();
+                let session = runtime.sessions.lock().await.get(&id);
+                let data_dir = runtime.data_dir.clone();
                 tokio::task::spawn_local(async move {
+                    let model_profile_id = session.as_ref().and_then(|session| {
+                        session
+                            .metadata
+                            .get(crate::SESSION_MODEL_PROFILE_METADATA_KEY)
+                            .and_then(serde_json::Value::as_str)
+                    });
+                    let agent_id = session.as_ref().and_then(|session| {
+                        session
+                            .metadata
+                            .get(crate::SESSION_AGENT_ID_METADATA_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            .or(Some(session.root_agent_id.as_str()))
+                    });
+                    let reasoning_effort = session.as_ref().and_then(|session| {
+                        session
+                            .metadata
+                            .get(crate::app::SESSION_REASONING_EFFORT_METADATA_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(ReasoningEffort::parse)
+                    });
                     let value = bot
-                        .compact_memory_for_app(&id, &app_id)
+                        .compact_memory_with_profile_for_app(
+                            &id,
+                            model_profile_id,
+                            agent_id,
+                            reasoning_effort,
+                            &app_id,
+                        )
                         .await
                         .map_err(anyhow::Error::from);
+                    if value.is_ok() {
+                        if let Err(err) =
+                            crate::model_input_store::delete_model_input_snapshots(&data_dir, &id)
+                        {
+                            tracing::warn!(session_id = %id, error = %err, "could not clear stale model input snapshots after compaction");
+                        }
+                    }
                     let _ = reply.send(value);
                 });
             }
@@ -1974,6 +2021,25 @@ async fn dispatch(
                     let _ = reply.send(Ok(bot.thread_history(&id).await));
                 });
             }
+            Command::ContextEstimate { session_id, reply } => {
+                let bot = runtime.bot.clone();
+                let agent_id = runtime
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|session| {
+                        session.metadata.get(SESSION_AGENT_ID_METADATA_KEY).cloned()
+                    })
+                    .and_then(|value| value.as_str().map(str::to_string));
+                tokio::task::spawn_local(async move {
+                    let value = bot
+                        .persisted_context_estimate(&session_id, agent_id.as_deref())
+                        .await
+                        .map_err(anyhow::Error::from);
+                    let _ = reply.send(value);
+                });
+            }
             Command::Submit {
                 request,
                 config,
@@ -2026,13 +2092,25 @@ async fn dispatch(
                 let run_telemetry = telemetry.clone();
                 let span = tracing::info_span!("application.run", app_id = %run_app_id, session_id = %run_session_id, run_id = id);
                 let join = tokio::task::spawn_local(async move {
-                    let mut stream = Box::pin(runtime.chat(chat_request(
+                    let mut stream = Box::pin(Rc::clone(&runtime).chat(chat_request(
                         request,
                         config,
                         Some(run_cancel),
                         &run_app_id,
                     )));
                     while let Some(event) = stream.next().await {
+                        if let CoreChatEvent::Bot(bot_core::CatEvent::ModelInputSnapshot(snapshot)) = &event {
+                            if let Ok(json) = serde_json::to_string(snapshot) {
+                                if let Err(error) = crate::model_input_store::upsert_model_input_snapshot_json(
+                                    &runtime.data_dir,
+                                    &run_session_id,
+                                    &snapshot.run_id,
+                                    &json,
+                                ) {
+                                    tracing::warn!(session_id = %run_session_id, error = %error, "failed to persist model input snapshot");
+                                }
+                            }
+                        }
                         if let CoreChatEvent::Bot(bot_core::CatEvent::Error(error)) = &event {
                             if let Some(telemetry) = &run_telemetry {
                                 telemetry.capture_agent_error(error, "application.run");

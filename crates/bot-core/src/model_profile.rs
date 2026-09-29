@@ -298,6 +298,14 @@ impl ModelProfileConfig {
         if self.context_tokens == 0 {
             bail!("model profile {} context_tokens must be > 0", self.id);
         }
+        if self.max_output_tokens >= self.context_tokens {
+            bail!(
+                "model profile {} max_output_tokens ({}) must be smaller than context_tokens ({})",
+                self.id,
+                self.max_output_tokens,
+                self.context_tokens
+            );
+        }
         if self.overflow_bytes == 0 {
             bail!("model profile {} overflow_bytes must be > 0", self.id);
         }
@@ -1086,7 +1094,7 @@ id: same
 name: One
 model: a
 max_output_tokens: 1
-context_tokens: 1
+context_tokens: 2
 supports_images: false
 overflow_bytes: 1
 context_compaction: hard
@@ -1100,7 +1108,7 @@ id: same
 name: Two
 model: b
 max_output_tokens: 1
-context_tokens: 1
+context_tokens: 2
 supports_images: false
 overflow_bytes: 1
 context_compaction: hard
@@ -1130,6 +1138,20 @@ context_compaction: hard
         );
         let err = ModelProfileRegistry::load(temp.path()).unwrap_err();
         assert!(err.to_string().contains("missing name"));
+    }
+
+    #[test]
+    fn output_budget_must_leave_room_for_input() {
+        let temp = tempdir().unwrap();
+        write_profile(
+            temp.path(),
+            "bad-budget.yaml",
+            "id: bad-budget\nname: Bad budget\nmodel: test\nmax_output_tokens: 100000\ncontext_tokens: 100000\nsupports_images: false\noverflow_bytes: 1024\n",
+        );
+        let err = ModelProfileRegistry::load(temp.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must be smaller than context_tokens"));
     }
 
     #[test]

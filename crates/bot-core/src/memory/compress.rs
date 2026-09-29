@@ -82,36 +82,41 @@ impl LlmCompressor {
         let mut options = self.extra_options.clone();
         let model = self.model.trim().to_ascii_lowercase();
 
-        // MiMo 2.5 enables deep thinking by default and counts reasoning tokens
-        // against max_completion_tokens. Compression needs a short visible
-        // summary, so allowing the default can exhaust the output budget with
-        // reasoning and produce a valid Done event without any final text.
-        // This override is local to the one-shot compressor and does not alter
-        // the model profile used by ordinary agent turns.
-        if matches!(model.as_str(), "mimo-v2.5" | "mimo-v2.5-pro") {
+        // Compression needs visible summary text. Providers that expose the
+        // thinking.type switch count hidden reasoning against the same output
+        // budget; disable it for this one-shot call across all such profiles.
+        // MiMo also needs an explicit switch because it reasons by default.
+        if options.contains_key("thinking")
+            || matches!(model.as_str(), "mimo-v2.5" | "mimo-v2.5-pro")
+        {
             options.insert(
                 "thinking".to_string(),
                 serde_json::json!({ "type": "disabled" }),
             );
-            options.remove("reasoning_effort");
         }
+        options.remove("reasoning_effort");
 
         options
     }
 
     fn output_budget(&self, source_tokens: u32) -> u32 {
-        source_tokens
-            .div_ceil(4)
-            .max(1_024)
-            .min(8_192)
-            .min((self.context_tokens / 10).max(1))
-            .min(self.max_output_tokens.max(1))
+        let safety = self.context_tokens.saturating_mul(5).div_ceil(100);
+        let available = self
+            .context_tokens
+            .saturating_sub(safety)
+            .saturating_sub(crate::estimate_model_input_tokens(COMPRESSION_SYSTEM))
+            .saturating_sub(source_tokens)
+            .saturating_sub(512);
+        available.min(self.max_output_tokens)
     }
 
     pub fn input_fits(&self, messages: &[Message]) -> bool {
         let text = compression_input_text(messages);
         let source = crate::estimate_model_input_tokens(&text);
         let output = self.output_budget(source);
+        if output < self.max_output_tokens.min(4_096) {
+            return false;
+        }
         let safety = self.context_tokens.saturating_mul(5).div_ceil(100);
         let system = crate::estimate_model_input_tokens(COMPRESSION_SYSTEM);
         system
@@ -325,9 +330,10 @@ mod tests {
             32_000,
             serde_json::Map::new(),
         );
-        assert_eq!(compressor.output_budget(100), 1_024);
-        assert_eq!(compressor.output_budget(20_000), 5_000);
-        assert_eq!(compressor.output_budget(100_000), 8_192);
+        assert_eq!(compressor.output_budget(100), 32_000);
+        assert_eq!(compressor.output_budget(20_000), 32_000);
+        assert!(compressor.output_budget(100_000) > 16_384);
+        assert!(compressor.output_budget(100_000) < 32_000);
     }
 
     #[test]
@@ -364,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn non_mimo_compression_preserves_reasoning_options() {
+    fn non_mimo_compression_disables_explicit_thinking() {
         let mut options = serde_json::Map::new();
         options.insert(
             "thinking".to_string(),
@@ -379,7 +385,10 @@ mod tests {
             options.clone(),
         );
 
-        assert_eq!(compressor.compression_extra_options(), options);
+        assert_eq!(
+            compressor.compression_extra_options().get("thinking"),
+            Some(&serde_json::json!({ "type": "disabled" }))
+        );
     }
 
     #[test]
@@ -488,8 +497,8 @@ mod tests {
             api_key,
             Some("https://api.xiaomimimo.com/v1".to_string()),
             "mimo-v2.5".to_string(),
-            1_000_000,
-            32_768,
+            100_000,
+            16_384,
             serde_json::Map::new(),
         );
         let messages = vec![
@@ -502,6 +511,26 @@ mod tests {
         let summary = compressor.compress(&messages).await.unwrap();
 
         assert!(!summary.trim().is_empty());
+        assert!(summary.to_ascii_lowercase().contains("staging"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KIMI_API_KEY and calls the live Moonshot API"]
+    async fn live_kimi_compression_returns_visible_summary_text() {
+        let api_key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY must be set");
+        let compressor = LlmCompressor::new(
+            api_key,
+            Some("https://api.moonshot.cn/v1".to_string()),
+            "kimi-k2.6".to_string(),
+            100_000,
+            16_384,
+            serde_json::Map::new(),
+        );
+        let messages = vec![
+            Message::user("The deployment target is staging and the release is blocked."),
+            Message::assistant("Recorded: deploy to staging only until verification passes."),
+        ];
+        let summary = compressor.compress(&messages).await.unwrap();
         assert!(summary.to_ascii_lowercase().contains("staging"));
     }
 }

@@ -178,11 +178,14 @@ impl MemoryStore {
 
     // ── Index I/O ─────────────────────────────────────────────────────────────
 
-    async fn read_index(dir: &PathBuf) -> MemoryIndex {
+    async fn read_index_checked(dir: &PathBuf) -> Result<MemoryIndex, AgentError> {
         let path = dir.join("index.json");
         match tokio::fs::read_to_string(&path).await {
-            Ok(s) => MemoryIndex::from_json(&s),
-            Err(_) => MemoryIndex::default(),
+            Ok(s) => serde_json::from_str(&s).map_err(|err| {
+                AgentError::other(format!("invalid memory index {}: {err}", path.display()))
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(MemoryIndex::default()),
+            Err(err) => Err(AgentError::Io(format!("read {}: {err}", path.display()))),
         }
     }
 
@@ -195,22 +198,39 @@ impl MemoryStore {
 
     // ── Short-term JSONL I/O ──────────────────────────────────────────────────
 
-    async fn read_short_term(path: &PathBuf) -> Vec<Message> {
+    async fn read_short_term_checked(path: &PathBuf) -> Result<Vec<Message>, AgentError> {
         let text = match tokio::fs::read_to_string(path).await {
             Ok(t) => t,
-            Err(_) => return vec![],
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(err) => return Err(AgentError::Io(format!("read {}: {err}", path.display()))),
         };
         let blobs_dir = path
             .parent()
             .map(|p| p.join("blobs"))
             .unwrap_or_else(|| PathBuf::from("blobs"));
         let text = super::blob::restore_blobs(&text, &blobs_dir).await;
-        let msgs: Vec<Message> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        msgs
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line).map_err(|err| {
+                    AgentError::other(format!(
+                        "invalid memory ledger {} line {}: {err}",
+                        path.display(),
+                        index + 1
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    async fn read_short_term(path: &PathBuf) -> Vec<Message> {
+        Self::read_short_term_checked(path)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::error!(error = %err, "memory ledger read failed");
+                Vec::new()
+            })
     }
 
     async fn write_short_term(path: &PathBuf, msgs: &[Message]) -> Result<(), AgentError> {
@@ -227,11 +247,12 @@ impl MemoryStore {
         );
         let lines: String = msgs
             .iter()
-            .filter_map(|m| {
-                let json = serde_json::to_string(m).ok();
-                tracing::debug!(role = ?m.role, has_metadata = m.metadata.is_some(), serialized_has_metadata = json.as_deref().map(|s| s.contains("\"metadata\"")).unwrap_or(false), "write_short_term: message");
-                json
+            .map(|m| {
+                serde_json::to_string(m)
+                    .map_err(|err| AgentError::other(format!("serialize memory message: {err}")))
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|l| l + "\n")
             .collect();
         let blobs_dir = path
@@ -241,9 +262,7 @@ impl MemoryStore {
         let lines = super::blob::extract_blobs(&lines, &blobs_dir)
             .await
             .map_err(|e| AgentError::Io(e.to_string()))?;
-        tokio::fs::write(path, lines)
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))
+        atomic_write(path, lines.as_bytes()).await
     }
 
     async fn append_short_term(path: &PathBuf, msgs: &[Message]) -> Result<(), AgentError> {
@@ -257,7 +276,12 @@ impl MemoryStore {
         }
         let lines = msgs
             .iter()
-            .filter_map(|message| serde_json::to_string(message).ok())
+            .map(|message| {
+                serde_json::to_string(message)
+                    .map_err(|err| AgentError::other(format!("serialize memory message: {err}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|line| line + "\n")
             .collect::<String>();
         let blobs_dir = path
@@ -290,6 +314,7 @@ impl MemoryStore {
         thread_id: &str,
         msgs: Vec<Message>,
         desired_split: Option<usize>,
+        compressor: &LlmCompressor,
     ) -> Result<Vec<Message>, AgentError> {
         let desired = desired_split.unwrap_or_else(|| (msgs.len() / 2).max(1));
         let split = safe_split_point(&msgs, desired);
@@ -306,7 +331,7 @@ impl MemoryStore {
         let mid_dir = self.mid_term_dir(thread_id);
 
         // The ledger is the raw source of truth; no new raw archive is made.
-        let summary = self.compressor.compress(&oldest).await?;
+        let summary = compressor.compress(&oldest).await?;
 
         // ── Skip empty compression results ───────────────────────────────
         if summary.trim().is_empty() {
@@ -314,9 +339,9 @@ impl MemoryStore {
                 "compress_to_mid_term: empty summary for {} oldest messages                  (all tool/empty after filtering), keeping raw archive without mid-term entry",
                 oldest.len(),
             );
-            // Return the remaining (newer) messages unchanged —
-            // no empty mid-term entry is created, but the raw archive remains available.
-            return Ok(remaining);
+            return Err(AgentError::other(
+                "compress_to_mid_term: compressor produced no committed summary",
+            ));
         }
 
         // ── Proceed with normal compression output ───────────────────────
@@ -332,7 +357,7 @@ impl MemoryStore {
         atomic_write(&md_path, summary_with_ts.as_bytes()).await?;
 
         // 4. Update index.
-        let mut idx = Self::read_index(&mid_dir).await;
+        let mut idx = Self::read_index_checked(&mid_dir).await?;
         idx.entries.push(MemoryEntry {
             uuid: new_uuid,
             created_at: Utc::now(),
@@ -354,7 +379,7 @@ impl MemoryStore {
         let mid_dir = self.mid_term_dir(thread_id);
         let long_dir = self.long_term_dir(thread_id);
 
-        let mut mid_idx = Self::read_index(&mid_dir).await;
+        let mut mid_idx = Self::read_index_checked(&mid_dir).await?;
         if mid_idx.entries.is_empty() {
             return Ok(());
         }
@@ -374,25 +399,27 @@ impl MemoryStore {
         let mut promoting_text = String::new();
         for entry in &to_promote {
             let md_path = mid_dir.join(format!("{}.md", entry.uuid));
-            if let Ok(text) = tokio::fs::read_to_string(&md_path).await {
-                if !promoting_text.is_empty() {
-                    promoting_text.push_str("\n\n---\n\n");
-                }
-                promoting_text.push_str(&text);
+            let text = tokio::fs::read_to_string(&md_path)
+                .await
+                .map_err(|err| AgentError::Io(format!("read {}: {err}", md_path.display())))?;
+            if !promoting_text.is_empty() {
+                promoting_text.push_str("\n\n---\n\n");
             }
+            promoting_text.push_str(&text);
         }
 
         // Collect ALL existing long-term summaries to merge with.
-        let lt_idx_existing = Self::read_index(&long_dir).await;
+        let lt_idx_existing = Self::read_index_checked(&long_dir).await?;
         let mut existing_long_text = String::new();
         for entry in &lt_idx_existing.entries {
             let md_path = long_dir.join(format!("{}.md", entry.uuid));
-            if let Ok(text) = tokio::fs::read_to_string(&md_path).await {
-                if !existing_long_text.is_empty() {
-                    existing_long_text.push_str("\n\n---\n\n");
-                }
-                existing_long_text.push_str(&text);
+            let text = tokio::fs::read_to_string(&md_path)
+                .await
+                .map_err(|err| AgentError::Io(format!("read {}: {err}", md_path.display())))?;
+            if !existing_long_text.is_empty() {
+                existing_long_text.push_str("\n\n---\n\n");
             }
+            existing_long_text.push_str(&text);
         }
 
         // Build compress input: existing long-term (as context) + incoming mid-term.
@@ -409,6 +436,11 @@ impl MemoryStore {
             let msgs = vec![Message::user(compress_input)];
             self.compressor.compress(&msgs).await?
         };
+        if long_summary.trim().is_empty() {
+            return Err(AgentError::other(
+                "long-term promotion compressor produced no committed summary",
+            ));
+        }
 
         let long_uuid = Uuid::new_v4().to_string();
         let preview = make_preview(&long_summary, 100);
@@ -417,38 +449,15 @@ impl MemoryStore {
             .await
             .map_err(|e| AgentError::Io(e.to_string()))?;
 
-        // Move each mid-term raw archive into long_term/raw/<long_uuid>/<orig_uuid>/.
-        for entry in &to_promote {
-            let src_raw = mid_dir.join("raw").join(&entry.uuid);
-            if src_raw.exists() {
-                let dst_raw = long_dir.join("raw").join(&long_uuid).join(&entry.uuid);
-                if let Some(p) = dst_raw.parent() {
-                    tokio::fs::create_dir_all(p)
-                        .await
-                        .map_err(|e| AgentError::Io(e.to_string()))?;
-                }
-                move_dir(&src_raw, &dst_raw).await?;
-            }
-            // Remove the mid-term summary file.
-            let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
-        }
-
-        // Remove old long-term summary files (they are merged into the new one).
-        for entry in &lt_idx_existing.entries {
-            let _ = tokio::fs::remove_file(long_dir.join(format!("{}.md", entry.uuid))).await;
-        }
-
         // Write merged long-term summary with timestamp header.
         let lt_path = long_dir.join(format!("{long_uuid}.md"));
         let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
-        tokio::fs::write(&lt_path, format!("{ts_header}{long_summary}"))
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
+        atomic_write(&lt_path, format!("{ts_header}{long_summary}").as_bytes()).await?;
 
         // Replace long-term index with single new entry.
         let new_lt_idx = MemoryIndex {
             entries: vec![MemoryEntry {
-                uuid: long_uuid,
+                uuid: long_uuid.clone(),
                 created_at: Utc::now(),
                 preview,
                 first_message_id: to_promote.iter().find_map(|e| e.first_message_id.clone()),
@@ -465,6 +474,28 @@ impl MemoryStore {
         // Update mid-term index (remove promoted entries).
         mid_idx.entries = keep;
         Self::write_index(&mid_dir, &mid_idx).await?;
+
+        // Both indexes now point to committed summaries.  Clean up old files
+        // only after that point so an interrupted write cannot lose context.
+        for entry in &to_promote {
+            let src_raw = mid_dir.join("raw").join(&entry.uuid);
+            if src_raw.exists() {
+                let dst_raw = long_dir.join("raw").join(&long_uuid).join(&entry.uuid);
+                if let Some(parent) = dst_raw.parent() {
+                    if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                        tracing::warn!(error = %err, "could not prepare promoted raw archive directory");
+                        continue;
+                    }
+                }
+                if let Err(err) = move_dir(&src_raw, &dst_raw).await {
+                    tracing::warn!(error = %err, "could not move promoted raw archive");
+                }
+            }
+            let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
+        }
+        for entry in &lt_idx_existing.entries {
+            let _ = tokio::fs::remove_file(long_dir.join(format!("{}.md", entry.uuid))).await;
+        }
 
         Ok(())
     }
@@ -486,9 +517,9 @@ impl MemoryStore {
             None => read_optional_file(&self.data_dir.join("Agent.md")).await,
         };
         let soul_md = read_optional_file(&self.data_dir.join("Soul.md")).await;
-        let long_term = Self::read_index(&self.long_term_dir(thread_id)).await;
-        let mid_term = Self::read_index(&self.mid_term_dir(thread_id)).await;
-        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let long_term = Self::read_index_checked(&self.long_term_dir(thread_id)).await?;
+        let mid_term = Self::read_index_checked(&self.mid_term_dir(thread_id)).await?;
+        let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
         // Never create a visibility gap between committed summary coverage and
         // the raw tail.  "Recent 10" is the normal direct-message window, but
         // messages which have not yet been covered by any summary must remain
@@ -512,9 +543,12 @@ impl MemoryStore {
                 } else {
                     self.long_term_dir(thread_id)
                 };
-                tokio::fs::read_to_string(dir.join(format!("{}.md", entry.uuid)))
-                    .await
-                    .ok()
+                let path = dir.join(format!("{}.md", entry.uuid));
+                Some(
+                    tokio::fs::read_to_string(&path)
+                        .await
+                        .map_err(|err| AgentError::Io(format!("read {}: {err}", path.display())))?,
+                )
             }
             None => None,
         };
@@ -549,7 +583,7 @@ impl MemoryStore {
             return Ok(());
         }
         let short_path = self.short_term_path(thread_id);
-        let mut merged = Self::read_short_term(&short_path).await;
+        let mut merged = Self::read_short_term_checked(&short_path).await?;
         let mut ids = merged
             .iter()
             .map(|m| m.id.to_string())
@@ -572,7 +606,7 @@ impl MemoryStore {
         }
         merged.sort_by_key(message_timestamp);
         Self::write_short_term(&short_path, &merged).await?;
-        let reparsed = Self::read_short_term(&short_path).await;
+        let reparsed = Self::read_short_term_checked(&short_path).await?;
         if reparsed.len() != merged.len() {
             return Err(AgentError::Io(
                 "legacy raw migration verification failed".to_string(),
@@ -757,11 +791,20 @@ impl MemoryStore {
     /// The ledger remains append-only; the returned count is newly covered raw
     /// messages. Recent raw messages are retained whenever a safe boundary exists.
     pub async fn compact_for_request(&self, thread_id: &str) -> Result<usize, AgentError> {
+        self.compact_for_request_with_compressor(thread_id, &self.compressor)
+            .await
+    }
+
+    pub async fn compact_for_request_with_compressor(
+        &self,
+        thread_id: &str,
+        compressor: &LlmCompressor,
+    ) -> Result<usize, AgentError> {
         let lock = thread_lock(self.token_cache_key(thread_id));
         let _guard = lock.lock().await;
-        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
-        let mid_idx = Self::read_index(&self.mid_term_dir(thread_id)).await;
-        let long_idx = Self::read_index(&self.long_term_dir(thread_id)).await;
+        let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
+        let mid_idx = Self::read_index_checked(&self.mid_term_dir(thread_id)).await?;
+        let long_idx = Self::read_index_checked(&self.long_term_dir(thread_id)).await?;
         let start = last_covered_position_across_tiers(&ledger, &mid_idx, &long_idx)
             .map_or(0, |position| position + 1);
         let active = ledger[start..].to_vec();
@@ -777,12 +820,12 @@ impl MemoryStore {
                 end < active.len()
                     && matches!(active[end].role, Role::User | Role::System)
                     && tool_protocol_closed(&active[..end])
-                    && self.compressor.input_fits(&active[..end])
+                    && compressor.input_fits(&active[..end])
             })
             .or_else(|| {
                 (desired == active.len()
                     && tool_protocol_closed(&active)
-                    && self.compressor.input_fits(&active))
+                    && compressor.input_fits(&active))
                 .then_some(desired)
             })
             .unwrap_or(0);
@@ -792,7 +835,7 @@ impl MemoryStore {
             ));
         }
         let remaining = self
-            .compress_to_mid_term(thread_id, active.clone(), Some(desired))
+            .compress_to_mid_term(thread_id, active.clone(), Some(desired), compressor)
             .await?;
         Ok(active.len().saturating_sub(remaining.len()))
     }
@@ -853,13 +896,13 @@ impl MemoryStore {
         }
         let lock = thread_lock(self.token_cache_key(thread_id));
         let _guard = lock.lock().await;
-        let ledger = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
         if ledger.is_empty() {
             return Ok(0);
         }
 
         let mid_dir = self.mid_term_dir(thread_id);
-        let old_index = Self::read_index(&mid_dir).await;
+        let old_index = Self::read_index_checked(&mid_dir).await?;
         let uuid = Uuid::new_v4().to_string();
         tokio::fs::create_dir_all(&mid_dir)
             .await
@@ -904,8 +947,8 @@ impl MemoryStore {
         let short_path = self.short_term_path(thread_id);
         let mid_dir = self.mid_term_dir(thread_id);
 
-        let ledger = Self::read_short_term(&short_path).await;
-        let mid_idx = Self::read_index(&mid_dir).await;
+        let ledger = Self::read_short_term_checked(&short_path).await?;
+        let mid_idx = Self::read_index_checked(&mid_dir).await?;
         let start = last_covered_position(&ledger, &mid_idx).map_or(0, |i| i + 1);
         let uncovered = &ledger[start..];
         let keep_start = recent_complete_start(uncovered, 10);
@@ -916,12 +959,13 @@ impl MemoryStore {
         let mut combined_text = String::new();
         for entry in &mid_idx.entries {
             let md_path = mid_dir.join(format!("{}.md", entry.uuid));
-            if let Ok(text) = tokio::fs::read_to_string(&md_path).await {
-                if !combined_text.is_empty() {
-                    combined_text.push_str("\n\n---\n\n");
-                }
-                combined_text.push_str(&text);
+            let text = tokio::fs::read_to_string(&md_path)
+                .await
+                .map_err(|err| AgentError::Io(format!("read {}: {err}", md_path.display())))?;
+            if !combined_text.is_empty() {
+                combined_text.push_str("\n\n---\n\n");
             }
+            combined_text.push_str(&text);
         }
 
         if short_count == 0 {
@@ -967,11 +1011,6 @@ impl MemoryStore {
         let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
         atomic_write(&md_path, format!("{ts_header}{summary}").as_bytes()).await?;
 
-        // ── Remove old mid-term .md files ─────────────────────────────────
-        for entry in &mid_idx.entries {
-            let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
-        }
-
         // ── Replace mid-term index with single new entry ──────────────────
         let new_idx = super::tier::MemoryIndex {
             entries: vec![MemoryEntry {
@@ -985,6 +1024,9 @@ impl MemoryStore {
             }],
         };
         Self::write_index(&mid_dir, &new_idx).await?;
+        for entry in &mid_idx.entries {
+            let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
+        }
 
         Ok(short_count)
     }
@@ -1035,8 +1077,8 @@ impl MemoryStore {
                 return Ok(Some(text));
             }
         }
-        if let Some(message) = Self::read_short_term(&self.short_term_path(thread_id))
-            .await
+        if let Some(message) = Self::read_short_term_checked(&self.short_term_path(thread_id))
+            .await?
             .into_iter()
             .find(|message| message.id.to_string() == uuid)
         {
@@ -1184,7 +1226,7 @@ impl MemoryStore {
         query: &TokenizedSearchQuery,
         results: &mut Vec<MemoryRecallResult>,
     ) -> Result<(), AgentError> {
-        let messages = Self::read_short_term(&self.short_term_path(thread_id)).await;
+        let messages = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
         let excluded_tool_results = recursive_memory_search_result_ids(&messages);
         for msg in messages {
             if msg.role == Role::Tool
@@ -1225,7 +1267,7 @@ impl MemoryStore {
             "long_term" => ("long_term", self.long_term_dir(thread_id)),
             _ => return Ok(()),
         };
-        let idx = Self::read_index(&dir).await;
+        let idx = Self::read_index_checked(&dir).await?;
         for entry in idx.entries {
             let path = dir.join(format!("{}.md", entry.uuid));
             let text = match tokio::fs::read_to_string(&path).await {
@@ -1851,8 +1893,9 @@ mod tests {
 
         assert_eq!(store.thread_history("append-only-save").await.len(), 20);
         assert!(
-            MemoryStore::read_index(&store.mid_term_dir("append-only-save"))
+            MemoryStore::read_index_checked(&store.mid_term_dir("append-only-save"))
                 .await
+                .unwrap()
                 .entries
                 .is_empty()
         );
@@ -2425,5 +2468,61 @@ mod tests {
         assert_eq!(results[0].timestamp, dt("2026-05-02T00:00:00Z"));
         assert_eq!(results[1].score, 13);
         assert_eq!(results[1].timestamp, dt("2026-05-01T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_or_index_stops_context_load_without_discarding_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let thread = "corrupt-thread";
+        store
+            .save_turn(thread, vec![Message::user("retain this message")])
+            .await
+            .unwrap();
+        let ledger_path = store.short_term_path(thread);
+        let original_ledger = tokio::fs::read(&ledger_path).await.unwrap();
+
+        tokio::fs::write(&ledger_path, "{invalid json}\n")
+            .await
+            .unwrap();
+        let err = store.load_context(thread).await.err().unwrap();
+        assert!(err.to_string().contains("invalid memory ledger"));
+        let err = store.compact_for_request(thread).await.unwrap_err();
+        assert!(err.to_string().contains("invalid memory ledger"));
+        tokio::fs::write(&ledger_path, &original_ledger)
+            .await
+            .unwrap();
+
+        let mid_dir = store.mid_term_dir(thread);
+        tokio::fs::create_dir_all(&mid_dir).await.unwrap();
+        tokio::fs::write(mid_dir.join("index.json"), "{invalid json}")
+            .await
+            .unwrap();
+        let err = store.load_context(thread).await.err().unwrap();
+        assert!(err.to_string().contains("invalid memory index"));
+        assert_eq!(
+            tokio::fs::read(&ledger_path).await.unwrap(),
+            original_ledger
+        );
+
+        let missing_id = Uuid::new_v4().to_string();
+        MemoryStore::write_index(
+            &mid_dir,
+            &MemoryIndex {
+                entries: vec![MemoryEntry {
+                    uuid: missing_id,
+                    created_at: Utc::now(),
+                    preview: "missing".to_string(),
+                    first_message_id: None,
+                    last_message_id: None,
+                    message_count: None,
+                    status: Some("committed".to_string()),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let err = store.load_context(thread).await.err().unwrap();
+        assert!(err.to_string().contains(".md"));
     }
 }

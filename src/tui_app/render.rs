@@ -176,13 +176,23 @@ impl TuiApp {
                 compact_workspace_label(&self.workspace_root_label)
             ),
         ];
-        if let Some(pct) = context_usage_percent(
-            self.status.prompt_tokens,
-            self.status.completion_tokens,
-            self.status.max_prompt_tokens,
-            self.effective_model_context_tokens,
-        ) {
-            parts.insert(1, format!("ctx {pct}%"));
+        if let Some(pct) = (self.status.max_prompt_tokens > 0)
+            .then(|| {
+                context_usage_percent(
+                    self.status.prompt_tokens,
+                    self.status.completion_tokens,
+                    self.status.max_prompt_tokens,
+                    self.effective_model_context_tokens,
+                )
+            })
+            .flatten()
+        {
+            let marker = if self.status.context_estimated {
+                "~"
+            } else {
+                ""
+            };
+            parts.insert(1, format!("ctx {marker}{pct}%"));
         }
         if self.status.model_elapsed_ms > 0 {
             parts.push(format!(

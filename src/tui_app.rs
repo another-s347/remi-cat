@@ -722,6 +722,13 @@ fn effective_tui_model_status(
     (agent_id, model_id, context_tokens)
 }
 
+fn restored_context_tokens(snapshot: &serde_json::Value, model_profile_id: &str) -> Option<u32> {
+    if snapshot.get("model_profile_id")?.as_str()? != model_profile_id {
+        return None;
+    }
+    u32::try_from(snapshot.get("totals")?.get("estimated_tokens")?.as_u64()?).ok()
+}
+
 fn watch_git_metadata(
     workspace_dir: &std::path::Path,
 ) -> Option<(RecommendedWatcher, mpsc::UnboundedReceiver<()>)> {
@@ -1056,6 +1063,7 @@ impl TuiApp {
             app.session_id
         )));
         app.load_thread_history().await;
+        app.restore_context_usage().await;
         app
     }
 
@@ -1720,6 +1728,7 @@ impl TuiApp {
             self.session_id
         )));
         self.load_thread_history().await;
+        self.restore_context_usage().await;
         if should_cleanup_old_session_on_switch(old_had_activity) {
             let _ = self.channel.delete_session(&old_session_id).await;
         }
@@ -1732,6 +1741,26 @@ impl TuiApp {
         self.effective_agent_id = agent_id;
         self.effective_model_profile_id = model_profile_id;
         self.effective_model_context_tokens = context_tokens;
+    }
+
+    async fn restore_context_usage(&mut self) {
+        let from_snapshot = self
+            .channel
+            .model_inputs(&self.session_id, Some(1))
+            .await
+            .ok()
+            .and_then(|snapshots| snapshots.first().cloned())
+            .and_then(|snapshot| {
+                restored_context_tokens(&snapshot, &self.effective_model_profile_id)
+            });
+        let tokens = match from_snapshot {
+            Some(tokens) => Some(tokens),
+            None => self.channel.context_estimate(&self.session_id).await.ok(),
+        };
+        if let Some(tokens) = tokens {
+            self.status.max_prompt_tokens = tokens;
+            self.status.context_estimated = true;
+        }
     }
 
     fn start_turn(&mut self, input: SubmittedInput) {
@@ -2111,6 +2140,12 @@ impl TuiApp {
             BotEvent::SubSession(event) => self.upsert_sub_session(event).await,
             BotEvent::ContextCompaction(event) => {
                 self.compressing_memory = matches!(event.status, ContextCompactionStatus::Started);
+                if matches!(event.status, ContextCompactionStatus::Completed)
+                    && event.thread_id == self.session_id
+                    && matches!(event.source, ContextCompactionSource::Manual)
+                {
+                    self.restore_context_usage().await;
+                }
                 upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(event));
             }
             BotEvent::TodoState {
@@ -2283,6 +2318,7 @@ impl TuiApp {
                 self.status.prompt_tokens = prompt_tokens;
                 self.status.completion_tokens = completion_tokens;
                 self.status.max_prompt_tokens = max_prompt_tokens;
+                self.status.context_estimated = false;
                 self.status.model_elapsed_ms = elapsed_ms;
                 self.update_cell_tokens_from_stats(prompt_tokens, completion_tokens);
             }
@@ -5978,6 +6014,24 @@ mod tests {
             Some(100)
         );
         assert_eq!(context_usage_percent(1, 0, 1, 0), None);
+    }
+
+    #[test]
+    fn restart_restores_estimated_context_for_same_model_only() {
+        let snapshot = serde_json::json!({
+            "model_profile_id": "mimo-v2.5",
+            "totals": {
+                "estimated_tokens": 57_000,
+                "max_prompt_tokens": 90_000,
+                "completion_tokens": 10_000
+            }
+        });
+        assert_eq!(
+            restored_context_tokens(&snapshot, "mimo-v2.5"),
+            Some(57_000)
+        );
+        assert_eq!(restored_context_tokens(&snapshot, "other-model"), None);
+        assert_eq!(context_usage_percent(0, 0, 57_000, 100_000), Some(57));
     }
 
     #[test]

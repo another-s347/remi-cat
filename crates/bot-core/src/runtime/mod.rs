@@ -920,6 +920,42 @@ impl CatBot {
         self.model_profile.context_tokens
     }
 
+    fn compressor_for_profile(
+        &self,
+        profile: &ModelProfileConfig,
+    ) -> Result<LlmCompressor, AgentError> {
+        let extra_options = profile
+            .merged_extra_options(None, profile.reasoning_effort)
+            .map_err(|err| AgentError::other(err.to_string()))?;
+        Ok(LlmCompressor::new(
+            runtime_api_key_for_profile(profile, self.api_keys.as_deref()),
+            profile.base_url.clone(),
+            profile.model.clone(),
+            profile.context_tokens,
+            profile.max_output_tokens,
+            extra_options,
+        ))
+    }
+
+    /// Estimate the currently injected persisted context without starting a model turn.
+    /// This is a fallback for sessions created before model-input snapshots existed.
+    pub async fn persisted_context_estimate(
+        &self,
+        thread_id: &str,
+        session_agent_id: Option<&str>,
+    ) -> Result<u32, AgentError> {
+        let context = self.memory.load_context(thread_id).await?;
+        let effective_agent = self.effective_agent_profile(session_agent_id);
+        let history = build_injected_history(&context);
+        let mut tokens = crate::estimate_model_input_tokens(&effective_agent.profile.system_prompt);
+        for message in history {
+            tokens = tokens.saturating_add(crate::estimate_model_input_tokens(
+                &message.content.text_content(),
+            ));
+        }
+        Ok(tokens)
+    }
+
     pub fn approval_manager(&self) -> Arc<ToolApprovalManager> {
         Arc::clone(&self.approval_manager)
     }
@@ -1268,6 +1304,25 @@ impl CatBot {
             .await
     }
 
+    /// Compact memory for an embedding application using the session's model selection.
+    pub async fn compact_memory_with_profile_for_app(
+        &self,
+        thread_id: &str,
+        session_model_profile_id: Option<&str>,
+        session_agent_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        app_id: &str,
+    ) -> Result<usize, remi_agentloop::prelude::AgentError> {
+        self.compact_memory_with_profile_and_app(
+            thread_id,
+            session_model_profile_id,
+            session_agent_id,
+            reasoning_effort,
+            Some(app_id),
+        )
+        .await
+    }
+
     /// Compact memory with the same effective model profile as the session.
     pub async fn compact_memory_with_profile(
         &self,
@@ -1328,18 +1383,7 @@ impl CatBot {
         )
         .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
         let profile = effective.profile;
-        let api_key = runtime_api_key_for_profile(&profile, self.api_keys.as_deref());
-        let extra_options = profile
-            .merged_extra_options(None, profile.reasoning_effort)
-            .map_err(|err| remi_agentloop::prelude::AgentError::other(err.to_string()))?;
-        let compressor = LlmCompressor::new(
-            api_key,
-            profile.base_url.clone(),
-            profile.model.clone(),
-            profile.context_tokens,
-            profile.max_output_tokens,
-            extra_options,
-        );
+        let compressor = self.compressor_for_profile(&profile)?;
         tracing::info!(
             thread_id,
             model_profile = %profile.id,
@@ -3062,7 +3106,27 @@ impl CatBot {
                         remaining_messages: 0,
                         error: None,
                     });
-                    let compacted = match self.memory.compact_for_request(&thread_id_owned).await {
+                    let compressor = match self.compressor_for_profile(&effective_model.profile) {
+                        Ok(compressor) => compressor,
+                        Err(err) => {
+                            yield CatEvent::ContextCompaction(ContextCompactionEvent {
+                                id: compaction_id,
+                                thread_id: thread_id_owned.clone(),
+                                status: ContextCompactionStatus::Failed,
+                                source: ContextCompactionSource::Auto,
+                                compacted_messages: 0,
+                                remaining_messages: 0,
+                                error: Some(err.to_string()),
+                            });
+                            let _ = self
+                                .memory
+                                .append_failed_turn(&thread_id_owned, vec![current_user_message.clone()])
+                                .await;
+                            yield CatEvent::Error(err);
+                            return;
+                        }
+                    };
+                    let compacted = match self.memory.compact_for_request_with_compressor(&thread_id_owned, &compressor).await {
                         Ok(count) if count > 0 => count,
                         Ok(_) => {
                             let error = "no complete older exchange is eligible for compression";
@@ -6249,6 +6313,46 @@ mod tests {
         )
     }
 
+    #[test]
+    fn persisted_context_estimate_survives_bot_restart() {
+        run_large_stack_local_test(|| async {
+            let data_dir = tempfile::tempdir().unwrap();
+            let make_bot = || {
+                build_mock_bot_with_tools(
+                    &data_dir,
+                    "http://127.0.0.1:1/v1".to_string(),
+                    false,
+                    1,
+                    Vec::new(),
+                    None,
+                )
+            };
+            let first = make_bot();
+            first
+                .memory
+                .append_failed_turn(
+                    "restart-context",
+                    vec![
+                        Message::user("persistent context"),
+                        Message::assistant("saved answer"),
+                    ],
+                )
+                .await
+                .unwrap();
+            let before = first
+                .persisted_context_estimate("restart-context", None)
+                .await
+                .unwrap();
+            drop(first);
+            let after = make_bot()
+                .persisted_context_estimate("restart-context", None)
+                .await
+                .unwrap();
+            assert!(before > 0);
+            assert_eq!(after, before);
+        });
+    }
+
     fn build_mock_bot_with_mode(
         data_dir: &tempfile::TempDir,
         base_url: String,
@@ -9166,6 +9270,7 @@ You are Remi.
             std::env::set_var("OPENAI_API_KEY", "test");
             std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "55");
             let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text(""),
                 sse_text("预算触发摘要：旧交换已压缩。"),
                 sse_text("automatic compaction completed before this answer"),
             ])
@@ -9228,6 +9333,29 @@ You are Remi.
                 .append_failed_turn(thread, messages)
                 .await
                 .unwrap();
+            let failed = bot
+                .stream(thread, "first continuity check")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(failed.iter().any(|event| matches!(
+                event,
+                CatEvent::ContextCompaction(ContextCompactionEvent {
+                    status: ContextCompactionStatus::Failed,
+                    source: ContextCompactionSource::Auto,
+                    ..
+                })
+            )));
+            assert!(failed
+                .iter()
+                .any(|event| matches!(event, CatEvent::Error(_))));
+            assert!(!failed
+                .iter()
+                .any(|event| matches!(event, CatEvent::Text(_))));
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "failed compression must not send an oversized chat request"
+            );
             let events = collect_stream(bot.stream(thread, "final continuity check")).await;
             assert!(events.iter().any(|event| matches!(
                 event,
@@ -9241,16 +9369,127 @@ You are Remi.
             assert!(events.iter().any(
                 |event| matches!(event, CatEvent::Text(text) if text.contains("automatic compaction"))
             ));
-            assert_eq!(bot.memory.thread_history(thread).await.len(), 18);
+            assert_eq!(bot.memory.thread_history(thread).await.len(), 19);
             let requests = requests.lock().unwrap();
             assert_eq!(
                 requests.len(),
-                2,
+                3,
                 "compression must precede the main request"
             );
             assert!(!requests[0].contains("final continuity check"));
-            assert!(requests[1].contains("final continuity check"));
-            assert!(requests[1].contains("LATEST COMPRESSED MEMORY"));
+            assert!(!requests[1].contains("final continuity check"));
+            assert!(requests[2].contains("final continuity check"));
+            assert!(requests[2].contains("LATEST COMPRESSED MEMORY"));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires KIMI_API_KEY and calls the live Moonshot API"]
+    fn live_kimi_compaction_survives_session_restart() {
+        run_large_stack_local_test(|| async {
+            let api_key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY must be set");
+            let data_dir = tempfile::tempdir().unwrap();
+            let models_dir = data_dir.path().join("models");
+            install_embedded_model_profiles(&models_dir).unwrap();
+            let make_bot = || {
+                let mut profile = test_model_profile();
+                profile.provider = Some("kimi".to_string());
+                profile.model = "kimi-k2.6".to_string();
+                profile.base_url = Some("https://api.moonshot.cn/v1".to_string());
+                profile.context_tokens = 40_000;
+                profile.max_output_tokens = 16_384;
+                CatBotBuilder {
+                    api_keys: None,
+                    agent_tracing: AgentTracingOptions::default(),
+                    a2a_delegate_transport: None,
+                    api_key: api_key.clone(),
+                    model_profile: profile,
+                    runtime_model_locked: false,
+                    system: default_system_prompt(),
+                    skills_dir: data_dir.path().join("skills"),
+                    data_dir: data_dir.path().to_path_buf(),
+                    memory_dir: data_dir.path().join("memory"),
+                    agent_md_path: None,
+                    overflow_bytes: None,
+                    memory_days: 7,
+                    sandbox_config: SandboxConfig::Disabled {
+                        host_dir: data_dir.path().to_path_buf(),
+                    },
+                    im_bridge: None,
+                    extra_options: serde_json::Map::new(),
+                    tool_allowlist: Some(Vec::new()),
+                    delegate_ids: Vec::new(),
+                    active_agent_id: DEFAULT_AGENT_ID.to_string(),
+                    model_bindings: AgentModelBindings::default(),
+                    approval_model_profile_id: None,
+                    agents_dir: data_dir.path().join("agents"),
+                    max_turns: Some(1),
+                    model_registry: Arc::new(ModelProfileRegistry::load(&models_dir).unwrap()),
+                    acp_client_tools: None,
+                    host_tools: Vec::new(),
+                    builtin_skills: Vec::new(),
+                    include_default_skills: false,
+                    file_skills: false,
+                    include_default_agents: false,
+                    hook_manager: None,
+                }
+                .build()
+                .unwrap()
+            };
+            let thread = "live-restart-context";
+            for cycle in 0..2 {
+                let bot = make_bot();
+                let old_messages = (1..=12)
+                    .flat_map(|i| {
+                        vec![
+                            Message::user(format!(
+                                "cycle {cycle} exchange {i}: {}",
+                                "context ".repeat(700)
+                            )),
+                            Message::assistant(format!(
+                                "cycle {cycle} answer {i}: {}",
+                                "evidence ".repeat(500)
+                            )),
+                        ]
+                    })
+                    .collect();
+                bot.memory
+                    .append_failed_turn(thread, old_messages)
+                    .await
+                    .unwrap();
+                let before = bot.persisted_context_estimate(thread, None).await.unwrap();
+                assert!(
+                    before > 16_000,
+                    "seeded history did not reach the compaction threshold: {before}"
+                );
+                let events = collect_stream(bot.stream(thread, "Reply with the word READY.")).await;
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    CatEvent::ContextCompaction(ContextCompactionEvent {
+                        status: ContextCompactionStatus::Completed,
+                        source: ContextCompactionSource::Auto,
+                        compacted_messages,
+                        ..
+                    }) if *compacted_messages > 0
+                )));
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CatEvent::Text(text) if !text.trim().is_empty())));
+                let after = bot.persisted_context_estimate(thread, None).await.unwrap();
+                assert!(
+                    after < before,
+                    "compaction did not reduce effective context: {before} -> {after}"
+                );
+                drop(bot);
+                let restored = make_bot()
+                    .persisted_context_estimate(thread, None)
+                    .await
+                    .unwrap();
+                assert_eq!(restored, after);
+                eprintln!(
+                    "live cycle {cycle}: context estimate {before} -> {after}, restored {restored}"
+                );
+            }
         });
     }
 
