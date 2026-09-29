@@ -114,6 +114,7 @@ impl Tool for ContextManageTool {
                 source: ContextCompactionSource::Agent,
                 compacted_messages: 0,
                 remaining_messages: 0,
+                before_tokens: None, after_tokens: None,
                 error: None,
             };
             yield ToolOutput::custom(
@@ -130,6 +131,7 @@ impl Tool for ContextManageTool {
                         source: ContextCompactionSource::Agent,
                         compacted_messages: 0,
                         remaining_messages: 0,
+                        before_tokens: None, after_tokens: None,
                         error: Some(error.to_string()),
                     };
                     yield ToolOutput::custom(
@@ -149,6 +151,7 @@ impl Tool for ContextManageTool {
                         source: ContextCompactionSource::Agent,
                         compacted_messages,
                         remaining_messages: 0,
+                        before_tokens: None, after_tokens: None,
                         error: None,
                     };
                     yield ToolOutput::custom(
@@ -167,6 +170,7 @@ impl Tool for ContextManageTool {
                         source: ContextCompactionSource::Agent,
                         compacted_messages: 0,
                         remaining_messages: 0,
+                        before_tokens: None, after_tokens: None,
                         error: Some(err.to_string()),
                     };
                     yield ToolOutput::custom(

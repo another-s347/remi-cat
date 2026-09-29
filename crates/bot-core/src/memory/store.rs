@@ -35,24 +35,40 @@ use crate::token_usage::estimate_memory_message_tokens;
 use crate::tool_pretty::{tool_success, PrettyToolCall};
 use crate::ContextCompactionEvent;
 
-use super::compress::LlmCompressor;
+use super::compress::{compression_input_text, LlmCompressor};
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
 use crate::search_query::{tokenized_search_query, TokenizedSearchQuery};
 
 // ── MemoryContext ─────────────────────────────────────────────────────────────
 
 /// Loaded context for a single thread, ready for injection into the agent.
+#[derive(Clone)]
 pub struct MemoryContext {
     pub agent_md: Option<String>,
     pub soul_md: Option<String>,
     pub long_term: MemoryIndex,
     pub mid_term: MemoryIndex,
     pub short_term: Vec<Message>,
+    /// Verbatim older user text retained separately from the raw exchange window.
+    pub retained_user_inputs: Vec<Message>,
     /// Full text of the newest non-overlapping summary selected for direct
     /// context injection (mid-term preferred, long-term fallback).
     pub latest_summary: Option<String>,
     /// Persisted tool-managed state (todos, etc.) restored from disk.
     pub user_state: serde_json::Value,
+}
+
+/// An uncommitted compression result. The runtime validates the rebuilt model
+/// request before making this checkpoint visible to later requests.
+pub struct CompactionDraft {
+    pub summary: String,
+    pub covered_messages: usize,
+    pub retained_user_budget: u32,
+    pub keep_recent_raw: bool,
+    uuid: String,
+    first_message_id: String,
+    last_message_id: String,
+    ledger_len: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -305,73 +321,6 @@ impl MemoryStore {
             .map_err(|e| AgentError::Io(e.to_string()))
     }
 
-    // ── Compression: short-term → mid-term ───────────────────────────────────
-
-    /// Compress the oldest ~50 % of short-term messages into one mid-term block.
-    /// Returns the remaining (newer) short-term messages to keep.
-    async fn compress_to_mid_term(
-        &self,
-        thread_id: &str,
-        msgs: Vec<Message>,
-        desired_split: Option<usize>,
-        compressor: &LlmCompressor,
-    ) -> Result<Vec<Message>, AgentError> {
-        let desired = desired_split.unwrap_or_else(|| (msgs.len() / 2).max(1));
-        let split = safe_split_point(&msgs, desired);
-        if split == 0 {
-            return Err(AgentError::other(
-                "no protocol-safe complete exchange is eligible for compression",
-            ));
-        }
-        let (oldest, remaining) = msgs.split_at(split);
-        let oldest = oldest.to_vec();
-        let remaining = remaining.to_vec();
-
-        let new_uuid = Uuid::new_v4().to_string();
-        let mid_dir = self.mid_term_dir(thread_id);
-
-        // The ledger is the raw source of truth; no new raw archive is made.
-        let summary = compressor.compress(&oldest).await?;
-
-        // ── Skip empty compression results ───────────────────────────────
-        if summary.trim().is_empty() {
-            tracing::warn!(
-                "compress_to_mid_term: empty summary for {} oldest messages                  (all tool/empty after filtering), keeping raw archive without mid-term entry",
-                oldest.len(),
-            );
-            return Err(AgentError::other(
-                "compress_to_mid_term: compressor produced no committed summary",
-            ));
-        }
-
-        // ── Proceed with normal compression output ───────────────────────
-        let preview = make_preview(&summary, 100);
-
-        // 3. Write summary with timestamp header.
-        tokio::fs::create_dir_all(&mid_dir)
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
-        let md_path = mid_dir.join(format!("{new_uuid}.md"));
-        let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
-        let summary_with_ts = format!("{ts_header}{summary}");
-        atomic_write(&md_path, summary_with_ts.as_bytes()).await?;
-
-        // 4. Update index.
-        let mut idx = Self::read_index_checked(&mid_dir).await?;
-        idx.entries.push(MemoryEntry {
-            uuid: new_uuid,
-            created_at: Utc::now(),
-            preview,
-            first_message_id: oldest.first().map(|m| m.id.to_string()),
-            last_message_id: oldest.last().map(|m| m.id.to_string()),
-            message_count: Some(oldest.len()),
-            status: Some("committed".to_string()),
-        });
-        Self::write_index(&mid_dir, &idx).await?;
-
-        Ok(remaining)
-    }
-
     // ── Promotion: mid-term → long-term ──────────────────────────────────────
 
     /// Promote mid-term entries older than `memory_days` into a single long-term block.
@@ -467,6 +416,10 @@ impl MemoryStore {
                     .find_map(|e| e.last_message_id.clone()),
                 message_count: Some(to_promote.iter().filter_map(|e| e.message_count).sum()),
                 status: Some("committed".to_string()),
+                retained_user_budget: to_promote
+                    .last()
+                    .and_then(|entry| entry.retained_user_budget),
+                keep_recent_raw: to_promote.last().and_then(|entry| entry.keep_recent_raw),
             }],
         };
         Self::write_index(&long_dir, &new_lt_idx).await?;
@@ -507,6 +460,14 @@ impl MemoryStore {
     /// This also runs `maybe_promote` to age out stale mid-term entries.
     /// Promotion failures are non-fatal.
     pub async fn load_context(&self, thread_id: &str) -> Result<MemoryContext, AgentError> {
+        self.load_context_with_user_budget(thread_id, 20_000).await
+    }
+
+    pub async fn load_context_with_user_budget(
+        &self,
+        thread_id: &str,
+        user_budget: u32,
+    ) -> Result<MemoryContext, AgentError> {
         self.migrate_legacy_raw_archives(thread_id).await?;
         // Attempt promotion first; ignore errors so a failing LLM call
         // does not block the main turn.
@@ -520,14 +481,30 @@ impl MemoryStore {
         let long_term = Self::read_index_checked(&self.long_term_dir(thread_id)).await?;
         let mid_term = Self::read_index_checked(&self.mid_term_dir(thread_id)).await?;
         let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
-        // Never create a visibility gap between committed summary coverage and
-        // the raw tail.  "Recent 10" is the normal direct-message window, but
-        // messages which have not yet been covered by any summary must remain
-        // directly visible until a later budget-driven compaction commits.
         let covered_position = last_covered_position_across_tiers(&ledger, &mid_term, &long_term);
         let uncovered_start = covered_position.map_or(0, |position| position + 1);
-        let recent_start = recent_complete_start(&ledger, 10);
-        let short_term = protocol_safe_history(&ledger[uncovered_start.min(recent_start)..]);
+        let covered_id = covered_position
+            .and_then(|position| ledger.get(position))
+            .map(|message| message.id.to_string());
+        let saved_window = mid_term
+            .entries
+            .iter()
+            .chain(long_term.entries.iter())
+            .filter(|entry| entry.status.as_deref() != Some("legacy"))
+            .filter(|entry| entry.last_message_id == covered_id)
+            .max_by_key(|entry| entry.created_at);
+        let selected_budget = saved_window.as_ref().map_or(user_budget, |window| {
+            user_budget.min(window.retained_user_budget.unwrap_or(20_000))
+        });
+        let keep_recent_raw = saved_window
+            .as_ref()
+            .is_none_or(|window| window.keep_recent_raw.unwrap_or(true));
+        let (short_term, retained_user_inputs) = visible_ledger_messages(
+            &ledger,
+            covered_position,
+            selected_budget.min(20_000),
+            keep_recent_raw,
+        );
         let uncovered_tokens = estimate_memory_message_tokens(&ledger[uncovered_start..]);
         short_term_token_counts()
             .lock()
@@ -558,6 +535,7 @@ impl MemoryStore {
             long_term,
             mid_term,
             short_term,
+            retained_user_inputs,
             latest_summary,
             user_state,
         })
@@ -800,6 +778,25 @@ impl MemoryStore {
         thread_id: &str,
         compressor: &LlmCompressor,
     ) -> Result<usize, AgentError> {
+        let draft = self.prepare_compaction(thread_id, compressor).await?;
+        self.commit_compaction(thread_id, draft).await
+    }
+
+    pub async fn prepare_compaction(
+        &self,
+        thread_id: &str,
+        compressor: &LlmCompressor,
+    ) -> Result<CompactionDraft, AgentError> {
+        self.prepare_compaction_with_recent(thread_id, compressor, false)
+            .await
+    }
+
+    async fn prepare_compaction_with_recent(
+        &self,
+        thread_id: &str,
+        compressor: &LlmCompressor,
+        preserve_recent: bool,
+    ) -> Result<CompactionDraft, AgentError> {
         let lock = thread_lock(self.token_cache_key(thread_id));
         let _guard = lock.lock().await;
         let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
@@ -807,37 +804,162 @@ impl MemoryStore {
         let long_idx = Self::read_index_checked(&self.long_term_dir(thread_id)).await?;
         let start = last_covered_position_across_tiers(&ledger, &mid_idx, &long_idx)
             .map_or(0, |position| position + 1);
-        let active = ledger[start..].to_vec();
-        let keep_start = recent_complete_start(&active, 10);
-        let desired = if keep_start > 0 {
-            keep_start
+        let end = if preserve_recent {
+            start + recent_complete_start(&ledger[start..], 10)
         } else {
-            safe_split_point(&active, (active.len() / 2).max(1))
+            ledger.len()
         };
-        let desired = (1..=desired)
-            .rev()
-            .find(|&end| {
-                end < active.len()
-                    && matches!(active[end].role, Role::User | Role::System)
-                    && tool_protocol_closed(&active[..end])
-                    && compressor.input_fits(&active[..end])
-            })
-            .or_else(|| {
-                (desired == active.len()
-                    && tool_protocol_closed(&active)
-                    && compressor.input_fits(&active))
-                .then_some(desired)
-            })
-            .unwrap_or(0);
-        if desired == 0 || active.len() <= 1 {
+        let active = &ledger[start..end];
+        if active.is_empty() && preserve_recent {
             return Err(AgentError::other(
-                "no old complete exchange fits the compressor context while retaining the latest exchange",
+                "no uncovered history remains eligible for compression",
             ));
         }
-        let remaining = self
-            .compress_to_mid_term(thread_id, active.clone(), Some(desired), compressor)
-            .await?;
-        Ok(active.len().saturating_sub(remaining.len()))
+        let mid_dir = self.mid_term_dir(thread_id);
+        let long_dir = self.long_term_dir(thread_id);
+        let previous = mid_idx
+            .entries
+            .last()
+            .map(|e| (&mid_dir, e))
+            .or_else(|| long_idx.entries.last().map(|e| (&long_dir, e)));
+        let previous_summary = if let Some((dir, entry)) = previous {
+            tokio::fs::read_to_string(dir.join(format!("{}.md", entry.uuid)))
+                .await
+                .map_err(|err| AgentError::Io(err.to_string()))?
+        } else {
+            String::new()
+        };
+        let source = compression_input_text(active);
+        let summary = if active.is_empty() {
+            if previous_summary.trim().is_empty() {
+                return Err(AgentError::other(
+                    "no uncovered history or summary remains eligible for compression",
+                ));
+            }
+            let value = fold_compression_source(compressor, "", &previous_summary).await?;
+            if crate::estimate_model_input_tokens(&value)
+                >= crate::estimate_model_input_tokens(&previous_summary)
+            {
+                return Err(AgentError::other("existing summary did not shrink"));
+            }
+            value
+        } else {
+            if source.trim().is_empty() {
+                return Err(AgentError::other(
+                    "uncovered history has no text to summarize",
+                ));
+            }
+            fold_compression_source(compressor, &previous_summary, &source).await?
+        };
+        let covered_id = ledger
+            .get(start.saturating_sub(1))
+            .map(|message| message.id.to_string());
+        Ok(CompactionDraft {
+            summary,
+            covered_messages: active.len(),
+            retained_user_budget: 20_000,
+            keep_recent_raw: true,
+            uuid: Uuid::new_v4().to_string(),
+            first_message_id: active
+                .first()
+                .map(|message| message.id.to_string())
+                .or_else(|| covered_id.clone())
+                .expect("a previous summary covers a ledger message"),
+            last_message_id: active
+                .last()
+                .map(|message| message.id.to_string())
+                .or(covered_id)
+                .expect("a previous summary covers a ledger message"),
+            ledger_len: ledger.len(),
+        })
+    }
+
+    pub async fn preview_compaction_context(
+        &self,
+        thread_id: &str,
+        draft: &CompactionDraft,
+        user_budget: u32,
+    ) -> Result<MemoryContext, AgentError> {
+        let mut context = self.load_context(thread_id).await?;
+        let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
+        let covered = ledger
+            .iter()
+            .position(|message| message.id.to_string() == draft.last_message_id)
+            .ok_or_else(|| {
+                AgentError::other("compression draft coverage is no longer in the ledger")
+            })?;
+        let (short_term, retained_user_inputs) = visible_ledger_messages(
+            &ledger,
+            Some(covered),
+            user_budget.min(draft.retained_user_budget).min(20_000),
+            draft.keep_recent_raw,
+        );
+        context.short_term = short_term;
+        context.retained_user_inputs = retained_user_inputs;
+        context.latest_summary = Some(draft.summary.clone());
+        context.mid_term.entries.push(MemoryEntry {
+            uuid: draft.uuid.clone(),
+            created_at: Utc::now(),
+            preview: make_preview(&draft.summary, 100),
+            first_message_id: Some(draft.first_message_id.clone()),
+            last_message_id: Some(draft.last_message_id.clone()),
+            message_count: Some(draft.covered_messages),
+            status: Some("pending".to_string()),
+            retained_user_budget: Some(draft.retained_user_budget),
+            keep_recent_raw: Some(draft.keep_recent_raw),
+        });
+        Ok(context)
+    }
+
+    pub async fn commit_compaction(
+        &self,
+        thread_id: &str,
+        draft: CompactionDraft,
+    ) -> Result<usize, AgentError> {
+        let lock = thread_lock(self.token_cache_key(thread_id));
+        let _guard = lock.lock().await;
+        let ledger = Self::read_short_term_checked(&self.short_term_path(thread_id)).await?;
+        let mut mid_idx = Self::read_index_checked(&self.mid_term_dir(thread_id)).await?;
+        let long_idx = Self::read_index_checked(&self.long_term_dir(thread_id)).await?;
+        let start = last_covered_position_across_tiers(&ledger, &mid_idx, &long_idx)
+            .map_or(0, |position| position + 1);
+        let coverage_unchanged = if draft.covered_messages == 0 {
+            ledger
+                .get(start.saturating_sub(1))
+                .map(|m| m.id.to_string())
+                == Some(draft.last_message_id.clone())
+        } else {
+            ledger.get(start).map(|m| m.id.to_string()) == Some(draft.first_message_id.clone())
+                && ledger
+                    .get(start + draft.covered_messages - 1)
+                    .map(|m| m.id.to_string())
+                    == Some(draft.last_message_id.clone())
+        };
+        if ledger.len() != draft.ledger_len || !coverage_unchanged {
+            return Err(AgentError::other(
+                "compression draft is stale; coverage was not committed",
+            ));
+        }
+        let uuid = draft.uuid.clone();
+        let dir = self.mid_term_dir(thread_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        atomic_write(&dir.join(format!("{uuid}.md")), draft.summary.as_bytes()).await?;
+        mid_idx.entries.push(MemoryEntry {
+            uuid,
+            created_at: Utc::now(),
+            preview: make_preview(&draft.summary, 100),
+            first_message_id: Some(draft.first_message_id),
+            last_message_id: Some(draft.last_message_id),
+            message_count: Some(draft.covered_messages),
+            status: Some("committed".to_string()),
+            retained_user_budget: Some(draft.retained_user_budget),
+            keep_recent_raw: Some(draft.keep_recent_raw),
+        });
+        Self::write_index(&dir, &mid_idx).await?;
+        remove_thread_caches(&self.token_cache_key(thread_id));
+        Ok(draft.covered_messages)
     }
 
     /// Persist tool-managed user_state (todos, etc.) to disk.
@@ -923,6 +1045,8 @@ impl MemoryStore {
                 last_message_id: ledger.last().map(|message| message.id.to_string()),
                 message_count: Some(ledger.len()),
                 status: Some("committed".to_string()),
+                retained_user_budget: None,
+                keep_recent_raw: None,
             }],
         };
         Self::write_index(&mid_dir, &index).await?;
@@ -942,93 +1066,38 @@ impl MemoryStore {
         thread_id: &str,
         compressor: &LlmCompressor,
     ) -> Result<usize, AgentError> {
-        let lock = thread_lock(self.token_cache_key(thread_id));
-        let _guard = lock.lock().await;
-        let short_path = self.short_term_path(thread_id);
-        let mid_dir = self.mid_term_dir(thread_id);
-
-        let ledger = Self::read_short_term_checked(&short_path).await?;
-        let mid_idx = Self::read_index_checked(&mid_dir).await?;
-        let start = last_covered_position(&ledger, &mid_idx).map_or(0, |i| i + 1);
-        let uncovered = &ledger[start..];
-        let keep_start = recent_complete_start(uncovered, 10);
-        let short_msgs = uncovered[..keep_start].to_vec();
-        let short_count = short_msgs.len();
-
-        // ── Collect existing mid-term summary texts ───────────────────────
-        let mut combined_text = String::new();
-        for entry in &mid_idx.entries {
-            let md_path = mid_dir.join(format!("{}.md", entry.uuid));
-            let text = tokio::fs::read_to_string(&md_path)
-                .await
-                .map_err(|err| AgentError::Io(format!("read {}: {err}", md_path.display())))?;
-            if !combined_text.is_empty() {
-                combined_text.push_str("\n\n---\n\n");
-            }
-            combined_text.push_str(&text);
+        let mut draft = match self
+            .prepare_compaction_with_recent(thread_id, compressor, true)
+            .await
+        {
+            Ok(draft) => draft,
+            Err(err) if err.to_string().contains("no uncovered history") => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let before = self.load_context(thread_id).await?;
+        let mut after = self
+            .preview_compaction_context(thread_id, &draft, 20_000)
+            .await?;
+        let tokens = |context: &MemoryContext| -> u32 {
+            super::build_injected_history(context)
+                .iter()
+                .map(|message| crate::estimate_model_input_tokens(&message.content.text_content()))
+                .sum()
+        };
+        while tokens(&after) >= tokens(&before) && !after.retained_user_inputs.is_empty() {
+            after.retained_user_inputs.remove(0);
+            draft.retained_user_budget = after
+                .retained_user_inputs
+                .iter()
+                .map(|message| crate::estimate_model_input_tokens(&message.content.text_content()))
+                .sum();
         }
-
-        if short_count == 0 {
-            return Ok(0);
-        }
-
-        // ── Build input: existing mid-term summaries (as a system context)
-        //    followed by the short-term messages ────────────────────────────
-        let mut compress_msgs: Vec<remi_agentloop::prelude::Message> = Vec::new();
-        if !combined_text.is_empty() {
-            compress_msgs.push(remi_agentloop::prelude::Message::system(format!(
-                "[已有中期记忆摘要]\n{combined_text}"
-            )));
-        }
-        compress_msgs.extend(short_msgs.iter().cloned());
-
-        let new_uuid = Uuid::new_v4().to_string();
-
-        // ── Compress ──────────────────────────────────────────────────────
-        let summary = compressor.compress(&compress_msgs).await?;
-
-        // ── Skip empty compression results ───────────────────────────────
-        if summary.trim().is_empty() {
-            tracing::warn!(
-                "compact_now: empty summary for {} messages ({} short-term + {} mid-term context),                  keeping raw archive without mid-term entry",
-                compress_msgs.len(),
-                short_msgs.len(),
-                if combined_text.is_empty() { 0 } else { 1 },
-            );
+        if tokens(&after) >= tokens(&before) {
             return Err(AgentError::other(
-                "compact_now: compressor returned an invalid empty summary",
+                "manual compaction did not reduce the injected context; coverage was not committed",
             ));
         }
-
-        // ── Proceed with normal compression output ───────────────────────
-        let preview = make_preview(&summary, 100);
-
-        // ── Write new summary ─────────────────────────────────────────────
-        tokio::fs::create_dir_all(&mid_dir)
-            .await
-            .map_err(|e| AgentError::Io(e.to_string()))?;
-        let md_path = mid_dir.join(format!("{new_uuid}.md"));
-        let ts_header = format!("<!-- created: {} -->\n\n", Utc::now().to_rfc3339());
-        atomic_write(&md_path, format!("{ts_header}{summary}").as_bytes()).await?;
-
-        // ── Replace mid-term index with single new entry ──────────────────
-        let new_idx = super::tier::MemoryIndex {
-            entries: vec![MemoryEntry {
-                uuid: new_uuid,
-                created_at: Utc::now(),
-                preview,
-                first_message_id: short_msgs.first().map(|m| m.id.to_string()),
-                last_message_id: short_msgs.last().map(|m| m.id.to_string()),
-                message_count: Some(short_msgs.len()),
-                status: Some("committed".to_string()),
-            }],
-        };
-        Self::write_index(&mid_dir, &new_idx).await?;
-        for entry in &mid_idx.entries {
-            let _ = tokio::fs::remove_file(mid_dir.join(format!("{}.md", entry.uuid))).await;
-        }
-
-        Ok(short_count)
+        self.commit_compaction(thread_id, draft).await
     }
 
     /// Clear conversational history for a thread while preserving tool-managed
@@ -1375,6 +1444,113 @@ fn recent_complete_start(messages: &[Message], max_messages: usize) -> usize {
         // Retaining extra raw history is safer than cutting through a tool
         // exchange when no closed boundary exists.
         .unwrap_or(0)
+}
+
+fn visible_ledger_messages(
+    ledger: &[Message],
+    covered_position: Option<usize>,
+    user_budget: u32,
+    keep_recent_raw: bool,
+) -> (Vec<Message>, Vec<Message>) {
+    let uncovered_start = covered_position.map_or(0, |position| position + 1);
+    // The injected suffix can neutralize orphaned tool traffic locally, so it
+    // only needs a user/system opening. Do not use the full-ledger protocol
+    // closure scan here: an old missing tool result would turn its zero
+    // fallback into a replay of all covered raw history.
+    let recent_start = (ledger.len().saturating_sub(10)..ledger.len())
+        .find(|&index| matches!(ledger[index].role, Role::User | Role::System))
+        .unwrap_or(ledger.len());
+    let raw_start = if keep_recent_raw && covered_position.is_some() {
+        uncovered_start.min(recent_start)
+    } else {
+        uncovered_start
+    };
+    let short_term = protocol_safe_history(&ledger[raw_start..]);
+    let mut retained_user_inputs = Vec::new();
+    let mut used = 0_u32;
+    for message in ledger[..raw_start]
+        .iter()
+        .rev()
+        .filter(|m| m.role == Role::User)
+    {
+        let tokens = crate::estimate_model_input_tokens(&message.content.text_content());
+        if used.saturating_add(tokens) > user_budget {
+            break;
+        }
+        retained_user_inputs.push(message.clone());
+        used = used.saturating_add(tokens);
+    }
+    retained_user_inputs.reverse();
+    (short_term, retained_user_inputs)
+}
+
+async fn fold_compression_source(
+    compressor: &LlmCompressor,
+    previous_summary: &str,
+    source: &str,
+) -> Result<String, AgentError> {
+    let mut summary = previous_summary.to_string();
+    let mut remaining = source;
+    let mut summary_reductions = 0_u8;
+    while !remaining.is_empty() {
+        let prefix = if summary.is_empty() {
+            String::new()
+        } else {
+            format!("[Previous committed summary]\n{summary}\n\n[New source]\n")
+        };
+        if !compressor.input_text_fits(&format!("{prefix}x")) {
+            if summary_reductions >= 8 {
+                return Err(AgentError::other(
+                    "compression summary still cannot admit more source after eight reductions",
+                ));
+            }
+            let reduced = compressor.compress_text(&summary).await?;
+            if crate::estimate_model_input_tokens(&reduced)
+                >= crate::estimate_model_input_tokens(&summary)
+            {
+                return Err(AgentError::other(
+                    "compression summary cannot be reduced enough to admit more source",
+                ));
+            }
+            summary = reduced;
+            summary_reductions += 1;
+            continue;
+        }
+        summary_reductions = 0;
+        let mut boundaries = remaining
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        boundaries.push(remaining.len());
+        let mut low = 1_usize;
+        let mut high = boundaries.len() - 1;
+        let mut fitted = 0_usize;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            let end = boundaries[middle];
+            if compressor.input_text_fits(&format!("{prefix}{}", &remaining[..end])) {
+                fitted = end;
+                low = middle + 1;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+        if fitted == 0 {
+            return Err(AgentError::other(
+                "no source text fits the compressor context",
+            ));
+        }
+        let input = format!("{prefix}{}", &remaining[..fitted]);
+        let next = compressor.compress_text(&input).await?;
+        if crate::estimate_model_input_tokens(&next) >= crate::estimate_model_input_tokens(&input) {
+            return Err(AgentError::other(
+                "compressor output did not reduce its input",
+            ));
+        }
+        summary = next;
+        remaining = &remaining[fitted..];
+    }
+    Ok(summary)
 }
 
 fn tool_protocol_closed(messages: &[Message]) -> bool {
@@ -1749,36 +1925,6 @@ fn copy_dir_all(
     })
 }
 
-/// Find a safe split point for compressing short-term messages.
-///
-/// Starting near `desired`, prefers the next `User` or `System` message after
-/// the midpoint, then falls back to an earlier boundary.  This guarantees the
-/// "remaining" half always starts at a clean exchange boundary and never begins
-/// with an orphaned `Tool` result (which would cause the API to reject the
-/// history with "tool_call_id not found").
-fn safe_split_point(msgs: &[Message], desired: usize) -> usize {
-    if msgs.len() <= 1 {
-        return msgs.len();
-    }
-    let desired = desired.clamp(1, msgs.len().saturating_sub(1));
-
-    for i in desired..msgs.len() {
-        if matches!(msgs[i].role, Role::User | Role::System) && tool_protocol_closed(&msgs[..i]) {
-            return i;
-        }
-    }
-    for i in (1..desired).rev() {
-        if matches!(msgs[i].role, Role::User | Role::System) && tool_protocol_closed(&msgs[..i]) {
-            return i;
-        }
-    }
-
-    // Compact everything only when the whole range is closed. An interrupted
-    // tool exchange must remain raw until its result arrives (or be neutralized
-    // by protocol_safe_history when building model context).
-    usize::from(tool_protocol_closed(msgs)) * msgs.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1825,6 +1971,8 @@ mod tests {
             last_message_id: Some(last_message_id),
             message_count: None,
             status: Some("committed".to_string()),
+            retained_user_budget: None,
+            keep_recent_raw: None,
         };
         let mid = MemoryIndex {
             entries: vec![entry(messages[0].id.to_string())],
@@ -1837,6 +1985,95 @@ mod tests {
             last_covered_position_across_tiers(&messages, &mid, &long),
             Some(1)
         );
+    }
+
+    #[test]
+    fn covered_history_does_not_reenter_when_recent_tool_chain_is_incomplete() {
+        let mut messages = (0..170)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!("exact original user input {index}"))
+                } else {
+                    Message::assistant(format!("answer {index}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut incomplete = Message::assistant("unfinished tool call");
+        incomplete.tool_calls = Some(vec![ToolCallMessage {
+            id: "missing-result".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        messages.push(incomplete);
+        for index in 171..186 {
+            messages.push(Message::user(format!("exact original user input {index}")));
+        }
+        assert_eq!(messages.len(), 186);
+        assert_eq!(recent_complete_start(&messages, 10), 0);
+        let (after_first, _) = visible_ledger_messages(&messages, Some(0), 20_000, true);
+        let (after_second, _) = visible_ledger_messages(&messages, Some(26), 20_000, true);
+        assert_eq!(after_first.len(), 185);
+        assert_eq!(after_second.len(), 159);
+        let (recent_only, _) = visible_ledger_messages(&messages, Some(185), 20_000, true);
+        assert_eq!(recent_only.len(), 10);
+        let (fully_covered, retained_users) =
+            visible_ledger_messages(&messages, Some(185), 20_000, false);
+        assert!(fully_covered.is_empty());
+        assert_eq!(
+            retained_users.last().unwrap().content.text_content(),
+            "exact original user input 185"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_context_window_survives_reload_without_reinjecting_covered_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path().to_path_buf());
+        let thread = "window-checkpoint-restart";
+        let messages = (0..20)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!("original input {index}"))
+                } else {
+                    Message::assistant(format!("answer {index}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        MemoryStore::append_short_term(&store.short_term_path(thread), &messages)
+            .await
+            .unwrap();
+        let mid_dir = store.mid_term_dir(thread);
+        tokio::fs::create_dir_all(&mid_dir).await.unwrap();
+        tokio::fs::write(mid_dir.join("checkpoint.md"), "summary")
+            .await
+            .unwrap();
+        MemoryStore::write_index(
+            &mid_dir,
+            &MemoryIndex {
+                entries: vec![MemoryEntry {
+                    uuid: "checkpoint".to_string(),
+                    created_at: Utc::now(),
+                    preview: "summary".to_string(),
+                    first_message_id: Some(messages[0].id.to_string()),
+                    last_message_id: Some(messages[19].id.to_string()),
+                    message_count: Some(20),
+                    status: Some("committed".to_string()),
+                    retained_user_budget: Some(0),
+                    keep_recent_raw: Some(false),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let restored_store = test_store(tmp.path().to_path_buf());
+        let restored = restored_store.load_context(thread).await.unwrap();
+        assert!(restored.short_term.is_empty());
+        assert!(restored.retained_user_inputs.is_empty());
+        assert_eq!(restored.latest_summary.as_deref(), Some("summary"));
+        assert_eq!(restored_store.thread_history(thread).await.len(), 20);
     }
 
     #[tokio::test]
@@ -1957,6 +2194,8 @@ mod tests {
             last_message_id: Some(messages[5].id.to_string()),
             message_count: Some(6),
             status: Some("committed".to_string()),
+            retained_user_budget: None,
+            keep_recent_raw: None,
         };
         let mid_dir = store.mid_term_dir(thread_id);
         tokio::fs::create_dir_all(&mid_dir).await.unwrap();
@@ -1989,6 +2228,8 @@ mod tests {
             last_message_id: Some(messages[11].id.to_string()),
             message_count: Some(12),
             status: Some("committed".to_string()),
+            retained_user_budget: None,
+            keep_recent_raw: None,
         };
         MemoryStore::write_index(
             &mid_dir,
@@ -2005,70 +2246,6 @@ mod tests {
             overlapping.latest_summary.as_deref(),
             Some("committed summary")
         );
-    }
-
-    #[test]
-    fn safe_split_prefers_later_boundary_to_avoid_tiny_compactions() {
-        let tool_call = |id: &str, name: &str| {
-            let mut message = Message::assistant("");
-            message.tool_calls = Some(vec![ToolCallMessage {
-                id: id.to_string(),
-                call_type: "function".to_string(),
-                function: FunctionCall {
-                    name: name.to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }]);
-            message
-        };
-        let msgs = vec![
-            Message::user("start"),
-            tool_call("call-1", "one"),
-            Message::tool_result("call-1", "t1"),
-            tool_call("call-2", "two"),
-            Message::tool_result("call-2", "t2"),
-            tool_call("call-3", "three"),
-            Message::tool_result("call-3", "t3"),
-            Message::user("next clean turn"),
-            Message::assistant("a4"),
-        ];
-
-        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), 7);
-    }
-
-    #[test]
-    fn safe_split_refuses_unclosed_tool_protocol() {
-        let msgs = vec![
-            Message::assistant("a1"),
-            Message::tool_result("call-1", "t1"),
-            Message::assistant("a2"),
-            Message::tool_result("call-2", "t2"),
-        ];
-
-        assert_eq!(safe_split_point(&msgs, msgs.len() / 2), 0);
-    }
-
-    #[test]
-    fn safe_split_skips_system_message_inside_tool_chain() {
-        let mut assistant = Message::assistant("");
-        assistant.tool_calls = Some(vec![ToolCallMessage {
-            id: "call-1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "lookup".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }]);
-        let msgs = vec![
-            Message::user("start"),
-            assistant,
-            Message::system("internal progress marker"),
-            Message::tool_result("call-1", "done"),
-            Message::user("next turn"),
-            Message::assistant("answer"),
-        ];
-
-        assert_eq!(safe_split_point(&msgs, 2), 4);
     }
 
     #[test]
@@ -2332,6 +2509,8 @@ mod tests {
                     last_message_id: None,
                     message_count: None,
                     status: None,
+                    retained_user_budget: None,
+                    keep_recent_raw: None,
                 }],
             },
         )
@@ -2348,6 +2527,8 @@ mod tests {
                     last_message_id: None,
                     message_count: None,
                     status: None,
+                    retained_user_budget: None,
+                    keep_recent_raw: None,
                 }],
             },
         )
@@ -2517,6 +2698,8 @@ mod tests {
                     last_message_id: None,
                     message_count: None,
                     status: Some("committed".to_string()),
+                    retained_user_budget: None,
+                    keep_recent_raw: None,
                 }],
             },
         )

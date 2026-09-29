@@ -112,7 +112,11 @@ impl LlmCompressor {
 
     pub fn input_fits(&self, messages: &[Message]) -> bool {
         let text = compression_input_text(messages);
-        let source = crate::estimate_model_input_tokens(&text);
+        self.input_text_fits(&text)
+    }
+
+    pub(crate) fn input_text_fits(&self, text: &str) -> bool {
+        let source = crate::estimate_model_input_tokens(text);
         let output = self.output_budget(source);
         if output < self.max_output_tokens.min(4_096) {
             return false;
@@ -146,13 +150,17 @@ impl LlmCompressor {
             return Ok(String::new());
         }
 
-        let source_tokens = crate::estimate_model_input_tokens(&text);
-        if !self.input_fits(messages) {
+        self.compress_text(&text).await
+    }
+
+    pub(crate) async fn compress_text(&self, text: &str) -> Result<String, AgentError> {
+        let source_tokens = crate::estimate_model_input_tokens(text);
+        if !self.input_text_fits(text) {
             return Err(AgentError::other(format!(
                 "LlmCompressor: compression input does not fit model context (estimated {source_tokens} source tokens)"
             )));
         }
-        let input = LoopInput::start(text);
+        let input = LoopInput::start(text.to_string());
         let inner = self.build_loop(self.output_budget(source_tokens));
         let stream = inner
             .chat(bot_runtime_core::chat_ctx_from_input(&input, None), input)
@@ -257,7 +265,7 @@ async fn collect_compression_output(
     Ok(result)
 }
 
-fn compression_input_text(messages: &[Message]) -> String {
+pub(crate) fn compression_input_text(messages: &[Message]) -> String {
     messages
         .iter()
         .map(|m| {

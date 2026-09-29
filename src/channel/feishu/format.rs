@@ -7,10 +7,16 @@ pub(crate) fn format_context_compaction_line(event: &bot_core::ContextCompaction
             "🧠 正在压缩上下文：压缩 {} 条，保留 {} 条",
             event.compacted_messages, event.remaining_messages
         ),
-        bot_core::ContextCompactionStatus::Completed => format!(
-            "🧠 上下文已压缩：压缩 {} 条，保留 {} 条",
-            event.compacted_messages, event.remaining_messages
-        ),
+        bot_core::ContextCompactionStatus::Completed => {
+            let mut line = format!(
+                "🧠 上下文已压缩：覆盖 {} 条，当前上下文保留 {} 条原始消息",
+                event.compacted_messages, event.remaining_messages
+            );
+            if let (Some(before), Some(after)) = (event.before_tokens, event.after_tokens) {
+                line.push_str(&format!("；估算 token {before} → {after}"));
+            }
+            line
+        }
         bot_core::ContextCompactionStatus::Failed => format!(
             "🧠 上下文压缩失败：{}",
             event.error.as_deref().unwrap_or("unknown error")

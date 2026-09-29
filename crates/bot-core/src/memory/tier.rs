@@ -24,6 +24,11 @@ pub struct MemoryEntry {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Live-context retention used by the committed compression checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_user_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_recent_raw: Option<bool>,
 }
 
 /// The `index.json` file for one memory tier.

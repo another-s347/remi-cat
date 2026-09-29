@@ -2151,6 +2151,8 @@ mod cli_tests {
             source: bot_core::ContextCompactionSource::Auto,
             compacted_messages: 5,
             remaining_messages: 3,
+            before_tokens: None,
+            after_tokens: None,
             error: None,
         };
         assert!(format_context_compaction_line(&event).contains("正在压缩上下文"));

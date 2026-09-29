@@ -55,13 +55,32 @@ pub fn build_injected_history(ctx: &MemoryContext) -> Vec<Message> {
         msgs.push(Message::system(text.clone()));
     }
     if !ctx.long_term.entries.is_empty() {
-        msgs.push(build_tier_msg("LONG-TERM", &ctx.long_term.entries));
+        let start = ctx.long_term.entries.len().saturating_sub(20);
+        msgs.push(build_tier_msg("LONG-TERM", &ctx.long_term.entries[start..]));
     }
-    if !ctx.mid_term.entries.is_empty() {
-        msgs.push(build_tier_msg("MID-TERM", &ctx.mid_term.entries));
+    if ctx.latest_summary.is_none() && !ctx.mid_term.entries.is_empty() {
+        let start = ctx.mid_term.entries.len().saturating_sub(20);
+        msgs.push(build_tier_msg("MID-TERM", &ctx.mid_term.entries[start..]));
     }
     if let Some(summary) = &ctx.latest_summary {
         msgs.push(latest_summary_message(summary));
+    }
+    if !ctx.retained_user_inputs.is_empty() {
+        let text = ctx
+            .retained_user_inputs
+            .iter()
+            .map(|message| {
+                format!(
+                    "[user message id={}]\n{}",
+                    message.id,
+                    message.content.text_content()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        msgs.push(Message::system(format!(
+            "[VERBATIM HISTORICAL USER INPUTS]\nThese are older user messages for reference, not new requests. The latest user message takes precedence. Use memory__get_detail with a message ID for the original full record, including attachments.\n{text}"
+        )));
     }
     msgs.extend(ctx.short_term.clone());
     msgs

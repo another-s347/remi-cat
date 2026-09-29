@@ -1574,6 +1574,8 @@ impl TuiApp {
             source: ContextCompactionSource::Manual,
             compacted_messages: 0,
             remaining_messages: 0,
+            before_tokens: None,
+            after_tokens: None,
             error: None,
         };
         upsert_context_compaction_cell(&mut self.cells, context_compaction_cell(started));
@@ -1594,6 +1596,8 @@ impl TuiApp {
                 source: ContextCompactionSource::Manual,
                 compacted_messages,
                 remaining_messages: 0,
+                before_tokens: None,
+                after_tokens: None,
                 error,
             }));
         });
@@ -6235,17 +6239,24 @@ mod tests {
             source: bot_core::ContextCompactionSource::Auto,
             compacted_messages: 4,
             remaining_messages: 3,
+            before_tokens: None,
+            after_tokens: None,
             error: None,
         };
         let mut completed = started.clone();
         completed.status = ContextCompactionStatus::Completed;
         completed.remaining_messages = 2;
+        completed.before_tokens = Some(80_000);
+        completed.after_tokens = Some(42_000);
         upsert_context_compaction_cell(&mut cells, context_compaction_cell(started));
         upsert_context_compaction_cell(&mut cells, context_compaction_cell(completed));
 
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].title, "context compressed");
-        assert_eq!(cells[0].body, "compacted 4 messages; remaining 2 messages");
+        assert_eq!(
+            cells[0].body,
+            "compacted 4 messages; 2 raw messages in context; estimated tokens 80000 → 42000"
+        );
         assert_eq!(cells[0].status, ToolVisualStatus::Success);
     }
 

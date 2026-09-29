@@ -925,14 +925,14 @@ pub(super) fn context_compaction_cell(event: ContextCompactionEvent) -> HistoryC
             .error
             .unwrap_or_else(|| "context compression failed".to_string()),
         ContextCompactionStatus::Completed => {
-            if event.remaining_messages > 0 {
-                format!(
-                    "compacted {} messages; remaining {} messages",
-                    event.compacted_messages, event.remaining_messages
-                )
-            } else {
-                format!("compacted {} messages", event.compacted_messages)
+            let mut detail = format!(
+                "compacted {} messages; {} raw messages in context",
+                event.compacted_messages, event.remaining_messages
+            );
+            if let (Some(before), Some(after)) = (event.before_tokens, event.after_tokens) {
+                detail.push_str(&format!("; estimated tokens {before} → {after}"));
             }
+            detail
         }
     };
     HistoryCell::context_compaction(event.id, title.to_string(), body, status)

@@ -28,6 +28,10 @@ pub struct ContextCompactionEvent {
     pub source: ContextCompactionSource,
     pub compacted_messages: usize,
     pub remaining_messages: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
