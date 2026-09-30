@@ -326,7 +326,40 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
             serde_json::Value::String(value.to_string()),
         );
     }
+    if let Some(value) = input.sender_username.as_deref() {
+        map.insert("sender_username".into(), serde_json::Value::String(value.to_string()));
+    }
+    if !input.im_attachments.is_empty() {
+        map.insert(
+            "im_attachments".into(),
+            serde_json::json!(input.im_attachments),
+        );
+    }
+    if !input.im_documents.is_empty() {
+        map.insert("im_documents".into(), serde_json::json!(input.im_documents));
+    }
     Some(serde_json::Value::Object(map))
+}
+
+fn apply_user_steer_context(
+    opts: &mut StreamOptions,
+    metadata: &serde_json::Value,
+    user_name: Option<String>,
+) {
+    opts.sender_username = user_name;
+    opts.message_id = metadata_string(metadata, "message_id");
+    opts.chat_type = metadata_string(metadata, "chat_type");
+    opts.platform = metadata_string(metadata, "platform");
+    opts.app_id = metadata_string(metadata, "app_id");
+    opts.sender_user_id = metadata_string(metadata, "sender_user_id");
+    opts.im_attachments = metadata
+        .get("im_attachments")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    opts.im_documents = metadata
+        .get("im_documents")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
 }
 
 fn user_message_metadata(opts: &StreamOptions) -> Option<serde_json::Value> {
@@ -571,6 +604,8 @@ pub struct SteerInput {
     pub chat_type: Option<String>,
     pub platform: Option<String>,
     pub app_id: Option<String>,
+    pub im_attachments: Vec<ImAttachment>,
+    pub im_documents: Vec<ImDocument>,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +627,7 @@ struct SteerQueueRegistration {
     session_id: String,
     queue: Arc<CoreSteerQueue>,
     active: ActiveSteerQueues,
+    memory: Arc<MemoryStore>,
     removes_queue_on_drop: bool,
 }
 
@@ -609,6 +645,44 @@ impl Drop for SteerQueueRegistration {
             .is_some_and(|queue| Arc::ptr_eq(queue, &self.queue))
         {
             active.remove(&self.session_id);
+        }
+        // A stream may be dropped by a channel timeout or an early return.
+        // Preserve accepted user inputs in history even when no continuation
+        // can run; background tool notifications are not user messages.
+        let pending = self.queue.drain_pending();
+        drop(active);
+        let messages = pending
+            .into_iter()
+            .filter(|input| {
+                matches!(
+                    input.source,
+                    CoreSteerSource::User | CoreSteerSource::UserNextTurn
+                )
+            })
+            .map(|input| Message {
+                id: MessageId::new(),
+                role: Role::User,
+                content: input.content,
+                tool_calls: None,
+                tool_call_id: None,
+                name: input.user_name,
+                reasoning_content: None,
+                metadata: input.message_metadata,
+            })
+            .collect::<Vec<_>>();
+        if messages.is_empty() {
+            return;
+        }
+        let memory = Arc::clone(&self.memory);
+        let session_id = self.session_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = memory.append_failed_turn(&session_id, messages).await {
+                    tracing::error!(%session_id, %error, "failed to preserve unconsumed steer inputs");
+                }
+            });
+        } else {
+            tracing::error!(%session_id, "no runtime available to preserve unconsumed steer inputs");
         }
     }
 }
@@ -928,9 +1002,34 @@ impl CatBot {
             session_id: session_id.to_string(),
             queue: Arc::clone(&queue),
             active: Arc::clone(&self.active_steers),
+            memory: Arc::clone(&self.memory),
             removes_queue_on_drop,
         };
         (queue, guard)
+    }
+
+    /// Atomically stop accepting steer for this run if its queue is empty.
+    /// A concurrent submit either lands in the returned batch or observes no
+    /// active run and starts a normal turn behind the per-thread run lock.
+    fn drain_or_close_steer_queue(
+        &self,
+        session_id: &str,
+        queue: &Arc<CoreSteerQueue>,
+    ) -> Option<bot_runtime_core::CoreSteerBatch> {
+        let mut active = self
+            .active_steers
+            .lock()
+            .expect("active steer queue lock poisoned");
+        if let Some(batch) = queue.drain_batch() {
+            return Some(batch);
+        }
+        if active
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, queue))
+        {
+            active.remove(session_id);
+        }
+        None
     }
 
     pub fn submit_steer(&self, input: SteerInput) -> SteerSubmitResult {
@@ -970,13 +1069,11 @@ impl CatBot {
     }
 
     fn submit_queued_input(&self, input: SteerInput, source: CoreSteerSource) -> SteerSubmitResult {
-        let queue = {
-            self.active_steers
-                .lock()
-                .expect("active steer queue lock poisoned")
-                .get(&input.session_id)
-                .cloned()
-        };
+        let active = self
+            .active_steers
+            .lock()
+            .expect("active steer queue lock poisoned");
+        let queue = active.get(&input.session_id).cloned();
         let Some(queue) = queue else {
             return SteerSubmitResult::NotRunning;
         };
@@ -1575,6 +1672,46 @@ impl CatBot {
         self.memory.save_turn(thread_id, messages).await
     }
 
+    /// Hold the same per-thread lock used by model turns while an external
+    /// delivery is sent and committed to the conversation ledger.
+    pub async fn acquire_thread_run_lock(
+        &self,
+        thread_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.thread_run_lock(thread_id).await.lock_owned().await
+    }
+
+    /// Call only while holding `acquire_thread_run_lock` for this thread.
+    pub async fn append_proactive_assistant_message(
+        &self,
+        thread_id: &str,
+        delivery_id: &str,
+        text: &str,
+        platform: &str,
+        platform_message_id: &str,
+    ) -> Result<(), remi_agentloop::prelude::AgentError> {
+        let message_id = format!("proactive:{delivery_id}");
+        if self
+            .memory
+            .thread_history(thread_id)
+            .await
+            .iter()
+            .any(|message| message.id == message_id)
+        {
+            return Ok(());
+        }
+        let mut message = remi_agentloop::prelude::Message::assistant(text);
+        message.id = remi_agentloop::prelude::MessageId(message_id);
+        message.metadata = Some(serde_json::json!({
+            "source": "proactive_message",
+            "delivery_id": delivery_id,
+            "platform": platform,
+            "platform_message_id": platform_message_id,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+        self.memory.save_turn(thread_id, vec![message]).await
+    }
+
     pub async fn delete_thread_data(
         &self,
         thread_id: &str,
@@ -1942,13 +2079,7 @@ impl CatBot {
                     // dropping it with the registration guard.
                     if let Some(steer) = steer_queue.as_ref() {
                         if let Some(batch) = steer.drain_batch() {
-                            yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                steer_ids: batch.ids.clone(),
-                                session_id: thread_id_owned.clone(),
-                                preview: batch.preview.clone(),
-                                count: batch.count,
-                                next_turn: batch.has_user_next_turn(),
-                            });
+                            yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()));
                             let mut stream = Box::pin(self.stream_with_options(
                                 &thread_id_owned,
                                 batch.content,
@@ -2881,17 +3012,10 @@ impl CatBot {
                     next_steer_metadata = None;
                     next_steer_user_name = None;
                 } else if user_next_turn_continuation {
-                    round_opts.sender_username = next_steer_user_name.take();
                     let metadata = next_steer_metadata
                         .take()
                         .unwrap_or(serde_json::Value::Null);
-                    round_opts.message_id = metadata_string(&metadata, "message_id");
-                    round_opts.chat_type = metadata_string(&metadata, "chat_type");
-                    round_opts.platform = metadata_string(&metadata, "platform");
-                    round_opts.app_id = metadata_string(&metadata, "app_id");
-                    round_opts.sender_user_id = metadata_string(&metadata, "sender_user_id");
-                    round_opts.im_attachments.clear();
-                    round_opts.im_documents.clear();
+                    apply_user_steer_context(&mut round_opts, &metadata, next_steer_user_name.take());
                 }
                 continuation_from_background_task = false;
                 continuation_from_user_next_turn = false;
@@ -3897,15 +4021,9 @@ impl CatBot {
                                 }
                                 if let Some(steer) = steer_queue.as_ref() {
                                     if let Some(batch) = steer.drain_batch() {
-                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                            steer_ids: batch.ids.clone(),
-                                            session_id: thread_id_owned.clone(),
-                                            preview: batch.preview.clone(),
-                                            count: batch.count,
-                                            next_turn: batch.has_user_next_turn(),
-                                        });
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()));
                                         continuation_from_background_task = batch.is_background_only();
-                                        continuation_from_user_next_turn = batch.has_user_next_turn();
+                                        continuation_from_user_next_turn = !batch.is_background_only();
                                         next_steer_metadata = batch.message_metadata.clone();
                                         next_steer_user_name = batch.user_name.clone();
                                         next_content = batch.content;
@@ -3960,16 +4078,10 @@ impl CatBot {
                                             if let Some(steer) = steer_queue.as_ref() {
                                                 if let Some(batch) = steer.drain_batch() {
                                                     yield CatEvent::SteerInjected(
-                                                        crate::SteerInjectedEvent {
-                                                            steer_ids: batch.ids.clone(),
-                                                            session_id: thread_id_owned.clone(),
-                                                            preview: batch.preview.clone(),
-                                                            count: batch.count,
-                                                            next_turn: batch.has_user_next_turn(),
-                                                        },
+                                                        crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()),
                                                     );
                                                     continuation_from_background_task = batch.is_background_only();
-                                                    continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                    continuation_from_user_next_turn = !batch.is_background_only();
                                                     next_steer_metadata = batch.message_metadata.clone();
                                                     next_steer_user_name = batch.user_name.clone();
                                                     next_content = batch.content;
@@ -3993,16 +4105,10 @@ impl CatBot {
                                         if let Some(steer) = steer_queue.as_ref() {
                                             if let Some(batch) = steer.drain_batch() {
                                                 yield CatEvent::SteerInjected(
-                                                    crate::SteerInjectedEvent {
-                                                        steer_ids: batch.ids.clone(),
-                                                        session_id: thread_id_owned.clone(),
-                                                        preview: batch.preview.clone(),
-                                                        count: batch.count,
-                                                        next_turn: batch.has_user_next_turn(),
-                                                    },
+                                                    crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()),
                                                 );
                                                 continuation_from_background_task = batch.is_background_only();
-                                                continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                continuation_from_user_next_turn = !batch.is_background_only();
                                                 next_steer_metadata = batch.message_metadata.clone();
                                                 next_steer_user_name = batch.user_name.clone();
                                                 next_content = batch.content;
@@ -4024,16 +4130,10 @@ impl CatBot {
                                             if let Some(steer) = steer_queue.as_ref() {
                                                 if let Some(batch) = steer.drain_batch() {
                                                     yield CatEvent::SteerInjected(
-                                                        crate::SteerInjectedEvent {
-                                                            steer_ids: batch.ids.clone(),
-                                                            session_id: thread_id_owned.clone(),
-                                                            preview: batch.preview.clone(),
-                                                            count: batch.count,
-                                                            next_turn: batch.has_user_next_turn(),
-                                                        },
+                                                        crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()),
                                                     );
                                                     continuation_from_background_task = batch.is_background_only();
-                                                    continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                    continuation_from_user_next_turn = !batch.is_background_only();
                                                     next_steer_metadata = batch.message_metadata.clone();
                                                     next_steer_user_name = batch.user_name.clone();
                                                     next_content = batch.content;
@@ -4107,16 +4207,10 @@ impl CatBot {
                                                         if let Some(steer) = steer_queue.as_ref() {
                                                             if let Some(batch) = steer.drain_batch() {
                                                                 yield CatEvent::SteerInjected(
-                                                                    crate::SteerInjectedEvent {
-                                                                        steer_ids: batch.ids.clone(),
-                                                                        session_id: thread_id_owned.clone(),
-                                                                        preview: batch.preview.clone(),
-                                                                        count: batch.count,
-                                                                        next_turn: batch.has_user_next_turn(),
-                                                                    },
+                                                                    crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()),
                                                                 );
                                                                 continuation_from_background_task = batch.is_background_only();
-                                                                continuation_from_user_next_turn = batch.has_user_next_turn();
+                                                                continuation_from_user_next_turn = !batch.is_background_only();
                                                                 next_steer_metadata = batch.message_metadata.clone();
                                                                 next_steer_user_name = batch.user_name.clone();
                                                                 next_content = batch.content;
@@ -4239,16 +4333,10 @@ impl CatBot {
                                     }
                                 }
                                 if let Some(steer) = steer_queue.as_ref() {
-                                    if let Some(batch) = steer.drain_batch() {
-                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                            steer_ids: batch.ids.clone(),
-                                            session_id: thread_id_owned.clone(),
-                                            preview: batch.preview.clone(),
-                                            count: batch.count,
-                                            next_turn: batch.has_user_next_turn(),
-                                        });
+                                    if let Some(batch) = self.drain_or_close_steer_queue(&thread_id_owned, steer) {
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()));
                                         continuation_from_background_task = batch.is_background_only();
-                                        continuation_from_user_next_turn = batch.has_user_next_turn();
+                                        continuation_from_user_next_turn = !batch.is_background_only();
                                         next_steer_metadata = batch.message_metadata.clone();
                                         next_steer_user_name = batch.user_name.clone();
                                         next_content = batch.content;
@@ -4286,6 +4374,18 @@ impl CatBot {
                                     error = %e,
                                     "agent_turn.failed"
                                 );
+                                if let Some(steer) = steer_queue.as_ref() {
+                                    if let Some(batch) = self.drain_or_close_steer_queue(&thread_id_owned, steer) {
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()));
+                                        continuation_from_background_task = batch.is_background_only();
+                                        continuation_from_user_next_turn = !batch.is_background_only();
+                                        next_steer_metadata = batch.message_metadata.clone();
+                                        next_steer_user_name = batch.user_name.clone();
+                                        next_content = batch.content;
+                                        continuation_from_supervisor = false;
+                                        continue 'workflow_loop;
+                                    }
+                                }
                                 yield CatEvent::Error(e);
                                 return;
                             }
@@ -4309,6 +4409,18 @@ impl CatBot {
                     elapsed_ms = turn_started.elapsed().as_millis() as u64,
                     "agent_turn.failed"
                 );
+                if let Some(steer) = steer_queue.as_ref() {
+                    if let Some(batch) = self.drain_or_close_steer_queue(&thread_id_owned, steer) {
+                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, thread_id_owned.clone()));
+                        continuation_from_background_task = batch.is_background_only();
+                        continuation_from_user_next_turn = !batch.is_background_only();
+                        next_steer_metadata = batch.message_metadata.clone();
+                        next_steer_user_name = batch.user_name.clone();
+                        next_content = batch.content;
+                        continuation_from_supervisor = false;
+                        continue 'workflow_loop;
+                    }
+                }
                 break 'workflow_loop;
             }
         }
@@ -4578,6 +4690,7 @@ pub struct CatBotBuilder {
     active_agent_id: String,
     model_bindings: AgentModelBindings,
     approval_model_profile_id: Option<String>,
+    jev_approval: Option<(crate::DecisionModelProfileConfig, String, u16)>,
     agents_dir: PathBuf,
     max_turns: Option<usize>,
     model_registry: Arc<ModelProfileRegistry>,
@@ -4621,6 +4734,27 @@ impl CatBotBuilder {
         let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
         let resolved_model = resolve_model_profile_from_env(&models_dir)?;
         let api_key = api_key_from_env(&resolved_model.profile)?;
+        let jev_approval = std::env::var("REMI_JEV_APPROVAL_PROFILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|id| -> anyhow::Result<_> {
+                let dir = std::env::var_os("REMI_DECISION_MODELS_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("decision-models"));
+                crate::install_embedded_decision_model_profiles(&dir)?;
+                let profile = crate::load_decision_model_profile(&dir, id.trim())?;
+                let key = profile.api_key(None)?;
+                let threshold = std::env::var("REMI_JEV_APPROVAL_MIN_LOW_BPS")
+                    .ok()
+                    .map(|value| value.parse::<u16>())
+                    .transpose()?
+                    .unwrap_or(9900);
+                if !(1..=10_000).contains(&threshold) {
+                    anyhow::bail!("REMI_JEV_APPROVAL_MIN_LOW_BPS must be 1..=10000");
+                }
+                Ok((profile, key, threshold))
+            })
+            .transpose()?;
         let runtime_model_locked = std::env::var("REMI_MODEL_PROFILE")
             .ok()
             .map(|value| !value.trim().is_empty())
@@ -4649,6 +4783,7 @@ impl CatBotBuilder {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            jev_approval,
             agents_dir: data_dir.join("agents"),
             max_turns: None,
             model_registry,
@@ -4769,6 +4904,7 @@ impl CatBotBuilder {
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir: data_dir.join("agents"),
             max_turns: None,
             model_registry,
@@ -4840,6 +4976,16 @@ impl CatBotBuilder {
     pub fn approval_model_profile(mut self, profile_id: impl Into<String>) -> Self {
         let profile_id = profile_id.into();
         self.approval_model_profile_id = Some(profile_id);
+        self
+    }
+
+    pub fn jev_approval(
+        mut self,
+        profile: crate::DecisionModelProfileConfig,
+        api_key: String,
+        min_low_probability_bps: u16,
+    ) -> Self {
+        self.jev_approval = Some((profile, api_key, min_low_probability_bps));
         self
     }
 
@@ -4946,7 +5092,9 @@ impl CatBotBuilder {
         );
         let overflow_bytes = self.overflow_bytes.unwrap_or(profile.overflow_bytes);
         let resolved_base_url = profile.base_url.clone();
-        let approval_profile = if let Some(profile_id) = self.approval_model_profile_id.as_deref() {
+        let approval_profile = if self.jev_approval.is_some() {
+            profile.clone()
+        } else if let Some(profile_id) = self.approval_model_profile_id.as_deref() {
             self.model_registry
                 .get(profile_id)
                 .cloned()
@@ -4956,19 +5104,30 @@ impl CatBotBuilder {
         } else {
             profile.clone()
         };
-        let approval_api_key = match self.api_keys.as_deref() {
-            Some(values) => crate::model_profile::api_key_from_values(&approval_profile, values)?,
-            None => api_key_from_env(&approval_profile)?,
-        };
-        let approval_reviewer = Arc::new(ModelApprovalReviewer::new(
-            approval_profile.clone(),
-            approval_api_key,
-        ));
+        let approval_reviewer =
+            if let Some((decision_profile, key, threshold_bps)) = self.jev_approval.as_ref() {
+                Arc::new(ModelApprovalReviewer::new_jev(
+                    decision_profile.clone(),
+                    key.clone(),
+                    f64::from(*threshold_bps) / 10_000.0,
+                )?)
+            } else {
+                let approval_api_key = match self.api_keys.as_deref() {
+                    Some(values) => {
+                        crate::model_profile::api_key_from_values(&approval_profile, values)?
+                    }
+                    None => api_key_from_env(&approval_profile)?,
+                };
+                Arc::new(ModelApprovalReviewer::new(
+                    approval_profile.clone(),
+                    approval_api_key,
+                ))
+            };
 
         tracing::debug!(
             model = %profile.model,
             profile = %profile.id,
-            approval_model_profile = %approval_profile.id,
+            approval_model_profile = %self.jev_approval.as_ref().map(|(profile, _, _)| profile.id.as_str()).unwrap_or(&approval_profile.id),
             helper_model_profile = self.model_bindings.helper.as_deref().unwrap_or(""),
             vision_model_profile = self.model_bindings.vision.as_deref().unwrap_or(""),
             context_tokens = profile.context_tokens,
@@ -6453,7 +6612,8 @@ fn register_delegate_agent_tools(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_thread_todo_system_prompt, background_task_completion_steer_input,
+        append_thread_todo_system_prompt, apply_user_steer_context,
+        background_task_completion_steer_input,
         context_percent_tokens, default_system_prompt, format_subagent_tool_result,
         insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
         install_embedded_model_profiles, local_acp_thread_id, memory_compaction_budget_tokens,
@@ -6462,7 +6622,8 @@ mod tests {
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
         try_recv_completed_tool_task, validate_host_tool_names, AgentModelBindings,
         AgentTracingOptions, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds,
-        LlmCompressor, LoopInput, Message, ModelProfileRegistry, PartialTurnRecorder,
+        ImAttachment, ImDocument, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
+        PartialTurnRecorder, SteerInput, steer_message_metadata,
         RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent, ThreadRunLocks,
         WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE, ASYNC_TOOL_SYSTEM_PROMPT,
         DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
@@ -6485,6 +6646,102 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn user_steer_replaces_sender_and_im_context() {
+        let attachment = ImAttachment {
+            key: "msg-new\\file-new".into(),
+            name: "new.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 3,
+            file_type: "file".into(),
+        };
+        let document = ImDocument {
+            url: "https://example.com/new".into(),
+            title: "new".into(),
+            doc_type: "docx".into(),
+            token: "doc-new".into(),
+        };
+        let input = SteerInput {
+            session_id: "session".into(),
+            content: Content::text("new message"),
+            sender_user_id: Some("sender-new".into()),
+            sender_username: Some("New Sender".into()),
+            message_id: Some("msg-new".into()),
+            chat_type: Some("group".into()),
+            platform: Some("feishu".into()),
+            app_id: Some("app-new".into()),
+            im_attachments: vec![attachment.clone()],
+            im_documents: vec![document.clone()],
+        };
+        let metadata = steer_message_metadata(&input).unwrap();
+        let mut opts = StreamOptions {
+            sender_user_id: Some("sender-old".into()),
+            sender_username: Some("Old Sender".into()),
+            message_id: Some("msg-old".into()),
+            im_attachments: vec![ImAttachment { name: "old.txt".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        apply_user_steer_context(&mut opts, &metadata, input.sender_username);
+        assert_eq!(opts.sender_user_id.as_deref(), Some("sender-new"));
+        assert_eq!(opts.sender_username.as_deref(), Some("New Sender"));
+        assert_eq!(opts.message_id.as_deref(), Some("msg-new"));
+        assert_eq!(opts.im_attachments[0].key, attachment.key);
+        assert_eq!(opts.im_documents[0].token, document.token);
+    }
+
+    #[test]
+    fn closing_steer_queue_preserves_accepted_input_and_rejects_late_submit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let bot = build_mock_bot(&data_dir, "http://127.0.0.1:1/v1".into(), true, 1);
+        let (queue, _guard) = bot.register_steer_queue("closing-steer-thread");
+        let input = || SteerInput {
+            session_id: "closing-steer-thread".into(),
+            content: Content::text("follow-up"),
+            sender_user_id: None,
+            sender_username: None,
+            message_id: None,
+            chat_type: None,
+            platform: None,
+            app_id: None,
+            im_attachments: Vec::new(),
+            im_documents: Vec::new(),
+        };
+        assert!(matches!(bot.submit_steer(input()), super::SteerSubmitResult::Queued(_)));
+        let batch = bot.drain_or_close_steer_queue("closing-steer-thread", &queue).unwrap();
+        assert_eq!(batch.count, 1);
+        assert!(bot.drain_or_close_steer_queue("closing-steer-thread", &queue).is_none());
+        assert!(matches!(bot.submit_steer(input()), super::SteerSubmitResult::NotRunning));
+    }
+
+    #[tokio::test]
+    async fn dropped_run_preserves_unconsumed_steer_in_history() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let bot = build_mock_bot(&data_dir, "http://127.0.0.1:1/v1".into(), true, 1);
+        let (_queue, guard) = bot.register_steer_queue("dropped-steer-thread");
+        assert!(matches!(bot.submit_steer(SteerInput {
+            session_id: "dropped-steer-thread".into(),
+            content: Content::text("preserve this steer"),
+            sender_user_id: Some("sender".into()),
+            sender_username: Some("Sender".into()),
+            message_id: Some("feishu-message".into()),
+            chat_type: Some("group".into()),
+            platform: Some("feishu".into()),
+            app_id: None,
+            im_attachments: Vec::new(),
+            im_documents: Vec::new(),
+        }), super::SteerSubmitResult::Queued(_)));
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if bot.memory.thread_history("dropped-steer-thread").await.iter()
+                    .any(|message| message.text.contains("preserve this steer")) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("unconsumed steer should be preserved");
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
@@ -6761,6 +7018,7 @@ mod tests {
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(max_turns),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -6774,6 +7032,36 @@ mod tests {
         }
         .build()
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_assistant_markdown_is_persisted_once_without_model_turn() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let bot = build_mock_bot(&data_dir, "http://127.0.0.1:9".into(), false, 1);
+        let markdown = "# Update\n\n**done**";
+        let _guard = bot.acquire_thread_run_lock("proactive-session").await;
+        bot.append_proactive_assistant_message(
+            "proactive-session",
+            "delivery-1",
+            markdown,
+            "feishu",
+            "om_receipt",
+        )
+        .await
+        .unwrap();
+        bot.append_proactive_assistant_message(
+            "proactive-session",
+            "delivery-1",
+            markdown,
+            "feishu",
+            "om_receipt",
+        )
+        .await
+        .unwrap();
+        let history = bot.memory.thread_history("proactive-session").await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, markdown);
+        assert_eq!(history[0].role, "assistant");
     }
 
     #[test]
@@ -6933,6 +7221,7 @@ mod tests {
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir: data_dir.path().join("agents"),
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -7249,6 +7538,7 @@ mod tests {
                             active_agent_id: DEFAULT_AGENT_ID.to_string(),
                             model_bindings: AgentModelBindings::default(),
                             approval_model_profile_id: None,
+                            jev_approval: None,
                             agents_dir,
                             max_turns: Some(3),
                             model_registry: Arc::new(
@@ -7647,6 +7937,7 @@ mod tests {
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir: agents_dir.clone(),
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -7709,6 +8000,7 @@ mod tests {
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir: agents_dir.clone(),
                 max_turns: Some(2),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir.clone()).unwrap()),
@@ -7819,6 +8111,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -8255,6 +8548,56 @@ You are Remi.
         });
     }
 
+    #[test]
+    fn queued_steer_continues_after_model_error() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            let partial = json!({
+                "choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": null}]
+            });
+            let (base_url, requests) = start_openai_mock_server(vec![
+                format!("data: {partial}\n\n"),
+                sse_text("steer handled"),
+            ]).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot(&data_dir, base_url, true, 3);
+            let stream = bot.stream("error-steer-thread", "first message");
+            let mut stream = std::pin::pin!(stream);
+            loop {
+                let event = stream.next().await.expect("first response event");
+                if matches!(event, CatEvent::Text(_)) {
+                    break;
+                }
+            }
+            let submitted = bot.submit_steer(SteerInput {
+                session_id: "error-steer-thread".into(),
+                content: Content::text("queued follow-up"),
+                sender_user_id: Some("sender-2".into()),
+                sender_username: Some("Second Sender".into()),
+                message_id: Some("msg-2".into()),
+                chat_type: Some("group".into()),
+                platform: Some("feishu".into()),
+                app_id: None,
+                im_attachments: Vec::new(),
+                im_documents: Vec::new(),
+            });
+            assert!(matches!(submitted, super::SteerSubmitResult::Queued(_)));
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            assert!(events.iter().any(|event| matches!(event, CatEvent::SteerInjected(_))));
+            assert!(events.iter().any(|event| matches!(event, CatEvent::Text(text) if text == "steer handled")));
+            assert!(!events.iter().any(|event| matches!(event, CatEvent::Error(_))));
+            let persisted = tokio::fs::read_to_string(
+                data_dir.path().join("memory/error-steer-thread/short_term.jsonl"),
+            ).await.unwrap();
+            assert!(persisted.contains("queued follow-up"));
+            assert!(persisted.contains("msg-2"));
+            assert_eq!(requests.lock().unwrap().len(), 2);
+        });
+    }
+
     #[tokio::test]
     async fn cancelled_stream_persists_partial_assistant_text() {
         std::env::set_var("OPENAI_API_KEY", "test");
@@ -8291,6 +8634,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -8377,6 +8721,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -8473,6 +8818,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -8496,7 +8842,6 @@ You are Remi.
         .await
         .unwrap();
         let cancel = CancellationToken::new();
-        let started = Instant::now();
         let mut stream = std::pin::pin!(bot.stream_with_options(
             thread_id,
             Content::text("start"),
@@ -8506,8 +8851,14 @@ You are Remi.
             },
         ));
         let mut events = Vec::new();
+        let mut cancel_started = None;
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            let wait_limit = if cancel_started.is_some() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(10)
+            };
+            let event = tokio::time::timeout(wait_limit, stream.next())
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for event: {events:?}"));
             let Some(event) = event else {
@@ -8518,6 +8869,7 @@ You are Remi.
                 CatEvent::SupervisorProgress(SupervisorTraceEvent::OutputDelta { content })
                     if content.contains("supervisor partial")
             ) {
+                cancel_started = Some(Instant::now());
                 cancel.cancel();
             }
             let done = matches!(event, CatEvent::Done);
@@ -8528,7 +8880,7 @@ You are Remi.
         }
 
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            cancel_started.expect("supervisor output should start before cancellation").elapsed() < Duration::from_secs(4),
             "supervisor cancel should not wait for slow response or timeout: {events:?}"
         );
         assert!(events.iter().any(|event| matches!(
@@ -8596,6 +8948,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(4),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -8802,6 +9155,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
@@ -8875,6 +9229,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir: PathBuf::from("agents"),
             max_turns: None,
             model_registry: Arc::new(ModelProfileRegistry::load(PathBuf::from("models")).unwrap()),
@@ -8926,6 +9281,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9052,6 +9408,57 @@ You are Remi.
             prompt.as_deref(),
             Some("当前是单聊场景。当前正在与你对话的用户内部ID是 uuid-1。")
         );
+    }
+
+    #[test]
+    fn completed_todo_batch_is_cleared_across_turns_and_restart_end_to_end() {
+        run_large_stack_local_test(|| async {
+            let responses = vec![
+                sse_tool_call("add-first", "todo__add", json!({
+                    "title": "First", "items": [{"title": "A"}, {"title": "B"}]
+                })),
+                sse_text("first created"),
+                sse_tool_call("add-second", "todo__add", json!({
+                    "title": "Second", "items": [{"title": "C"}]
+                })),
+                sse_text("second created"),
+                sse_tool_call("complete-a", "todo__complete", json!({"id": 1})),
+                sse_text("A completed"),
+                sse_tool_call("complete-b", "todo__complete", json!({"id": 2})),
+                sse_text("B completed"),
+                sse_tool_call("list-after-restart", "todo__list", json!({})),
+                sse_text("listed"),
+            ];
+            let (base_url, requests) = start_openai_mock_server(responses).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let thread = "todo-batch-clear-e2e";
+            let bot = build_mock_bot(&data_dir, base_url.clone(), false, 4);
+            bot.approval_manager().grant_session(thread).await;
+
+            collect_stream(bot.stream(thread, "create first batch")).await;
+            collect_stream(bot.stream(thread, "create second batch")).await;
+            collect_stream(bot.stream(thread, "complete A")).await;
+            let partial = bot.memory.load_user_state(thread).await;
+            assert_eq!(crate::todo::todos_from_user_state(&partial).len(), 3);
+            collect_stream(bot.stream(thread, "complete B")).await;
+            let cleared = bot.memory.load_user_state(thread).await;
+            let remaining = crate::todo::todos_from_user_state(&cleared);
+            assert_eq!(remaining.iter().map(|todo| todo.id).collect::<Vec<_>>(), vec![3]);
+            assert_eq!(cleared["__todo_next_id"], 4);
+
+            drop(bot);
+            let restarted = build_mock_bot(&data_dir, base_url, false, 4);
+            let list_events = collect_stream(restarted.stream(thread, "list todos")).await;
+            assert!(list_events.iter().any(|event| matches!(
+                event,
+                CatEvent::ToolCallResult { name, result, success: true, .. }
+                    if name == "todo__list" && result.contains("[Batch] Second")
+                        && result.contains("3 C") && !result.contains("[Batch] First")
+            )));
+            let restored = restarted.memory.load_user_state(thread).await;
+            assert_eq!(crate::todo::todos_from_user_state(&restored), remaining);
+            assert_eq!(requests.lock().unwrap().len(), 10);
+        });
     }
 
     #[test]
@@ -9193,6 +9600,7 @@ You are Remi.
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir,
                 max_turns: Some(8),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9282,6 +9690,7 @@ You are Remi.
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir,
                 max_turns: Some(8),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9421,6 +9830,7 @@ You are Remi.
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
             approval_model_profile_id: None,
+            jev_approval: None,
             agents_dir,
             max_turns: Some(2),
             model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9550,6 +9960,7 @@ You are Remi.
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir,
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9705,6 +10116,7 @@ You are Remi.
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir: data_dir.path().join("agents"),
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -9790,6 +10202,7 @@ You are Remi.
                 active_agent_id: DEFAULT_AGENT_ID.to_string(),
                 model_bindings: AgentModelBindings::default(),
                 approval_model_profile_id: None,
+                jev_approval: None,
                 agents_dir: data_dir.path().join("agents"),
                 max_turns: Some(4),
                 model_registry: Arc::new(ModelProfileRegistry::load(models_dir).unwrap()),
@@ -10035,6 +10448,7 @@ You are Remi.
                     active_agent_id: DEFAULT_AGENT_ID.to_string(),
                     model_bindings: AgentModelBindings::default(),
                     approval_model_profile_id: None,
+                    jev_approval: None,
                     agents_dir: data_dir.path().join("agents"),
                     max_turns: Some(1),
                     model_registry: Arc::new(ModelProfileRegistry::load(&models_dir).unwrap()),

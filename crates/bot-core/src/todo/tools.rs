@@ -17,6 +17,7 @@ use serde_json::json;
 use super::backend::HybridTodoBackend;
 
 pub(crate) const TODOS_STATE_KEY: &str = "__todos";
+pub(crate) const TODO_NEXT_ID_STATE_KEY: &str = "__todo_next_id";
 const UNGROUPED_SECTION_TITLE: &str = "Ungrouped";
 const TODO_BATCH_PROMPT_HEADER: &str = "[CURRENT TODO BATCH]";
 const TODO_BATCH_EXECUTION_GUIDANCE: &str = "When this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.";
@@ -197,9 +198,10 @@ fn parse_add_request(arguments: serde_json::Value) -> Result<TodoBatchAddRequest
 pub(crate) fn add_batch_to_todos(
     mut todos: Vec<TodoItem>,
     request: TodoBatchAddRequest,
+    next_id_hint: u64,
 ) -> (Vec<TodoItem>, TodoBatchAddResult) {
     let batch_title = request.title;
-    let first_id = next_id(&todos);
+    let first_id = next_id(&todos).max(next_id_hint);
     let batch_id = first_id;
     let mut todo_ids = Vec::with_capacity(request.items.len());
     let mut result_items = Vec::with_capacity(request.items.len());
@@ -643,6 +645,7 @@ mod tests {
                     ("Publish notes", None),
                 ],
             ),
+            1,
         );
 
         assert_eq!(result.batch_id, 5);
@@ -665,12 +668,14 @@ mod tests {
         let (todos_a, result_a) = add_batch_to_todos(
             todos_from_user_state(&thread_a),
             batch_request("Thread A", &[("Task A1", None), ("Task A2", None)]),
+            1,
         );
         write_todos_to_user_state(&mut thread_a, &todos_a);
 
         let (todos_b, result_b) = add_batch_to_todos(
             todos_from_user_state(&thread_b),
             batch_request("Thread B", &[("Task B1", Some("Only in B"))]),
+            1,
         );
         write_todos_to_user_state(&mut thread_b, &todos_b);
 
@@ -719,6 +724,7 @@ mod tests {
         let (todos, _) = add_batch_to_todos(
             vec![],
             batch_request("Phase 1", &[("Design schema", None), ("Write docs", None)]),
+            1,
         );
         let (mut todos, _) = add_batch_to_todos(
             todos,
@@ -726,6 +732,7 @@ mod tests {
                 "Phase 2",
                 &[("Ship backend", Some("Deploy first")), ("Announce", None)],
             ),
+            1,
         );
 
         for todo in &mut todos {

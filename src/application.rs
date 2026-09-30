@@ -1550,6 +1550,25 @@ async fn build_runtime(
     .agent_tracing(agent_tracing)
     .a2a_delegate_transport(a2a_delegate_transport)
     .hook_manager(hook_manager);
+    let runtime_config_path = std::env::var_os("REMI_RUNTIME_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source.join("runtime.yaml"));
+    if let Some(runtime_config) =
+        crate::runtime_config::load_runtime_config_at(&runtime_config_path, source)?
+    {
+        let config = runtime_config.experimental_jev_approval;
+        if config.enabled {
+            let dir = std::env::var_os("REMI_DECISION_MODELS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| source.join("decision-models"));
+            bot_core::install_embedded_decision_model_profiles(&dir)?;
+            let profile = bot_core::load_decision_model_profile(&dir, &config.profile)?;
+            let key = profile
+                .api_key(Some(&secret_entries))
+                .or_else(|_| profile.api_key(None))?;
+            builder = builder.jev_approval(profile, key, config.min_low_probability_bps);
+        }
+    }
     let agents_dir = std::env::var_os("REMI_AGENTS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join("agents"));
@@ -1908,6 +1927,8 @@ async fn dispatch(
                     chat_type: config.chat_type,
                     platform: Some(config.id),
                     app_id: Some(app_id.to_string()),
+                    im_attachments: Vec::new(),
+                    im_documents: Vec::new(),
                 };
                 let _ = reply.send(Ok(runtime.bot.submit_subagent_steer(&thread_id, input)));
             }

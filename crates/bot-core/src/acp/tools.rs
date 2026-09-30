@@ -208,11 +208,25 @@ impl Tool for AcpChatTool {
                                 );
                             }
                             AcpToolTaskEvent::ApprovalRequested(request) => {
-                                for output in handle_acp_approval_request(
+                                let mut approval = begin_acp_approval_request(
                                     request,
                                     &approval_manager,
                                     decision_tx.clone(),
                                     &ctx,
+                                    &sub_thread_id,
+                                    &sub_run_id,
+                                    title.clone(),
+                                ).await;
+                                for output in std::mem::take(&mut approval.initial_outputs) {
+                                    yield output;
+                                }
+                                // Yield the pending marker before awaiting the
+                                // decision so channel UIs can render it and
+                                // submit the response that releases this wait.
+                                for output in finish_acp_approval_request(
+                                    approval,
+                                    &approval_manager,
+                                    decision_tx.clone(),
                                     &sub_thread_id,
                                     &sub_run_id,
                                     title.clone(),
@@ -415,7 +429,13 @@ fn acp_task_event_output(
     ))
 }
 
-async fn handle_acp_approval_request(
+struct PendingAcpApproval {
+    initial_outputs: Vec<ToolOutput>,
+    current_request: ToolApprovalRequest,
+    wait: Option<ApprovalWait>,
+}
+
+async fn begin_acp_approval_request(
     request: ToolApprovalRequest,
     approval_manager: &Arc<ToolApprovalManager>,
     decision_tx: Option<tokio::sync::mpsc::UnboundedSender<AcpApprovalDecision>>,
@@ -423,7 +443,7 @@ async fn handle_acp_approval_request(
     sub_thread_id: &ThreadId,
     sub_run_id: &RunId,
     title: Option<String>,
-) -> Vec<ToolOutput> {
+) -> PendingAcpApproval {
     let request = normalize_acp_approval_request(request, ctx);
     let mut outputs = Vec::new();
 
@@ -445,7 +465,11 @@ async fn handle_acp_approval_request(
             title,
             "ACP approval requested, but this ACP backend does not expose a decision channel.",
         ));
-        return outputs;
+        return PendingAcpApproval {
+            initial_outputs: outputs,
+            current_request: request,
+            wait: None,
+        };
     }
 
     let (wait, events) = approval_manager.start_request(request.clone()).await;
@@ -479,6 +503,31 @@ async fn handle_acp_approval_request(
             }
         }
     }
+
+    PendingAcpApproval {
+        initial_outputs: outputs,
+        current_request,
+        wait: Some(wait),
+    }
+}
+
+async fn finish_acp_approval_request(
+    approval: PendingAcpApproval,
+    approval_manager: &Arc<ToolApprovalManager>,
+    decision_tx: Option<tokio::sync::mpsc::UnboundedSender<AcpApprovalDecision>>,
+    sub_thread_id: &ThreadId,
+    sub_run_id: &RunId,
+    title: Option<String>,
+) -> Vec<ToolOutput> {
+    let PendingAcpApproval {
+        mut current_request,
+        wait,
+        ..
+    } = approval;
+    let Some(wait) = wait else {
+        return Vec::new();
+    };
+    let mut outputs = Vec::new();
 
     let decision = match wait {
         ApprovalWait::Immediate(ApprovalResolution::Approved) => {
@@ -606,9 +655,15 @@ fn current_bound_channel(
 
 #[cfg(test)]
 mod tests {
-    use super::{current_bound_channel, status_sub_session_outputs, AcpChatTool};
+    use super::{
+        begin_acp_approval_request, current_bound_channel, finish_acp_approval_request,
+        status_sub_session_outputs, AcpChatTool,
+    };
     use crate::acp::backend::{AcpBackend, AcpToolResponse, AcpToolTaskStatus};
-    use crate::approval::ToolApprovalManager;
+    use crate::approval::{
+        ApprovalWait, ToolApprovalDecision, ToolApprovalManager, ToolApprovalRequest,
+        ToolRiskLevel,
+    };
     use bot_runtime_core::{ChatCtxState, ToolContext};
     use remi_agentloop::prelude::{ProtocolEvent, ThreadId, Tool, ToolOutput};
     use remi_agentloop::types::RunId;
@@ -659,6 +714,61 @@ mod tests {
         assert_eq!(tool.name(), "codex");
         assert!(tool.description().contains("session_id"));
         assert!(schema["properties"].get("session_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_marker_is_ready_before_waiting_for_decision() {
+        let manager = ToolApprovalManager::new();
+        let (decision_tx, mut decision_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sub_thread_id = ThreadId("sub-1".into());
+        let sub_run_id = RunId("run-1".into());
+        let request = ToolApprovalRequest {
+            id: "approval-1".into(),
+            session_id: "external-session".into(),
+            run_id: String::new(),
+            tool_call_id: "call-1".into(),
+            tool_name: "codex_acp".into(),
+            risk: ToolRiskLevel::High,
+            args_summary: "write a file".into(),
+            command_key: None,
+            model_review_reason: None,
+            platform: Some("feishu".into()),
+            app_id: None,
+            review: None,
+        };
+
+        let mut approval = begin_acp_approval_request(
+            request,
+            &manager,
+            Some(decision_tx.clone()),
+            &tool_context(Some(serde_json::json!({"platform": "feishu"}))),
+            &sub_thread_id,
+            &sub_run_id,
+            Some("Codex ACP".into()),
+        )
+        .await;
+        assert!(!approval.initial_outputs.is_empty());
+        assert!(matches!(approval.wait, Some(ApprovalWait::Pending(_))));
+
+        manager
+            .decide("approval-1", ToolApprovalDecision::AllowOnce)
+            .await
+            .unwrap();
+        let initial = std::mem::take(&mut approval.initial_outputs);
+        assert!(!initial.is_empty());
+        let resolved = finish_acp_approval_request(
+            approval,
+            &manager,
+            Some(decision_tx),
+            &sub_thread_id,
+            &sub_run_id,
+            Some("Codex ACP".into()),
+        )
+        .await;
+        assert!(!resolved.is_empty());
+        let delivered = decision_rx.recv().await.unwrap();
+        assert_eq!(delivered.approval_id, "approval-1");
+        assert_eq!(delivered.decision, ToolApprovalDecision::AllowOnce);
     }
 
     #[test]

@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, NewSessionResponse, SessionNotification,
+    CancelNotification, ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification,
     SessionUpdate as AcpSessionUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -19,11 +21,11 @@ use chrono::Utc;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::approval::{ToolApprovalDecision, ToolApprovalRequest};
+use crate::approval::{ToolApprovalDecision, ToolApprovalRequest, ToolRiskLevel};
 use crate::im_tools::{AcpBindingDeleteRequest, AcpBindingUpsertRequest, ImFileBridge};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,10 +109,6 @@ impl AcpRemoteClient {
             Self::Other(value) => value,
         }
     }
-
-    fn is_codex(&self) -> bool {
-        matches!(self, Self::Other(value) if value == "codex")
-    }
 }
 
 impl std::fmt::Display for AcpRemoteClient {
@@ -132,8 +130,8 @@ impl AcpConfig {
             .to_ascii_lowercase();
         let client = AcpRemoteClient::from_env();
         if mode == "local" || mode == "stub" {
-            let local_args = local_acp_args_from_env(&client);
-            let local_bin = local_acp_binary_from_env(&client);
+            let local_args = local_acp_args_from_env();
+            let local_bin = local_acp_binary_from_env();
             return Self::Local {
                 client,
                 agent_name,
@@ -161,8 +159,8 @@ impl AcpConfig {
             }
         }
 
-        let local_args = local_acp_args_from_env(&client);
-        let local_bin = local_acp_binary_from_env(&client);
+        let local_args = local_acp_args_from_env();
+        let local_bin = local_acp_binary_from_env();
         Self::Local {
             client,
             agent_name,
@@ -188,6 +186,17 @@ impl AcpConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| default_tool_name_for_client(self.client().as_str()))
+    }
+
+    fn needs_prompt_history(&self) -> bool {
+        matches!(
+            self,
+            Self::Local {
+                client: AcpRemoteClient::Remi,
+                local_bin: None,
+                ..
+            } | Self::Remote { .. }
+        )
     }
 }
 
@@ -315,6 +324,7 @@ struct AcpToolTask {
     session_id: String,
     sub_session_id: String,
     handle: JoinHandle<Result<AcpToolResponse>>,
+    cancel_tx: Option<oneshot::Sender<()>>,
 }
 
 impl AcpBackend {
@@ -452,13 +462,17 @@ impl AcpBackend {
             .cloned()
             .with_context(|| format!("ACP session not found: {session_id}"))?;
 
-        let prompt = build_prompt_with_recent_summaries(
-            &self.config,
-            &store,
-            &session_id,
-            &record.transcript,
-            &message,
-        );
+        let prompt = if self.config.needs_prompt_history() {
+            build_prompt_with_recent_summaries(
+                &self.config,
+                &store,
+                &session_id,
+                &record.transcript,
+                &message,
+            )
+        } else {
+            message.clone()
+        };
 
         tracing::info!(
             acp_session_id = %session_id,
@@ -569,7 +583,8 @@ impl AcpBackend {
         &self,
         prepared: PreparedToolTurn,
         event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
-        _decision_rx: Option<mpsc::UnboundedReceiver<AcpApprovalDecision>>,
+        decision_rx: Option<mpsc::UnboundedReceiver<AcpApprovalDecision>>,
+        cancel_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<AcpToolResponse> {
         let started = Instant::now();
         tracing::info!(
@@ -594,6 +609,8 @@ impl AcpBackend {
                         &prepared.prompt,
                         local_args,
                         event_tx,
+                        decision_rx,
+                        cancel_rx,
                     )
                     .await
                 } else {
@@ -623,6 +640,8 @@ impl AcpBackend {
                     &prepared.prompt,
                     local_args,
                     event_tx,
+                    decision_rx,
+                    cancel_rx,
                 )
                 .await
             }
@@ -715,6 +734,12 @@ impl AcpBackend {
             (None, None)
         };
         let backend = Arc::clone(self);
+        let (cancel_tx, cancel_rx) = if self.uses_inprocess_local_runner() {
+            (None, None)
+        } else {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        };
         let handle = if self.uses_inprocess_local_runner() {
             drop(event_tx);
             tokio::task::spawn_blocking(move || {
@@ -724,7 +749,12 @@ impl AcpBackend {
         } else {
             tokio::spawn(async move {
                 backend
-                    .run_prepared_streaming_tool_turn(prepared, Some(event_tx), decision_rx)
+                    .run_prepared_streaming_tool_turn(
+                        prepared,
+                        Some(event_tx),
+                        decision_rx,
+                        cancel_rx,
+                    )
                     .await
             })
         };
@@ -734,6 +764,7 @@ impl AcpBackend {
                 session_id: session_id.clone(),
                 sub_session_id: sub_session_id.clone(),
                 handle,
+                cancel_tx,
             },
         );
 
@@ -747,7 +778,13 @@ impl AcpBackend {
     }
 
     fn approval_decisions_supported(&self) -> bool {
-        false
+        matches!(
+            &self.config,
+            AcpConfig::Local {
+                local_bin: Some(_),
+                ..
+            }
+        )
     }
 
     fn uses_inprocess_local_runner(&self) -> bool {
@@ -842,7 +879,13 @@ impl AcpBackend {
         let Some(task) = self.tool_tasks.lock().await.remove(task_id) else {
             return false;
         };
-        task.handle.abort();
+        if let Some(cancel_tx) = task.cancel_tx {
+            if cancel_tx.send(()).is_err() {
+                task.handle.abort();
+            }
+        } else {
+            task.handle.abort();
+        }
         true
     }
 
@@ -971,6 +1014,8 @@ impl AcpBackend {
                             prompt,
                             local_args,
                             event_tx,
+                            None,
+                            None,
                         )
                         .await;
                     }
@@ -1023,6 +1068,8 @@ impl AcpBackend {
                         prompt,
                         local_args,
                         event_tx,
+                        None,
+                        None,
                     )
                     .await
                 }
@@ -1108,28 +1155,10 @@ async fn invoke_remote_http(
     Ok(text)
 }
 
-fn local_acp_binary_from_env(client: &AcpRemoteClient) -> Option<String> {
+fn local_acp_binary_from_env() -> Option<String> {
     std::env::var("REMI_ACP_LOCAL_BIN")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            if client.is_codex()
-                && (std::env::var("REMI_ACP_CODEX_BIN")
-                    .ok()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-                    || std::env::var("REMI_ACP_CODEX_ARGS")
-                        .ok()
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false))
-            {
-                std::env::current_exe()
-                    .ok()
-                    .map(|path| path.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        })
 }
 
 fn local_acp_binary_available(bin: &str) -> bool {
@@ -1140,13 +1169,13 @@ fn local_acp_binary_available(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn local_acp_args_from_env(client: &AcpRemoteClient) -> Vec<String> {
+fn local_acp_args_from_env() -> Vec<String> {
     let Ok(value) = std::env::var("REMI_ACP_LOCAL_ARGS") else {
-        return legacy_codex_adapter_args_from_env(client);
+        return Vec::new();
     };
     let value = value.trim();
     if value.is_empty() {
-        return legacy_codex_adapter_args_from_env(client);
+        return Vec::new();
     }
     match serde_json::from_str::<Vec<String>>(value) {
         Ok(args) => args,
@@ -1160,51 +1189,6 @@ fn local_acp_args_from_env(client: &AcpRemoteClient) -> Vec<String> {
     }
 }
 
-fn legacy_codex_adapter_args_from_env(client: &AcpRemoteClient) -> Vec<String> {
-    if !client.is_codex() {
-        return Vec::new();
-    }
-    let codex_bin = std::env::var("REMI_ACP_CODEX_BIN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let codex_args = string_array_env("REMI_ACP_CODEX_ARGS");
-    if codex_bin.is_none() && codex_args.is_empty() {
-        return Vec::new();
-    }
-    let mut args = vec!["acp-adapter".to_string(), "codex".to_string()];
-    if let Some(bin) = codex_bin {
-        args.push("--bin".to_string());
-        args.push(bin);
-    }
-    for arg in codex_args {
-        args.push("--arg".to_string());
-        args.push(arg);
-    }
-    args
-}
-
-fn string_array_env(key: &str) -> Vec<String> {
-    let Ok(value) = std::env::var(key) else {
-        return Vec::new();
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return Vec::new();
-    }
-    match serde_json::from_str::<Vec<String>>(value) {
-        Ok(args) => args,
-        Err(err) => {
-            tracing::warn!(
-                key,
-                error = %err,
-                "ignoring invalid string array env; expected JSON string array"
-            );
-            Vec::new()
-        }
-    }
-}
-
 async fn invoke_local_acp_stdio(
     program: &str,
     session_id: &str,
@@ -1212,6 +1196,8 @@ async fn invoke_local_acp_stdio(
     message: &str,
     configured_startup_args: &[String],
     event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
+    decision_rx: Option<mpsc::UnboundedReceiver<AcpApprovalDecision>>,
+    cancel_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<AcpInvocationResult> {
     let started = Instant::now();
     let cwd = std::env::current_dir().context("failed to resolve current directory for ACP")?;
@@ -1230,8 +1216,58 @@ async fn invoke_local_acp_stdio(
     let prompt_text = message.to_string();
     let remi_session_id = session_id.to_string();
     let external_session_id = external_session_id.map(str::to_string);
+    let approvals_enabled = event_tx.is_some() && decision_rx.is_some();
+    let pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ToolApprovalDecision>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let decision_dispatch = decision_rx.map(|mut decisions| {
+        let pending_approvals = Arc::clone(&pending_approvals);
+        tokio::spawn(async move {
+            while let Some(decision) = decisions.recv().await {
+                if let Some(reply) = pending_approvals.lock().await.remove(&decision.approval_id) {
+                    let _ = reply.send(decision.decision);
+                }
+            }
+        })
+    });
+    let cancel_pending_approvals = Arc::clone(&pending_approvals);
     let result = Client
         .builder()
+        .on_receive_request(
+            {
+                let event_tx = event_tx.clone();
+                let pending_approvals = Arc::clone(&pending_approvals);
+                async move |request: RequestPermissionRequest, responder, _connection| {
+                    let approval_id = Uuid::new_v4().to_string();
+                    let decision = if approvals_enabled {
+                        let event_tx = event_tx
+                            .as_ref()
+                            .expect("checked before enabling approvals");
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        pending_approvals
+                            .lock()
+                            .await
+                            .insert(approval_id.clone(), reply_tx);
+                        let approval = acp_permission_approval(&request, approval_id.clone());
+                        if event_tx
+                            .send(AcpToolTaskEvent::ApprovalRequested(approval))
+                            .is_ok()
+                        {
+                            reply_rx.await.ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    pending_approvals.lock().await.remove(&approval_id);
+                    responder.respond(RequestPermissionResponse::new(acp_permission_outcome(
+                        &request.options,
+                        decision,
+                    )))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(
             agent,
             |connection: agent_client_protocol::ConnectionTo<Agent>| async move {
@@ -1264,9 +1300,39 @@ async fn invoke_local_acp_stdio(
                     };
                 session.send_prompt(prompt_text)?;
                 let mut output = String::new();
+                let mut cancel_rx = cancel_rx;
                 loop {
+                    let message = if let Some(mut cancel) = cancel_rx.take() {
+                        tokio::select! {
+                            result = &mut cancel => {
+                                if result.is_ok() {
+                                    cancel_pending_approvals.lock().await.clear();
+                                    connection.send_notification(CancelNotification::new(
+                                        actual_external_session_id.clone(),
+                                    ))?;
+                                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                                        while let Ok(update) = session.read_update().await {
+                                            if matches!(update, SessionMessage::StopReason(_)) {
+                                                break;
+                                            }
+                                        }
+                                    }).await;
+                                    return Err(agent_client_protocol::util::internal_error(
+                                        "ACP task cancelled",
+                                    ));
+                                }
+                                continue;
+                            }
+                            update = session.read_update() => {
+                                cancel_rx = Some(cancel);
+                                update?
+                            }
+                        }
+                    } else {
+                        session.read_update().await?
+                    };
                     let stopped = handle_external_acp_session_message(
-                        session.read_update().await?,
+                        message,
                         &actual_external_session_id,
                         &mut output,
                         event_tx.as_ref(),
@@ -1294,8 +1360,11 @@ async fn invoke_local_acp_stdio(
                 })
             },
         )
-        .await
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        .await;
+    if let Some(dispatch) = decision_dispatch {
+        dispatch.abort();
+    }
+    let result = result.map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let text = result.reply.trim().to_string();
     if text.is_empty() {
         anyhow::bail!("external ACP agent completed without a readable final message");
@@ -1312,6 +1381,51 @@ async fn invoke_local_acp_stdio(
         reply: text,
         external_session_id: result.external_session_id,
     })
+}
+
+fn acp_permission_approval(request: &RequestPermissionRequest, id: String) -> ToolApprovalRequest {
+    let title = request
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .unwrap_or("Codex tool call");
+    ToolApprovalRequest {
+        id,
+        session_id: request.session_id.to_string(),
+        run_id: String::new(),
+        tool_call_id: request.tool_call.tool_call_id.to_string(),
+        tool_name: "codex_acp".to_string(),
+        risk: ToolRiskLevel::High,
+        args_summary: title.to_string(),
+        command_key: None,
+        model_review_reason: None,
+        platform: None,
+        app_id: None,
+        review: None,
+    }
+}
+
+fn acp_permission_outcome(
+    options: &[PermissionOption],
+    decision: Option<ToolApprovalDecision>,
+) -> RequestPermissionOutcome {
+    let desired = match decision {
+        Some(
+            ToolApprovalDecision::AllowOnce
+            | ToolApprovalDecision::AllowSameCommandSession
+            | ToolApprovalDecision::AllowRiskLevelSession,
+        ) => PermissionOptionKind::AllowOnce,
+        Some(ToolApprovalDecision::Deny) => PermissionOptionKind::RejectOnce,
+        None => return RequestPermissionOutcome::Cancelled,
+    };
+    let option = options.iter().find(|option| option.kind == desired);
+    match option {
+        Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            option.option_id.clone(),
+        )),
+        None => RequestPermissionOutcome::Cancelled,
+    }
 }
 
 async fn handle_external_acp_session_message(
@@ -1642,17 +1756,31 @@ fn extract_text_from_response(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        invoke_local_acp_stdio, invoke_local_stub, AcpBackend, AcpConfig, AcpRemoteClient,
-        AcpToolRequest, AcpToolTaskEvent,
+        invoke_local_acp_stdio, invoke_local_stub, AcpApprovalDecision, AcpBackend, AcpConfig,
+        AcpRemoteClient, AcpToolRequest, AcpToolTaskEvent,
     };
+    use crate::approval::{ToolApprovalDecision, ToolRiskLevel};
     use anyhow::Result;
     use std::future::Future;
     use std::io::Write;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     static ACP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn external_acp_owns_its_session_history() {
+        let official = AcpConfig::Local {
+            client: AcpRemoteClient::Other("codex".to_string()),
+            agent_name: "default".to_string(),
+            local_args: Vec::new(),
+            local_bin: Some("codex-acp".to_string()),
+        };
+        assert!(!official.needs_prompt_history());
+    }
 
     fn with_acp_client_env<T>(client: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = ACP_ENV_LOCK
@@ -1662,8 +1790,6 @@ mod tests {
             "REMI_ACP_CLIENT",
             "REMI_ACP_LOCAL_BIN",
             "REMI_ACP_LOCAL_ARGS",
-            "REMI_ACP_CODEX_BIN",
-            "REMI_ACP_CODEX_ARGS",
         ]
         .into_iter()
         .map(|key| (key, std::env::var(key).ok()))
@@ -1675,8 +1801,6 @@ mod tests {
             }
             std::env::remove_var("REMI_ACP_LOCAL_BIN");
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
-            std::env::remove_var("REMI_ACP_CODEX_BIN");
-            std::env::remove_var("REMI_ACP_CODEX_ARGS");
         }
         let result = f();
         unsafe {
@@ -1944,6 +2068,8 @@ for raw in sys.stdin:
             "hello stdio",
             &[],
             Some(tx),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1956,6 +2082,263 @@ for raw in sys.stdin:
         assert!(
             matches!(rx.recv().await.unwrap(), AcpToolTaskEvent::Delta(text) if text == "external saw: hello stdio")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_external_acp_permission_uses_decision_channel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("permission-acp-agent.py");
+        std::fs::write(
+            &bin_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+session_id = "permission-session"
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": 1, "agentCapabilities": {"loadSession": True}
+        }}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id,
+            "result": {"sessionId": session_id}}), flush=True)
+    elif method == "session/prompt":
+        prompt_id = request_id
+        print(json.dumps({"jsonrpc": "2.0", "id": 100,
+            "method": "session/request_permission", "params": {
+                "sessionId": session_id,
+                "toolCall": {"toolCallId": "tool-1", "title": "Run test command"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
+                ]
+            }}), flush=True)
+    elif request_id == 100 and "result" in msg:
+        outcome = msg["result"]["outcome"]
+        selected = outcome.get("optionId", outcome["outcome"])
+        print(json.dumps({"jsonrpc": "2.0", "method": "sessionUpdate", "params": {
+            "sessionId": session_id, "update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": selected}}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": prompt_id,
+            "result": {"stopReason": "end_turn"}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel();
+        let program = bin_path.to_string_lossy().to_string();
+        let invocation = tokio::spawn(async move {
+            invoke_local_acp_stdio(
+                &program,
+                "remi-session",
+                None,
+                "run",
+                &[],
+                Some(event_tx),
+                Some(decision_rx),
+                None,
+            )
+            .await
+        });
+        let approval = match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AcpToolTaskEvent::ApprovalRequested(approval) => approval,
+            other => panic!("expected approval request, got {other:?}"),
+        };
+        assert_eq!(approval.tool_call_id, "tool-1");
+        assert_eq!(approval.risk, ToolRiskLevel::High);
+        assert_eq!(approval.args_summary, "Run test command");
+        decision_tx
+            .send(AcpApprovalDecision {
+                approval_id: approval.id,
+                decision: ToolApprovalDecision::AllowOnce,
+            })
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), invocation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.reply, "allow");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke_local_acp_stdio(
+                &bin_path.to_string_lossy(),
+                "remi-session-2",
+                None,
+                "run",
+                &[],
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled.reply, "cancelled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_external_acp_cancel_sends_protocol_notification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("cancel-acp-agent.py");
+        let marker = dir.path().join("cancelled.txt");
+        std::fs::write(
+            &bin_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+prompt_id = None
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    method = msg.get("method")
+    request_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": 1, "agentCapabilities": {"loadSession": True}
+        }}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id,
+            "result": {"sessionId": "cancel-session"}}), flush=True)
+    elif method == "session/prompt":
+        prompt_id = request_id
+        print(json.dumps({"jsonrpc": "2.0", "method": "sessionUpdate", "params": {
+            "sessionId": "cancel-session", "update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ready"}}
+        }}), flush=True)
+    elif method == "session/cancel":
+        with open(sys.argv[1], "w", encoding="utf-8") as marker:
+            marker.write(msg["params"]["sessionId"])
+        print(json.dumps({"jsonrpc": "2.0", "id": prompt_id,
+            "result": {"stopReason": "cancelled"}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).unwrap();
+
+        let mut backend = Arc::new(AcpBackend::new(dir.path().to_path_buf(), None));
+        Arc::get_mut(&mut backend).unwrap().config = AcpConfig::Local {
+            client: AcpRemoteClient::Other("codex".to_string()),
+            agent_name: "default".to_string(),
+            local_args: vec![marker.to_string_lossy().to_string()],
+            local_bin: Some(bin_path.to_string_lossy().to_string()),
+        };
+        let prepared = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "run".to_string(),
+                session_id: None,
+                title: None,
+                current_channel: None,
+                startup_args: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut spawned = backend.spawn_prepared_tool_turn_with_events(prepared).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), spawned.events.recv())
+                .await
+                .unwrap(),
+            Some(AcpToolTaskEvent::Delta(text)) if text == "ready"
+        ));
+        assert!(backend.abort_tool_task(&spawned.task_id).await);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "cancel-session");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires an installed codex-acp and Codex login"]
+    async fn official_codex_acp_resumes_across_processes() {
+        let program = std::env::var("REMI_CODEX_ACP_SMOKE_BIN")
+            .expect("set REMI_CODEX_ACP_SMOKE_BIN to the codex-acp executable");
+        let dir = tempdir().unwrap();
+        let mut backend = AcpBackend::new(dir.path().to_path_buf(), None);
+        backend.config = AcpConfig::Local {
+            client: AcpRemoteClient::Other("codex".to_string()),
+            agent_name: "default".to_string(),
+            local_args: Vec::new(),
+            local_bin: Some(program),
+        };
+        let first_message = "Reply with OK. Do not use tools or change files.";
+        let first = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: first_message.to_string(),
+                session_id: None,
+                title: None,
+                current_channel: None,
+                startup_args: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.prompt, first_message);
+        let remi_session_id = first.session_id.clone();
+        assert!(!backend
+            .run_prepared_tool_turn(first)
+            .await
+            .unwrap()
+            .reply
+            .is_empty());
+        let external_session_id = backend
+            .store
+            .lock()
+            .await
+            .sessions
+            .get(&remi_session_id)
+            .unwrap()
+            .external_session_id
+            .clone()
+            .unwrap();
+
+        let second_message = "Reply with DONE. Do not use tools or change files.";
+        let second = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: second_message.to_string(),
+                session_id: Some(remi_session_id.clone()),
+                title: None,
+                current_channel: None,
+                startup_args: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.prompt, second_message);
+        assert_eq!(
+            second.external_session_id.as_deref(),
+            Some(external_session_id.as_str())
+        );
+        assert!(!backend
+            .run_prepared_tool_turn(second)
+            .await
+            .unwrap()
+            .reply
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -2209,8 +2592,7 @@ for raw in sys.stdin:
         let response = completed
             .response
             .expect("completed task should include response");
-        assert!(response.reply.contains("slow external saw: ACP agent"));
-        assert!(response.reply.contains("hello slow external"));
+        assert_eq!(response.reply, "slow external saw: hello slow external");
 
         let store = backend.store.lock().await;
         let record = store.sessions.get(&response.session_id).unwrap();
@@ -2242,51 +2624,6 @@ for raw in sys.stdin:
                 AcpRemoteClient::Other("codex".to_string())
             );
         });
-    }
-
-    #[test]
-    fn local_codex_uses_legacy_codex_env_as_adapter_config() {
-        with_acp_env(
-            &[
-                ("REMI_ACP_CLIENT", Some("codex")),
-                ("REMI_ACP_MODE", Some("local")),
-                ("REMI_ACP_LOCAL_BIN", None),
-                ("REMI_ACP_LOCAL_ARGS", None),
-                ("REMI_ACP_CODEX_BIN", Some("/usr/local/bin/codex")),
-                (
-                    "REMI_ACP_CODEX_ARGS",
-                    Some(r#"["--config","model=\"gpt-5-codex\""]"#),
-                ),
-            ],
-            || {
-                let config = AcpConfig::from_env();
-                match config {
-                    AcpConfig::Local {
-                        client,
-                        local_bin,
-                        local_args,
-                        ..
-                    } => {
-                        assert_eq!(client, AcpRemoteClient::Other("codex".to_string()));
-                        assert!(local_bin.is_some());
-                        assert_eq!(
-                            local_args,
-                            vec![
-                                "acp-adapter".to_string(),
-                                "codex".to_string(),
-                                "--bin".to_string(),
-                                "/usr/local/bin/codex".to_string(),
-                                "--arg".to_string(),
-                                "--config".to_string(),
-                                "--arg".to_string(),
-                                "model=\"gpt-5-codex\"".to_string(),
-                            ]
-                        );
-                    }
-                    other => panic!("expected local config, got {other:?}"),
-                }
-            },
-        );
     }
 
     #[test]

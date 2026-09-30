@@ -6,7 +6,8 @@ use anyhow::Context;
 
 use bot_core::{
     install_embedded_agent_profiles, install_embedded_model_profiles,
-    validate_model_profile_api_key, AgentProfile, AgentRegistry, ModelProfileRegistry,
+    validate_model_profile_api_key, AgentProfile, AgentRegistry, ModelProfileConfig,
+    ModelProfileRegistry,
     WorkflowDefinition,
 };
 
@@ -101,6 +102,7 @@ pub enum ProfileCommand {
         format: String,
     },
     Channel(ProfileChannelCommand),
+    Model(ProfileModelCommand),
     Create {
         name: String,
         entries: Vec<String>,
@@ -145,6 +147,25 @@ pub enum ProfileChannelCommand {
         reference: String,
         id: String,
         force: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileModelCommand {
+    Show {
+        reference: String,
+        id: Option<String>,
+        format: String,
+    },
+    Set {
+        reference: String,
+        id: Option<String>,
+        model: Option<String>,
+        context_tokens: Option<u32>,
+        max_output_tokens: Option<u32>,
+        overflow_bytes: Option<usize>,
+        context_compaction: Option<String>,
+        dry_run: bool,
     },
 }
 
@@ -368,6 +389,7 @@ pub async fn run_profile_command(
             print_instance_statuses(&statuses, format)?;
         }
         ProfileCommand::Channel(command) => run_profile_channel_command(command, &registry)?,
+        ProfileCommand::Model(command) => run_profile_model_command(command, &registry)?,
         ProfileCommand::Create { name, entries } => {
             eprintln!("Warning: `profile create` is deprecated; use `profile init`, `profile register`, and `setup --profile`.");
             let profile = InstanceProfile::named_in_data_root(name, data_root)?;
@@ -391,15 +413,10 @@ pub async fn run_profile_command(
         }
         ProfileCommand::Resource(command) => run_profile_resource_command(command, &registry)?,
         ProfileCommand::Registry(command) => run_profile_registry_command(command, &mut registry)?,
-        ProfileCommand::Agent(command) => {
-            eprintln!(
-                "Warning: `profile agent` is deprecated; use the agent command with --profile."
-            );
-            run_profile_agent_command(command, data_root).await?
-        }
+        ProfileCommand::Agent(command) => run_profile_agent_command(command, &registry).await?,
         ProfileCommand::Workflow(command) => {
             eprintln!("Warning: `profile workflow` is deprecated; use `workflow --profile`.");
-            run_profile_workflow_command(command, data_root)?
+            run_profile_workflow_command(command, &registry)?
         }
     }
     Ok(())
@@ -563,6 +580,127 @@ fn run_profile_channel_command(
             }
             crate::runtime_config::write_channels_config_at(&profile.channels_config, &config)?;
             println!("Removed channel `{id}` from {}.", profile.manifest.id);
+        }
+    }
+    Ok(())
+}
+
+fn model_profile_file(models_dir: &Path, id: &str) -> anyhow::Result<PathBuf> {
+    let registry = ModelProfileRegistry::load(models_dir)?;
+    anyhow::ensure!(registry.get(id).is_some(), "model profile `{id}` not found");
+    for entry in std::fs::read_dir(models_dir)? {
+        let path = entry?.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let profile: ModelProfileConfig = serde_yaml::from_str(&raw)?;
+        if profile.id == id {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("model profile `{id}` has no source file in {}", models_dir.display())
+}
+
+fn run_profile_model_command(
+    command: &ProfileModelCommand,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<()> {
+    let (reference, id) = match command {
+        ProfileModelCommand::Show { reference, id, .. }
+        | ProfileModelCommand::Set { reference, id, .. } => (reference, id),
+    };
+    let profile = registry.resolve(reference)?;
+    let id = match id {
+        Some(id) => id.clone(),
+        None => crate::runtime_config::load_runtime_config_at(
+            &profile.runtime_config,
+            &profile.data_dir,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime config is missing; provide a model ID explicitly or initialize {}",
+                profile.runtime_config.display()
+            )
+        })?
+        .model_profile,
+    };
+    let path = model_profile_file(&profile.models_dir, &id)?;
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading model profile {}", path.display()))?;
+    match command {
+        ProfileModelCommand::Show { format, .. } => {
+            if format == "json" {
+                let model: ModelProfileConfig = serde_yaml::from_str(&raw)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "source_file": path,
+                        "model_profile": model,
+                    }))?
+                );
+            } else {
+                print!("{raw}");
+                if !raw.ends_with('\n') {
+                    println!();
+                }
+                eprintln!("Model file: {}", path.display());
+            }
+        }
+        ProfileModelCommand::Set {
+            model,
+            context_tokens,
+            max_output_tokens,
+            overflow_bytes,
+            context_compaction,
+            dry_run,
+            ..
+        } => {
+            anyhow::ensure!(
+                model.is_some()
+                    || context_tokens.is_some()
+                    || max_output_tokens.is_some()
+                    || overflow_bytes.is_some()
+                    || context_compaction.is_some(),
+                "provide at least one model field to set"
+            );
+            let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)?;
+            let fields = document
+                .as_mapping_mut()
+                .ok_or_else(|| anyhow::anyhow!("model profile YAML must be a mapping"))?;
+            let mut set_field = |key: &str, value: serde_yaml::Value| {
+                fields.insert(serde_yaml::Value::String(key.to_string()), value);
+            };
+            if let Some(value) = model {
+                set_field("model", serde_yaml::Value::String(value.clone()));
+            }
+            if let Some(value) = context_tokens {
+                set_field("context_tokens", serde_yaml::to_value(value)?);
+            }
+            if let Some(value) = max_output_tokens {
+                set_field("max_output_tokens", serde_yaml::to_value(value)?);
+            }
+            if let Some(value) = overflow_bytes {
+                set_field("overflow_bytes", serde_yaml::to_value(value)?);
+            }
+            if let Some(value) = context_compaction {
+                set_field("context_compaction", serde_yaml::Value::String(value.clone()));
+            }
+            let updated: ModelProfileConfig = serde_yaml::from_value(document.clone())?;
+            updated.validate().with_context(|| {
+                "model changes were not saved; when lowering context_tokens, also set a smaller max_output_tokens"
+            })?;
+            anyhow::ensure!(updated.id == id, "model profile id changed unexpectedly");
+            let serialized = serde_yaml::to_string(&document)?;
+            if *dry_run {
+                print!("{serialized}");
+                eprintln!("Dry run; model file was not changed: {}", path.display());
+            } else {
+                crate::atomic_file::write(&path, serialized.as_bytes())
+                    .with_context(|| format!("replacing model profile {}", path.display()))?;
+                println!("Saved model profile `{id}` to {}", path.display());
+                println!("Local validation: OK. Restart a running instance to apply the change.");
+            }
         }
     }
     Ok(())
@@ -1039,18 +1177,22 @@ fn profile_check_issues(profile: &InstanceProfile) -> (Vec<String>, Vec<String>)
             &profile.data_dir,
         ) {
             Ok(Some(config)) => {
-                if let Ok(agents) = AgentRegistry::load(&profile.agents_dir) {
-                    if agents.get(&config.root_agent_id).is_none() {
+                match AgentRegistry::load(&profile.agents_dir) {
+                    Ok(agents) if agents.get(&config.root_agent_id).is_none() => {
                         errors.push(format!("root agent `{}` not found", config.root_agent_id));
                     }
+                    Err(err) => errors.push(format!("invalid agent definitions: {err:#}")),
+                    _ => {}
                 }
-                if let Ok(models) = ModelProfileRegistry::load(&profile.models_dir) {
-                    if models.get(&config.model_profile).is_none() {
+                match ModelProfileRegistry::load(&profile.models_dir) {
+                    Ok(models) if models.get(&config.model_profile).is_none() => {
                         errors.push(format!(
                             "model profile `{}` not found",
                             config.model_profile
                         ));
                     }
+                    Err(err) => errors.push(format!("invalid model profiles: {err:#}")),
+                    _ => {}
                 }
             }
             Ok(None) => warnings.push(format!(
@@ -1502,26 +1644,13 @@ fn run_profile_registry_command(
     Ok(())
 }
 
-fn profile_from_label(label: &str, data_root: &Path) -> anyhow::Result<InstanceProfile> {
-    if label.ends_with(".yaml")
-        || label.ends_with(".yml")
-        || label.contains('/')
-        || label.contains('\\')
-        || Path::new(label).is_dir()
-    {
-        InstanceProfile::from_manifest(label)
-    } else {
-        InstanceProfile::from_label_in_data_root(label, data_root)
-    }
-}
-
 async fn run_profile_agent_command(
     command: &ProfileAgentCommand,
-    data_root: &Path,
+    registry: &ProfileRegistry,
 ) -> anyhow::Result<()> {
     match command {
         ProfileAgentCommand::List { profile } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let registry = AgentRegistry::load(&profile.agents_dir)?;
             println!("ID\tNAME\tMODEL\tTOOLS\tDESCRIPTION");
@@ -1539,7 +1668,7 @@ async fn run_profile_agent_command(
             }
         }
         ProfileAgentCommand::Show { profile, agent_id } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let registry = AgentRegistry::load(&profile.agents_dir)?;
             let agent = registry
@@ -1548,7 +1677,7 @@ async fn run_profile_agent_command(
             print_agent(agent);
         }
         ProfileAgentCommand::Upsert { profile, path } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let markdown = read_cli_input(path)?;
             let parsed = AgentProfile::from_markdown(&markdown)?;
@@ -1566,7 +1695,7 @@ async fn run_profile_agent_command(
             );
         }
         ProfileAgentCommand::SetDefault { profile, agent_id } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let registry = AgentRegistry::load(&profile.agents_dir)?;
             if registry.get(agent_id).is_none() {
@@ -1590,11 +1719,11 @@ async fn run_profile_agent_command(
 
 fn run_profile_workflow_command(
     command: &ProfileWorkflowCommand,
-    data_root: &Path,
+    registry: &ProfileRegistry,
 ) -> anyhow::Result<()> {
     match command {
         ProfileWorkflowCommand::List { profile } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             println!("ID\tNAME\tNODES\tEDGES\tDESCRIPTION");
             println!("goal\tGoal\t2\t1\tEmbedded goal workflow");
@@ -1615,7 +1744,7 @@ fn run_profile_workflow_command(
             profile,
             workflow_id,
         } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let workflow = if workflow_id == "goal" {
                 bot_core::supervisor_workflow::embedded_goal_definition()
@@ -1625,7 +1754,7 @@ fn run_profile_workflow_command(
             print_workflow(&workflow)?;
         }
         ProfileWorkflowCommand::Upsert { profile, path } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             ensure_profile_assets(&profile)?;
             let raw = read_cli_input(path)?;
             let workflow: WorkflowDefinition =
@@ -1656,7 +1785,7 @@ fn run_profile_workflow_command(
             profile,
             workflow_id,
         } => {
-            let profile = profile_from_label(profile, data_root)?;
+            let profile = registry.resolve(profile)?;
             let path = profile.workflows_dir.join(format!("{workflow_id}.json"));
             if !path.exists() {
                 anyhow::bail!("workflow `{workflow_id}` not found");
@@ -1953,6 +2082,9 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
     match key.as_str() {
         "root_agent_id" | "root_agent" | "agent" => config.root_agent_id = value.to_string(),
         "model_profile" | "model" => config.model_profile = value.to_string(),
+        "auto_compress_context_percent" | "context.auto_compress_percent" => {
+            config.auto_compress_context_percent = Some(parse_percent(value)?)
+        }
         "tool_output_overflow_bytes"
         | "tool_output.overflow_bytes"
         | "overflow_bytes"
@@ -2003,12 +2135,6 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         }
         "acp_local_args" | "acp.local_args" | "local.args" | "local_args" => {
             config.acp.local_args = parse_string_array(value)?
-        }
-        "acp_codex_bin" | "acp.codex_bin" | "codex.bin" | "codex_bin" => {
-            config.acp.codex_bin = nonempty_optional(value)
-        }
-        "acp_codex_args" | "acp.codex_args" | "codex.args" | "codex_args" => {
-            config.acp.codex_args = parse_string_array(value)?
         }
         "im_mode" | "im.mode" => config.im.mode = parse_im_mode(value)?,
         "feishu_transport" | "im_transport" | "im.transport" | "feishu.transport" => {
@@ -2287,5 +2413,129 @@ mod tests {
         assert!(profile.skills_dirs.iter().all(|path| path.is_dir()));
         assert!(profile_check_issues(&profile).0.is_empty());
         assert!(profile_check_issues(&profile).1.is_empty());
+    }
+
+    #[test]
+    fn profile_check_reports_invalid_model_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("invalid-model");
+        init_profile(
+            root.path(),
+            directory.to_str().unwrap(),
+            Some("test.invalid-model"),
+            Some("Invalid Model"),
+            "remi-cat",
+            None,
+            true,
+        )
+        .unwrap();
+        let profile = InstanceProfile::from_manifest(directory.join(PROFILE_FILE_NAME)).unwrap();
+        std::fs::write(profile.models_dir.join("broken.yaml"), "id: broken\ncontext_tokens: [\n")
+            .unwrap();
+
+        let (errors, _) = profile_check_issues(&profile);
+        assert!(
+            errors.iter().any(|error| error.contains("invalid model profiles")),
+            "expected the invalid model profile to be reported: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn model_set_rejects_invalid_budget_without_changing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("model-edit");
+        init_profile(
+            root.path(),
+            directory.to_str().unwrap(),
+            Some("test.model-edit"),
+            Some("Model Edit"),
+            "remi-cat",
+            None,
+            true,
+        )
+        .unwrap();
+        let reference = directory.join(PROFILE_FILE_NAME).display().to_string();
+        let registry = ProfileRegistry::load(root.path()).unwrap();
+        let profile = registry.resolve(&reference).unwrap();
+        let path = model_profile_file(&profile.models_dir, "default").unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let invalid = ProfileModelCommand::Set {
+            reference: reference.clone(),
+            id: Some("default".to_string()),
+            model: None,
+            context_tokens: Some(8192),
+            max_output_tokens: Some(16384),
+            overflow_bytes: None,
+            context_compaction: None,
+            dry_run: false,
+        };
+        assert!(run_profile_model_command(&invalid, &registry).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let valid = ProfileModelCommand::Set {
+            reference,
+            id: Some("default".to_string()),
+            model: None,
+            context_tokens: Some(65536),
+            max_output_tokens: Some(32768),
+            overflow_bytes: None,
+            context_compaction: None,
+            dry_run: false,
+        };
+        run_profile_model_command(&valid, &registry).unwrap();
+        let updated = ModelProfileRegistry::load(&profile.models_dir).unwrap();
+        let model = updated.get("default").unwrap();
+        assert_eq!(model.context_tokens, 65536);
+        assert_eq!(model.max_output_tokens, 32768);
+    }
+
+    #[test]
+    fn model_set_without_id_targets_runtime_selected_model() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("selected-model");
+        init_profile(
+            root.path(),
+            directory.to_str().unwrap(),
+            Some("test.selected-model"),
+            Some("Selected Model"),
+            "remi-cat",
+            None,
+            true,
+        )
+        .unwrap();
+        let reference = directory.join(PROFILE_FILE_NAME).display().to_string();
+        let registry = ProfileRegistry::load(root.path()).unwrap();
+        let profile = registry.resolve(&reference).unwrap();
+        let mut runtime = crate::runtime_config::load_runtime_config_at(
+            &profile.runtime_config,
+            &profile.data_dir,
+        )
+        .unwrap()
+        .unwrap();
+        runtime.model_profile = "gpt-4o".to_string();
+        crate::runtime_config::write_runtime_config_at(&profile.runtime_config, &runtime).unwrap();
+        let original_default = std::fs::read(profile.models_dir.join("default.yaml")).unwrap();
+
+        run_profile_model_command(
+            &ProfileModelCommand::Set {
+                reference,
+                id: None,
+                model: None,
+                context_tokens: Some(65536),
+                max_output_tokens: Some(8192),
+                overflow_bytes: None,
+                context_compaction: None,
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+        let models = ModelProfileRegistry::load(&profile.models_dir).unwrap();
+        assert_eq!(models.get("gpt-4o").unwrap().context_tokens, 65536);
+        assert_eq!(
+            std::fs::read(profile.models_dir.join("default.yaml")).unwrap(),
+            original_default
+        );
     }
 }

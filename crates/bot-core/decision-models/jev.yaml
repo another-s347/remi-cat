@@ -1,0 +1,5 @@
+id: jev
+base_url: https://api.typesafe.ai/v1
+model: jev-latest
+api_key_env: TYPESAFE_API_KEY
+timeout_ms: 5000

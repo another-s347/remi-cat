@@ -302,6 +302,8 @@ struct FileContent {
 #[derive(Debug, Deserialize)]
 struct RawSender {
     sender_id: RawSenderId,
+    #[serde(default)]
+    sender_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -668,6 +670,11 @@ impl FeishuGateway {
                     .open_id
                     .or(ev.sender.sender_id.user_id)
                     .unwrap_or_default();
+                if ev.sender.sender_type.as_deref() == Some("app")
+                    || bot_open_id.is_some_and(|id| id == sender_id) {
+                    debug!(message_id = %msg.message_id, "ignoring bot-authored Feishu message");
+                    return None;
+                }
                 let mentions = msg
                     .mentions
                     .iter()
@@ -907,8 +914,21 @@ impl FeishuGateway {
         self.client.send_card(chat_id, text).await
     }
 
+    /// Authenticate an outbound-only gateway without starting event intake.
+    pub async fn ensure_authenticated(&self) -> Result<()> {
+        self.client.ensure_authenticated().await
+    }
+
+    pub async fn send_card_with_uuid(&self, chat_id: &str, text: &str, uuid: &str) -> Result<String> {
+        self.client.send_card_with_uuid(chat_id, text, Some(uuid)).await
+    }
+
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
         self.client.reply_card(message_id, text).await
+    }
+
+    pub async fn reply_card_in_thread_with_uuid(&self, message_id: &str, text: &str, uuid: &str) -> Result<String> {
+        self.client.reply_card_in_thread_with_uuid(message_id, text, uuid).await
     }
 
     /// Reply to a message with a fully-built card JSON value.
@@ -1425,6 +1445,25 @@ mod tests {
             }
             other => panic!("expected message event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ignores_bot_authored_message_events() {
+        let event = |sender: serde_json::Value| json!({
+            "schema": "2.0",
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": sender,
+                "message": {
+                    "message_id": "om_bot", "chat_id": "oc_chat", "chat_type": "p2p",
+                    "message_type": "text", "content": "{\"text\":\"echo\"}", "mentions": []
+                }
+            }
+        });
+        let by_type = serde_json::to_vec(&event(json!({"sender_type": "app", "sender_id": {"open_id": "ou_bot"}}))).unwrap();
+        assert!(FeishuGateway::extract_event(&by_type, None).is_none());
+        let by_id = serde_json::to_vec(&event(json!({"sender_id": {"open_id": "ou_bot"}}))).unwrap();
+        assert!(FeishuGateway::extract_event(&by_id, Some("ou_bot")).is_none());
     }
 
     #[test]

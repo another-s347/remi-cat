@@ -142,7 +142,6 @@ impl Tool for WorkspaceBashTool {
                 ));
             }
             Ok(ToolResult::Output(stream! {
-                yield ToolOutput::Delta(format!("$ {}", command));
                 let started = Instant::now();
                 let cmd_preview = log_preview(&command, 160);
                 tracing::info!(

@@ -1336,6 +1336,12 @@ fn approval_details(request: &ToolApprovalRequest) -> String {
         details.push_str("\nReason: ");
         details.push_str(reason);
     }
+    if let Some(review) = &request.review {
+        if !review.reason.trim().is_empty() {
+            details.push_str("\nReview: ");
+            details.push_str(review.reason.trim());
+        }
+    }
     details
 }
 

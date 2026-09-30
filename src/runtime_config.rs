@@ -19,6 +19,10 @@ pub struct RuntimeConfig {
     pub data_dir: String,
     pub root_agent_id: String,
     pub model_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compress_context_percent: Option<u8>,
+    #[serde(default)]
+    pub experimental_jev_approval: ExperimentalJevApprovalConfig,
     #[serde(default)]
     pub tool_output: ToolOutputConfig,
     #[serde(default)]
@@ -35,6 +39,45 @@ pub struct RuntimeConfig {
     pub weaver_networks: Vec<WeaverNetworkConfig>,
     #[serde(default)]
     pub profile_hubs: Vec<ProfileHubConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExperimentalJevApprovalConfig {
+    pub enabled: bool,
+    pub profile: String,
+    /// 9900 means P(low) >= 0.99.
+    pub min_low_probability_bps: u16,
+}
+
+impl Default for ExperimentalJevApprovalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: "jev".into(),
+            min_low_probability_bps: 9900,
+        }
+    }
+}
+
+impl ExperimentalJevApprovalConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.profile.is_empty()
+            || !self
+                .profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            anyhow::bail!("experimental_jev_approval.profile must be a valid profile id");
+        }
+        if !(1..=10_000).contains(&self.min_low_probability_bps) {
+            anyhow::bail!("experimental_jev_approval.min_low_probability_bps must be 1..=10000");
+        }
+        Ok(())
+    }
 }
 
 /// One already-provisioned Weaver membership shared by any number of Hub entries.
@@ -249,11 +292,24 @@ pub struct RuntimeConfigResolution {
 }
 
 impl RuntimeConfig {
+    fn validate_auto_compress_context_percent(&self) -> Result<()> {
+        if matches!(self.auto_compress_context_percent, Some(0))
+            || self
+                .auto_compress_context_percent
+                .is_some_and(|percent| percent > 100)
+        {
+            anyhow::bail!("auto_compress_context_percent must be between 1 and 100");
+        }
+        Ok(())
+    }
+
     pub fn default_for(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.display().to_string(),
             root_agent_id: "default".to_string(),
             model_profile: "default".to_string(),
+            auto_compress_context_percent: None,
+            experimental_jev_approval: ExperimentalJevApprovalConfig::default(),
             tool_output: ToolOutputConfig::default(),
             sandbox: RuntimeSandboxConfig::default_for(data_dir),
             im: ImConfig::default(),
@@ -269,6 +325,22 @@ impl RuntimeConfig {
         set_env_if_absent("REMI_DATA_DIR", &self.data_dir);
         set_env_if_absent("REMI_AGENT_ID", &self.root_agent_id);
         set_env_if_absent("REMI_MODEL_PROFILE", &self.model_profile);
+        if let Some(percent) = self.auto_compress_context_percent {
+            set_env_if_absent("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", &percent.to_string());
+        }
+        if self.experimental_jev_approval.enabled {
+            set_env_if_absent(
+                "REMI_JEV_APPROVAL_PROFILE",
+                &self.experimental_jev_approval.profile,
+            );
+            set_env_if_absent(
+                "REMI_JEV_APPROVAL_MIN_LOW_BPS",
+                &self
+                    .experimental_jev_approval
+                    .min_low_probability_bps
+                    .to_string(),
+            );
+        }
         set_env_if_absent(
             "REMI_SENTRY_AGENT_TRACING",
             if self.telemetry.agent_tracing {
@@ -367,13 +439,11 @@ impl RuntimeConfig {
         {
             set_env_if_absent("REMI_ACP_AGENT_NAME", agent_name);
         }
-        let effective_local_bin = self.acp_effective_local_bin();
-        let effective_local_args = self.acp_effective_local_args();
-        if let Some(local_bin) = effective_local_bin.as_deref() {
+        if let Some(local_bin) = self.acp.local_bin.as_deref() {
             set_env_if_absent("REMI_ACP_LOCAL_BIN", local_bin);
         }
-        if !effective_local_args.is_empty() {
-            match serde_json::to_string(&effective_local_args) {
+        if !self.acp.local_args.is_empty() {
+            match serde_json::to_string(&self.acp.local_args) {
                 Ok(value) => set_env_if_absent("REMI_ACP_LOCAL_ARGS", &value),
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to serialize ACP local startup args")
@@ -387,6 +457,26 @@ impl RuntimeConfig {
         set_env("REMI_DATA_DIR", &self.data_dir);
         set_env("REMI_AGENT_ID", &self.root_agent_id);
         set_env("REMI_MODEL_PROFILE", &self.model_profile);
+        if let Some(percent) = self.auto_compress_context_percent {
+            set_env("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", &percent.to_string());
+        }
+        set_env_optional(
+            "REMI_JEV_APPROVAL_PROFILE",
+            self.experimental_jev_approval
+                .enabled
+                .then_some(self.experimental_jev_approval.profile.as_str()),
+        );
+        set_env_optional(
+            "REMI_JEV_APPROVAL_MIN_LOW_BPS",
+            self.experimental_jev_approval
+                .enabled
+                .then(|| {
+                    self.experimental_jev_approval
+                        .min_low_probability_bps
+                        .to_string()
+                })
+                .as_deref(),
+        );
         if let Some(overflow_bytes) = self.tool_output.overflow_bytes {
             set_env(
                 "REMI_TOOL_OUTPUT_OVERFLOW_BYTES",
@@ -436,66 +526,9 @@ impl RuntimeConfig {
         set_env_optional("REMI_ACP_MODEL", self.acp.model.as_deref());
         set_env_optional("REMI_ACP_API_KEY", self.acp.api_key.as_deref());
         set_env_optional("REMI_ACP_AGENT_NAME", self.acp.agent_name.as_deref());
-        let effective_local_bin = self.acp_effective_local_bin();
-        let effective_local_args = self.acp_effective_local_args();
-        set_env_optional("REMI_ACP_LOCAL_BIN", effective_local_bin.as_deref());
-        set_env_json_array("REMI_ACP_LOCAL_ARGS", &effective_local_args);
-        remove_env("REMI_ACP_CODEX_BIN");
-        remove_env("REMI_ACP_CODEX_ARGS");
+        set_env_optional("REMI_ACP_LOCAL_BIN", self.acp.local_bin.as_deref());
+        set_env_json_array("REMI_ACP_LOCAL_ARGS", &self.acp.local_args);
     }
-
-    fn acp_effective_local_bin(&self) -> Option<String> {
-        self.acp
-            .local_bin
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                if matches!(self.acp.client, AcpClient::Codex)
-                    && (self
-                        .acp
-                        .codex_bin
-                        .as_deref()
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false)
-                        || !self.acp.codex_args.is_empty())
-                {
-                    std::env::current_exe()
-                        .ok()
-                        .map(|path| path.to_string_lossy().to_string())
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn acp_effective_local_args(&self) -> Vec<String> {
-        if !self.acp.local_args.is_empty() {
-            return self.acp.local_args.clone();
-        }
-        if !matches!(self.acp.client, AcpClient::Codex)
-            || (self.acp.codex_bin.is_none() && self.acp.codex_args.is_empty())
-        {
-            return Vec::new();
-        }
-        codex_adapter_args(self.acp.codex_bin.clone(), &self.acp.codex_args)
-    }
-}
-
-fn codex_adapter_args(codex_bin: Option<String>, codex_args: &[String]) -> Vec<String> {
-    let mut args = vec!["acp-adapter".to_string(), "codex".to_string()];
-    if let Some(bin) = codex_bin
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        args.push("--bin".to_string());
-        args.push(bin);
-    }
-    for arg in codex_args {
-        args.push("--arg".to_string());
-        args.push(arg.clone());
-    }
-    args
 }
 
 pub fn resolve_runtime_config_for_run(
@@ -892,10 +925,6 @@ pub struct AcpConfig {
     pub local_bin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_bin: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub codex_args: Vec<String>,
 }
 
 impl Default for AcpConfig {
@@ -910,8 +939,6 @@ impl Default for AcpConfig {
             api_key: None,
             local_bin: None,
             local_args: Vec::new(),
-            codex_bin: None,
-            codex_args: Vec::new(),
         }
     }
 }
@@ -1040,6 +1067,8 @@ pub fn load_runtime_config_at(path: &Path, data_dir: &Path) -> Result<Option<Run
             .extract()
             .with_context(|| format!("loading runtime config {}", path.display()))?;
     config.telemetry.validate()?;
+    config.experimental_jev_approval.validate()?;
+    config.validate_auto_compress_context_percent()?;
     validate_weaver_networks(&config.weaver_networks)?;
     validate_profile_hubs(&config.profile_hubs)?;
     validate_profile_hub_network_refs(&config)?;
@@ -1084,6 +1113,7 @@ pub fn write_runtime_config(data_dir: &Path, config: &RuntimeConfig) -> Result<P
 
 pub fn write_runtime_config_at(path: &Path, config: &RuntimeConfig) -> Result<PathBuf> {
     config.telemetry.validate()?;
+    config.validate_auto_compress_context_percent()?;
     validate_weaver_networks(&config.weaver_networks)?;
     validate_profile_hubs(&config.profile_hubs)?;
     validate_profile_hub_network_refs(config)?;
@@ -1092,7 +1122,8 @@ pub fn write_runtime_config_at(path: &Path, config: &RuntimeConfig) -> Result<Pa
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let raw = serde_yaml::to_string(config).context("serializing runtime config")?;
-    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    crate::atomic_file::write(path, raw.as_bytes())
+        .with_context(|| format!("replacing runtime config {}", path.display()))?;
     Ok(path.to_path_buf())
 }
 
@@ -1223,6 +1254,28 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn experimental_jev_approval_is_opt_in_and_validated() {
+        let default = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        assert!(!default.experimental_jev_approval.enabled);
+        let raw = r#"
+data_dir: .remi-cat
+root_agent_id: default
+model_profile: default
+experimental_jev_approval:
+  enabled: true
+  profile: custom-jev
+  min_low_probability_bps: 9950
+"#;
+        let config: RuntimeConfig = serde_yaml::from_str(raw).unwrap();
+        assert!(config.experimental_jev_approval.enabled);
+        assert_eq!(config.experimental_jev_approval.profile, "custom-jev");
+        config.experimental_jev_approval.validate().unwrap();
+        let mut invalid = config.experimental_jev_approval;
+        invalid.min_low_probability_bps = 10_001;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn runtime_config_round_trip() {
         let dir =
             std::env::temp_dir().join(format!("remi-runtime-config-{}", uuid::Uuid::new_v4()));
@@ -1230,6 +1283,7 @@ mod tests {
             data_dir: dir.display().to_string(),
             root_agent_id: "default".into(),
             model_profile: "deepseek-v4-flash".into(),
+            auto_compress_context_percent: Some(75),
             tool_output: super::ToolOutputConfig {
                 overflow_bytes: Some(32_768),
                 foreground_timeout_ms: Some(15_000),
@@ -1239,15 +1293,48 @@ mod tests {
             im: Default::default(),
             shell: Default::default(),
             acp: Default::default(),
+            experimental_jev_approval: Default::default(),
             telemetry: Default::default(),
             weaver_networks: Default::default(),
             profile_hubs: Default::default(),
         };
-        cfg.acp.codex_args = vec!["--config".into(), "model=\"gpt-5-codex\"".into()];
+        cfg.acp.local_bin = Some("codex-acp".into());
+        cfg.acp.local_args = vec!["--some-acp-option".into()];
         write_runtime_config(&dir, &cfg).unwrap();
         let loaded = load_runtime_config(&dir).unwrap().unwrap();
         assert_eq!(loaded, cfg);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_compress_context_percent_must_be_within_one_to_one_hundred() {
+        let mut config = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        assert!(config.validate_auto_compress_context_percent().is_ok());
+        config.auto_compress_context_percent = Some(75);
+        assert!(config.validate_auto_compress_context_percent().is_ok());
+        config.auto_compress_context_percent = Some(0);
+        assert!(config.validate_auto_compress_context_percent().is_err());
+        config.auto_compress_context_percent = Some(101);
+        assert!(config.validate_auto_compress_context_percent().is_err());
+    }
+
+    #[test]
+    fn configured_auto_compress_context_percent_sets_runtime_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = std::env::var_os("REMI_AUTO_COMPRESS_CONTEXT_PERCENT");
+        let mut config = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        config.auto_compress_context_percent = Some(70);
+        config.apply_env_overrides();
+        assert_eq!(
+            std::env::var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT").unwrap(),
+            "70"
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", value),
+                None => std::env::remove_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT"),
+            }
+        }
     }
 
     #[test]
@@ -1440,11 +1527,11 @@ channels:
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
         }
         let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
-        cfg.acp.local_args = vec!["acp-adapter".into(), "codex".into()];
+        cfg.acp.local_args = vec!["--some-acp-option".into()];
         cfg.apply_env_defaults();
         assert_eq!(
             std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
-            r#"["acp-adapter","codex"]"#
+            r#"["--some-acp-option"]"#
         );
         unsafe {
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
@@ -1474,35 +1561,27 @@ channels:
     }
 
     #[test]
-    fn apply_env_overrides_maps_legacy_codex_config_to_local_adapter() {
+    fn apply_env_overrides_uses_configured_acp_process() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("REMI_ACP_LOCAL_BIN");
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
-            std::env::remove_var("REMI_ACP_CODEX_BIN");
-            std::env::remove_var("REMI_ACP_CODEX_ARGS");
         }
 
         let mut cfg = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
         cfg.acp.client = AcpClient::Codex;
-        cfg.acp.codex_bin = Some("/usr/local/bin/codex".to_string());
-        cfg.acp.codex_args = vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()];
+        cfg.acp.local_bin = Some("/usr/local/bin/codex-acp".to_string());
+        cfg.acp.local_args = vec!["--some-acp-option".to_string()];
         cfg.apply_env_overrides();
 
-        assert!(std::env::var("REMI_ACP_LOCAL_BIN").unwrap().contains(
-            std::env::current_exe()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-        ));
+        assert_eq!(
+            std::env::var("REMI_ACP_LOCAL_BIN").unwrap(),
+            "/usr/local/bin/codex-acp"
+        );
         assert_eq!(
             std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
-            r#"["acp-adapter","codex","--bin","/usr/local/bin/codex","--arg","--config","--arg","model=\"gpt-5-codex\""]"#
+            r#"["--some-acp-option"]"#
         );
-        assert!(std::env::var("REMI_ACP_CODEX_BIN").is_err());
-        assert!(std::env::var("REMI_ACP_CODEX_ARGS").is_err());
 
         unsafe {
             std::env::remove_var("REMI_ACP_LOCAL_BIN");
@@ -1517,7 +1596,6 @@ channels:
             std::env::set_var("REMI_ACP_CLIENT", "codex");
             std::env::set_var("REMI_ACP_TOOL_NAME", "old_acp");
             std::env::set_var("REMI_ACP_LOCAL_ARGS", r#"["old"]"#);
-            std::env::set_var("REMI_ACP_CODEX_ARGS", r#"["old"]"#);
             std::env::set_var("REMI_SHELL_MODE", "disabled");
             std::env::set_var("REMI_SANDBOX_KIND", "docker");
             std::env::set_var("REMI_IM_MODE", "feishu");
@@ -1534,7 +1612,6 @@ channels:
         cfg.acp.client = AcpClient::Remi;
         cfg.acp.tool_name = Some("e2e_acp".to_string());
         cfg.acp.local_args = vec!["hello".to_string(), "world".to_string()];
-        cfg.acp.codex_args.clear();
 
         cfg.apply_env_overrides();
 
@@ -1544,7 +1621,6 @@ channels:
             std::env::var("REMI_ACP_LOCAL_ARGS").unwrap(),
             r#"["hello","world"]"#
         );
-        assert!(std::env::var("REMI_ACP_CODEX_ARGS").is_err());
         assert_eq!(std::env::var("REMI_SHELL_MODE").unwrap(), "local");
         assert_eq!(std::env::var("REMI_SANDBOX_KIND").unwrap(), "no_sandbox");
         assert_eq!(std::env::var("REMI_IM_MODE").unwrap(), "disabled");
@@ -1561,7 +1637,6 @@ channels:
             std::env::remove_var("REMI_ACP_CLIENT");
             std::env::remove_var("REMI_ACP_TOOL_NAME");
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
-            std::env::remove_var("REMI_ACP_CODEX_ARGS");
             std::env::remove_var("REMI_SHELL_MODE");
             std::env::remove_var("REMI_SANDBOX_KIND");
             std::env::remove_var("REMI_IM_MODE");

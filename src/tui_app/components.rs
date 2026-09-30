@@ -760,12 +760,26 @@ impl HistoryCell {
             lines.push(Line::from(""));
             return lines;
         }
-        let title = if self.meta.is_empty() {
-            self.title.clone()
-        } else if self.status == ToolVisualStatus::Neutral {
-            format!("{} {}", self.title, self.meta)
+        let compact_bash = matches!(self.kind, CellKind::Tool { .. })
+            && self.title == "执行 bash"
+            && self.body.trim_start().starts_with("$ ")
+            && !self.body.contains('\n');
+        let display_title = if compact_bash {
+            format!("{} {}", self.title, self.body.trim())
         } else {
-            format!("{} · {} · {}", self.title, self.status.label(), self.meta)
+            self.title.clone()
+        };
+        let title = if self.meta.is_empty() {
+            display_title
+        } else if self.status == ToolVisualStatus::Neutral {
+            format!("{} {}", display_title, self.meta)
+        } else {
+            format!(
+                "{} · {} · {}",
+                display_title,
+                self.status.label(),
+                self.meta
+            )
         };
         let title_width = width.saturating_sub(HISTORY_GUTTER_WIDTH);
         let title = truncate_for_width(&sanitize_tui_text(&title), title_width);
@@ -773,6 +787,10 @@ impl HistoryCell {
             Span::styled(history_gutter(prefix), title_style),
             Span::styled(title, title_style),
         ]));
+        if compact_bash {
+            lines.push(Line::from(""));
+            return lines;
+        }
         if self.body.trim().is_empty()
             && matches!(
                 self.kind,

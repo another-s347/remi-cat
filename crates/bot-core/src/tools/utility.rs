@@ -17,7 +17,7 @@ impl Tool for ManageYourselfTool {
     }
 
     fn description(&self) -> &str {
-        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. Profile management includes init/register/find/show/set/check, concrete IM channels under `profile channel`, and persistent host lifecycle through `profile start/status/stop/restart`; read the pinned builtin `remi` skill before mutating them. Use {\"command\":\"tools --json\"} to inspect every registered tool and configuration diagnostics, including tools outside the active allowlist. Use {\"command\":\"telemetry status\"}, `telemetry enable`, or `telemetry disable` to manage diagnostics for the active profile. Use help commands such as {\"command\":\"help\"} or {\"command\":\"profile --help\"} to inspect available CLI commands. Local SKILL.md frontmatter can set pin: true to keep a skill's name and description in the pinned-skill prompt after Remi restarts. Current chat runtime settings that are slash commands, including model reasoning strength, are available to the user as commands such as `/model reasoning set high` and `/model reasoning reset`. The command is parsed as shell-like arguments but is not executed through a shell."
+        "Run a remi-cat CLI command against the current host binary for Remi self-management. Only pass a top-level `command` string, for example: {\"command\":\"profile list\"}. Use `profile current` to identify the active profile and why it was selected; `profile list` to discover profiles; `profile show <ref>` for fields; `profile show <ref> --sources` to explain where fields came from; `profile resource list <ref>` for resource/state paths; `profile status <ref>` for a managed process; `profile registry info` for the registry; and `profile channel list <ref>` for concrete IM channels. The `<ref>` in these examples is a required positional argument, such as `@travel` or a manifest path. Profile management includes init/register/find/show/set/check, channel configuration, and persistent host lifecycle; read the pinned builtin `remi` skill before mutating them. Use {\"command\":\"tools --json\"} to inspect every registered tool and configuration diagnostics, including tools outside the active allowlist. Use {\"command\":\"telemetry status\"}, `telemetry enable`, or `telemetry disable` to manage diagnostics for the active profile. Use help commands such as {\"command\":\"help\"} or {\"command\":\"profile --help\"} to inspect available CLI commands. Local SKILL.md frontmatter can set pin: true to keep a skill's name and description in the pinned-skill prompt after Remi restarts. Current chat runtime settings that are slash commands, including model reasoning strength, are available to the user as commands such as `/model reasoning set high` and `/model reasoning reset`. The command is parsed as shell-like arguments but is not executed through a shell."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -26,7 +26,7 @@ impl Tool for ManageYourselfTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "remi-cat arguments without the binary name, for example: profile list or profile channel list @travel; use help or <command> --help to inspect available commands"
+                    "description": "remi-cat arguments without the binary name. Examples: profile list; profile channel list @travel --format json; --profile @travel config set model_profile=default; --profile @travel config set auto_compress_context_percent=70; profile model show @travel; profile model set @travel --context-tokens 65536 --max-output-tokens 32768. Omit the model ID to target the runtime-selected default; literal ID `default` may be a different model. Set context and output budget together when needed; the CLI validates before saving. Use help or <command> --help for syntax."
                 }
             },
             "required": ["command"]
@@ -129,7 +129,11 @@ async fn run_manage_yourself_command(args: &[String]) -> anyhow::Result<String> 
         use std::os::windows::process::CommandExt;
         command.as_std_mut().creation_flags(0x0800_0000);
     }
-    command.args(args).kill_on_drop(true);
+    let argv = manage_yourself_argv(
+        args,
+        std::env::var_os("REMI_PROFILE_PATH").map(PathBuf::from).as_deref(),
+    );
+    command.args(&argv).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(90), command.output())
         .await
         .context("remi-cat command timed out after 90 seconds")?
@@ -157,6 +161,26 @@ async fn run_manage_yourself_command(args: &[String]) -> anyhow::Result<String> 
     let text = format_command_output(output);
     anyhow::ensure!(exit_code == Some(0), "remi-cat command failed: {text}");
     Ok(text)
+}
+
+pub(super) fn manage_yourself_argv(
+    args: &[String],
+    current_manifest: Option<&std::path::Path>,
+) -> Vec<String> {
+    if args
+        .iter()
+        .any(|arg| arg == "--profile" || arg.starts_with("--profile="))
+    {
+        return args.to_vec();
+    }
+    let Some(manifest) = current_manifest else {
+        return args.to_vec();
+    };
+    let mut argv = Vec::with_capacity(args.len() + 2);
+    argv.push("--profile".to_string());
+    argv.push(manifest.to_string_lossy().into_owned());
+    argv.extend_from_slice(args);
+    argv
 }
 
 pub(super) fn format_command_output(output: std::process::Output) -> String {

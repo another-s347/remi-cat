@@ -224,11 +224,13 @@ async fn run_acp_setup(
                 "local".to_string()
             }
         });
-    let mut entries = vec![
-        "im.mode=disabled".to_string(),
-        format!("acp.mode={mode}"),
-        format!("acp.client={client}"),
-    ];
+    let mut entries = vec![format!("acp.mode={mode}"), format!("acp.client={client}")];
+    if !matches!(
+        detect_setup_state_at(&profile.runtime_config, data_dir),
+        SetupState::Initialized { .. } | SetupState::LegacyEnvCompatible { .. }
+    ) {
+        entries.push("im.mode=disabled".to_string());
+    }
     let tool_name = tool_name.or_else(|| {
         if client == "codex" {
             Some("codex".to_string())
@@ -276,10 +278,11 @@ async fn run_acp_setup(
         .filter(|value| !value.is_empty())
         .collect();
     if client == "codex" && mode == "local" {
-        entries.push(format!("acp.local_bin={}", current_remi_cat_bin()?));
+        let (local_bin, local_args) = codex_local_command(bin, &args);
+        entries.push(format!("acp.local_bin={local_bin}"));
         entries.push(format!(
             "acp.local_args={}",
-            serde_json::to_string(&codex_adapter_args(bin, &args))?
+            serde_json::to_string(&local_args)?
         ));
         apply_runtime_config_entries(profile, data_dir, &entries, true).await?;
         println!();
@@ -300,24 +303,11 @@ async fn run_acp_setup(
     run_acp_doctor(profile, data_dir, "acp")
 }
 
-fn current_remi_cat_bin() -> anyhow::Result<String> {
-    Ok(std::env::current_exe()?
-        .to_string_lossy()
-        .trim()
-        .to_string())
-}
-
-fn codex_adapter_args(codex_bin: Option<String>, codex_args: &[String]) -> Vec<String> {
-    let mut args = vec!["acp-adapter".to_string(), "codex".to_string()];
-    if let Some(bin) = codex_bin {
-        args.push("--bin".to_string());
-        args.push(bin);
-    }
-    for arg in codex_args {
-        args.push("--arg".to_string());
-        args.push(arg.clone());
-    }
-    args
+fn codex_local_command(acp_bin: Option<String>, startup_args: &[String]) -> (String, Vec<String>) {
+    (
+        acp_bin.unwrap_or_else(|| "codex-acp".to_string()),
+        startup_args.to_vec(),
+    )
 }
 
 fn run_acp_doctor(profile: &InstanceProfile, data_dir: &Path, label: &str) -> anyhow::Result<()> {
@@ -1000,4 +990,24 @@ pub(crate) fn print_registered_tools(bot: &CatBot, json: bool) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod codex_setup_tests {
+    use super::codex_local_command;
+
+    #[test]
+    fn default_uses_official_app_server_adapter() {
+        let (bin, args) = codex_local_command(None, &[]);
+        assert_eq!(bin, "codex-acp");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn explicit_codex_options_are_acp_process_options() {
+        let (bin, args) =
+            codex_local_command(Some("/tmp/codex-acp".into()), &["--some-acp-option".into()]);
+        assert_eq!(bin, "/tmp/codex-acp");
+        assert_eq!(args, ["--some-acp-option"]);
+    }
 }

@@ -1706,6 +1706,28 @@ mod tests {
     }
 
     #[test]
+    fn manage_yourself_inherits_manifest_unless_profile_is_explicit() {
+        use std::path::Path;
+
+        let current = Path::new("/tmp/current/profile.yaml");
+        let implicit = vec!["profile".to_string(), "current".to_string()];
+        assert_eq!(
+            super::utility::manage_yourself_argv(&implicit, Some(current)),
+            vec!["--profile", "/tmp/current/profile.yaml", "profile", "current"]
+        );
+        let explicit = vec![
+            "--profile".to_string(),
+            "@other".to_string(),
+            "profile".to_string(),
+            "show".to_string(),
+        ];
+        assert_eq!(
+            super::utility::manage_yourself_argv(&explicit, Some(current)),
+            explicit
+        );
+    }
+
+    #[test]
     fn manage_yourself_rejects_empty_or_unclosed_quotes() {
         assert!(parse_manage_yourself_command("   ").is_err());
         assert!(parse_manage_yourself_command("profile 'unterminated").is_err());

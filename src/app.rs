@@ -12,11 +12,12 @@ pub(crate) use crate::channel::feishu::{
     format_feishu_tool_line, should_ignore_unaddressed_topic_start,
 };
 use crate::channel::Channel;
+use crate::cli::MessageCommand;
 #[cfg(test)]
 pub(crate) use crate::cli::UpdateCommand;
 pub(crate) use crate::cli::{
-    parse_cli_args, try_parse_cli_args, AcpAdapterCommand, AcpCommand, AppCommand, CliConfig,
-    FeishuCommand, TasksCommand, CLI_USER_ID,
+    parse_cli_args, try_parse_cli_args, AcpCommand, AppCommand, CliConfig, FeishuCommand,
+    TasksCommand, CLI_USER_ID,
 };
 #[cfg(test)]
 pub(crate) use crate::cli::{parse_command, parse_global_args};
@@ -51,6 +52,7 @@ use crate::core::Runtime;
 use crate::instance_profile::{
     profile_registry_home_dir, tui_home_data_dir, InstanceProfile, DIAGNOSTIC_PROFILE_NAME,
 };
+use crate::proactive::{self, DeliveryRequest, ProfileLock};
 #[cfg(test)]
 pub(crate) use crate::profile_command::first_available_port;
 #[cfg(test)]
@@ -66,6 +68,7 @@ use crate::web_chat;
 use bot_core::im_tools::ImFileBridge;
 use bot_core::{install_embedded_agent_profiles, install_embedded_model_profiles, CatBotBuilder};
 use im_feishu::FeishuGateway;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use user_store::UserStore;
@@ -287,6 +290,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let mut offline_message: Option<(DeliveryRequest, bool)> = None;
     match command {
         AppCommand::Setup(entries) => {
             if entries.is_empty() {
@@ -398,9 +402,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             run_feishu_doctor().await?;
             return Ok(());
         }
-        AppCommand::AcpAdapter(AcpAdapterCommand::Codex { bin, args }) => {
-            return crate::codex_acp_adapter::run_codex_adapter(bin, args).await;
-        }
         AppCommand::Acp(AcpCommand::Agent) => {
             unsafe {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
@@ -492,6 +493,70 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 anyhow::bail!(
                     "remi-cat is not initialized yet. Run `remi-cat setup` first, or provide legacy env config."
                 );
+            }
+        }
+        AppCommand::Message(ref message) => {
+            unsafe {
+                std::env::set_var("REMI_DATA_DIR", &data_dir);
+            }
+            apply_runtime_env_defaults(&mut data_dir, false);
+            match message {
+                MessageCommand::Status {
+                    session_id,
+                    idempotency_key,
+                    json,
+                } => {
+                    let receipt = match proactive::try_status_online(
+                        &data_dir,
+                        session_id.clone(),
+                        idempotency_key.clone(),
+                    )
+                    .await?
+                    {
+                        Some(receipt) => receipt,
+                        None => proactive::read_status(&data_dir, session_id, idempotency_key)?,
+                    };
+                    proactive::print_receipt(&receipt, *json)?;
+                    return Ok(());
+                }
+                MessageCommand::Send {
+                    session_id,
+                    text,
+                    stdin,
+                    idempotency_key,
+                    json,
+                } => {
+                    let text = if *stdin {
+                        let mut input = String::new();
+                        tokio::io::stdin().read_to_string(&mut input).await?;
+                        input
+                    } else {
+                        text.clone()
+                            .context("message send requires --text or --stdin")?
+                    };
+                    let request = DeliveryRequest {
+                        session_id: session_id.clone(),
+                        text,
+                        idempotency_key: idempotency_key.clone(),
+                    };
+                    if let Some(receipt) =
+                        proactive::try_send_online(&data_dir, request.clone()).await?
+                    {
+                        proactive::print_receipt(&receipt, *json)?;
+                        if !receipt.complete() {
+                            anyhow::bail!("proactive delivery {}", receipt.state);
+                        }
+                        return Ok(());
+                    }
+                    if !matches!(
+                        detect_setup_state_at(&selected_profile.runtime_config, &data_dir),
+                        SetupState::Initialized { .. }
+                    ) && !has_legacy_env_credentials()
+                    {
+                        anyhow::bail!("selected profile is not initialized");
+                    }
+                    offline_message = Some((request, *json));
+                }
             }
         }
         AppCommand::Tools(_) => {
@@ -587,9 +652,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         return crate::acp_agent::run_stdio_agent(factory).await;
     }
 
+    let _profile_lock = if offline_message.is_some() || matches!(&command, AppCommand::Run(_)) {
+        Some(ProfileLock::try_acquire(&data_dir)?.context(
+            "profile runtime is locked but its local control endpoint is unavailable",
+        )?)
+    } else {
+        None
+    };
     let cli = match &command {
         AppCommand::Run(cli) => cli.clone(),
-        AppCommand::Tools(_) | AppCommand::Tasks(_) => CliConfig {
+        AppCommand::Tools(_) | AppCommand::Tasks(_) | AppCommand::Message(_) => CliConfig {
             enabled: false,
             tui: false,
             resume: false,
@@ -707,6 +779,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
 
+    let delivery_gateways = feishu_gateways.clone();
     let bridge: Arc<dyn ImFileBridge> = Arc::new(
         crate::channel::feishu::LocalImFileBridge::with_gateways(feishu_gateways),
     );
@@ -745,18 +818,40 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         data_dir: data_dir.clone(),
     });
     let (web_chat, web_chat_rx) = web_chat::WebChatHandle::channel();
-    crate::a2a_channel::maybe_start(
-        web_chat.clone(),
-        Arc::clone(&runtime.sessions),
-        runtime.root_agent_id.clone(),
-        data_dir.clone(),
-        a2a_required_for_delegates,
-    )
-    .await?;
+    if offline_message.is_none() {
+        crate::a2a_channel::maybe_start(
+            web_chat.clone(),
+            Arc::clone(&runtime.sessions),
+            runtime.root_agent_id.clone(),
+            data_dir.clone(),
+            a2a_required_for_delegates,
+        )
+        .await?;
+    }
 
     let local_set = tokio::task::LocalSet::new();
     local_set
         .run_until(async move {
+            let delivery_service = Rc::new(proactive::DeliveryService::new(
+                Rc::clone(&runtime),
+                delivery_gateways,
+                data_dir.clone(),
+            ));
+            if let Some((request, json)) = offline_message {
+                let receipt = delivery_service.send(request).await?;
+                proactive::print_receipt(&receipt, json)?;
+                if !receipt.complete() {
+                    anyhow::bail!("proactive delivery {}", receipt.state);
+                }
+                return Ok(());
+            }
+            let _control_guard = if !cli.enabled && cli.once.is_none() {
+                let (rx, guard) = proactive::start_control(&data_dir).await?;
+                tokio::task::spawn_local(proactive::run_control(rx, Rc::clone(&delivery_service)));
+                Some(guard)
+            } else {
+                None
+            };
             tokio::task::spawn_local(web_chat::run_dispatcher(Rc::clone(&runtime), web_chat_rx));
             if let Some(message) = cli.once.clone() {
                 if cli.pure_prompt {
@@ -1037,7 +1132,7 @@ fn command_surface(command: &AppCommand) -> &'static str {
     match command {
         AppCommand::Run(cli) if cli.tui => "tui",
         AppCommand::Run(_) => "cli",
-        AppCommand::Acp(_) | AppCommand::AcpAdapter(_) => "acp",
+        AppCommand::Acp(_) => "acp",
         AppCommand::A2a(_) => "a2a-stdio",
         AppCommand::Feishu(_) => "feishu",
         AppCommand::Feedback(_) => "feedback",
@@ -1073,10 +1168,9 @@ mod cli_tests {
         parse_command, parse_global_args, parse_goal_max_rounds, parse_release_version,
         parse_workflow_start_options, prefix_short_config_entry, redact_known_secrets,
         resolve_instance_profile, resolve_profile_registry_root,
-        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available,
-        AcpAdapterCommand, AcpCommand, AppCommand, CliConfig, CodexCommand, FeedbackCommand,
-        FeishuCommand, FeishuDoctorStatus, HooksCommand, ProfileCommand, TelemetryCommand,
-        UpdateCommand,
+        should_ignore_unaddressed_topic_start, try_parse_cli_args, update_available, AcpCommand,
+        AppCommand, CliConfig, CodexCommand, FeedbackCommand, FeishuCommand, FeishuDoctorStatus,
+        HooksCommand, ProfileCommand, TelemetryCommand, UpdateCommand,
     };
     #[cfg(unix)]
     use super::{run_streaming_command, run_streaming_command_with_stdin};
@@ -1831,7 +1925,7 @@ mod cli_tests {
                 "codex",
                 "setup",
                 "--bin",
-                "/usr/local/bin/codex",
+                "/usr/local/bin/codex-acp",
                 "--agent",
                 "default",
                 "--arg=--config",
@@ -1839,7 +1933,7 @@ mod cli_tests {
             ]))
             .unwrap(),
             AppCommand::Codex(CodexCommand::Setup { bin, agent, args })
-                if bin.as_deref() == Some("/usr/local/bin/codex")
+                if bin.as_deref() == Some("/usr/local/bin/codex-acp")
                     && agent.as_deref() == Some("default")
                     && args == vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()]
         ));
@@ -1916,24 +2010,6 @@ mod cli_tests {
                     && bin.as_deref() == Some("/usr/local/bin/remi-cat")
                     && tool_name.as_deref() == Some("acp__remi")
                     && args.is_empty()
-        ));
-    }
-
-    #[test]
-    fn acp_adapter_codex_command_is_recognized() {
-        assert!(matches!(
-            parse_command(&args(&[
-                "acp-adapter",
-                "codex",
-                "--bin",
-                "/usr/local/bin/codex",
-                "--arg=--config",
-                "--arg=model=\"gpt-5-codex\""
-            ]))
-            .unwrap(),
-            AppCommand::AcpAdapter(AcpAdapterCommand::Codex { bin, args })
-                if bin.as_deref() == Some("/usr/local/bin/codex")
-                    && args == vec!["--config".to_string(), "model=\"gpt-5-codex\"".to_string()]
         ));
     }
 

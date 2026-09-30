@@ -19,6 +19,7 @@ mod a2a_delegate;
 pub mod acp;
 pub mod agent;
 pub mod approval;
+pub mod decision_model;
 pub mod desktop_html_skill;
 pub mod events;
 pub mod goal;
@@ -52,6 +53,10 @@ pub use agent::CatAgent;
 pub use approval::{
     ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
     ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
+};
+pub use decision_model::{
+    install_embedded_decision_model_profiles, load_decision_model_profile,
+    DecisionModelProfileConfig,
 };
 pub use bot_runtime_core::{AgentError, Content, ContentPart, Message, ToolOutput, ToolResult};
 pub use bot_runtime_core::{DynamicTool, DynamicToolRisk};

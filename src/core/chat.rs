@@ -184,6 +184,8 @@ impl From<ChatRequest> for SteerInput {
             chat_type: request.chat_type,
             platform: request.platform.or_else(|| request.channel.as_platform()),
             app_id: request.app_id,
+            im_attachments: request.im_attachments,
+            im_documents: request.im_documents,
         }
     }
 }
@@ -534,7 +536,29 @@ mod tests {
     use super::{
         apply_preprocessed_text, ChatChannel, ChatRequest, CoreChatEvent, FinalResponseTracker,
     };
-    use bot_core::{CatEvent, Content, ContentPart, ReasoningEffort, SteerInjectedEvent};
+    use bot_core::{
+        CatEvent, Content, ContentPart, ImAttachment, ImDocument, ReasoningEffort,
+        SteerInjectedEvent, SteerInput,
+    };
+
+    #[test]
+    fn chat_request_preserves_feishu_im_context_when_steered() {
+        let request = ChatRequest::text("session", ChatChannel::Feishu, "read the file")
+            .with_im_context(
+                vec![ImAttachment {
+                    key: "message\\file".into(),
+                    ..Default::default()
+                }],
+                vec![ImDocument {
+                    token: "doc-token".into(),
+                    ..Default::default()
+                }],
+            );
+        let steer: SteerInput = request.into();
+        assert_eq!(steer.im_attachments[0].key, "message\\file");
+        assert_eq!(steer.im_documents[0].token, "doc-token");
+        assert_eq!(steer.platform.as_deref(), Some("feishu"));
+    }
 
     #[test]
     fn foreground_response_completes_once_before_background_and_next_turn() {
@@ -555,6 +579,7 @@ mod tests {
             session_id: "thread".into(),
             preview: "second question".into(),
             count: 1,
+            message_id: None,
             next_turn: true,
         };
         assert_eq!(

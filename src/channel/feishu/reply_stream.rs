@@ -163,6 +163,37 @@ impl FeishuReplyStream {
         }
     }
 
+    /// End the current process view and start a new one anchored to the
+    /// message that supplied the injected steer. The final reply follows the
+    /// same anchor rather than the message that started the original run.
+    pub(super) async fn switch_to_steer(&mut self, parent_message_id: &str) {
+        if parent_message_id.is_empty() || self.parent_message_id == parent_message_id {
+            return;
+        }
+        self.flush_pending_as_process().await;
+        self.close_active_narrative().await;
+        self.finish_run("done").await;
+
+        self.reset_for_steer(parent_message_id);
+        self.ensure_cot().await;
+    }
+
+    fn reset_for_steer(&mut self, parent_message_id: &str) {
+        self.parent_message_id = parent_message_id.to_string();
+        self.run_id = format!("run-{}", uuid::Uuid::new_v4());
+        self.pending_final_text.clear();
+        self.final_output_committed = false;
+        self.cot = None;
+        self.cot_create_failed = false;
+        self.cot_completed = false;
+        self.pending_events.clear();
+        self.last_cot_flush = Instant::now() - COT_FLUSH_INTERVAL;
+        self.active_narrative = None;
+        self.sequence = 0;
+        self.last_event_timestamp = 0;
+        self.activities.clear();
+    }
+
     pub(super) async fn interrupt_run(&mut self, reason: &str) {
         self.flush_pending_as_process().await;
         self.close_active_narrative().await;
@@ -765,10 +796,38 @@ fn bounded_cot_payload(mut content: Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_cot_payload, process_title, FeishuReplyKind, NarrativeKind,
+        bounded_cot_payload, process_title, FeishuReplyKind, FeishuReplyStream, NarrativeKind,
         COT_EVENT_CONTENT_MAX_BYTES, COT_TEXT_MAX_CHARS,
     };
+    use im_feishu::FeishuGateway;
     use serde_json::json;
+
+    #[test]
+    fn steer_resets_cot_and_final_reply_anchor() {
+        let gateway = FeishuGateway::new("app", "secret");
+        let mut replies = FeishuReplyStream::new(gateway, "oc_chat".into(), "om_first".into());
+        let first_run_id = replies.run_id.clone();
+        replies.pending_final_text = "old final".into();
+        replies.cot_completed = true;
+        replies.cot_create_failed = true;
+        replies.final_output_committed = true;
+        replies.activities.insert("status-old".into());
+
+        replies.reset_for_steer("om_steer");
+
+        assert_eq!(replies.parent_message_id, "om_steer");
+        assert_ne!(replies.run_id, first_run_id);
+        assert!(replies.pending_final_text.is_empty());
+        assert!(!replies.cot_completed);
+        assert!(!replies.cot_create_failed);
+        assert!(!replies.final_output_committed);
+        assert!(replies.activities.is_empty());
+
+        let steer_run_id = replies.run_id.clone();
+        replies.reset_for_steer("om_second_steer");
+        assert_eq!(replies.parent_message_id, "om_second_steer");
+        assert_ne!(replies.run_id, steer_run_id);
+    }
 
     #[test]
     fn reasoning_is_hidden_inside_expanded_cot() {

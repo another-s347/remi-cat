@@ -766,16 +766,8 @@ fn ssh_target_preview(args: &Value) -> String {
     format!("{user}{host}{port}")
 }
 
-fn bash_summary(args: &Value, result: &str) -> String {
-    let command = bash_command_preview(args);
-    let line_count = result.lines().count();
-    if line_count == 0 {
-        format!("{command}\n无输出")
-    } else if let Some(preview) = bash_output_preview(result) {
-        format!("{command}\n输出 {line_count} 行:\n{preview}")
-    } else {
-        format!("{command}\n输出 {line_count} 行")
-    }
+fn bash_summary(args: &Value, _result: &str) -> String {
+    bash_command_preview(args)
 }
 
 fn ssh_summary(args: &Value, result: &str) -> String {
@@ -891,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_bash_command_and_first_three_output_lines_on_separate_lines() {
+    fn formats_bash_command_without_repeating_output() {
         let pretty = PrettyToolCall::completed(
             "1",
             "bash",
@@ -901,8 +893,7 @@ mod tests {
             42,
         );
 
-        assert_eq!(pretty.summary, "$ cargo test\n输出 4 行:\none\ntwo\nthree");
-        assert!(!pretty.summary.contains("four"));
+        assert_eq!(pretty.summary, "$ cargo test");
     }
 
     #[test]

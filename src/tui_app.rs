@@ -6262,6 +6262,9 @@ mod tests {
                 risk: bot_core::ToolRiskLevel::Medium,
                 reason: "mutates files".to_string(),
                 concerns: vec!["Deletes local data".to_string()],
+                model: None,
+                low_probability: None,
+                requires_human_approval: false,
             }),
         };
         let pending = approval_cell(&request, "waiting", 1, None, None);
@@ -6564,7 +6567,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_body_preserves_bash_summary_lines() {
+    fn tool_body_omits_bash_output_preview() {
         let pretty = PrettyToolCall::completed(
             "call-1",
             "bash",
@@ -6575,8 +6578,22 @@ mod tests {
         );
         let body = tool_body(&pretty);
 
-        assert!(body.contains("$ cargo test\n输出 4 行:\none\ntwo\nthree"));
+        assert_eq!(body, "$ cargo test");
         assert!(!body.contains("four"));
+    }
+
+    #[test]
+    fn bash_tool_renders_command_in_one_row() {
+        let cell = HistoryCell::tool(
+            "bash-1".to_string(),
+            "执行 bash".to_string(),
+            "$ echo ok".to_string(),
+            "42ms".to_string(),
+            ToolVisualStatus::Success,
+        );
+        let lines = cell.lines(80);
+        assert_eq!(lines.len(), 2);
+        assert!(rendered_text(&lines).contains("执行 bash $ echo ok"));
     }
 
     #[test]

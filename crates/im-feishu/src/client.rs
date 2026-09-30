@@ -396,6 +396,16 @@ impl FeishuClient {
         Ok(())
     }
 
+    /// Ensure an access token is available without refreshing an already
+    /// initialized client. This is used by short-lived outbound-only runtimes
+    /// that do not start the event receiver first.
+    pub async fn ensure_authenticated(&self) -> Result<()> {
+        if self.token().await.trim().is_empty() {
+            self.refresh_token().await?;
+        }
+        Ok(())
+    }
+
     /// Return the current bearer token string.
     pub async fn token(&self) -> String {
         self.token.read().await.clone()
@@ -991,7 +1001,11 @@ impl FeishuClient {
 
     /// Send an interactive card to a chat. Returns the new `message_id`.
     pub async fn send_card(&self, chat_id: &str, text: &str) -> Result<String> {
-        let res = self.send_card_once(chat_id, text).await;
+        self.send_card_with_uuid(chat_id, text, None).await
+    }
+
+    pub async fn send_card_with_uuid(&self, chat_id: &str, text: &str, uuid: Option<&str>) -> Result<String> {
+        let res = self.send_card_once(chat_id, text, uuid).await;
         if res
             .as_ref()
             .err()
@@ -1000,14 +1014,22 @@ impl FeishuClient {
         {
             warn!("send_card: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.send_card_once(chat_id, text).await;
+            return self.send_card_once(chat_id, text, uuid).await;
         }
         res
     }
 
-    async fn send_card_once(&self, chat_id: &str, text: &str) -> Result<String> {
+    async fn send_card_once(&self, chat_id: &str, text: &str, uuid: Option<&str>) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
+        let mut body = serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": content,
+        });
+        if let Some(uuid) = uuid {
+            body["uuid"] = serde_json::Value::String(uuid.to_string());
+        }
 
         let resp: MessageResponse = self
             .http
@@ -1015,11 +1037,7 @@ impl FeishuClient {
                 "{FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
             ))
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "receive_id": chat_id,
-                "msg_type": "interactive",
-                "content": content,
-            }))
+            .json(&body)
             .send()
             .await
             .context("send_card")?
@@ -1035,12 +1053,16 @@ impl FeishuClient {
     /// Reply to an existing message with an interactive card.
     /// Returns the new card `message_id` (used for subsequent [`update_card`] calls).
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
-        self.reply_card_with_thread(message_id, text, false).await
+        self.reply_card_with_thread(message_id, text, false, None).await
     }
 
     /// Reply with an interactive card and force the reply into a topic thread.
     pub async fn reply_card_in_thread(&self, message_id: &str, text: &str) -> Result<String> {
-        self.reply_card_with_thread(message_id, text, true).await
+        self.reply_card_with_thread(message_id, text, true, None).await
+    }
+
+    pub async fn reply_card_in_thread_with_uuid(&self, message_id: &str, text: &str, uuid: &str) -> Result<String> {
+        self.reply_card_with_thread(message_id, text, true, Some(uuid)).await
     }
 
     async fn reply_card_with_thread(
@@ -1048,9 +1070,10 @@ impl FeishuClient {
         message_id: &str,
         text: &str,
         reply_in_thread: bool,
+        uuid: Option<&str>,
     ) -> Result<String> {
         let res = self
-            .reply_card_once(message_id, text, reply_in_thread)
+            .reply_card_once(message_id, text, reply_in_thread, uuid)
             .await;
         if res
             .as_ref()
@@ -1061,7 +1084,7 @@ impl FeishuClient {
             warn!("reply_card: token expired, refreshing and retrying");
             self.refresh_token().await?;
             return self
-                .reply_card_once(message_id, text, reply_in_thread)
+                .reply_card_once(message_id, text, reply_in_thread, uuid)
                 .await;
         }
         res
@@ -1072,19 +1095,24 @@ impl FeishuClient {
         message_id: &str,
         text: &str,
         reply_in_thread: bool,
+        uuid: Option<&str>,
     ) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
+        let mut body = serde_json::json!({
+            "msg_type": "interactive",
+            "content": content,
+            "reply_in_thread": reply_in_thread,
+        });
+        if let Some(uuid) = uuid {
+            body["uuid"] = serde_json::Value::String(uuid.to_string());
+        }
 
         let resp: MessageResponse = self
             .http
             .post(format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply"))
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "msg_type": "interactive",
-                "content": content,
-                "reply_in_thread": reply_in_thread,
-            }))
+            .json(&body)
             .send()
             .await
             .context("reply_card")?
@@ -2296,10 +2324,18 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        build_tool_approval_card, build_tool_approval_resolved_card, is_retryable_cot_error,
+        build_tool_approval_card, build_tool_approval_resolved_card, card_content, is_retryable_cot_error,
         log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
         ContactUserIdType, CotEvent, MessageResponse,
     };
+
+    #[test]
+    fn markdown_card_preserves_input_text() {
+        let markdown = "# Update\n\n**done**";
+        let card: serde_json::Value = serde_json::from_str(&card_content(markdown)).unwrap();
+        assert_eq!(card["body"]["elements"][0]["tag"], "markdown");
+        assert_eq!(card["body"]["elements"][0]["content"], markdown);
+    }
 
     #[test]
     fn cot_retry_classifier_accepts_transient_api_failures() {

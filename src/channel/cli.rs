@@ -100,6 +100,10 @@ pub(crate) async fn process_prompt_message(
         .with_async_agent(cli.async_agent || cli.wait_background_tasks || async_agent_enabled());
     let mut stream = std::pin::pin!(Rc::clone(&runtime).chat(request));
     let mut output = String::new();
+    let mut completed = false;
+    let mut model_completed = false;
+    let mut direct_reply = false;
+    let mut denied_tool = None;
     let timeout = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(timeout);
     loop {
@@ -107,10 +111,16 @@ pub(crate) async fn process_prompt_message(
             event = stream.next() => {
                 let Some(event) = event else { break };
                 match event {
-                    CoreChatEvent::Prefix(prefix) | CoreChatEvent::Reply(prefix) => {
+                    CoreChatEvent::Prefix(prefix) => {
                         print!("{prefix}");
                         io::stdout().flush()?;
                         output.push_str(&prefix);
+                    }
+                    CoreChatEvent::Reply(reply) => {
+                        print!("{reply}");
+                        io::stdout().flush()?;
+                        output.push_str(&reply);
+                        direct_reply = true;
                     }
                     CoreChatEvent::Bot(CatEvent::Text(delta)) => {
                         print!("{delta}");
@@ -121,7 +131,15 @@ pub(crate) async fn process_prompt_message(
                         crate::telemetry::capture_agent_error(&err, "cli.chat");
                         anyhow::bail!(err.to_string())
                     }
-                    CoreChatEvent::Done => break,
+                    CoreChatEvent::Bot(CatEvent::ToolApprovalResolved { request, decision })
+                        if decision == bot_core::ToolApprovalDecision::Deny => {
+                            denied_tool = Some(request.tool_name);
+                        }
+                    CoreChatEvent::Bot(CatEvent::Done) => model_completed = true,
+                    CoreChatEvent::Done => {
+                        completed = true;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -132,6 +150,19 @@ pub(crate) async fn process_prompt_message(
     }
     if !output.ends_with('\n') {
         println!();
+    }
+    anyhow::ensure!(completed, "prompt stream ended before completion");
+    anyhow::ensure!(
+        model_completed || direct_reply,
+        "prompt stream ended without a model completion or direct reply"
+    );
+    if output.trim().is_empty() {
+        if let Some(tool) = denied_tool {
+            anyhow::bail!(
+                "prompt completed without a reply after approval denied for `{tool}` under the current permission policy"
+            );
+        }
+        anyhow::bail!("prompt completed without a visible reply");
     }
     Ok(())
 }

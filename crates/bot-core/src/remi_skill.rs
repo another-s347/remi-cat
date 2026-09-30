@@ -21,6 +21,8 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 ## Safety
 
 - Prefer read-only commands first: `profile list`, `profile show`, `profile status`, `profile channel list`, `profile agent list`, and `workflow list`.
+- For "which profile am I using?" or "why was this profile selected?", run `profile current`; `profile show` is for inspecting that profile's manifest and resolved fields. For "which profiles exist?", run `profile list`.
+- For "where did this path or setting come from?", run `profile show <reference> --sources`; plain `profile show` only displays values. Use `--resolved` for effective absolute paths and `--manifest` for the raw declaration.
 - Do not remove or overwrite profiles, channels, agents, or workflows unless the user explicitly asks for that destructive change.
 - `profile unregister` removes only the global registry entry; it preserves the manifest and all referenced resources/state.
 - For background instances, use `profile status <reference>` before `profile stop`, `profile restart`, or `profile unregister`.
@@ -34,6 +36,16 @@ Also use it when the user asks about updating remi-cat, configuring Codex ACP, c
 - Registered profiles use the process-global registry at `~/.remi-cat/profile-registry.json`, independent of the current directory and profile state directory.
 - Prefer registered references such as `@travel` for every command after initialization.
 - When a command may affect a different profile, include the profile name explicitly.
+- Keep the three configuration layers separate: `profile set <reference> <field> <value>` edits `profile.yaml` (identity, paths, discovery metadata); `--profile <reference> config set key=value` edits `runtime.yaml` (model, sandbox, shell, IM mode, telemetry); `profile channel ... <reference>` edits concrete connector instances in `channels.yaml`.
+- `capabilities.channels` advertises a channel for discovery. It does not enable an IM connector. To make Feishu run, configure a concrete `profile channel upsert-feishu` instance, then restart the managed instance if it is already running.
+- `profile find` searches registered and legacy profiles; an unregistered manifest path can be inspected directly, but it will not appear in discovery until registered.
+- Agent and workflow definitions are separate Markdown and JSON resources. Use `profile agent ... <reference>` and `workflow ... --profile <reference>` to manage them; use `--profile <reference> config set root_agent_id=<id>` to change the runtime root agent.
+- Distinguish model selection from model definition. `--profile <reference> config set model_profile=<id>` selects a persistent runtime default, while `/model use <id>` changes only the current conversation. The actual provider model name, context window, output budget, and compaction mode live in the model YAML. For the runtime-selected default model, omit the ID: `profile model show <reference>` and `profile model set <reference> ...`. Supply `<id>` only when the user identifies a particular model profile; the literal ID `default` may differ from the runtime-selected model.
+- Before lowering `context_tokens`, read the existing `max_output_tokens`; if it would be equal to or above the new context, set a smaller output budget in the same `profile model set` command. The CLI validates the whole model definition before atomically writing it. Confirm the requested context does not exceed the provider's real limit. Never put API keys in model YAML. Other model YAML fields may still require a file editor.
+- The persistent automatic compaction trigger is `--profile <reference> config set auto_compress_context_percent=70` (1–100; default 80 when unset). This is a runtime threshold, distinct from `context_tokens` in model YAML and `tool_output.overflow_bytes` in runtime config. A process-level `REMI_AUTO_COMPRESS_CONTEXT_PERCENT` also works when the config field is unset.
+- `tools --json` lists registered tools but may require an initialized runtime and its configured model credential to construct the tool registry. If it fails for missing credentials, report that diagnostic instead of claiming the tool is unavailable.
+- Choose the command that matches the question: `profile resource list <reference>` lists all referenced resource and state paths; `profile resource show <reference> config.runtime` shows one; `profile status <reference>` checks its managed process; `profile registry info` inspects the registry. `profile show` describes the manifest and resolved fields, but does not replace a requested process or registry status check.
+- For `profile channel list`, `profile resource list/show`, and `profile status`, pass the target as a positional argument after the subcommand: for example `profile channel list @travel`, `profile resource list @travel`, or `profile status @travel`. The global `--profile` option alone does not fill these required positional arguments.
 - Preserve an explicit destination path exactly as the user supplied it. Do not shorten an absolute path to a workspace-relative path. After `profile init`, use `profile show @alias --sources --format yaml` and confirm that `manifest` and `workspace` resolve beneath the intended destination before making further changes.
 - Feishu/Lark chat channels are normally resolved from incoming IM events. For local CLI testing, use `cli --channel <id>` to reuse a persistent local session.
 
@@ -51,6 +63,7 @@ Inspect profiles:
 
 ```bash
 profile list
+profile current
 profile show <profile>
 profile status <profile>
 profile status --all
@@ -118,7 +131,28 @@ profile agent set-default <profile> <agent_id>
 ```
 
 Agent files are markdown with YAML frontmatter. `agent upsert` validates the markdown and writes `<profile-data-dir>/agents/<id>.md`.
-`profile agent list` shows both builtin agents and profile-specific overrides; `profile agent show` displays the resolved definition.
+`profile agent list` shows both builtin agents and profile-specific overrides; `profile agent show` displays the resolved definition. Use a manifest path or registered reference as its profile argument.
+
+## Model And Context Configuration
+
+Find the selected profile's model directory and runtime config before editing:
+
+```bash
+profile resource show @travel models
+profile resource show @travel config.runtime
+```
+
+To change the runtime default model, first ensure its YAML exists in the selected models directory, then run `--profile @travel config set model_profile=<id>` and verify the saved `runtime.yaml`. This command checks the model credential against its provider, so a credential or network failure is not proof that the model profile was saved. For the current chat only, use `/model list`, `/model use <id>`, and `/model status`.
+
+To change the selected model's context size, actual model name, maximum output, tool overflow limit, or compaction policy, use `profile model set @travel --context-tokens 65536 --max-output-tokens 32768` or the corresponding typed options. Use `--dry-run` to preview. The command rejects an invalid output/context budget without changing the file; use `profile model show @travel` to verify, then restart a managed instance to apply it. Do not silently change a model's declared context beyond the provider's supported window.
+
+To change the automatic compaction trigger for this runtime profile:
+
+```bash
+--profile @travel config set auto_compress_context_percent=70
+```
+
+The accepted range is 1–100 percent of the selected model's `context_tokens`. `context_compaction: hard` compresses automatically, `agent` asks the agent to manage context, and `off` disables compaction; the threshold does not change the model's context window.
 
 ## Supervisor Workflow Commands
 
@@ -129,7 +163,7 @@ workflow add --profile <profile> ./workflows/<workflow_id>.json
 workflow rm --profile <profile> <workflow_id>
 ```
 
-Workflow files are JSON graph definitions. `workflow upsert` validates the graph and writes `<profile-data-dir>/workflows/<id>.json`. The builtin `goal` workflow can be listed and shown, but it cannot be overwritten or deleted.
+Workflow files are JSON graph definitions. `workflow add` validates the graph and writes `<profile-data-dir>/workflows/<id>.json`. The builtin `goal` workflow can be listed and shown, but it cannot be overwritten or deleted.
 
 To create or modify a supervisor workflow:
 
@@ -197,7 +231,7 @@ acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-
 acp doctor
 ```
 
-`acp setup` writes the ACP runtime settings for the selected profile. `--client codex` writes an out-of-box local profile that launches `remi-cat acp-adapter codex`; repeated `--arg` values become adapter argv passed to Codex before `exec`, and the backend still speaks standard ACP stdio. `codex setup` and `codex doctor` remain convenience aliases for that profile. Other local clients use `acp.local_bin` plus repeated `--arg` values as their process argv. Named ACP tools default to `codex` for the Codex adapter setup command, or `acp__<client>` for other clients unless `--tool-name` is set. `acp agent` runs remi-cat as a standard ACP stdio agent and defaults to the HOME config root unless `REMI_DATA_DIR` is set. For `--client remi`, omitting `--bin` uses Remi's internal local runner; providing `--bin /path/to/remi-cat` configures an external stdio process and defaults local args to `["acp","agent"]` unless explicit `--arg` values are supplied.
+`acp setup` writes the ACP runtime settings for the selected profile. `--client codex` uses the official `codex-acp` executable by default, which calls Codex app-server; install `@agentclientprotocol/codex-acp` so `codex-acp` is on PATH. `--bin` selects a different ACP executable and `--arg` passes startup arguments to it. `codex setup` and `codex doctor` are convenience aliases. Other local clients use `acp.local_bin` plus repeated `--arg` values as their process argv. Named ACP tools default to `codex` for Codex, or `acp__<client>` for other clients unless `--tool-name` is set. `acp agent` runs remi-cat as a standard ACP stdio agent and defaults to the HOME config root unless `REMI_DATA_DIR` is set. For `--client remi`, omitting `--bin` uses Remi's internal local runner; providing `--bin /path/to/remi-cat` configures an external stdio process and defaults local args to `["acp","agent"]` unless explicit `--arg` values are supplied.
 
 ## Hook Commands
 

@@ -1,5 +1,5 @@
 use crate::app::{CLI_CHAT_ID, CLI_USERNAME};
-use crate::instance_profile::{self, InstanceProfile, DIAGNOSTIC_PROFILE_NAME};
+use crate::instance_profile::{self, DIAGNOSTIC_PROFILE_NAME};
 use crate::profile_command::{self, ProfileCommand, ProfileWorkflowCommand};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
@@ -20,11 +20,27 @@ pub(crate) enum AppCommand {
     A2a(A2aCommand),
     Feishu(FeishuCommand),
     Acp(AcpCommand),
-    AcpAdapter(AcpAdapterCommand),
     Codex(CodexCommand),
     Update(UpdateCommand),
     Feedback(FeedbackCommand),
     Telemetry(TelemetryCommand),
+    Message(MessageCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageCommand {
+    Send {
+        session_id: String,
+        text: Option<String>,
+        stdin: bool,
+        idempotency_key: Option<String>,
+        json: bool,
+    },
+    Status {
+        session_id: String,
+        idempotency_key: String,
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +181,11 @@ struct RunArgs {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    #[command(about = "Inject and deliver an assistant message to an existing session")]
+    Message {
+        #[command(subcommand)]
+        command: MessageCliCommand,
+    },
     #[command(about = "Run the interactive setup wizard or non-interactive setup")]
     Setup(SetupArgs),
     #[command(
@@ -218,11 +239,6 @@ enum CliCommand {
         #[command(subcommand)]
         command: AcpCliCommand,
     },
-    #[command(about = "Run built-in ACP adapter processes")]
-    AcpAdapter {
-        #[command(subcommand)]
-        command: AcpAdapterCliCommand,
-    },
     #[command(about = "Configure and inspect Codex ACP")]
     Codex {
         #[command(subcommand)]
@@ -241,6 +257,32 @@ enum CliCommand {
     Tui(TuiArgs),
     #[command(about = "Send one prompt-style local message and exit")]
     Prompt(PromptArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MessageCliCommand {
+    #[command(about = "Store and send Markdown without running the model")]
+    Send {
+        #[arg(long = "session", value_name = "SESSION_ID")]
+        session_id: String,
+        #[arg(long, conflicts_with = "stdin")]
+        text: Option<String>,
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect a proactive delivery")]
+    Status {
+        #[arg(long = "session", value_name = "SESSION_ID")]
+        session_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -394,14 +436,14 @@ enum FeishuCliCommand {
 #[derive(Debug, Subcommand)]
 enum CodexCliCommand {
     #[command(
-        about = "Configure the built-in Codex ACP adapter profile",
-        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex --agent default\n  remi-cat codex setup --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThis writes a local ACP profile that launches `remi-cat acp-adapter codex`. `--bin` and repeated `--arg` values are stored as adapter argv, not as backend-specific Codex settings."
+        about = "Configure the Codex ACP profile",
+        after_help = "Examples:\n  remi-cat codex setup\n  remi-cat codex setup --bin /usr/local/bin/codex-acp --agent default\n\nUses the official `codex-acp` executable, which calls Codex app-server. Install @agentclientprotocol/codex-acp first. --bin selects a different ACP executable; --arg passes startup arguments to it."
     )]
     Setup {
         #[arg(
             long = "bin",
             value_name = "PATH",
-            help = "Path to the codex binary used by the adapter"
+            help = "Path to the Codex ACP executable"
         )]
         bin: Option<String>,
         #[arg(long, value_name = "NAME", help = "ACP agent name")]
@@ -411,7 +453,7 @@ enum CodexCliCommand {
             value_name = "ARG",
             action = ArgAction::Append,
             allow_hyphen_values = true,
-            help = "Extra Codex startup arg passed by the adapter before `exec`; repeat to pass multiple args"
+            help = "Extra Codex ACP startup argument; repeat to pass multiple args"
         )]
         args: Vec<String>,
     },
@@ -423,7 +465,7 @@ enum CodexCliCommand {
 enum AcpCliCommand {
     #[command(
         about = "Configure an ACP client",
-        after_help = "Examples:\n  remi-cat acp setup --client codex --bin /usr/local/bin/codex\n  remi-cat acp setup --client remi --tool-name acp__remi\n  remi-cat acp setup --client remi --bin /path/to/remi-cat --tool-name acp__remi\n  remi-cat acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp\n\nThis writes generic `acp.*` runtime settings to the selected profile runtime config. `--client codex` uses the bundled `acp-adapter codex` profile so the backend still talks standard ACP stdio."
+        after_help = "Examples:\n  remi-cat acp setup --client codex\n  remi-cat acp setup --client remi --tool-name acp__remi\n  remi-cat acp setup --client remi --bin /path/to/remi-cat --tool-name acp__remi\n  remi-cat acp setup --client my-acp --mode remote --base-url http://127.0.0.1:8788 --tool-name acp__my_acp\n\nThis writes generic `acp.*` runtime settings to the selected profile runtime config. Codex uses the official `codex-acp` executable by default. --bin and --arg configure its executable and startup arguments."
     )]
     Setup {
         #[arg(
@@ -471,26 +513,6 @@ enum AcpCliCommand {
         long_about = "Run remi-cat as an Agent Client Protocol stdio agent. stdin/stdout are reserved for ACP JSON-RPC; logs are emitted on stderr."
     )]
     Agent,
-}
-
-#[derive(Debug, Subcommand)]
-enum AcpAdapterCliCommand {
-    #[command(
-        about = "Run Codex through a standard ACP stdio adapter",
-        after_help = "Examples:\n  remi-cat acp-adapter codex\n  remi-cat acp-adapter codex --bin /usr/local/bin/codex --arg=--config --arg=model=\\\"gpt-5-codex\\\"\n\nThe adapter speaks ACP on stdin/stdout and translates each prompt into `codex exec --json`."
-    )]
-    Codex {
-        #[arg(long = "bin", value_name = "PATH", help = "Path to the codex binary")]
-        bin: Option<String>,
-        #[arg(
-            long = "arg",
-            value_name = "ARG",
-            action = ArgAction::Append,
-            allow_hyphen_values = true,
-            help = "Extra Codex startup arg inserted before `exec`; repeat to pass multiple args"
-        )]
-        args: Vec<String>,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -697,6 +719,11 @@ enum ProfileCliCommand {
         #[command(subcommand)]
         command: ProfileChannelCliCommand,
     },
+    #[command(about = "Inspect or safely edit model definitions for a profile")]
+    Model {
+        #[command(subcommand)]
+        command: ProfileModelCliCommand,
+    },
     #[command(about = "Inspect referenced profile resources")]
     Resource {
         #[command(subcommand)]
@@ -715,7 +742,7 @@ enum ProfileCliCommand {
         #[arg(long)]
         force: bool,
     },
-    #[command(hide = true, about = "Deprecated: use remi-cat agent --profile")]
+    #[command(about = "Manage agent profile definitions")]
     Agent {
         #[command(subcommand)]
         command: ProfileAgentCliCommand,
@@ -913,6 +940,36 @@ struct ProfileStatusArgs {
     instance: Option<String>,
     #[arg(long, default_value = "plain", value_parser = ["plain", "json"], help = "Choose human or machine-readable output")]
     format: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileModelCliCommand {
+    #[command(about = "Show one model definition and its source file")]
+    Show {
+        reference: String,
+        #[arg(help = "Model Profile ID; omit to use the runtime-selected default")]
+        id: Option<String>,
+        #[arg(long, default_value = "yaml", value_parser = ["yaml", "json"])]
+        format: String,
+    },
+    #[command(about = "Validate and atomically update model definition fields")]
+    Set {
+        reference: String,
+        #[arg(help = "Model Profile ID; omit to use the runtime-selected default")]
+        id: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        context_tokens: Option<u32>,
+        #[arg(long)]
+        max_output_tokens: Option<u32>,
+        #[arg(long = "model-overflow-bytes")]
+        overflow_bytes: Option<usize>,
+        #[arg(long, value_parser = ["hard", "agent", "off"])]
+        context_compaction: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1116,14 +1173,6 @@ pub(crate) enum AcpCommand {
     },
     Doctor,
     Agent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AcpAdapterCommand {
-    Codex {
-        bin: Option<String>,
-        args: Vec<String>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1387,6 +1436,35 @@ fn validate_positive_usize_arg(value: &str) -> Result<usize, String> {
 
 fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Result<AppCommand> {
     match command {
+        Some(CliCommand::Message { command }) => Ok(AppCommand::Message(match command {
+            MessageCliCommand::Send {
+                session_id,
+                text,
+                stdin,
+                idempotency_key,
+                json,
+            } => {
+                if text.is_none() && !stdin {
+                    anyhow::bail!("message send requires --text or --stdin");
+                }
+                MessageCommand::Send {
+                    session_id,
+                    text,
+                    stdin,
+                    idempotency_key,
+                    json,
+                }
+            }
+            MessageCliCommand::Status {
+                session_id,
+                idempotency_key,
+                json,
+            } => MessageCommand::Status {
+                session_id,
+                idempotency_key,
+                json,
+            },
+        })),
         Some(CliCommand::Setup(args)) => Ok(AppCommand::Setup(args.entries)),
         Some(CliCommand::Doctor) => Ok(AppCommand::Doctor),
         Some(CliCommand::Tools(args)) => Ok(AppCommand::Tools(args)),
@@ -1442,9 +1520,6 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
             AcpCliCommand::Doctor => AcpCommand::Doctor,
             AcpCliCommand::Agent => AcpCommand::Agent,
         })),
-        Some(CliCommand::AcpAdapter { command }) => Ok(AppCommand::AcpAdapter(match command {
-            AcpAdapterCliCommand::Codex { bin, args } => AcpAdapterCommand::Codex { bin, args },
-        })),
         Some(CliCommand::Codex { command }) => Ok(AppCommand::Codex(match command {
             CodexCliCommand::Setup { bin, agent, args } => CodexCommand::Setup { bin, agent, args },
             CodexCliCommand::Doctor => CodexCommand::Doctor,
@@ -1475,35 +1550,27 @@ fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Resu
 
 fn workflow_cli_to_command(command: WorkflowCliCommand) -> anyhow::Result<ProfileWorkflowCommand> {
     match command {
-        WorkflowCliCommand::List(args) => {
-            let _ = InstanceProfile::from_label(&args.profile)?;
-            Ok(ProfileWorkflowCommand::List {
-                profile: args.profile,
-            })
-        }
+        WorkflowCliCommand::List(args) => Ok(ProfileWorkflowCommand::List {
+            profile: args.profile,
+        }),
         WorkflowCliCommand::Show {
             profile,
             workflow_id,
         } => {
-            let _ = InstanceProfile::from_label(&profile.profile)?;
             profile_command::validate_file_id(&workflow_id)?;
             Ok(ProfileWorkflowCommand::Show {
                 profile: profile.profile,
                 workflow_id,
             })
         }
-        WorkflowCliCommand::Add { profile, path } => {
-            let _ = InstanceProfile::from_label(&profile.profile)?;
-            Ok(ProfileWorkflowCommand::Upsert {
-                profile: profile.profile,
-                path,
-            })
-        }
+        WorkflowCliCommand::Add { profile, path } => Ok(ProfileWorkflowCommand::Upsert {
+            profile: profile.profile,
+            path,
+        }),
         WorkflowCliCommand::Rm {
             profile,
             workflow_id,
         } => {
-            let _ = InstanceProfile::from_label(&profile.profile)?;
             profile_command::validate_file_id(&workflow_id)?;
             if workflow_id == "goal" {
                 anyhow::bail!("embedded workflow `goal` cannot be deleted");
@@ -1713,6 +1780,36 @@ fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileC
                 force,
             },
         })),
+        ProfileCliCommand::Model { command } => Ok(ProfileCommand::Model(match command {
+            ProfileModelCliCommand::Show {
+                reference,
+                id,
+                format,
+            } => profile_command::ProfileModelCommand::Show {
+                reference,
+                id,
+                format,
+            },
+            ProfileModelCliCommand::Set {
+                reference,
+                id,
+                model,
+                context_tokens,
+                max_output_tokens,
+                overflow_bytes,
+                context_compaction,
+                dry_run,
+            } => profile_command::ProfileModelCommand::Set {
+                reference,
+                id,
+                model,
+                context_tokens,
+                max_output_tokens,
+                overflow_bytes,
+                context_compaction,
+                dry_run,
+            },
+        })),
         ProfileCliCommand::Resource { command } => Ok(ProfileCommand::Resource(match command {
             ProfileResourceCliCommand::List { reference } => {
                 profile_command::ProfileResourceCommand::List { reference }
@@ -1760,32 +1857,26 @@ fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileC
         }
         ProfileCliCommand::Agent { command } => Ok(ProfileCommand::Agent(match command {
             ProfileAgentCliCommand::List { profile } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileAgentCommand::List { profile }
             }
             ProfileAgentCliCommand::Show { profile, agent_id } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileAgentCommand::Show { profile, agent_id }
             }
             ProfileAgentCliCommand::Upsert { profile, path } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileAgentCommand::Upsert { profile, path }
             }
             ProfileAgentCliCommand::SetDefault { profile, agent_id } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileAgentCommand::SetDefault { profile, agent_id }
             }
         })),
         ProfileCliCommand::Workflow { command } => Ok(ProfileCommand::Workflow(match command {
             ProfileWorkflowCliCommand::List { profile } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileWorkflowCommand::List { profile }
             }
             ProfileWorkflowCliCommand::Show {
                 profile,
                 workflow_id,
             } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::validate_file_id(&workflow_id)?;
                 profile_command::ProfileWorkflowCommand::Show {
                     profile,
@@ -1793,14 +1884,12 @@ fn profile_cli_to_command(command: ProfileCliCommand) -> anyhow::Result<ProfileC
                 }
             }
             ProfileWorkflowCliCommand::Upsert { profile, path } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::ProfileWorkflowCommand::Upsert { profile, path }
             }
             ProfileWorkflowCliCommand::Delete {
                 profile,
                 workflow_id,
             } => {
-                let _ = InstanceProfile::from_label(&profile)?;
                 profile_command::validate_file_id(&workflow_id)?;
                 if workflow_id == "goal" {
                     anyhow::bail!("embedded workflow `goal` cannot be deleted");
@@ -2001,4 +2090,62 @@ fn optional_arg(args: &[String], index: usize) -> Option<String> {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty() && !value.starts_with('-'))
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod message_cli_tests {
+    use super::{parse_cli_args, AppCommand, MessageCommand};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_markdown_text_and_stdin_send() {
+        let parsed = parse_cli_args(&args(&[
+            "message",
+            "send",
+            "--session",
+            "session-1",
+            "--text",
+            "# Heading\n**bold**",
+            "--idempotency-key",
+            "job-1",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(parsed.command, AppCommand::Message(MessageCommand::Send { session_id, text: Some(text), idempotency_key: Some(key), json: true, .. }) if session_id == "session-1" && text == "# Heading\n**bold**" && key == "job-1")
+        );
+        let parsed = parse_cli_args(&args(&[
+            "message",
+            "send",
+            "--session",
+            "session-1",
+            "--stdin",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            AppCommand::Message(MessageCommand::Send { stdin: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_status_and_rejects_missing_input() {
+        let parsed = parse_cli_args(&args(&[
+            "message",
+            "status",
+            "--session",
+            "session-1",
+            "--idempotency-key",
+            "job-1",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(parsed.command, AppCommand::Message(MessageCommand::Status { session_id, idempotency_key, json: true }) if session_id == "session-1" && idempotency_key == "job-1")
+        );
+        assert!(parse_cli_args(&args(&["message", "send", "--session", "session-1"])).is_err());
+    }
 }

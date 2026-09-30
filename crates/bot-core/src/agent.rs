@@ -400,13 +400,7 @@ where
                                 ev = inner_stream.next() => ev,
                                 _ = steer.notified() => {
                                     if let Some(batch) = steer.drain_batch() {
-                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                            steer_ids: batch.ids.clone(),
-                                            session_id: log_thread_id.clone(),
-                                            preview: batch.preview.clone(),
-                                            count: batch.count,
-                                            next_turn: batch.has_user_next_turn(),
-                                        });
+                                        yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, log_thread_id.clone()));
                                         let (messages, user_state) = last_checkpoint_state
                                             .take()
                                             .map(|mut state| {
@@ -437,13 +431,7 @@ where
                                 (options.steer.as_ref(), last_checkpoint_state.clone())
                             {
                                 if let Some(batch) = steer.drain_batch() {
-                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                        steer_ids: batch.ids.clone(),
-                                        session_id: state.thread_id.0.clone(),
-                                        preview: batch.preview.clone(),
-                                        count: batch.count,
-                                        next_turn: batch.has_user_next_turn(),
-                                    });
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, state.thread_id.0.clone()));
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         let mut state = state;
                                         complete_pending_tool_calls_in_state(&mut state);
@@ -451,7 +439,10 @@ where
                                         yield CatEvent::Done;
                                         return;
                                     }
-                                    next_input = Some(steer_start_input(state, batch));
+                                    let injected = steer_start_input(state, batch);
+                                    let (messages, user_state) = handoff_history_from_input(&injected);
+                                    yield CatEvent::History(messages, user_state);
+                                    next_input = Some(injected);
                                     break;
                                 }
                             }
@@ -1491,13 +1482,7 @@ where
 
                             if let Some(steer) = options.steer.as_ref() {
                                 if let Some(batch) = steer.drain_batch() {
-                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                        steer_ids: batch.ids.clone(),
-                                        session_id: state.thread_id.0.clone(),
-                                        preview: batch.preview.clone(),
-                                        count: batch.count,
-                                        next_turn: batch.has_user_next_turn(),
-                                    });
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, state.thread_id.0.clone()));
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         append_tool_results_to_history(&mut state.messages, all_outcomes);
                                         complete_pending_tool_calls_in_state(&mut state);
@@ -1505,8 +1490,10 @@ where
                                         yield CatEvent::Done;
                                         return;
                                     }
-                                    next_input =
-                                        Some(steer_start_input_after_tool_results(state, all_outcomes, batch));
+                                    let injected = steer_start_input_after_tool_results(state, all_outcomes, batch);
+                                    let (messages, user_state) = handoff_history_from_input(&injected);
+                                    yield CatEvent::History(messages, user_state);
+                                    next_input = Some(injected);
                                     break;
                                 }
                             }
@@ -1521,13 +1508,7 @@ where
                         CoreDriveEvent::Checkpoint { state } => {
                             if let Some(steer) = options.steer.as_ref() {
                                 if let Some(batch) = steer.drain_batch() {
-                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent {
-                                        steer_ids: batch.ids.clone(),
-                                        session_id: state.thread_id.0.clone(),
-                                        preview: batch.preview.clone(),
-                                        count: batch.count,
-                                        next_turn: batch.has_user_next_turn(),
-                                    });
+                                    yield CatEvent::SteerInjected(crate::SteerInjectedEvent::from_batch(&batch, state.thread_id.0.clone()));
                                     if options.steer_behavior == CoreSteerBehavior::Handoff {
                                         let mut state = state;
                                         complete_pending_tool_calls_in_state(&mut state);
@@ -1535,7 +1516,10 @@ where
                                         yield CatEvent::Done;
                                         return;
                                     }
-                                    next_input = Some(steer_start_input(state, batch));
+                                    let injected = steer_start_input(state, batch);
+                                    let (messages, user_state) = handoff_history_from_input(&injected);
+                                    yield CatEvent::History(messages, user_state);
+                                    next_input = Some(injected);
                                     break;
                                 }
                             }
@@ -1639,14 +1623,63 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+const STEER_CONTEXT_KEYS: [&str; 8] = [
+    "sender_user_id",
+    "sender_username",
+    "message_id",
+    "chat_type",
+    "platform",
+    "app_id",
+    "im_attachments",
+    "im_documents",
+];
+const BACKGROUND_STEER_CONTEXT_KEYS: [&str; 5] = [
+    "sender_user_id",
+    "sender_username",
+    "message_id",
+    "im_attachments",
+    "im_documents",
+];
+
 fn steer_start_input(mut state: AgentState, batch: CoreSteerBatch) -> LoopInput {
     complete_pending_tool_calls_in_state(&mut state);
+    let mut metadata = state
+        .config
+        .metadata
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    let runtime_metadata = metadata.as_object_mut().expect("object metadata");
+    let stale_keys: &[&str] = if batch.is_background_only() {
+        &BACKGROUND_STEER_CONTEXT_KEYS
+    } else {
+        &STEER_CONTEXT_KEYS
+    };
+    for key in stale_keys {
+        runtime_metadata.remove(*key);
+    }
+    if let Some(steer_metadata) = batch
+        .message_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    {
+        for key in STEER_CONTEXT_KEYS {
+            if let Some(value) = steer_metadata.get(key) {
+                runtime_metadata.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(user_name) = batch.user_name.as_ref() {
+        runtime_metadata.insert(
+            "sender_username".into(),
+            serde_json::Value::String(user_name.clone()),
+        );
+    }
     let mut input = LoopInput::start_content(batch.content)
         .history(state.messages)
-        .user_state(state.user_state);
-    if let Some(metadata) = state.config.metadata {
-        input = input.metadata(metadata);
-    }
+        .user_state(state.user_state)
+        .metadata(metadata);
     if let Some(message_metadata) = batch.message_metadata {
         input = input.message_metadata(message_metadata);
     }
@@ -2121,6 +2154,9 @@ async fn prepare_approval_request_for_tool(
                     risk: ToolRiskLevel::High,
                     reason: "No approval model reviewer is configured.".to_string(),
                     concerns: vec!["Requires explicit human confirmation.".to_string()],
+                    model: None,
+                    low_probability: None,
+                    requires_human_approval: false,
                 },
             };
             request.risk = review.risk;
@@ -3066,6 +3102,63 @@ mod tests {
                     .text_content()
                     .contains(INTERRUPTED_TOOL_RESULT_ERROR));
                 assert_eq!(message.content.text_content(), "steer");
+            }
+            other => panic!("expected start input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steer_start_input_replaces_tool_context_with_new_message_context() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.config.metadata = Some(serde_json::json!({
+            "thread_id": "session",
+            "message_id": "old-message",
+            "sender_user_id": "old-sender",
+            "im_attachments": "old-attachment",
+        }));
+        let mut batch = test_steer_batch("read new attachment");
+        batch.message_metadata = Some(serde_json::json!({
+            "message_id": "new-message",
+            "sender_user_id": "new-sender",
+            "im_attachments": [{"key": "new-file", "name": "new.txt"}],
+        }));
+        batch.user_name = Some("New Sender".into());
+
+        let input = steer_start_input(state, batch);
+        match input {
+            LoopInput::Start { metadata, message, .. } => {
+                let metadata = metadata.expect("runtime metadata");
+                assert_eq!(metadata["thread_id"], "session");
+                assert_eq!(metadata["message_id"], "new-message");
+                assert_eq!(metadata["sender_user_id"], "new-sender");
+                assert_eq!(metadata["sender_username"], "New Sender");
+                assert_eq!(metadata["im_attachments"][0]["key"], "new-file");
+                assert_eq!(message.name.as_deref(), Some("New Sender"));
+            }
+            other => panic!("expected start input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_steer_keeps_channel_but_clears_previous_sender() {
+        let mut state = AgentState::new(StepConfig::new("test-model"));
+        state.config.metadata = Some(serde_json::json!({
+            "thread_id": "session",
+            "platform": "feishu",
+            "app_id": "app",
+            "sender_user_id": "old-sender",
+            "im_attachments": "old-attachment",
+        }));
+        let mut batch = test_steer_batch("background result");
+        batch.sources = vec![CoreSteerSource::BackgroundToolCompletion];
+        let input = steer_start_input(state, batch);
+        match input {
+            LoopInput::Start { metadata, .. } => {
+                let metadata = metadata.expect("runtime metadata");
+                assert_eq!(metadata["platform"], "feishu");
+                assert_eq!(metadata["app_id"], "app");
+                assert!(metadata.get("sender_user_id").is_none());
+                assert!(metadata.get("im_attachments").is_none());
             }
             other => panic!("expected start input, got {other:?}"),
         }
@@ -4836,6 +4929,11 @@ mod tests {
                     ),
                     "{events:#?}"
                 );
+                assert!(events.iter().any(|event| matches!(event,
+                    CatEvent::History(messages, _) if messages.iter().any(|message|
+                        message.role == Role::User
+                            && message.content.text_content().contains("while-tool steer"))
+                )));
                 assert!(events
                     .iter()
                     .any(|event| matches!(event, CatEvent::Text(text) if text == "steered")));

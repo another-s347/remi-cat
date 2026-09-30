@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use bot_core::{
 };
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
-use remi_agentloop::prelude::ProtocolEvent;
+use remi_agentloop::prelude::{CancellationToken, ProtocolEvent};
 use tracing::{info, warn};
 use user_store::UserStore;
 
@@ -55,6 +56,59 @@ use sub_session::record_sub_session_event;
 
 const MAX_FEISHU_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_FEISHU_IMAGES: usize = 8;
+
+type FeishuRunKey = (String, String);
+
+#[derive(Clone, Default)]
+struct FeishuActiveRuns(Rc<RefCell<HashMap<FeishuRunKey, HashMap<String, CancellationToken>>>>);
+
+impl FeishuActiveRuns {
+    fn register(&self, key: FeishuRunKey) -> FeishuRunRegistration {
+        let cancel = CancellationToken::new();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        self.0
+            .borrow_mut()
+            .entry(key.clone())
+            .or_default()
+            .insert(run_id.clone(), cancel.clone());
+        FeishuRunRegistration {
+            runs: self.clone(),
+            key,
+            run_id,
+            cancel,
+        }
+    }
+
+    fn stop(&self, key: &FeishuRunKey) -> usize {
+        let runs = self.0.borrow();
+        let Some(active) = runs.get(key) else {
+            return 0;
+        };
+        for cancel in active.values() {
+            cancel.cancel();
+        }
+        active.len()
+    }
+}
+
+struct FeishuRunRegistration {
+    runs: FeishuActiveRuns,
+    key: FeishuRunKey,
+    run_id: String,
+    cancel: CancellationToken,
+}
+
+impl Drop for FeishuRunRegistration {
+    fn drop(&mut self) {
+        let mut runs = self.runs.0.borrow_mut();
+        if let Some(active) = runs.get_mut(&self.key) {
+            active.remove(&self.run_id);
+            if active.is_empty() {
+                runs.remove(&self.key);
+            }
+        }
+    }
+}
 
 pub(crate) struct FeishuChannel {
     platform: String,
@@ -114,14 +168,17 @@ async fn run_feishu_configured(
                 .await?
         }
     };
+    let active_runs = FeishuActiveRuns::default();
     while let Some(event) = rx.recv().await {
         match event {
             FeishuEvent::MessageReceived(msg) => {
                 let runtime = Rc::clone(&runtime);
                 let gateway = gateway.clone();
                 let platform = platform.clone();
+                let active_runs = active_runs.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = process_feishu_message(runtime, gateway, platform, msg).await
+                    if let Err(err) =
+                        process_feishu_message(runtime, gateway, platform, msg, active_runs).await
                     {
                         warn!("failed to process Feishu message: {err:#}");
                     }
@@ -146,8 +203,10 @@ async fn run_feishu_configured(
                 let runtime = Rc::clone(&runtime);
                 let gateway = gateway.clone();
                 let platform = platform.clone();
+                let active_runs = active_runs.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = process_feishu_message(runtime, gateway, platform, msg).await
+                    if let Err(err) =
+                        process_feishu_message(runtime, gateway, platform, msg, active_runs).await
                     {
                         warn!("failed to process Feishu reaction: {err:#}");
                     }
@@ -187,15 +246,23 @@ async fn process_feishu_message(
     gateway: FeishuGateway,
     platform: String,
     msg: FeishuMessage,
+    active_runs: FeishuActiveRuns,
 ) -> anyhow::Result<()> {
     let channel_id = feishu_session_channel_id(&msg);
+    let run_key = (platform.clone(), channel_id.clone());
+    let is_stop = msg.text.trim() == "/stop";
+    let stopped = if is_stop {
+        active_runs.stop(&run_key)
+    } else {
+        0
+    };
     let session_exists = runtime
         .sessions
         .lock()
         .await
         .channel_session_id(&platform, &channel_id)
         .is_some();
-    if should_ignore_unaddressed_topic_start(&msg, session_exists) {
+    if should_ignore_unaddressed_topic_start(&msg, session_exists) && stopped == 0 {
         info!(
             chat_id = %msg.chat_id,
             thread_id = msg.thread_id.as_deref().unwrap_or(""),
@@ -204,6 +271,17 @@ async fn process_feishu_message(
         );
         return Ok(());
     }
+
+    if is_stop {
+        let reply = if stopped == 0 {
+            "当前会话没有正在运行的回复。"
+        } else {
+            "已请求停止当前会话的回复。"
+        };
+        gateway.reply_text(&msg.message_id, reply).await?;
+        return Ok(());
+    }
+    let run = active_runs.register(run_key);
 
     let sender_uuid = runtime
         .user_store
@@ -230,10 +308,12 @@ async fn process_feishu_message(
         &platform,
         msg.clone(),
         sender_username,
+        Some(run.cancel.clone()),
         Some(&gateway),
         Some(&mut replies),
     )
     .await;
+    drop(run);
     replies.finish().await;
     if let Some(reaction_id) = reaction_id {
         gateway
@@ -249,7 +329,7 @@ pub(crate) async fn collect_cli_bot_reply(
     msg: FeishuMessage,
     sender_username: Option<String>,
 ) -> anyhow::Result<String> {
-    collect_bot_reply(runtime, CLI_CHANNEL, msg, sender_username, None, None).await
+    collect_bot_reply(runtime, CLI_CHANNEL, msg, sender_username, None, None, None).await
 }
 
 fn async_agent_enabled() -> bool {
@@ -392,6 +472,7 @@ async fn collect_bot_reply(
     platform: &str,
     msg: FeishuMessage,
     sender_username: Option<String>,
+    cancel: Option<CancellationToken>,
     gateway: Option<&FeishuGateway>,
     mut replies: Option<&mut FeishuReplyStream>,
 ) -> anyhow::Result<String> {
@@ -401,6 +482,23 @@ async fn collect_bot_reply(
         &channel_id,
         &runtime.root_agent_id,
     )?;
+    if is_feishu_platform(platform) {
+        if let Some(thread_id) = msg.thread_id.as_deref() {
+            if msg.message_id.starts_with("om_") {
+                let mut sessions = runtime.sessions.lock().await;
+                sessions.set_metadata_string(
+                    &session_id,
+                    "feishu_reply_anchor",
+                    &msg.message_id,
+                )?;
+                sessions.set_metadata_string(
+                    &session_id,
+                    "feishu_reply_anchor_thread_id",
+                    thread_id,
+                )?;
+            }
+        }
+    }
     if is_feishu_platform(platform) && is_fork_command(msg.text.trim()) {
         let reply = handle_feishu_fork_command(&runtime, platform, &session_id, &msg).await?;
         append_reply_chunk(
@@ -448,15 +546,23 @@ async fn collect_bot_reply(
         gateway,
     )
     .await;
-    let request = ChatRequest::text(session_id.clone(), channel, prepared.text)
+    let mut system_prompt = output_protocol.context.prompt();
+    if is_feishu_platform(platform) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&feishu_channel_context_prompt(platform, &session_id, &msg));
+    }
+    let mut request = ChatRequest::text(session_id.clone(), channel, prepared.text)
         .with_content(content)
         .with_sender(msg.sender_user_id.clone(), sender_username)
         .with_message(msg.message_id.clone(), msg.chat_type.clone())
         .with_platform(Some(platform.to_string()))
         .with_async_agent(async_agent_enabled())
-        .with_output_protocol_prompt(Some(output_protocol.context.prompt()))
+        .with_output_protocol_prompt(Some(system_prompt))
         .enable_sdk_todo()
         .with_im_context(im_attachments, im_documents);
+    if let Some(cancel) = cancel {
+        request = request.with_cancel(cancel);
+    }
     let debug_enabled = runtime
         .sessions
         .lock()
@@ -470,6 +576,7 @@ async fn collect_bot_reply(
         session_id: &session_id,
         debug_enabled,
         output: String::new(),
+        active_reply_message_id: msg.message_id.clone(),
         replies: &mut replies,
         streaming_tool_names: HashMap::new(),
         streaming_tool_args: HashMap::new(),
@@ -492,6 +599,24 @@ async fn collect_bot_reply(
 
 fn is_feishu_platform(platform: &str) -> bool {
     platform == FEISHU_CHANNEL || platform.starts_with("feishu:")
+}
+
+fn feishu_channel_context_prompt(platform: &str, session_id: &str, msg: &FeishuMessage) -> String {
+    let context = serde_json::json!({
+        "platform": platform,
+        "chat_type": msg.chat_type,
+        "chat_id": msg.chat_id,
+        "thread_id": msg.thread_id,
+        "message_id": msg.message_id,
+        "parent_message_id": msg.parent_id,
+        "sender_user_id": msg.sender_user_id,
+        "remi_session_id": session_id,
+    });
+    format!(
+        "## Feishu Channel Context\n\nCurrent incoming message (Feishu IDs, except remi_session_id): {context}\n\
+         chat_id identifies the Feishu chat. thread_id is the Feishu topic/thread ID when present; null means this message is not in a topic. remi_session_id is internal and must not be used as a Feishu chat or thread ID.\n\
+         If more chat context is needed, you may use lark-cli with these Feishu IDs when it is installed, authenticated, and authorized. Do not assume lark-cli is available or that chat history has already been read."
+    )
 }
 
 fn is_fork_command(command: &str) -> bool {
@@ -816,6 +941,7 @@ struct FeishuEventForwarder<'a, 'b> {
     session_id: &'a str,
     debug_enabled: bool,
     output: String,
+    active_reply_message_id: String,
     replies: &'b mut Option<&'b mut FeishuReplyStream>,
     streaming_tool_names: HashMap<String, String>,
     streaming_tool_args: HashMap<String, String>,
@@ -840,9 +966,11 @@ impl FeishuEventForwarder<'_, '_> {
                 true
             }
             CoreChatEvent::ResponseCompleted { text, .. } => {
+                let mut reply_msg = self.msg.clone();
+                reply_msg.message_id = self.active_reply_message_id.clone();
                 let rendered = self
                     .output_protocol
-                    .render_final(self.runtime, self.msg, &text)
+                    .render_final(self.runtime, &reply_msg, &text)
                     .await;
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.set_pending_final_text(rendered);
@@ -1009,15 +1137,21 @@ impl FeishuEventForwarder<'_, '_> {
                 self.supervisor_execution_started = false;
             }
             CatEvent::SteerQueued(event) => {
-                let preview = compact_preview(&event.preview, 120);
-                let line = if preview.is_empty() {
-                    "↪️ 新消息已加入当前运行队列".to_string()
-                } else {
-                    format!("↪️ 已排队：{preview}")
-                };
-                self.update_status("steer", &line).await;
+                // The queued message gets a short ordinary reply. Its COT is
+                // created only when the original run actually injects it.
+                tracing::debug!(steer_id = %event.steer_id, "Feishu steer queued");
             }
             CatEvent::SteerInjected(event) => {
+                if let Some(message_id) = event
+                    .message_id
+                    .as_deref()
+                    .filter(|id| id.starts_with("om_"))
+                {
+                    if let Some(replies) = self.replies.as_deref_mut() {
+                        replies.switch_to_steer(message_id).await;
+                    }
+                    self.active_reply_message_id = message_id.to_string();
+                }
                 let preview = compact_preview(&event.preview, 120);
                 let line = if preview.is_empty() {
                     format!("✅ 已将 {} 条新消息注入当前运行", event.count)
@@ -1404,16 +1538,81 @@ fn format_narrative_delta(
 #[cfg(test)]
 mod tests {
     use bot_core::{Content, ContentPart};
+    use im_feishu::FeishuMessage;
 
     use super::{
-        build_message_content, compact_preview, format_feishu_todo_state, format_narrative_delta,
-        quoted_reply_text, should_emit_empty_fallback, FeishuOutputProtocol, FeishuReplyKind,
+        build_message_content, compact_preview, feishu_channel_context_prompt,
+        format_feishu_todo_state, format_narrative_delta, quoted_reply_text,
+        should_emit_empty_fallback, FeishuActiveRuns, FeishuOutputProtocol, FeishuReplyKind,
     };
     use crate::{
         OutputCapabilities, OutputCapability, OutputEntity, OutputEntityKind, OutputProtocolContext,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    fn feishu_context_test_message(thread_id: Option<&str>) -> FeishuMessage {
+        FeishuMessage {
+            message_id: "om_message".into(),
+            sender_user_id: "ou_sender".into(),
+            chat_id: "oc_chat".into(),
+            chat_type: "group".into(),
+            text: "hello".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            documents: Vec::new(),
+            parent_id: None,
+            thread_id: thread_id.map(str::to_string),
+            at_bot: true,
+            mentions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn feishu_channel_prompt_distinguishes_chat_topic_and_internal_session() {
+        let prompt = feishu_channel_context_prompt(
+            "feishu:work",
+            "internal-session",
+            &feishu_context_test_message(Some("omt_topic")),
+        );
+        assert!(prompt.contains("\"chat_id\":\"oc_chat\""));
+        assert!(prompt.contains("\"thread_id\":\"omt_topic\""));
+        assert!(prompt.contains("\"message_id\":\"om_message\""));
+        assert!(prompt.contains("\"sender_user_id\":\"ou_sender\""));
+        assert!(prompt.contains("\"remi_session_id\":\"internal-session\""));
+        assert!(prompt.contains("lark-cli"));
+
+        let no_topic = feishu_channel_context_prompt(
+            "feishu",
+            "internal-session",
+            &feishu_context_test_message(None),
+        );
+        assert!(no_topic.contains("\"thread_id\":null"));
+    }
+
+    #[test]
+    fn stop_cancels_only_active_runs_in_the_same_feishu_session() {
+        let runs = FeishuActiveRuns::default();
+        let key = ("feishu:one".to_string(), "chat:thread:topic".to_string());
+        let other_key = ("feishu:one".to_string(), "chat:thread:other".to_string());
+        let other_platform = ("feishu:two".to_string(), key.1.clone());
+        let first = runs.register(key.clone());
+        let second = runs.register(key.clone());
+        let other = runs.register(other_key.clone());
+        let another_platform = runs.register(other_platform.clone());
+
+        assert_eq!(runs.stop(&key), 2);
+        assert!(first.cancel.is_cancelled());
+        assert!(second.cancel.is_cancelled());
+        assert!(!other.cancel.is_cancelled());
+        assert!(!another_platform.cancel.is_cancelled());
+
+        drop(first);
+        assert_eq!(runs.stop(&key), 1);
+        drop(second);
+        assert_eq!(runs.stop(&key), 0);
+        assert_eq!(runs.stop(&other_key), 1);
+    }
 
     #[test]
     fn feishu_protocol_renders_native_user_and_all_mentions() {

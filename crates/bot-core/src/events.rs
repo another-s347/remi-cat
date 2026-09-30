@@ -137,8 +137,30 @@ pub struct SteerInjectedEvent {
     pub session_id: String,
     pub preview: String,
     pub count: usize,
+    /// Source IM message to anchor a new channel reply when this user steer runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     #[serde(default)]
     pub next_turn: bool,
+}
+
+impl SteerInjectedEvent {
+    pub fn from_batch(batch: &bot_runtime_core::CoreSteerBatch, session_id: String) -> Self {
+        Self {
+            steer_ids: batch.ids.clone(),
+            session_id,
+            preview: batch.preview.clone(),
+            count: batch.count,
+            message_id: batch
+                .message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("message_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
+            next_turn: batch.has_user_next_turn(),
+        }
+    }
 }
 
 // ── Top-level CatEvent ───────────────────────────────────────────────────────
@@ -230,4 +252,27 @@ pub enum CatEvent {
     /// Intermediate state snapshot — user_state after each tool round.
     /// Used by `CatBot` to persist user_state eagerly.
     StateUpdate(serde_json::Value),
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use bot_runtime_core::{Content, CoreSteerBatch, CoreSteerSource};
+
+    use super::SteerInjectedEvent;
+
+    #[test]
+    fn injected_event_carries_the_source_message_anchor() {
+        let batch = CoreSteerBatch {
+            ids: vec!["steer-1".into()],
+            content: Content::text("follow-up"),
+            preview: "follow-up".into(),
+            count: 1,
+            message_metadata: Some(serde_json::json!({"message_id": "om_steer"})),
+            user_name: None,
+            sources: vec![CoreSteerSource::User],
+        };
+        let event = SteerInjectedEvent::from_batch(&batch, "session".into());
+        assert_eq!(event.message_id.as_deref(), Some("om_steer"));
+        assert_eq!(event.steer_ids, vec!["steer-1"]);
+    }
 }

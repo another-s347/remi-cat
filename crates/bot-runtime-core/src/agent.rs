@@ -123,9 +123,28 @@ impl CoreSteerQueue {
         if pending.is_empty() {
             return None;
         }
-        let drained = pending.drain(..).collect::<Vec<_>>();
+        // Keep user messages as separate turns so each retains its own sender,
+        // message ID and downloadable attachment context.
+        let count = if pending
+            .front()
+            .is_some_and(|input| input.source == CoreSteerSource::BackgroundToolCompletion)
+        {
+            pending
+                .iter()
+                .take_while(|input| input.source == CoreSteerSource::BackgroundToolCompletion)
+                .count()
+        } else {
+            1
+        };
+        let drained = pending.drain(..count).collect::<Vec<_>>();
         drop(pending);
         Some(merge_steer_inputs(drained))
+    }
+
+    /// Recover inputs that were accepted but never consumed when a run ends
+    /// unexpectedly. The caller must first stop new submissions to this queue.
+    pub fn drain_pending(&self) -> Vec<CoreSteerInput> {
+        self.pending.lock().expect("steer queue lock poisoned").drain(..).collect()
     }
 }
 
@@ -508,7 +527,7 @@ You are a markdown agent.
     }
 
     #[test]
-    fn steer_queue_drains_inputs_in_submission_order_as_one_batch() {
+    fn steer_queue_drains_user_inputs_as_distinct_ordered_turns() {
         let queue = CoreSteerQueue::new();
         queue.push(CoreSteerInput {
             id: "one".to_string(),
@@ -527,19 +546,19 @@ You are a markdown agent.
             source: CoreSteerSource::User,
         });
 
-        let batch = queue.drain_batch().expect("batch should be present");
-
-        assert_eq!(batch.ids, vec!["one", "two"]);
-        assert_eq!(batch.count, 2);
-        assert_eq!(batch.user_name.as_deref(), Some("alice"));
-        let text = batch.content.text_content();
-        assert!(text.contains("1. User steer: first"));
-        assert!(text.contains("2. User steer: second"));
+        let first = queue.drain_batch().expect("first turn should be present");
+        assert_eq!(first.ids, vec!["one"]);
+        assert_eq!(first.count, 1);
+        assert!(first.content.text_content().contains("first"));
+        let second = queue.drain_batch().expect("second turn should be present");
+        assert_eq!(second.ids, vec!["two"]);
+        assert_eq!(second.user_name.as_deref(), Some("alice"));
+        assert!(second.content.text_content().contains("second"));
         assert!(queue.drain_batch().is_none());
     }
 
     #[test]
-    fn steer_batch_preserves_user_next_turn_metadata_when_mixed_with_background() {
+    fn steer_queue_keeps_user_metadata_separate_from_background() {
         let queue = CoreSteerQueue::new();
         queue.push(CoreSteerInput {
             id: "user".to_string(),
@@ -558,7 +577,7 @@ You are a markdown agent.
             source: CoreSteerSource::BackgroundToolCompletion,
         });
 
-        let batch = queue.drain_batch().expect("batch should be present");
+        let batch = queue.drain_batch().expect("user turn should be present");
 
         assert!(batch.has_user_next_turn());
         assert!(!batch.is_background_only());
@@ -571,6 +590,8 @@ You are a markdown agent.
                 .and_then(serde_json::Value::as_str),
             Some("message-2")
         );
+        let background = queue.drain_batch().expect("background turn should be present");
+        assert!(background.is_background_only());
     }
 
     #[tokio::test]
