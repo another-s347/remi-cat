@@ -145,6 +145,7 @@ pub struct HookMutationResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplicationCatalog {
+    pub default_model_profile_id: Option<String>,
     pub models: Vec<ModelProfileConfig>,
     pub agents: Vec<AgentProfile>,
     pub skills: Vec<SkillSummary>,
@@ -1657,6 +1658,9 @@ async fn dispatch(
                     .bot
                     .workflow_definitions()
                     .map(|workflows| ApplicationCatalog {
+                        default_model_profile_id: Some(
+                            runtime.bot.default_model_profile().id.clone(),
+                        ),
                         models: runtime.bot.model_profiles().into_iter().cloned().collect(),
                         agents: runtime.bot.agent_profiles().into_iter().cloned().collect(),
                         skills: runtime.bot.skill_summaries(),

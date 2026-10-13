@@ -53,6 +53,8 @@ struct AcpSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     external_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound_channel: Option<AcpBoundChannel>,
@@ -214,6 +216,7 @@ pub struct AcpToolRequest {
     pub title: Option<String>,
     pub current_channel: Option<AcpBoundChannel>,
     pub startup_args: Vec<String>,
+    pub working_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +289,7 @@ pub struct PreparedToolTurn {
     pub prompt: String,
     pub message: String,
     pub startup_args: Vec<String>,
+    pub working_directory: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +407,17 @@ impl AcpBackend {
                 "startup_args are not supported by the ACP backend; configure local adapter args in the ACP profile"
             );
         }
+        if request.working_directory.is_some()
+            && !matches!(
+                &self.config,
+                AcpConfig::Local {
+                    local_bin: Some(_),
+                    ..
+                }
+            )
+        {
+            anyhow::bail!("working_directory requires a local external ACP agent");
+        }
         tracing::info!(
             acp_session_id = request.session_id.as_deref().unwrap_or(""),
             title_present = request
@@ -437,6 +452,8 @@ impl AcpBackend {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         if is_new {
+            let working_directory =
+                resolve_acp_working_directory(request.working_directory.as_deref())?;
             let mut record = AcpSessionRecord {
                 session_id: session_id.clone(),
                 sub_session_id: Uuid::new_v4().to_string(),
@@ -444,6 +461,7 @@ impl AcpBackend {
                 created_at: now.clone(),
                 updated_at: now.clone(),
                 external_session_id: None,
+                working_directory: Some(working_directory),
                 last_summary: None,
                 bound_channel: None,
                 transcript: Vec::new(),
@@ -461,6 +479,30 @@ impl AcpBackend {
             .get(&session_id)
             .cloned()
             .with_context(|| format!("ACP session not found: {session_id}"))?;
+        let working_directory = match record.working_directory.as_deref() {
+            Some(saved) => {
+                if let Some(requested) = request.working_directory.as_deref() {
+                    let requested = resolve_acp_working_directory(Some(requested))?;
+                    if requested != saved {
+                        anyhow::bail!(
+                            "ACP session {session_id} uses working_directory {}; start a new session to use {}",
+                            saved.display(),
+                            requested.display()
+                        );
+                    }
+                }
+                saved.to_path_buf()
+            }
+            None => resolve_acp_working_directory(request.working_directory.as_deref())?,
+        };
+        if record.working_directory.is_none() {
+            store
+                .sessions
+                .get_mut(&session_id)
+                .expect("session was just loaded")
+                .working_directory = Some(working_directory.clone());
+            save_store(&self.store_path, &store)?;
+        }
 
         let prompt = if self.config.needs_prompt_history() {
             build_prompt_with_recent_summaries(
@@ -491,6 +533,7 @@ impl AcpBackend {
             prompt,
             message,
             startup_args: request.startup_args,
+            working_directory,
         })
     }
 
@@ -529,6 +572,7 @@ impl AcpBackend {
             .invoke_remote(
                 &prepared.session_id,
                 prepared.external_session_id.as_deref(),
+                &prepared.working_directory,
                 &prepared.message,
                 &prepared.prompt,
                 &prepared.startup_args,
@@ -606,6 +650,7 @@ impl AcpBackend {
                         local_bin,
                         &prepared.session_id,
                         prepared.external_session_id.as_deref(),
+                        &prepared.working_directory,
                         &prepared.prompt,
                         local_args,
                         event_tx,
@@ -637,6 +682,7 @@ impl AcpBackend {
                     local_bin,
                     &prepared.session_id,
                     prepared.external_session_id.as_deref(),
+                    &prepared.working_directory,
                     &prepared.prompt,
                     local_args,
                     event_tx,
@@ -869,6 +915,7 @@ impl AcpBackend {
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await?;
         let response = self.run_prepared_tool_turn(prepared).await?;
@@ -987,6 +1034,7 @@ impl AcpBackend {
         &self,
         session_id: &str,
         external_session_id: Option<&str>,
+        working_directory: &std::path::Path,
         message: &str,
         prompt: &str,
         startup_args: &[String],
@@ -1011,6 +1059,7 @@ impl AcpBackend {
                             local_bin,
                             session_id,
                             external_session_id,
+                            working_directory,
                             prompt,
                             local_args,
                             event_tx,
@@ -1065,6 +1114,7 @@ impl AcpBackend {
                         local_bin,
                         session_id,
                         external_session_id,
+                        working_directory,
                         prompt,
                         local_args,
                         event_tx,
@@ -1189,10 +1239,34 @@ fn local_acp_args_from_env() -> Vec<String> {
     }
 }
 
+fn resolve_acp_working_directory(requested: Option<&std::path::Path>) -> Result<PathBuf> {
+    let process_cwd =
+        std::env::current_dir().context("failed to resolve current directory for ACP")?;
+    let path = match requested {
+        Some(path) if path.as_os_str().is_empty() => {
+            anyhow::bail!("working_directory must not be empty")
+        }
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => process_cwd.join(path),
+        None => process_cwd,
+    };
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("ACP working_directory does not exist: {}", path.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!(
+            "ACP working_directory is not a directory: {}",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
 async fn invoke_local_acp_stdio(
     program: &str,
     session_id: &str,
     external_session_id: Option<&str>,
+    working_directory: &std::path::Path,
     message: &str,
     configured_startup_args: &[String],
     event_tx: Option<mpsc::UnboundedSender<AcpToolTaskEvent>>,
@@ -1200,7 +1274,7 @@ async fn invoke_local_acp_stdio(
     cancel_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<AcpInvocationResult> {
     let started = Instant::now();
-    let cwd = std::env::current_dir().context("failed to resolve current directory for ACP")?;
+    let cwd = working_directory.to_path_buf();
     let mut argv = Vec::with_capacity(1 + configured_startup_args.len());
     argv.push(program.to_string());
     argv.extend(configured_startup_args.iter().cloned());
@@ -1869,6 +1943,7 @@ mod tests {
                 title: Some("demo".to_string()),
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
@@ -1884,6 +1959,7 @@ mod tests {
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
@@ -1907,6 +1983,7 @@ mod tests {
                 title: Some("runner test".to_string()),
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
@@ -1934,6 +2011,7 @@ mod tests {
                 title: Some("spawn runner test".to_string()),
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
@@ -1971,6 +2049,7 @@ mod tests {
                 title: None,
                 current_channel: None,
                 startup_args: vec!["--config".to_string()],
+                working_directory: None,
             })
             .await
             .unwrap_err();
@@ -2065,6 +2144,7 @@ for raw in sys.stdin:
             &program,
             "acp-session-1",
             None,
+            dir.path(),
             "hello stdio",
             &[],
             Some(tx),
@@ -2139,11 +2219,13 @@ for raw in sys.stdin:
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let (decision_tx, decision_rx) = mpsc::unbounded_channel();
         let program = bin_path.to_string_lossy().to_string();
+        let working_directory = dir.path().to_path_buf();
         let invocation = tokio::spawn(async move {
             invoke_local_acp_stdio(
                 &program,
                 "remi-session",
                 None,
+                &working_directory,
                 "run",
                 &[],
                 Some(event_tx),
@@ -2182,6 +2264,7 @@ for raw in sys.stdin:
                 &bin_path.to_string_lossy(),
                 "remi-session-2",
                 None,
+                dir.path(),
                 "run",
                 &[],
                 None,
@@ -2253,6 +2336,7 @@ for raw in sys.stdin:
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
@@ -2277,8 +2361,8 @@ for raw in sys.stdin:
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires an installed codex-acp and Codex login"]
     async fn official_codex_acp_resumes_across_processes() {
-        let program = std::env::var("REMI_CODEX_ACP_SMOKE_BIN")
-            .expect("set REMI_CODEX_ACP_SMOKE_BIN to the codex-acp executable");
+        let program = std::env::var("REMI_CODEX_ACP_E2E_BIN")
+            .expect("set REMI_CODEX_ACP_E2E_BIN to the real codex-acp executable");
         let dir = tempdir().unwrap();
         let mut backend = AcpBackend::new(dir.path().to_path_buf(), None);
         backend.config = AcpConfig::Local {
@@ -2295,6 +2379,7 @@ for raw in sys.stdin:
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: Some(dir.path().to_path_buf()),
             })
             .await
             .unwrap();
@@ -2325,10 +2410,12 @@ for raw in sys.stdin:
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
         assert_eq!(second.prompt, second_message);
+        assert_eq!(second.working_directory, dir.path().canonicalize().unwrap());
         assert_eq!(
             second.external_session_id.as_deref(),
             Some(external_session_id.as_str())
@@ -2352,6 +2439,9 @@ for raw in sys.stdin:
         let dir = tempdir().unwrap();
         let bin_path = dir.path().join("fake-acp-agent.py");
         let log_path = dir.path().join("acp.log");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let expected_cwd = workspace.canonicalize().unwrap();
         let mut file = std::fs::File::create(&bin_path).unwrap();
         writeln!(
             file,
@@ -2380,14 +2470,14 @@ for raw in sys.stdin:
             }},
         }}), flush=True)
     elif method == "session/new":
-        log("session/new")
+        log("session/new:" + params["cwd"])
         print(json.dumps({{
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {{"sessionId": "external-session-resume"}},
         }}), flush=True)
     elif method == "session/load":
-        log("session/load:" + params["sessionId"])
+        log("session/load:" + params["sessionId"] + ":" + params["cwd"])
         print(json.dumps({{
             "jsonrpc": "2.0",
             "id": request_id,
@@ -2442,12 +2532,27 @@ for raw in sys.stdin:
                 title: Some("external resume".to_string()),
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: Some(workspace.clone()),
             })
             .await
             .unwrap();
+        assert_eq!(prepared.working_directory, expected_cwd);
         let remi_session_id = prepared.session_id.clone();
         backend.run_prepared_tool_turn(prepared).await.unwrap();
 
+        let backend = AcpBackend::new(dir.path().join("store"), None);
+        let mismatched = backend
+            .prepare_tool_turn(AcpToolRequest {
+                message: "wrong directory".to_string(),
+                session_id: Some(remi_session_id.clone()),
+                title: None,
+                current_channel: None,
+                startup_args: Vec::new(),
+                working_directory: Some(dir.path().to_path_buf()),
+            })
+            .await
+            .unwrap_err();
+        assert!(mismatched.to_string().contains("start a new session"));
         let prepared = backend
             .prepare_tool_turn(AcpToolRequest {
                 message: "second external".to_string(),
@@ -2455,9 +2560,11 @@ for raw in sys.stdin:
                 title: None,
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();
+        assert_eq!(prepared.working_directory, expected_cwd);
         assert_eq!(
             prepared.external_session_id.as_deref(),
             Some("external-session-resume")
@@ -2466,9 +2573,15 @@ for raw in sys.stdin:
 
         let log = std::fs::read_to_string(&log_path).unwrap();
         let lines = log.lines().collect::<Vec<_>>();
-        assert_eq!(lines[0], "session/new");
+        assert_eq!(lines[0], format!("session/new:{}", expected_cwd.display()));
         assert_eq!(lines[1], "session/prompt:external-session-resume");
-        assert_eq!(lines[2], "session/load:external-session-resume");
+        assert_eq!(
+            lines[2],
+            format!(
+                "session/load:external-session-resume:{}",
+                expected_cwd.display()
+            )
+        );
         assert_eq!(lines[3], "session/prompt:external-session-resume");
         assert!(!log.contains(&format!("session/load:{remi_session_id}")));
 
@@ -2567,6 +2680,7 @@ for raw in sys.stdin:
                 title: Some("slow external".to_string()),
                 current_channel: None,
                 startup_args: Vec::new(),
+                working_directory: None,
             })
             .await
             .unwrap();

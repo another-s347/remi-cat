@@ -7,8 +7,7 @@ use anyhow::Context;
 use bot_core::{
     install_embedded_agent_profiles, install_embedded_model_profiles,
     validate_model_profile_api_key, AgentProfile, AgentRegistry, ModelProfileConfig,
-    ModelProfileRegistry,
-    WorkflowDefinition,
+    ModelProfileRegistry, WorkflowDefinition,
 };
 
 use crate::instance_profile::{
@@ -599,7 +598,10 @@ fn model_profile_file(models_dir: &Path, id: &str) -> anyhow::Result<PathBuf> {
             return Ok(path);
         }
     }
-    anyhow::bail!("model profile `{id}` has no source file in {}", models_dir.display())
+    anyhow::bail!(
+        "model profile `{id}` has no source file in {}",
+        models_dir.display()
+    )
 }
 
 fn run_profile_model_command(
@@ -613,17 +615,19 @@ fn run_profile_model_command(
     let profile = registry.resolve(reference)?;
     let id = match id {
         Some(id) => id.clone(),
-        None => crate::runtime_config::load_runtime_config_at(
-            &profile.runtime_config,
-            &profile.data_dir,
-        )?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "runtime config is missing; provide a model ID explicitly or initialize {}",
-                profile.runtime_config.display()
-            )
-        })?
-        .model_profile,
+        None => {
+            crate::runtime_config::load_runtime_config_at(
+                &profile.runtime_config,
+                &profile.data_dir,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime config is missing; provide a model ID explicitly or initialize {}",
+                    profile.runtime_config.display()
+                )
+            })?
+            .model_profile
+        }
     };
     let path = model_profile_file(&profile.models_dir, &id)?;
     let raw = std::fs::read_to_string(&path)
@@ -684,7 +688,10 @@ fn run_profile_model_command(
                 set_field("overflow_bytes", serde_yaml::to_value(value)?);
             }
             if let Some(value) = context_compaction {
-                set_field("context_compaction", serde_yaml::Value::String(value.clone()));
+                set_field(
+                    "context_compaction",
+                    serde_yaml::Value::String(value.clone()),
+                );
             }
             let updated: ModelProfileConfig = serde_yaml::from_value(document.clone())?;
             updated.validate().with_context(|| {
@@ -2137,6 +2144,9 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
             config.acp.local_args = parse_string_array(value)?
         }
         "im_mode" | "im.mode" => config.im.mode = parse_im_mode(value)?,
+        "im.auto_open_sub_session_channel" => {
+            config.im.auto_open_sub_session_channel = parse_bool(value)?
+        }
         "feishu_transport" | "im_transport" | "im.transport" | "feishu.transport" => {
             config.im.transport = parse_feishu_transport(value)?
         }
@@ -2391,6 +2401,24 @@ pub fn available_container_name_in_data_root(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sub_session_channels_config_entry_accepts_only_booleans() {
+        let mut config =
+            crate::runtime_config::RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        super::apply_runtime_config_entry(&mut config, "im.auto_open_sub_session_channel=true")
+            .unwrap();
+        assert!(config.im.auto_open_sub_session_channel);
+        assert!(super::apply_runtime_config_entry(
+            &mut config,
+            "im.auto_open_sub_session_channel=invalid"
+        )
+        .is_err());
+        assert!(config.im.auto_open_sub_session_channel);
+        super::apply_runtime_config_entry(&mut config, "im.auto_open_sub_session_channel=false")
+            .unwrap();
+        assert!(!config.im.auto_open_sub_session_channel);
+    }
+
     use super::*;
 
     #[test]
@@ -2430,12 +2458,17 @@ mod tests {
         )
         .unwrap();
         let profile = InstanceProfile::from_manifest(directory.join(PROFILE_FILE_NAME)).unwrap();
-        std::fs::write(profile.models_dir.join("broken.yaml"), "id: broken\ncontext_tokens: [\n")
-            .unwrap();
+        std::fs::write(
+            profile.models_dir.join("broken.yaml"),
+            "id: broken\ncontext_tokens: [\n",
+        )
+        .unwrap();
 
         let (errors, _) = profile_check_issues(&profile);
         assert!(
-            errors.iter().any(|error| error.contains("invalid model profiles")),
+            errors
+                .iter()
+                .any(|error| error.contains("invalid model profiles")),
             "expected the invalid model profile to be reported: {errors:?}"
         );
     }

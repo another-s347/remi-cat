@@ -780,8 +780,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
 
     let delivery_gateways = feishu_gateways.clone();
+    let runtime_config_path = std::env::var_os("REMI_RUNTIME_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| selected_profile.runtime_config.clone());
+    let auto_open_sub_session_channel = load_runtime_config_at(&runtime_config_path, &data_dir)?
+        .is_some_and(|config| config.im.auto_open_sub_session_channel);
     let bridge: Arc<dyn ImFileBridge> = Arc::new(
-        crate::channel::feishu::LocalImFileBridge::with_gateways(feishu_gateways),
+        crate::channel::feishu::LocalImFileBridge::with_gateways(
+            feishu_gateways,
+            auto_open_sub_session_channel,
+        ),
     );
     let mut bot_builder = CatBotBuilder::from_env()?
             .agent_tracing(if agent_tracing_enabled {

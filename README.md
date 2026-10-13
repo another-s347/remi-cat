@@ -45,6 +45,21 @@ remi-cat codex doctor
 
 `codex setup --bin` selects a different ACP executable, and repeated `--arg` values pass startup arguments to it. Existing profiles keep their configured `acp.local_bin` until setup is run again.
 
+Automatic Feishu/Lark channel creation for ACP, agent sub-sessions and `/fork`
+is disabled by default. To enable it, set this in the active profile's
+`runtime.yaml` and restart the runtime:
+
+```yaml
+im:
+  auto_open_sub_session_channel: true
+```
+
+When disabled (or omitted), sub-session history and forked sessions are still
+saved, and existing channel bindings continue to work.
+
+You can also enable it with
+`remi-cat config set im.auto_open_sub_session_channel=true`.
+
 ## Run
 
 Start the terminal UI (async background-tool handling is enabled by default):
@@ -58,6 +73,23 @@ Use synchronous tool handling instead:
 ```bash
 cargo run -- tui --sync
 ```
+
+Run the local Qwen service at `http://127.0.0.1:8080/v1`:
+
+```bash
+./scripts/local-qwen.sh
+./scripts/local-qwen.sh prompt --channel local-qwen "你好"
+```
+
+This selects `.remi-cat/models/local-qwen.yaml` with a 65,536-token context
+through `profiles/local-qwen/profile.yaml` and its runtime configuration,
+and uses the unauthenticated service's `local` API key for this process. Build with
+`cargo build` first, or set `REMI_LOCAL_BINARY` to an existing executable.
+When running in WSL with a Windows-only service, the launcher starts a
+loopback-only forwarding process using Windows `curl.exe`, preserves streaming,
+and stops that process on exit. Loopback requests bypass environment HTTP proxies.
+The launcher supplies `local` through a temporary credential file and removes it
+on exit. Windows must keep the model service running.
 
 Start the configured IM runtime:
 

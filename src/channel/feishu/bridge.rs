@@ -14,6 +14,7 @@ use crate::app::FEISHU_CHANNEL;
 
 pub(crate) struct LocalImFileBridge {
     gateways: HashMap<String, FeishuGateway>,
+    auto_open_sub_session_channel: bool,
     sub_session_cards: Mutex<HashMap<String, StreamingCard>>,
 }
 
@@ -24,13 +25,18 @@ impl LocalImFileBridge {
             .unwrap_or_default();
         Self {
             gateways,
+            auto_open_sub_session_channel: false,
             sub_session_cards: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn with_gateways(gateways: HashMap<String, FeishuGateway>) -> Self {
+    pub(crate) fn with_gateways(
+        gateways: HashMap<String, FeishuGateway>,
+        auto_open_sub_session_channel: bool,
+    ) -> Self {
         Self {
             gateways,
+            auto_open_sub_session_channel,
             sub_session_cards: Mutex::new(HashMap::new()),
         }
     }
@@ -156,6 +162,9 @@ impl ImFileBridge for LocalImFileBridge {
         Box<dyn std::future::Future<Output = anyhow::Result<Option<BoundImChannel>>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if !self.auto_open_sub_session_channel {
+                return Ok(None);
+            }
             if request.platform != FEISHU_CHANNEL && !request.platform.starts_with("feishu:") {
                 return Ok(None);
             }
@@ -267,18 +276,44 @@ mod tests {
 
     #[test]
     fn connector_platform_selects_the_matching_gateway() {
-        let bridge = LocalImFileBridge::with_gateways(HashMap::from([
-            (
-                "feishu:work".to_string(),
-                FeishuGateway::new("work-app", "work-secret"),
-            ),
-            (
-                "feishu:travel".to_string(),
-                FeishuGateway::new("travel-app", "travel-secret"),
-            ),
-        ]));
+        let bridge = LocalImFileBridge::with_gateways(
+            HashMap::from([
+                (
+                    "feishu:work".to_string(),
+                    FeishuGateway::new("work-app", "work-secret"),
+                ),
+                (
+                    "feishu:travel".to_string(),
+                    FeishuGateway::new("travel-app", "travel-secret"),
+                ),
+            ]),
+            false,
+        );
         assert!(bridge.gateway("feishu:work").is_some());
         assert!(bridge.gateway("feishu:travel").is_some());
         assert!(bridge.gateway("feishu:missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_sub_session_channels_skip_remote_creation() {
+        let bridge =
+            LocalImFileBridge::new(Some(FeishuGateway::new("unused-app", "unused-secret")));
+        for kind in ["acp", "fork", "agent"] {
+            let binding = bridge
+                .sub_session_binding_upsert(SubSessionBindingUpsertRequest {
+                    parent_session_id: "parent".into(),
+                    sub_session_id: "child".into(),
+                    kind: kind.into(),
+                    target: "test".into(),
+                    title: None,
+                    platform: FEISHU_CHANNEL.into(),
+                    parent_channel_id: "chat".into(),
+                    parent_thread_id: Some("topic".into()),
+                    actor_user_id: None,
+                })
+                .await
+                .unwrap();
+            assert!(binding.is_none());
+        }
     }
 }

@@ -1,0 +1,11 @@
+id: local-qwen
+name: Local Qwen
+description: Windows-local Qwen service; use scripts/local-qwen.sh from WSL.
+provider: openai
+model: qwen3.8-flash-next-unsloth-ud-iq4_xs
+base_url: http://127.0.0.1:8080/v1
+max_output_tokens: 8192
+context_tokens: 65536
+supports_images: false
+overflow_bytes: 32000
+context_compaction: hard

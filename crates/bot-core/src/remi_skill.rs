@@ -233,6 +233,8 @@ acp doctor
 
 `acp setup` writes the ACP runtime settings for the selected profile. `--client codex` uses the official `codex-acp` executable by default, which calls Codex app-server; install `@agentclientprotocol/codex-acp` so `codex-acp` is on PATH. `--bin` selects a different ACP executable and `--arg` passes startup arguments to it. `codex setup` and `codex doctor` are convenience aliases. Other local clients use `acp.local_bin` plus repeated `--arg` values as their process argv. Named ACP tools default to `codex` for Codex, or `acp__<client>` for other clients unless `--tool-name` is set. `acp agent` runs remi-cat as a standard ACP stdio agent and defaults to the HOME config root unless `REMI_DATA_DIR` is set. For `--client remi`, omitting `--bin` uses Remi's internal local runner; providing `--bin /path/to/remi-cat` configures an external stdio process and defaults local args to `["acp","agent"]` unless explicit `--arg` values are supplied.
 
+The `codex` and other external local ACP tools accept `working_directory` when creating a session. Relative directories resolve from the Remi process directory. Resume with `session_id` to keep using that directory.
+
 ## Hook Commands
 
 ```bash

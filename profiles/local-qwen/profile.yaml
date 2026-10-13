@@ -1,0 +1,17 @@
+schema_version: 1
+id: remi.local-qwen
+name: Local Qwen
+workspace: ../..
+config:
+  runtime: runtime.yaml
+resources:
+  agents: ../../.remi-cat/agents
+  models: ../../.remi-cat/models
+  skills:
+    - ../../.remi-cat/skills
+  workflows: ../../.remi-cat/workflows
+state:
+  data: ../../.remi-cat
+endpoint:
+  type: local
+  command: remi-cat

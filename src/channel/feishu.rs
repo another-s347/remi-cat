@@ -13,7 +13,7 @@ use bot_core::{
 use futures::StreamExt;
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
 use remi_agentloop::prelude::{CancellationToken, ProtocolEvent};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use user_store::UserStore;
 
 use crate::app::{
@@ -185,32 +185,7 @@ async fn run_feishu_configured(
                 });
             }
             FeishuEvent::ReactionReceived(reaction) => {
-                let text = format!("[user reacted with {}]", reaction.emoji_type);
-                let msg = FeishuMessage {
-                    message_id: reaction.message_id,
-                    sender_user_id: reaction.sender_user_id,
-                    chat_id: reaction.chat_id,
-                    chat_type: "group".to_string(),
-                    text,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    documents: Vec::new(),
-                    parent_id: None,
-                    thread_id: reaction.thread_id,
-                    at_bot: true,
-                    mentions: Vec::new(),
-                };
-                let runtime = Rc::clone(&runtime);
-                let gateway = gateway.clone();
-                let platform = platform.clone();
-                let active_runs = active_runs.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(err) =
-                        process_feishu_message(runtime, gateway, platform, msg, active_runs).await
-                    {
-                        warn!("failed to process Feishu reaction: {err:#}");
-                    }
-                });
+                debug!(message_id = %reaction.message_id, "ignored Feishu reaction");
             }
             FeishuEvent::Unknown { event_type, .. } => {
                 info!("ignored event type: {event_type}");

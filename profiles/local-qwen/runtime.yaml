@@ -1,0 +1,7 @@
+data_dir: .remi-cat
+root_agent_id: default
+model_profile: local-qwen
+sandbox:
+  kind: no_sandbox
+shell:
+  mode: disabled

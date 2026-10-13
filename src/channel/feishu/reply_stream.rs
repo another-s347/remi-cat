@@ -75,6 +75,7 @@ pub(super) struct FeishuReplyStream {
     sequence: u64,
     last_event_timestamp: u64,
     activities: HashSet<String>,
+    completed_tools: HashSet<String>,
     approval_cards: HashMap<String, String>,
     question_cards: HashMap<String, String>,
 }
@@ -98,6 +99,7 @@ impl FeishuReplyStream {
             sequence: 0,
             last_event_timestamp: 0,
             activities: HashSet::new(),
+            completed_tools: HashSet::new(),
             approval_cards: HashMap::new(),
             question_cards: HashMap::new(),
         }
@@ -192,6 +194,7 @@ impl FeishuReplyStream {
         self.sequence = 0;
         self.last_event_timestamp = 0;
         self.activities.clear();
+        self.completed_tools.clear();
     }
 
     pub(super) async fn interrupt_run(&mut self, reason: &str) {
@@ -549,12 +552,34 @@ impl FeishuReplyStream {
         line: &str,
         done: bool,
     ) -> bool {
+        let (created, events) = self.activity_events(id, name, icon, line, done);
+        if events.is_empty() {
+            return false;
+        }
         self.flush_pending_as_process().await;
         self.close_active_narrative().await;
+        for (event_type, content) in events {
+            self.enqueue_event(event_type, content).await;
+        }
+        self.flush_events().await;
+        created
+    }
+
+    fn activity_events(
+        &mut self,
+        id: &str,
+        name: &str,
+        icon: &str,
+        line: &str,
+        done: bool,
+    ) -> (bool, Vec<(&'static str, Value)>) {
+        if name == "tool" && self.completed_tools.contains(id) {
+            return (false, Vec::new());
+        }
+        let mut events = Vec::new();
         let created = self.activities.insert(id.to_string());
         if created {
-            self.enqueue_process_title(id, &process_title(line)).await;
-            self.enqueue_event(
+            events.push((
                 "TOOL_CALL_START",
                 json!({
                     "toolCallId": id,
@@ -563,15 +588,14 @@ impl FeishuReplyStream {
                     "icon": icon,
                     "status": "running"
                 }),
-            )
-            .await;
-            self.enqueue_event("TOOL_CALL_END", json!({"toolCallId": id}))
-                .await;
+            ));
+            events.push(("TOOL_CALL_END", json!({"toolCallId": id})));
         }
         if done {
-            self.enqueue_process_title(&format!("{id}-done"), &process_title(line))
-                .await;
-            self.enqueue_event(
+            if name == "tool" {
+                self.completed_tools.insert(id.to_string());
+            }
+            events.push((
                 "TOOL_CALL_RESULT",
                 json!({
                     "messageId": format!("result-{id}"),
@@ -580,13 +604,9 @@ impl FeishuReplyStream {
                     "role": "tool",
                     "status": "completed"
                 }),
-            )
-            .await;
+            ));
         }
-        if created || done {
-            self.flush_events().await;
-        }
-        created
+        (created, events)
     }
 
     async fn send_interactive_card(&self, card: serde_json::Value) -> anyhow::Result<String> {
@@ -812,6 +832,7 @@ mod tests {
         replies.cot_create_failed = true;
         replies.final_output_committed = true;
         replies.activities.insert("status-old".into());
+        replies.completed_tools.insert("tool-old".into());
 
         replies.reset_for_steer("om_steer");
 
@@ -822,11 +843,80 @@ mod tests {
         assert!(!replies.cot_create_failed);
         assert!(!replies.final_output_committed);
         assert!(replies.activities.is_empty());
+        assert!(replies.completed_tools.is_empty());
 
         let steer_run_id = replies.run_id.clone();
         replies.reset_for_steer("om_second_steer");
         assert_eq!(replies.parent_message_id, "om_second_steer");
         assert_ne!(replies.run_id, steer_run_id);
+    }
+
+    #[test]
+    fn tool_lifecycle_has_one_start_and_result_without_extra_text_cells() {
+        let gateway = FeishuGateway::new("app", "secret");
+        let mut replies = FeishuReplyStream::new(gateway, "oc_chat".into(), "om_msg".into());
+        let (created, mut events) =
+            replies.activity_events("call-1", "tool", "bash", "Running bash", false);
+        assert!(created);
+        // Argument deltas and the complete ToolCall describe the same invocation.
+        for line in ["Running bash: sleep 20", "Running bash: sleep 20"] {
+            let (created, updates) = replies.activity_events("call-1", "tool", "bash", line, false);
+            assert!(!created);
+            events.extend(updates);
+        }
+        events.extend(
+            replies
+                .activity_events("call-1", "tool", "bash", "Done bash", true)
+                .1,
+        );
+        // A repeated result or a late start must not render another cell.
+        events.extend(
+            replies
+                .activity_events("call-1", "tool", "bash", "Done bash", true)
+                .1,
+        );
+        events.extend(
+            replies
+                .activity_events("call-1", "tool", "bash", "Running bash", false)
+                .1,
+        );
+        assert_eq!(
+            events.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec!["TOOL_CALL_START", "TOOL_CALL_END", "TOOL_CALL_RESULT"]
+        );
+        assert!(events
+            .iter()
+            .all(|(_, content)| content["toolCallId"] == "call-1"));
+        assert_eq!(events[2].1["messageId"], "result-call-1");
+        // Identical tool text with a different ID is a separate invocation.
+        assert!(
+            replies
+                .activity_events("call-2", "tool", "bash", "Running bash", false)
+                .0
+        );
+        replies.reset_for_steer("om_steer");
+        assert!(
+            replies
+                .activity_events("call-1", "tool", "bash", "Running bash", false)
+                .0
+        );
+    }
+
+    #[test]
+    fn result_without_start_creates_one_complete_tool_lifecycle() {
+        let gateway = FeishuGateway::new("app", "secret");
+        let mut replies = FeishuReplyStream::new(gateway, "oc_chat".into(), "om_msg".into());
+        let (created, events) =
+            replies.activity_events("call-1", "tool", "bash", "Done bash", true);
+        assert!(created);
+        assert_eq!(
+            events.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec!["TOOL_CALL_START", "TOOL_CALL_END", "TOOL_CALL_RESULT"]
+        );
+        assert!(replies
+            .activity_events("call-1", "tool", "bash", "Done bash", true)
+            .1
+            .is_empty());
     }
 
     #[test]

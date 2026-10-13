@@ -714,7 +714,12 @@ fn effective_tui_model_status(
                     .and_then(|id| catalog.models.iter().find(|model| model.id == id))
             })?
         })
-        .or_else(|| catalog.models.first());
+        .or_else(|| {
+            catalog
+                .default_model_profile_id
+                .as_deref()
+                .and_then(|id| catalog.models.iter().find(|model| model.id == id))
+        });
     let model_id = model
         .map(|model| model.id.clone())
         .unwrap_or_else(|| "default".to_string());
@@ -7171,6 +7176,32 @@ mod tests {
             persistent_sessions: true,
             system_prompt: String::new(),
         }
+    }
+
+    #[test]
+    fn tui_status_uses_runtime_default_instead_of_first_catalog_model() {
+        let catalog = ApplicationCatalog {
+            default_model_profile_id: Some("local-qwen".to_string()),
+            models: vec![
+                test_model("deepseek", 128_000),
+                test_model("local-qwen", 65_536),
+            ],
+            agents: vec![test_agent("default", None)],
+            ..ApplicationCatalog::default()
+        };
+        assert_eq!(
+            effective_tui_model_status(&catalog, None),
+            ("default".to_string(), "local-qwen".to_string(), 65_536)
+        );
+        let mut session = test_session("session", TUI_CHANNEL, "tui:1", "now", None);
+        session.metadata.insert(
+            SESSION_MODEL_PROFILE_METADATA_KEY.to_string(),
+            serde_json::json!("removed-model"),
+        );
+        assert_eq!(
+            effective_tui_model_status(&catalog, Some(&session)),
+            ("default".to_string(), "local-qwen".to_string(), 65_536)
+        );
     }
 
     #[test]

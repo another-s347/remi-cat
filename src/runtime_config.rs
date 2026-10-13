@@ -665,6 +665,9 @@ fn default_container_name() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImConfig {
+    /// Automatically create IM channels for ACP, agent sub-sessions and forks.
+    #[serde(default)]
+    pub auto_open_sub_session_channel: bool,
     #[serde(default)]
     pub mode: ImMode,
     #[serde(default)]
@@ -816,6 +819,7 @@ impl ChannelsConfig {
 impl Default for ImConfig {
     fn default() -> Self {
         Self {
+            auto_open_sub_session_channel: false,
             mode: ImMode::Feishu,
             transport: FeishuTransport::WebSocket,
             event_hook: FeishuEventHookRuntimeConfig::default(),
@@ -1252,6 +1256,30 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn sub_session_channels_are_opt_in() {
+        let default = RuntimeConfig::default_for(std::path::Path::new(".remi-cat"));
+        assert!(!default.im.auto_open_sub_session_channel);
+        for im in [
+            "",
+            "im: {}",
+            "im:\n  auto_open_sub_session_channel: false",
+            "im:\n  auto_open_sub_session_channel: true",
+        ] {
+            let raw = format!(
+                "data_dir: .remi-cat\nroot_agent_id: default\nmodel_profile: default\n{im}\n"
+            );
+            let config: RuntimeConfig = serde_yaml::from_str(&raw).unwrap();
+            assert_eq!(
+                config.im.auto_open_sub_session_channel,
+                im.ends_with("true")
+            );
+            let restored: RuntimeConfig =
+                serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(restored.im, config.im);
+        }
+    }
 
     #[test]
     fn experimental_jev_approval_is_opt_in_and_validated() {

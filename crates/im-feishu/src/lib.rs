@@ -620,6 +620,7 @@ impl FeishuGateway {
                         )
                     }
                     "post" => extract_from_post(content_str),
+                    "interactive" => (extract_text_from_card(content_str), vec![], vec![], vec![]),
                     other => {
                         debug!(
                             message_id = %msg.message_id,
@@ -670,8 +671,9 @@ impl FeishuGateway {
                     .open_id
                     .or(ev.sender.sender_id.user_id)
                     .unwrap_or_default();
-                if ev.sender.sender_type.as_deref() == Some("app")
-                    || bot_open_id.is_some_and(|id| id == sender_id) {
+                if bot_open_id.is_some_and(|id| id == sender_id)
+                    || (ev.sender.sender_type.as_deref() == Some("app") && !at_bot)
+                {
                     debug!(message_id = %msg.message_id, "ignoring bot-authored Feishu message");
                     return None;
                 }
@@ -702,41 +704,7 @@ impl FeishuGateway {
                 }))
             }
 
-            "im.message.reaction.created_v1" => {
-                // Ignore reactions added by the bot itself.
-                if event_body.get("operator_type").and_then(|v| v.as_str()) != Some("user") {
-                    return None;
-                }
-                let message_id = event_body.get("message_id")?.as_str()?.to_string();
-                let chat_id = event_body
-                    .get("chat_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_default();
-                let thread_id = event_body
-                    .get("thread_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_string);
-                let sender_user_id = event_body
-                    .get("user_id")?
-                    .get("open_id")?
-                    .as_str()?
-                    .to_string();
-                let emoji_type = event_body
-                    .get("reaction_type")?
-                    .get("emoji_type")?
-                    .as_str()?
-                    .to_string();
-
-                Some(FeishuEvent::ReactionReceived(FeishuReaction {
-                    message_id,
-                    chat_id,
-                    thread_id,
-                    sender_user_id,
-                    emoji_type,
-                }))
-            }
+            "im.message.reaction.created_v1" | "im.message.reaction.deleted_v1" => None,
 
             "card.action.trigger" => {
                 debug!(event_body = ?event_body, "card.action.trigger received");
@@ -919,16 +887,30 @@ impl FeishuGateway {
         self.client.ensure_authenticated().await
     }
 
-    pub async fn send_card_with_uuid(&self, chat_id: &str, text: &str, uuid: &str) -> Result<String> {
-        self.client.send_card_with_uuid(chat_id, text, Some(uuid)).await
+    pub async fn send_card_with_uuid(
+        &self,
+        chat_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.client
+            .send_card_with_uuid(chat_id, text, Some(uuid))
+            .await
     }
 
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
         self.client.reply_card(message_id, text).await
     }
 
-    pub async fn reply_card_in_thread_with_uuid(&self, message_id: &str, text: &str, uuid: &str) -> Result<String> {
-        self.client.reply_card_in_thread_with_uuid(message_id, text, uuid).await
+    pub async fn reply_card_in_thread_with_uuid(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.client
+            .reply_card_in_thread_with_uuid(message_id, text, uuid)
+            .await
     }
 
     /// Reply to a message with a fully-built card JSON value.
@@ -1245,30 +1227,57 @@ fn extract_from_post(
 
 /// Extract plain text from a Feishu interactive card content JSON string.
 ///
-/// The card schema used by this bot is:
-/// `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"..."}]},...}`
-///
-/// We join the `content` fields of all `markdown` elements, which covers both
-/// bot-generated cards and generic Feishu 2.0 cards.
+/// Supports schema 1/2 card elements and the flattened text elements returned
+/// by Feishu message events. Only display fields are traversed, not action data.
 fn extract_text_from_card(content_str: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(content_str) {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
-    let mut parts: Vec<&str> = Vec::new();
-    if let Some(elements) = v
-        .get("body")
-        .and_then(|b| b.get("elements"))
-        .and_then(|e| e.as_array())
-    {
-        for el in elements {
-            if el.get("tag").and_then(|t| t.as_str()) == Some("markdown") {
-                if let Some(text) = el.get("content").and_then(|c| c.as_str()) {
-                    parts.push(text);
+    fn collect<'a>(value: &'a serde_json::Value, parts: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, parts);
                 }
             }
+            serde_json::Value::Object(object) => {
+                if matches!(
+                    object.get("tag").and_then(|v| v.as_str()),
+                    Some("markdown" | "plain_text" | "lark_md" | "text")
+                ) {
+                    if let Some(text) = object
+                        .get("content")
+                        .or_else(|| object.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if !text.trim().is_empty() {
+                            parts.push(text);
+                        }
+                    }
+                    return;
+                }
+                for key in [
+                    "header", "title", "body", "elements", "columns", "items", "fields", "text",
+                ] {
+                    if let Some(child) = object.get(key) {
+                        if key == "title" {
+                            if let Some(title) = child.as_str() {
+                                if !title.trim().is_empty() {
+                                    parts.push(title);
+                                }
+                                continue;
+                            }
+                        }
+                        collect(child, parts);
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    let mut parts = Vec::new();
+    collect(&v, &mut parts);
     parts.join("\n").trim().to_string()
 }
 
@@ -1390,8 +1399,8 @@ pub(crate) fn parse_feishu_document_url(raw: &str) -> Option<FeishuDocument> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_doc_links_from_text, extract_from_post, normalize_hook_path,
-        parse_feishu_document_url, token_matches, FeishuEvent, FeishuGateway,
+        extract_doc_links_from_text, extract_from_post, extract_text_from_card,
+        normalize_hook_path, parse_feishu_document_url, token_matches, FeishuEvent, FeishuGateway,
     };
     use serde_json::json;
 
@@ -1449,21 +1458,110 @@ mod tests {
 
     #[test]
     fn ignores_bot_authored_message_events() {
-        let event = |sender: serde_json::Value| json!({
-            "schema": "2.0",
-            "header": { "event_type": "im.message.receive_v1" },
-            "event": {
-                "sender": sender,
-                "message": {
-                    "message_id": "om_bot", "chat_id": "oc_chat", "chat_type": "p2p",
-                    "message_type": "text", "content": "{\"text\":\"echo\"}", "mentions": []
+        let event = |sender: serde_json::Value| {
+            json!({
+                "schema": "2.0",
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": sender,
+                    "message": {
+                        "message_id": "om_bot", "chat_id": "oc_chat", "chat_type": "p2p",
+                        "message_type": "text", "content": "{\"text\":\"echo\"}", "mentions": []
+                    }
                 }
-            }
-        });
-        let by_type = serde_json::to_vec(&event(json!({"sender_type": "app", "sender_id": {"open_id": "ou_bot"}}))).unwrap();
-        assert!(FeishuGateway::extract_event(&by_type, None).is_none());
-        let by_id = serde_json::to_vec(&event(json!({"sender_id": {"open_id": "ou_bot"}}))).unwrap();
+            })
+        };
+        let by_type = serde_json::to_vec(&event(
+            json!({"sender_type": "app", "sender_id": {"open_id": "ou_bot"}}),
+        ))
+        .unwrap();
+        assert!(FeishuGateway::extract_event(&by_type, Some("ou_bot")).is_none());
+        let by_id =
+            serde_json::to_vec(&event(json!({"sender_id": {"open_id": "ou_bot"}}))).unwrap();
         assert!(FeishuGateway::extract_event(&by_id, Some("ou_bot")).is_none());
+    }
+
+    #[test]
+    fn accepts_external_app_mentions_and_interactive_messages() {
+        for (message_type, content, expected) in [
+            ("text", json!({"text": "@_user_1 hello"}), "hello"),
+            (
+                "interactive",
+                json!({"title": "Card", "elements": [[{"tag": "text", "text": "@_user_1 hello"}]]}),
+                "Card\n hello",
+            ),
+            (
+                "interactive",
+                json!({"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "@_user_1 **hello**"}]}}),
+                "**hello**",
+            ),
+        ] {
+            let mut payload = json!({
+                "header": {"event_type": "im.message.receive_v1"},
+                "event": {
+                    "sender": {"sender_type": "app", "sender_id": {"open_id": "ou_external_app"}},
+                    "message": {
+                        "message_id": "om_external", "chat_id": "oc_group", "chat_type": "group",
+                        "message_type": message_type, "content": content.to_string(),
+                        "thread_id": "omt_topic", "parent_id": "om_parent",
+                        "mentions": [{"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Remi"}]
+                    }
+                }
+            });
+            let parse = |payload: &serde_json::Value| {
+                FeishuGateway::extract_event(&serde_json::to_vec(payload).unwrap(), Some("ou_bot"))
+            };
+            let Some(FeishuEvent::MessageReceived(message)) = parse(&payload) else {
+                panic!("external app mention should be accepted: {message_type}");
+            };
+            assert_eq!(message.text, expected);
+            assert!(message.at_bot);
+            assert_eq!(message.sender_user_id, "ou_external_app");
+            assert_eq!(message.thread_id.as_deref(), Some("omt_topic"));
+            assert_eq!(message.parent_id.as_deref(), Some("om_parent"));
+            payload["event"]["message"]["mentions"] = json!([]);
+            assert!(
+                parse(&payload).is_none(),
+                "unaddressed app message should be ignored"
+            );
+            payload["event"]["sender"]["sender_type"] = json!("user");
+            assert!(matches!(
+                parse(&payload),
+                Some(FeishuEvent::MessageReceived(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ignores_reaction_events() {
+        for event_type in [
+            "im.message.reaction.created_v1",
+            "im.message.reaction.deleted_v1",
+        ] {
+            let payload = json!({
+                "header": {"event_type": event_type},
+                "event": {"operator_type": "user", "message_id": "om_msg", "chat_id": "oc_group",
+                    "user_id": {"open_id": "ou_user"}, "reaction_type": {"emoji_type": "THUMBSUP"}}
+            });
+            assert!(FeishuGateway::extract_event(
+                &serde_json::to_vec(&payload).unwrap(),
+                Some("ou_bot")
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn extracts_nested_legacy_card_text_without_action_values() {
+        let content = json!({"header": {"title": {"tag": "plain_text", "content": "Title"}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**Body**"}},
+                {"tag": "column_set", "columns": [{"elements": [{"tag": "markdown", "content": "Nested"}]}]},
+                {"tag": "button", "value": {"text": "secret action"}}]});
+        assert_eq!(
+            extract_text_from_card(&content.to_string()),
+            "Title\n**Body**\nNested"
+        );
+        assert_eq!(extract_text_from_card("invalid JSON"), "");
     }
 
     #[test]
