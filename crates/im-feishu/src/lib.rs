@@ -27,6 +27,7 @@
 pub mod client;
 pub mod frame;
 pub mod streaming;
+pub mod structured_output;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -270,6 +271,8 @@ struct RawMessage {
     chat_type: String,
     message_type: String,
     content: Option<String>,
+    #[serde(default)]
+    content_v2: Option<String>,
     parent_id: Option<String>,
     thread_id: Option<String>,
     #[serde(default)]
@@ -552,7 +555,12 @@ impl FeishuGateway {
                 let ev: MessageReceiveEvent = serde_json::from_value(event_body).ok()?;
                 let msg = &ev.message;
 
-                let content_str = msg.content.as_deref().unwrap_or("");
+                let content_str = msg
+                    .content_v2
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .or(msg.content.as_deref())
+                    .unwrap_or("");
                 debug!(
                     message_id = %msg.message_id,
                     chat_id = %msg.chat_id,
@@ -620,7 +628,12 @@ impl FeishuGateway {
                         )
                     }
                     "post" => extract_from_post(content_str),
-                    "interactive" => (extract_text_from_card(content_str), vec![], vec![], vec![]),
+                    "interactive" => {
+                        let (images, files) = extract_card_resources(content_str);
+                        let text = extract_text_from_card(content_str);
+                        let documents = extract_doc_links_from_text(&text);
+                        (text, images, files, documents)
+                    }
                     other => {
                         debug!(
                             message_id = %msg.message_id,
@@ -902,6 +915,24 @@ impl FeishuGateway {
         self.client.reply_card(message_id, text).await
     }
 
+    pub async fn reply_final_card(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.client.reply_final_card(message_id, text, uuid).await
+    }
+
+    pub async fn reply_final_text(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.client.reply_final_text(message_id, text, uuid).await
+    }
+
     pub async fn reply_card_in_thread_with_uuid(
         &self,
         message_id: &str,
@@ -1085,10 +1116,11 @@ impl FeishuGateway {
             }
             "interactive" => {
                 let text = extract_text_from_card(&content_str);
+                let (images, files) = extract_card_resources(&content_str);
                 ParentContent {
                     text: Some(text).filter(|s| !s.is_empty()),
-                    images: vec![],
-                    files: vec![],
+                    images,
+                    files,
                 }
             }
             "image" => {
@@ -1190,39 +1222,139 @@ fn extract_from_post(
         return (String::new(), vec![], vec![], vec![]);
     };
 
-    let mut texts: Vec<&str> = Vec::new();
-    let mut images: Vec<String> = Vec::new();
-    let mut documents: Vec<FeishuDocument> = Vec::new();
-
+    let mut rows_text = Vec::new();
+    if let Some(title) = lang_val
+        .get("title")
+        .and_then(|value| value.as_str())
+        .filter(|title| !title.is_empty())
+    {
+        rows_text.push(title.to_string());
+    }
+    let mut images = Vec::new();
+    let mut documents = Vec::new();
     if let Some(rows) = lang_val.get("content").and_then(|c| c.as_array()) {
         for row in rows {
+            let mut text = String::new();
             if let Some(items) = row.as_array() {
                 for item in items {
                     match item.get("tag").and_then(|t| t.as_str()) {
-                        Some("text") => {
-                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                                texts.push(t);
+                        Some("text" | "md" | "code_block") => {
+                            if let Some(value) = item.get("text").and_then(|v| v.as_str()) {
+                                text.push_str(value);
+                                if item.get("tag").and_then(|value| value.as_str()) == Some("md") {
+                                    collect_markdown_images(value, &mut images);
+                                }
                             }
+                        }
+                        Some("a") => {
+                            let href = item.get("href").and_then(|v| v.as_str()).unwrap_or("");
+                            let label = item.get("text").and_then(|v| v.as_str()).unwrap_or(href);
+                            text.push_str(&format!("[{label}]({href})"));
                         }
                         Some("img") => {
-                            if let Some(k) = item.get("image_key").and_then(|k| k.as_str()) {
-                                images.push(k.to_string());
+                            if let Some(key) = item.get("image_key").and_then(|v| v.as_str()) {
+                                push_image_key(&mut images, key);
                             }
                         }
+                        Some("hr") => text.push_str("---"),
                         _ => {}
                     }
                     collect_doc_links_from_value(item, &mut documents);
                 }
             }
+            rows_text.push(text);
         }
     }
-
     (
-        texts.join("").trim().to_string(),
+        rows_text.join("\n").trim().to_string(),
         images,
         vec![],
         unique_documents(documents),
     )
+}
+
+fn push_image_key(images: &mut Vec<String>, key: &str) {
+    if !key.is_empty() && !images.iter().any(|existing| existing == key) {
+        images.push(key.to_string());
+    }
+}
+
+fn collect_markdown_images(text: &str, images: &mut Vec<String>) {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    for event in Parser::new_ext(text, Options::all()) {
+        if let Event::Start(Tag::Image { dest_url, .. }) = event {
+            if dest_url.starts_with("img_") {
+                push_image_key(images, &dest_url);
+            }
+        }
+    }
+}
+
+/// Traverse display fields only; callback values must never become model inputs.
+fn extract_card_resources(content: &str) -> (Vec<String>, Vec<FeishuFile>) {
+    fn collect(value: &serde_json::Value, images: &mut Vec<String>, files: &mut Vec<FeishuFile>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, images, files);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                match object.get("tag").and_then(|v| v.as_str()) {
+                    Some("img" | "image") => {
+                        if let Some(key) = object
+                            .get("img_key")
+                            .or_else(|| object.get("image_key"))
+                            .and_then(|v| v.as_str())
+                        {
+                            push_image_key(images, key);
+                        }
+                    }
+                    Some("markdown" | "lark_md") => {
+                        if let Some(text) = object
+                            .get("content")
+                            .or_else(|| object.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            collect_markdown_images(text, images);
+                        }
+                    }
+                    Some("file") => {
+                        if let Some(key) = object.get("file_key").and_then(|v| v.as_str()) {
+                            if !files.iter().any(|file| file.file_key == key) {
+                                files.push(FeishuFile {
+                                    file_key: key.into(),
+                                    file_name: object
+                                        .get("file_name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("attachment")
+                                        .into(),
+                                    mime_type: String::new(),
+                                    size_bytes: 0,
+                                    file_type: "file".into(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for key in [
+                    "header", "title", "body", "elements", "columns", "items", "fields", "text",
+                ] {
+                    if let Some(child) = object.get(key) {
+                        collect(child, images, files);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut images = Vec::new();
+    let mut files = Vec::new();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        collect(&value, &mut images, &mut files);
+    }
+    (images, files)
 }
 
 /// Extract plain text from a Feishu interactive card content JSON string.
@@ -1234,7 +1366,7 @@ fn extract_text_from_card(content_str: &str) -> String {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
-    fn collect<'a>(value: &'a serde_json::Value, parts: &mut Vec<&'a str>) {
+    fn collect(value: &serde_json::Value, parts: &mut Vec<String>) {
         match value {
             serde_json::Value::Array(items) => {
                 for item in items {
@@ -1242,6 +1374,16 @@ fn extract_text_from_card(content_str: &str) -> String {
                 }
             }
             serde_json::Value::Object(object) => {
+                if let Some(markdown) = crate::structured_output::component_markdown(value) {
+                    parts.push(markdown);
+                    return;
+                }
+                if object.get("tag").and_then(|v| v.as_str()) == Some("a") {
+                    let href = object.get("href").and_then(|v| v.as_str()).unwrap_or("");
+                    let label = object.get("text").and_then(|v| v.as_str()).unwrap_or(href);
+                    parts.push(format!("[{label}]({href})"));
+                    return;
+                }
                 if matches!(
                     object.get("tag").and_then(|v| v.as_str()),
                     Some("markdown" | "plain_text" | "lark_md" | "text")
@@ -1252,7 +1394,7 @@ fn extract_text_from_card(content_str: &str) -> String {
                         .and_then(|v| v.as_str())
                     {
                         if !text.trim().is_empty() {
-                            parts.push(text);
+                            parts.push(text.to_string());
                         }
                     }
                     return;
@@ -1264,7 +1406,7 @@ fn extract_text_from_card(content_str: &str) -> String {
                         if key == "title" {
                             if let Some(title) = child.as_str() {
                                 if !title.trim().is_empty() {
-                                    parts.push(title);
+                                    parts.push(title.to_string());
                                 }
                                 continue;
                             }
@@ -1562,6 +1704,51 @@ mod tests {
             "Title\n**Body**\nNested"
         );
         assert_eq!(extract_text_from_card("invalid JSON"), "");
+    }
+
+    #[test]
+    fn card_roundtrip_preserves_native_and_markdown_images_without_callback_data() {
+        let card = json!({"schema": "2.0", "body": {"elements": [
+            {"tag": "markdown", "content": "before ![inline](img_v3_a)"},
+            {"tag": "column_set", "columns": [{"elements": [{"tag": "img", "img_key": "img_v3_b"}]}]},
+            {"tag": "img", "image_key": "img_v3_a"},
+            {"tag": "file", "file_key": "file_v3_a", "file_name": "report.pdf"},
+            {"tag": "button", "behaviors": [{"value": {"tag": "img", "img_key": "private_image", "content": "private"}}]}
+        ]}}).to_string();
+        let (images, files) = super::extract_card_resources(&card);
+        assert_eq!(images, vec!["img_v3_a", "img_v3_b"]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "report.pdf");
+        assert_eq!(extract_text_from_card(&card), "before ![inline](img_v3_a)");
+    }
+
+    #[test]
+    fn post_keeps_paragraphs_links_markdown_and_embedded_images() {
+        let post = json!({"title": "Report", "content": [
+            [{"tag": "text", "text": "First "}, {"tag": "a", "text": "source", "href": "https://example.com"}],
+            [{"tag": "md", "text": "**Second** ![image](img_v3_md)"}],
+            [{"tag": "code_block", "text": "![literal](img_v3_code)"}]
+        ]});
+        let (text, images, _, _) = extract_from_post(&post.to_string());
+        assert_eq!(text, "Report\nFirst [source](https://example.com)\n**Second** ![image](img_v3_md)\n![literal](img_v3_code)");
+        assert_eq!(images, vec!["img_v3_md"]);
+    }
+
+    #[test]
+    fn incoming_post_prefers_content_v2_over_legacy_fallback() {
+        let post = json!({"content": [[{"tag": "md", "text": "new body ![x](img_v3_new)"}]]});
+        let event = json!({"header": {"event_type": "im.message.receive_v1"}, "event": {
+            "sender": {"sender_id": {"open_id": "ou_user"}, "sender_type": "user"},
+            "message": {"message_id": "om_test", "chat_id": "oc_test", "chat_type": "p2p", "message_type": "post",
+                "content": "{\"content\":[[{\"tag\":\"text\",\"text\":\"legacy\"}]]}", "content_v2": post.to_string()}
+        }});
+        let Some(super::FeishuEvent::MessageReceived(message)) =
+            super::FeishuGateway::extract_event(&serde_json::to_vec(&event).unwrap(), None)
+        else {
+            panic!("expected message");
+        };
+        assert_eq!(message.text, "new body ![x](img_v3_new)");
+        assert_eq!(message.images, vec!["img_v3_new"]);
     }
 
     #[test]

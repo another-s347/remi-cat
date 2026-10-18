@@ -556,6 +556,7 @@ async fn run_prompt_turn(
         session_id: session_id.clone(),
         message_id: message_id.clone(),
         announced_tools: HashSet::new(),
+        tool_output: HashMap::new(),
         announced_sub_sessions: HashSet::new(),
         sub_session_summaries: HashMap::new(),
         elicitation_supported,
@@ -624,6 +625,7 @@ struct AcpEventForwarder {
     session_id: agent_client_protocol::schema::v1::SessionId,
     message_id: MessageId,
     announced_tools: HashSet<String>,
+    tool_output: HashMap<String, String>,
     announced_sub_sessions: HashSet<String>,
     sub_session_summaries: HashMap<String, String>,
     elicitation_supported: bool,
@@ -655,6 +657,13 @@ impl AcpEventForwarder {
                     send_tool_call(&self.cx, self.session_id.clone(), id, name, None)?;
                 }
                 CatEvent::ToolCallArgumentsDelta { .. } => {}
+                CatEvent::ToolDelta { id, name, delta } => {
+                    let fields = accumulated_tool_output(&mut self.tool_output, &id, name, &delta);
+                    self.cx.send_notification(SessionNotification::new(
+                        self.session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
+                    ))?;
+                }
                 CatEvent::ToolCall { id, name, args } => {
                     if self.announced_tools.insert(id.clone()) {
                         send_tool_call(&self.cx, self.session_id.clone(), id, name, Some(args))?;
@@ -670,6 +679,7 @@ impl AcpEventForwarder {
                     success,
                     elapsed_ms: _,
                 } => {
+                    self.tool_output.remove(&id);
                     send_tool_result(&self.cx, self.session_id.clone(), id, name, result, success)?;
                 }
                 CatEvent::ToolTaskCompleted(task) => {
@@ -1364,6 +1374,23 @@ fn send_content_chunk(
     ))
 }
 
+fn accumulated_tool_output(
+    output: &mut HashMap<String, String>,
+    id: &str,
+    name: String,
+    delta: &str,
+) -> ToolCallUpdateFields {
+    // ACP content updates replace the collection; CatEvent carries deltas.
+    let content = output.entry(id.to_string()).or_default();
+    content.push_str(delta);
+    ToolCallUpdateFields::new()
+        .title(name)
+        .status(ToolCallStatus::InProgress)
+        .content(vec![ToolCallContent::from(ContentBlock::Text(
+            TextContent::new(content.clone()),
+        ))])
+}
+
 fn send_tool_call(
     cx: &ConnectionTo<Client>,
     session_id: impl Into<agent_client_protocol::schema::v1::SessionId>,
@@ -1479,6 +1506,31 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn tool_output_updates_replace_with_the_complete_per_call_snapshot() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ToolCall, ToolCallContent};
+        let mut output = std::collections::HashMap::new();
+        let mut call = ToolCall::new("first", "read");
+        for (id, text) in [
+            ("first", "line1\n"),
+            ("second", "other"),
+            ("first", "line2\n"),
+        ] {
+            let fields = super::accumulated_tool_output(&mut output, id, "read".into(), text);
+            if id == "first" {
+                call.update(fields);
+            }
+        }
+        let ToolCallContent::Content(content) = &call.content[0] else {
+            panic!("text content expected")
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            panic!("text expected")
+        };
+        assert_eq!(text.text, "line1\nline2\n");
+        assert_eq!(output["second"], "other");
+    }
 
     #[test]
     fn permission_option_maps_to_tool_decision() {

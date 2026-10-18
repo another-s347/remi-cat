@@ -1985,12 +1985,13 @@ async fn dispatch(
                 user_id,
                 reply,
             } => {
-                let value = match runtime.sessions.lock().await.fork_session(
+                let fork_result = runtime.sessions.lock().await.fork_session(
                     &source_id,
                     &platform,
                     &channel_id,
                     title,
-                ) {
+                );
+                let value = match fork_result {
                     Ok(Some(mut fork)) => {
                         let metadata_result = runtime.sessions.lock().await.set_metadata_string(
                             &fork.id,
@@ -2130,6 +2131,8 @@ async fn dispatch(
                 let run_telemetry = telemetry.clone();
                 let span = tracing::info_span!("application.run", app_id = %run_app_id, session_id = %run_session_id, run_id = id);
                 let join = tokio::task::spawn_local(async move {
+                    let sub_session_config = config.clone();
+                    let mut deliver_events = true;
                     let mut stream = Box::pin(Rc::clone(&runtime).chat(chat_request(
                         request,
                         config,
@@ -2137,6 +2140,11 @@ async fn dispatch(
                         &run_app_id,
                     )));
                     while let Some(event) = stream.next().await {
+                        if let CoreChatEvent::Bot(bot_core::CatEvent::SubSession(child)) = &event {
+                            if let Err(error) = record_sub_session(&runtime, &run_session_id, child, &run_app_id, &sub_session_config).await {
+                                tracing::warn!(error = %error, "failed to persist sub-session conversation");
+                            }
+                        }
                         if let CoreChatEvent::Bot(bot_core::CatEvent::ModelInputSnapshot(snapshot)) = &event {
                             if let Ok(json) = serde_json::to_string(snapshot) {
                                 if let Err(error) = crate::model_input_store::upsert_model_input_snapshot_json(
@@ -2154,6 +2162,7 @@ async fn dispatch(
                                 telemetry.capture_agent_error(error, "application.run");
                             }
                         }
+                        if !deliver_events { continue; }
                         let event = match event {
                             CoreChatEvent::Prefix(v) => ApplicationEvent::Prefix(v),
                             CoreChatEvent::Reply(v) => ApplicationEvent::Reply(v),
@@ -2166,37 +2175,10 @@ async fn dispatch(
                         };
                         tokio::select! {
                             result = event_tx.send(event) => {
-                                if result.is_err() {
-                                    while let Some(drained) = stream.next().await {
-                                        if let CoreChatEvent::Bot(bot_core::CatEvent::Error(error)) = drained {
-                                            if let Some(telemetry) = &run_telemetry {
-                                                telemetry.capture_agent_error(&error, "application.run");
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
+                                if result.is_err() { deliver_events = false; }
                             }
-                            _ = run_stop_delivery.cancelled() => {
-                                while let Some(drained) = stream.next().await {
-                                    if let CoreChatEvent::Bot(bot_core::CatEvent::Error(error)) = drained {
-                                        if let Some(telemetry) = &run_telemetry {
-                                            telemetry.capture_agent_error(&error, "application.run");
-                                        }
-                                    }
-                                }
-                                break;
-                            }
-                            _ = delivery_cancel.cancelled() => {
-                                while let Some(drained) = stream.next().await {
-                                    if let CoreChatEvent::Bot(bot_core::CatEvent::Error(error)) = drained {
-                                        if let Some(telemetry) = &run_telemetry {
-                                            telemetry.capture_agent_error(&error, "application.run");
-                                        }
-                                    }
-                                }
-                                break;
-                            }
+                            _ = run_stop_delivery.cancelled() => { deliver_events = false; }
+                            _ = delivery_cancel.cancelled() => { deliver_events = false; }
                         }
                     }
                     let _ = finished.send(Command::RunFinished(id));
@@ -2420,27 +2402,8 @@ async fn record_sub_session(
                 .context("sub-session channel references a missing session")?
         };
     drop(sessions);
-    let messages = match event.event.as_ref() {
-        ProtocolEvent::RunStart { .. } => {
-            vec![bot_core::Message::user(event.title.clone().unwrap_or_else(
-                || format!("Sub-session started: {} / {thread_id}", event.agent_name),
-            ))]
-        }
-        ProtocolEvent::Delta { content, .. } if !content.trim().is_empty() => {
-            vec![bot_core::Message::assistant(content.clone())]
-        }
-        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
-            .get("final_output")
-            .and_then(serde_json::Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| vec![bot_core::Message::assistant(v.to_string())])
-            .unwrap_or_default(),
-        ProtocolEvent::Error { message, .. } => {
-            vec![bot_core::Message::assistant(format!("Error: {message}"))]
-        }
-        ProtocolEvent::Cancelled => vec![bot_core::Message::assistant("Error: cancelled")],
-        _ => Vec::new(),
-    };
+    let messages =
+        crate::sub_session::history_messages_for_run(&runtime.data_dir, &child.id, event).await;
     if !messages.is_empty() {
         runtime
             .bot
@@ -2448,26 +2411,11 @@ async fn record_sub_session(
             .await
             .map_err(anyhow::Error::from)?;
     }
-    let path = runtime
-        .data_dir
-        .join("tui-subsession-events")
-        .join(format!("{}.jsonl", child.id));
+    crate::sub_session::append_event_log(&runtime.data_dir, &child.id, event).await?;
     let metadata_path = runtime
         .data_dir
         .join("tui-subsession-events")
         .join(format!("{}.meta.json", child.id));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut bytes = serde_json::to_vec(event)?;
-    bytes.push(b'\n');
-    use tokio::io::AsyncWriteExt as _;
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(&bytes).await?;
     if persists_session_state || !tokio::fs::try_exists(&metadata_path).await? {
         tokio::fs::write(
             metadata_path,
@@ -2918,6 +2866,7 @@ mod tests {
                 application_e2e_sse_tool_call(),
                 application_e2e_sse_text("MEMORY_A2A_CHILD_OK"),
                 application_e2e_sse_text("MEMORY_A2A_E2E_OK"),
+                application_e2e_sse_text("MEMORY_A2A_CONTINUE_OK"),
             ]))),
             requests: Arc::clone(&requests),
         };
@@ -3019,10 +2968,6 @@ mod tests {
                     saw_child_output |= serde_json::to_string(&event)
                         .unwrap()
                         .contains("MEMORY_A2A_CHILD_OK");
-                    channel
-                        .record_sub_session(&parent_session_id, event)
-                        .await
-                        .unwrap();
                 }
                 ApplicationEvent::Done => break,
                 _ => {}
@@ -3034,18 +2979,22 @@ mod tests {
             saw_child_output,
             "child output did not cross the A2A event stream"
         );
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[1].contains("Return MEMORY_A2A_CHILD_OK exactly."));
-        assert!(requests[2].contains("MEMORY_A2A_CHILD_OK"));
-        drop(requests);
+        let recorded_requests = requests.lock().unwrap();
+        assert_eq!(recorded_requests.len(), 3);
+        assert!(recorded_requests[1].contains("Return MEMORY_A2A_CHILD_OK exactly."));
+        assert!(recorded_requests[2].contains("MEMORY_A2A_CHILD_OK"));
+        drop(recorded_requests);
         let persisted_parent = channel.session(&parent_session_id).await.unwrap().unwrap();
         let persisted_child = persisted_parent
             .sub_sessions
             .iter()
             .find(|child| child.target == "worker")
             .expect("worker sub-session should be persisted");
-        assert_eq!(persisted_child.status, "done");
+        assert_eq!(
+            persisted_child.status, "done",
+            "{:?}",
+            persisted_parent.sub_sessions
+        );
         let persisted_child_session = channel.resolve_session(&persisted_child.id).await.unwrap();
         let persisted_events = channel
             .sub_session_events(&persisted_child_session.id, 0, 256)
@@ -3056,6 +3005,51 @@ mod tests {
             persisted_events_json.contains("MEMORY_A2A_CHILD_OK"),
             "{persisted_events_json}"
         );
+        assert!(persisted_events_json.contains("Return MEMORY_A2A_CHILD_OK exactly."));
+        let history = channel.history(&persisted_child_session.id).await.unwrap();
+        assert!(history.iter().any(|message| message.role == "user"
+            && message.text.contains("Return MEMORY_A2A_CHILD_OK exactly.")));
+        assert!(history
+            .iter()
+            .any(|message| message.role == "assistant"
+                && message.text.contains("MEMORY_A2A_CHILD_OK")));
+        let fork = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            channel.fork_session(&persisted_child_session.id, "fork-child", None),
+        )
+        .await
+        .expect("fork must not deadlock the session store")
+        .unwrap()
+        .unwrap();
+        let fork_history = channel.history(&fork.id).await.unwrap();
+        assert_eq!(
+            crate::sub_session::transcript(&fork_history),
+            crate::sub_session::transcript(&history)
+        );
+        let mut continuation = channel
+            .run(RunRequest::text(
+                &persisted_child_session.id,
+                "Continue the worker conversation.",
+            ))
+            .await
+            .unwrap();
+        let mut continuation_text = String::new();
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), continuation.recv())
+                .await
+                .unwrap()
+        {
+            if let ApplicationEvent::Cat(bot_core::CatEvent::Text(text)) = event {
+                continuation_text.push_str(&text);
+            }
+        }
+        assert!(continuation_text.contains("MEMORY_A2A_CONTINUE_OK"));
+        let recorded_requests = requests.lock().unwrap();
+        assert_eq!(recorded_requests.len(), 4);
+        assert!(recorded_requests[3].contains("Return the requested marker."));
+        assert!(recorded_requests[3].contains("MEMORY_A2A_CHILD_OK"));
+        assert!(!recorded_requests[3].contains("Use the worker, then report its result."));
+        drop(recorded_requests);
         application.shutdown().await.unwrap();
         server.abort();
         drop(reserved_a2a_port);

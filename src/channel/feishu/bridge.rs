@@ -6,7 +6,7 @@ use bot_core::im_tools::{
     DownloadedImFile, ImDownloadRequest, ImFileBridge, ImUploadRequest,
     SubSessionBindingUpsertRequest, UploadedImFile,
 };
-use im_feishu::{FeishuGateway, StreamingCard};
+use im_feishu::FeishuGateway;
 use tokio::sync::Mutex;
 
 use super::feishu_topic_channel_id;
@@ -15,7 +15,8 @@ use crate::app::FEISHU_CHANNEL;
 pub(crate) struct LocalImFileBridge {
     gateways: HashMap<String, FeishuGateway>,
     auto_open_sub_session_channel: bool,
-    sub_session_cards: Mutex<HashMap<String, StreamingCard>>,
+    topic_anchors: Mutex<HashMap<String, String>>,
+    topic_anchors_path: Option<std::path::PathBuf>,
 }
 
 impl LocalImFileBridge {
@@ -26,7 +27,8 @@ impl LocalImFileBridge {
         Self {
             gateways,
             auto_open_sub_session_channel: false,
-            sub_session_cards: Mutex::new(HashMap::new()),
+            topic_anchors: Mutex::new(HashMap::new()),
+            topic_anchors_path: None,
         }
     }
 
@@ -37,8 +39,23 @@ impl LocalImFileBridge {
         Self {
             gateways,
             auto_open_sub_session_channel,
-            sub_session_cards: Mutex::new(HashMap::new()),
+            topic_anchors: Mutex::new(HashMap::new()),
+            topic_anchors_path: None,
         }
+    }
+
+    pub(crate) fn with_topic_anchors_path(
+        mut self,
+        path: std::path::PathBuf,
+    ) -> anyhow::Result<Self> {
+        let anchors = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        self.topic_anchors = Mutex::new(anchors);
+        self.topic_anchors_path = Some(path);
+        Ok(self)
     }
 
     fn gateway(&self, platform: &str) -> Option<&FeishuGateway> {
@@ -51,6 +68,19 @@ impl LocalImFileBridge {
 }
 
 impl ImFileBridge for LocalImFileBridge {
+    fn sub_session_reply_anchor<'a>(
+        &'a self,
+        platform: &'a str,
+        channel_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.topic_anchors
+                .lock()
+                .await
+                .get(&format!("{platform}:{channel_id}"))
+                .cloned()
+        })
+    }
     fn download<'a>(
         &'a self,
         req: ImDownloadRequest,
@@ -108,35 +138,39 @@ impl ImFileBridge for LocalImFileBridge {
             if req.platform != FEISHU_CHANNEL && !req.platform.starts_with("feishu:") {
                 anyhow::bail!("unsupported platform: {}", req.platform);
             }
+            // Both model-authored resources and im_upload use this shared path.
+            let file_type = if req.file_type == "image"
+                || (req.file_type != "folder" && is_native_image_mime(&req.mime_type))
+            {
+                "image"
+            } else {
+                &req.file_type
+            };
             let file_key = gateway
-                .upload_file(&req.file_name, &req.mime_type, &req.content, &req.file_type)
+                .upload_file(&req.file_name, &req.mime_type, &req.content, file_type)
                 .await?;
             let sent_message_id = if !req.message_id.is_empty() {
                 match gateway
-                    .reply_file(&req.message_id, &file_key, &req.file_type)
+                    .reply_file(&req.message_id, &file_key, file_type)
                     .await
                 {
                     Ok(message_id) => message_id,
                     Err(_) => {
                         gateway
-                            .send_file(&req.chat_id, &file_key, &req.file_type)
+                            .send_file(&req.chat_id, &file_key, file_type)
                             .await?
                     }
                 }
             } else {
                 gateway
-                    .send_file(&req.chat_id, &file_key, &req.file_type)
+                    .send_file(&req.chat_id, &file_key, file_type)
                     .await?
             };
             Ok(UploadedImFile {
                 file_name: req.file_name,
                 file_key: file_key.clone(),
                 message_id: sent_message_id.clone(),
-                resource_url: gateway.file_resource_url(
-                    &sent_message_id,
-                    &file_key,
-                    &req.file_type,
-                ),
+                resource_url: gateway.file_resource_url(&sent_message_id, &file_key, file_type),
             })
         })
     }
@@ -162,7 +196,9 @@ impl ImFileBridge for LocalImFileBridge {
         Box<dyn std::future::Future<Output = anyhow::Result<Option<BoundImChannel>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if !self.auto_open_sub_session_channel {
+            if matches!(request.kind.as_str(), "acp" | "agent")
+                && !self.auto_open_sub_session_channel
+            {
                 return Ok(None);
             }
             if request.platform != FEISHU_CHANNEL && !request.platform.starts_with("feishu:") {
@@ -189,7 +225,7 @@ impl ImFileBridge for LocalImFileBridge {
                     "Fork session `{}` is bound here.\nparent_session_id: {}\ntarget: {}",
                     request.sub_session_id, request.parent_session_id, request.target
                 );
-                let (_, thread_id) = gateway
+                let (message_id, thread_id) = gateway
                     .send_topic_text(&request.parent_channel_id, &topic_text)
                     .await
                     .with_context(|| {
@@ -200,9 +236,18 @@ impl ImFileBridge for LocalImFileBridge {
                             request.sub_session_id,
                         )
                     })?;
+                let channel_id = feishu_topic_channel_id(&request.parent_channel_id, &thread_id);
+                let mut anchors = self.topic_anchors.lock().await;
+                anchors.insert(format!("{}:{channel_id}", request.platform), message_id);
+                if let Some(path) = &self.topic_anchors_path {
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    crate::atomic_file::write(path, &serde_json::to_vec(&*anchors)?)?;
+                }
                 return Ok(Some(BoundImChannel {
                     platform: request.platform.clone(),
-                    channel_id: feishu_topic_channel_id(&request.parent_channel_id, &thread_id),
+                    channel_id,
                 }));
             }
             let chat_id = gateway
@@ -239,35 +284,6 @@ impl ImFileBridge for LocalImFileBridge {
             }))
         })
     }
-
-    fn sub_session_send_text<'a>(
-        &'a self,
-        platform: &'a str,
-        channel_id: &'a str,
-        text: &'a str,
-        done: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if platform != FEISHU_CHANNEL && !platform.starts_with("feishu:") {
-                return Ok(());
-            }
-            let Some(gateway) = self.gateway(platform) else {
-                return Ok(());
-            };
-            let mut cards = self.sub_session_cards.lock().await;
-            let card_key = format!("{platform}:{channel_id}");
-            let card = cards
-                .entry(card_key.clone())
-                .or_insert_with(|| gateway.begin_streaming_reply(channel_id));
-            if done {
-                card.replace_final(text).await?;
-                cards.remove(&card_key);
-            } else {
-                card.replace(text).await?;
-            }
-            Ok(())
-        })
-    }
 }
 
 #[cfg(test)]
@@ -298,7 +314,7 @@ mod tests {
     async fn disabled_sub_session_channels_skip_remote_creation() {
         let bridge =
             LocalImFileBridge::new(Some(FeishuGateway::new("unused-app", "unused-secret")));
-        for kind in ["acp", "fork", "agent"] {
+        for kind in ["acp", "agent"] {
             let binding = bridge
                 .sub_session_binding_upsert(SubSessionBindingUpsertRequest {
                     parent_session_id: "parent".into(),
@@ -315,5 +331,35 @@ mod tests {
                 .unwrap();
             assert!(binding.is_none());
         }
+    }
+}
+
+fn is_native_image_mime(mime: &str) -> bool {
+    matches!(
+        mime.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+            | "image/tiff"
+    )
+}
+
+#[cfg(test)]
+mod image_tests {
+    #[test]
+    fn native_images_are_separate_from_other_file_formats() {
+        assert!(super::is_native_image_mime("image/png"));
+        assert!(super::is_native_image_mime("Image/JPEG; charset=binary"));
+        assert!(!super::is_native_image_mime("image/svg+xml"));
+        assert!(!super::is_native_image_mime("application/pdf"));
     }
 }

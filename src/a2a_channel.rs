@@ -312,6 +312,10 @@ fn application_cat_activity(
             "tool_call_started",
             serde_json::json!({"call_id": id, "tool_name": name}),
         )),
+        bot_core::CatEvent::ToolDelta { id, name, delta } => Some((
+            "tool_delta",
+            serde_json::json!({"id":id,"name":name,"delta":delta}),
+        )),
         bot_core::CatEvent::ToolCallArgumentsDelta { id, delta } => Some((
             "tool_call_arguments_delta",
             serde_json::json!({"call_id": id, "delta": delta}),

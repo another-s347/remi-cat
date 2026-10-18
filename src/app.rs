@@ -789,7 +789,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         crate::channel::feishu::LocalImFileBridge::with_gateways(
             feishu_gateways,
             auto_open_sub_session_channel,
-        ),
+        ).with_topic_anchors_path(data_dir.join("sub-session-topic-anchors.json"))?,
     );
     let mut bot_builder = CatBotBuilder::from_env()?
             .agent_tracing(if agent_tracing_enabled {

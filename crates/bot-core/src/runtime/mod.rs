@@ -327,7 +327,10 @@ fn steer_message_metadata(input: &SteerInput) -> Option<serde_json::Value> {
         );
     }
     if let Some(value) = input.sender_username.as_deref() {
-        map.insert("sender_username".into(), serde_json::Value::String(value.to_string()));
+        map.insert(
+            "sender_username".into(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
     if !input.im_attachments.is_empty() {
         map.insert(
@@ -5998,7 +6001,7 @@ impl RemiSubAgentTool {
                 ProtocolEvent::RunStart {
                     thread_id: sub_thread_id.0.clone(),
                     run_id: sub_run_id.0.clone(),
-                    metadata: None,
+                    metadata: Some(serde_json::json!({"input": &task})),
                 },
             ));
 
@@ -6365,6 +6368,19 @@ fn a2a_activity_tool_output(
             id: data.get("call_id")?.as_str()?.to_string(),
             arguments_delta: data.get("delta")?.as_str()?.to_string(),
         },
+        "tool_delta" | "tool_output_delta" => ProtocolEvent::ToolDelta {
+            id: data
+                .get("call_id")
+                .or_else(|| data.get("id"))?
+                .as_str()?
+                .to_string(),
+            name: data
+                .get("tool_name")
+                .or_else(|| data.get("name"))?
+                .as_str()?
+                .to_string(),
+            delta: data.get("delta")?.as_str()?.to_string(),
+        },
         "tool_call_result" => ProtocolEvent::ToolResult {
             id: data.get("call_id")?.as_str()?.to_string(),
             name: data.get("tool_name")?.as_str()?.to_string(),
@@ -6613,20 +6629,19 @@ fn register_delegate_agent_tools(
 mod tests {
     use super::{
         append_thread_todo_system_prompt, apply_user_steer_context,
-        background_task_completion_steer_input,
-        context_percent_tokens, default_system_prompt, format_subagent_tool_result,
-        insert_async_tool_system_prompt, insert_single_chat_sender_system_prompt,
-        install_embedded_model_profiles, local_acp_thread_id, memory_compaction_budget_tokens,
-        model_input_snapshot_from_loop_input, model_request_budget_tokens,
-        prepend_group_sender_username, route_thread_todo_prompt, single_chat_sender_system_prompt,
+        background_task_completion_steer_input, context_percent_tokens, default_system_prompt,
+        format_subagent_tool_result, insert_async_tool_system_prompt,
+        insert_single_chat_sender_system_prompt, install_embedded_model_profiles,
+        local_acp_thread_id, memory_compaction_budget_tokens, model_input_snapshot_from_loop_input,
+        model_request_budget_tokens, prepend_group_sender_username, route_thread_todo_prompt,
+        single_chat_sender_system_prompt, steer_message_metadata,
         system_prompt_with_agent_md_notice, thread_run_lock, try_recv_background_side_event,
         try_recv_completed_tool_task, validate_host_tool_names, AgentModelBindings,
         AgentTracingOptions, CatBotBuilder, CatEvent, Content, ContentPart, GoalMaxRounds,
         ImAttachment, ImDocument, LlmCompressor, LoopInput, Message, ModelProfileRegistry,
-        PartialTurnRecorder, SteerInput, steer_message_metadata,
-        RemiSubAgentTool, SandboxConfig, StreamOptions, SupervisorTraceEvent, ThreadRunLocks,
-        WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE, ASYNC_TOOL_SYSTEM_PROMPT,
-        DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
+        PartialTurnRecorder, RemiSubAgentTool, SandboxConfig, SteerInput, StreamOptions,
+        SupervisorTraceEvent, ThreadRunLocks, WorkflowStatus, AGENT_MD_CWD_SYSTEM_PROMPT_NOTICE,
+        ASYNC_TOOL_SYSTEM_PROMPT, DEFAULT_AGENT_ID, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT,
     };
     use crate::memory::{build_injected_history, MemoryContext, MemoryIndex};
     use crate::model_profile::{ContextCompactionMode, ModelProfileConfig};
@@ -6679,7 +6694,10 @@ mod tests {
             sender_user_id: Some("sender-old".into()),
             sender_username: Some("Old Sender".into()),
             message_id: Some("msg-old".into()),
-            im_attachments: vec![ImAttachment { name: "old.txt".into(), ..Default::default() }],
+            im_attachments: vec![ImAttachment {
+                name: "old.txt".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         apply_user_steer_context(&mut opts, &metadata, input.sender_username);
@@ -6707,11 +6725,21 @@ mod tests {
             im_attachments: Vec::new(),
             im_documents: Vec::new(),
         };
-        assert!(matches!(bot.submit_steer(input()), super::SteerSubmitResult::Queued(_)));
-        let batch = bot.drain_or_close_steer_queue("closing-steer-thread", &queue).unwrap();
+        assert!(matches!(
+            bot.submit_steer(input()),
+            super::SteerSubmitResult::Queued(_)
+        ));
+        let batch = bot
+            .drain_or_close_steer_queue("closing-steer-thread", &queue)
+            .unwrap();
         assert_eq!(batch.count, 1);
-        assert!(bot.drain_or_close_steer_queue("closing-steer-thread", &queue).is_none());
-        assert!(matches!(bot.submit_steer(input()), super::SteerSubmitResult::NotRunning));
+        assert!(bot
+            .drain_or_close_steer_queue("closing-steer-thread", &queue)
+            .is_none());
+        assert!(matches!(
+            bot.submit_steer(input()),
+            super::SteerSubmitResult::NotRunning
+        ));
     }
 
     #[tokio::test]
@@ -6719,28 +6747,38 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let bot = build_mock_bot(&data_dir, "http://127.0.0.1:1/v1".into(), true, 1);
         let (_queue, guard) = bot.register_steer_queue("dropped-steer-thread");
-        assert!(matches!(bot.submit_steer(SteerInput {
-            session_id: "dropped-steer-thread".into(),
-            content: Content::text("preserve this steer"),
-            sender_user_id: Some("sender".into()),
-            sender_username: Some("Sender".into()),
-            message_id: Some("feishu-message".into()),
-            chat_type: Some("group".into()),
-            platform: Some("feishu".into()),
-            app_id: None,
-            im_attachments: Vec::new(),
-            im_documents: Vec::new(),
-        }), super::SteerSubmitResult::Queued(_)));
+        assert!(matches!(
+            bot.submit_steer(SteerInput {
+                session_id: "dropped-steer-thread".into(),
+                content: Content::text("preserve this steer"),
+                sender_user_id: Some("sender".into()),
+                sender_username: Some("Sender".into()),
+                message_id: Some("feishu-message".into()),
+                chat_type: Some("group".into()),
+                platform: Some("feishu".into()),
+                app_id: None,
+                im_attachments: Vec::new(),
+                im_documents: Vec::new(),
+            }),
+            super::SteerSubmitResult::Queued(_)
+        ));
         drop(guard);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if bot.memory.thread_history("dropped-steer-thread").await.iter()
-                    .any(|message| message.text.contains("preserve this steer")) {
+                if bot
+                    .memory
+                    .thread_history("dropped-steer-thread")
+                    .await
+                    .iter()
+                    .any(|message| message.text.contains("preserve this steer"))
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.expect("unconsumed steer should be preserved");
+        })
+        .await
+        .expect("unconsumed steer should be preserved");
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -8558,7 +8596,8 @@ You are Remi.
             let (base_url, requests) = start_openai_mock_server(vec![
                 format!("data: {partial}\n\n"),
                 sse_text("steer handled"),
-            ]).await;
+            ])
+            .await;
             let data_dir = tempfile::tempdir().unwrap();
             let bot = build_mock_bot(&data_dir, base_url, true, 3);
             let stream = bot.stream("error-steer-thread", "first message");
@@ -8586,12 +8625,22 @@ You are Remi.
             while let Some(event) = stream.next().await {
                 events.push(event);
             }
-            assert!(events.iter().any(|event| matches!(event, CatEvent::SteerInjected(_))));
-            assert!(events.iter().any(|event| matches!(event, CatEvent::Text(text) if text == "steer handled")));
-            assert!(!events.iter().any(|event| matches!(event, CatEvent::Error(_))));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, CatEvent::SteerInjected(_))));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, CatEvent::Text(text) if text == "steer handled")));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, CatEvent::Error(_))));
             let persisted = tokio::fs::read_to_string(
-                data_dir.path().join("memory/error-steer-thread/short_term.jsonl"),
-            ).await.unwrap();
+                data_dir
+                    .path()
+                    .join("memory/error-steer-thread/short_term.jsonl"),
+            )
+            .await
+            .unwrap();
             assert!(persisted.contains("queued follow-up"));
             assert!(persisted.contains("msg-2"));
             assert_eq!(requests.lock().unwrap().len(), 2);
@@ -8880,7 +8929,10 @@ You are Remi.
         }
 
         assert!(
-            cancel_started.expect("supervisor output should start before cancellation").elapsed() < Duration::from_secs(4),
+            cancel_started
+                .expect("supervisor output should start before cancellation")
+                .elapsed()
+                < Duration::from_secs(4),
             "supervisor cancel should not wait for slow response or timeout: {events:?}"
         );
         assert!(events.iter().any(|event| matches!(
@@ -9414,13 +9466,21 @@ You are Remi.
     fn completed_todo_batch_is_cleared_across_turns_and_restart_end_to_end() {
         run_large_stack_local_test(|| async {
             let responses = vec![
-                sse_tool_call("add-first", "todo__add", json!({
-                    "title": "First", "items": [{"title": "A"}, {"title": "B"}]
-                })),
+                sse_tool_call(
+                    "add-first",
+                    "todo__add",
+                    json!({
+                        "title": "First", "items": [{"title": "A"}, {"title": "B"}]
+                    }),
+                ),
                 sse_text("first created"),
-                sse_tool_call("add-second", "todo__add", json!({
-                    "title": "Second", "items": [{"title": "C"}]
-                })),
+                sse_tool_call(
+                    "add-second",
+                    "todo__add",
+                    json!({
+                        "title": "Second", "items": [{"title": "C"}]
+                    }),
+                ),
                 sse_text("second created"),
                 sse_tool_call("complete-a", "todo__complete", json!({"id": 1})),
                 sse_text("A completed"),
@@ -9443,7 +9503,10 @@ You are Remi.
             collect_stream(bot.stream(thread, "complete B")).await;
             let cleared = bot.memory.load_user_state(thread).await;
             let remaining = crate::todo::todos_from_user_state(&cleared);
-            assert_eq!(remaining.iter().map(|todo| todo.id).collect::<Vec<_>>(), vec![3]);
+            assert_eq!(
+                remaining.iter().map(|todo| todo.id).collect::<Vec<_>>(),
+                vec![3]
+            );
             assert_eq!(cleared["__todo_next_id"], 4);
 
             drop(bot);

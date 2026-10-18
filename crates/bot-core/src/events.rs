@@ -231,7 +231,13 @@ pub enum CatEvent {
         request: UserQuestionRequest,
         response: UserQuestionResponse,
     },
-    /// A tool returned its result.
+    /// Incremental output from a running tool.
+    ToolDelta {
+        id: String,
+        name: String,
+        delta: String,
+    },
+    /// A tool returned its final result.
     ToolCallResult {
         id: String,
         name: String,

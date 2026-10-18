@@ -66,6 +66,7 @@ pub(super) struct FeishuReplyStream {
     run_id: String,
     pending_final_text: String,
     final_output_committed: bool,
+    final_delivery_error: Option<String>,
     cot: Option<CotMessage>,
     cot_create_failed: bool,
     cot_completed: bool,
@@ -90,6 +91,7 @@ impl FeishuReplyStream {
             run_id: format!("run-{}", uuid::Uuid::new_v4()),
             pending_final_text: String::new(),
             final_output_committed: false,
+            final_delivery_error: None,
             cot: None,
             cot_create_failed: false,
             cot_completed: false,
@@ -105,6 +107,10 @@ impl FeishuReplyStream {
         }
     }
 
+    pub(super) async fn start(&mut self) {
+        self.ensure_cot().await;
+    }
+
     pub(super) async fn push(&mut self, kind: FeishuReplyKind, chunk: &str) {
         if kind == FeishuReplyKind::Text {
             self.close_active_narrative().await;
@@ -114,7 +120,9 @@ impl FeishuReplyStream {
         if kind == FeishuReplyKind::Error {
             self.flush_pending_as_process().await;
             self.fail_run("AGENT_ERROR", chunk).await;
-            self.send_final(chunk).await;
+            self.pending_final_text = chunk.to_string();
+            let result = self.send_final(chunk).await;
+            self.record_delivery_result(result);
             return;
         }
         self.flush_pending_as_process().await;
@@ -139,7 +147,8 @@ impl FeishuReplyStream {
     }
 
     pub(super) async fn finish(&mut self) {
-        if self.final_output_committed || self.cot_completed {
+        if self.final_output_committed || self.cot_completed || self.final_delivery_error.is_some()
+        {
             return;
         }
         self.flush_pending_as_process().await;
@@ -148,19 +157,50 @@ impl FeishuReplyStream {
         }
     }
 
-    pub(super) async fn commit_final_output(&mut self) {
-        if self.final_output_committed {
-            return;
+    pub(super) async fn commit_final_output(&mut self) -> anyhow::Result<()> {
+        if self.final_output_committed || self.final_delivery_error.is_some() {
+            return self.delivery_result();
         }
-        self.final_output_committed = true;
         self.close_active_narrative().await;
-        self.finish_run("done").await;
-        let final_text = std::mem::take(&mut self.pending_final_text);
-        self.send_final(&final_text).await;
+        let result = self.send_final(&self.pending_final_text).await;
+        let delivered = result.is_ok();
+        self.record_delivery_result(result);
+        if delivered {
+            self.finish_run("done").await;
+        } else {
+            self.fail_run(
+                "DELIVERY_FAILED",
+                "最终回复发送失败，回复内容已保留。请重试。",
+            )
+            .await;
+        }
+        self.delivery_result()
+    }
+
+    fn record_delivery_result(&mut self, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.final_output_committed = true;
+                self.pending_final_text.clear();
+                self.final_delivery_error = None;
+            }
+            Err(error) => {
+                warn!("Feishu final delivery failed: {error:#}");
+                self.final_delivery_error =
+                    Some(format!("Feishu final delivery failed: {error:#}"));
+            }
+        }
+    }
+
+    pub(super) fn delivery_result(&self) -> anyhow::Result<()> {
+        match &self.final_delivery_error {
+            Some(error) => Err(anyhow::anyhow!(error.clone())),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn set_pending_final_text(&mut self, text: String) {
-        if !self.final_output_committed {
+        if !self.final_output_committed && self.final_delivery_error.is_none() {
             self.pending_final_text = text;
         }
     }
@@ -185,6 +225,7 @@ impl FeishuReplyStream {
         self.run_id = format!("run-{}", uuid::Uuid::new_v4());
         self.pending_final_text.clear();
         self.final_output_committed = false;
+        self.final_delivery_error = None;
         self.cot = None;
         self.cot_create_failed = false;
         self.cot_completed = false;
@@ -480,21 +521,26 @@ impl FeishuReplyStream {
         }
     }
 
-    async fn send_final(&self, content: &str) {
-        if content.trim().is_empty() {
-            return;
-        }
-        let mut card = self.gateway.begin_streaming_reply(&self.parent_message_id);
-        if let Err(error) = card.replace_final(content).await {
-            warn!("send Feishu final reply failed: {error:#}");
-            if content.contains("<at id=all></at>") {
-                let fallback = content.replace("<at id=all></at>", "**[At 所有人失败]**");
-                let mut fallback_card = self.gateway.begin_streaming_reply(&self.parent_message_id);
-                if let Err(fallback_error) = fallback_card.replace_final(&fallback).await {
-                    warn!("send Feishu broadcast fallback failed: {fallback_error:#}");
-                }
-            }
-        }
+    async fn send_final(&self, content: &str) -> anyhow::Result<()> {
+        let card_gateway = self.gateway.clone();
+        let text_gateway = self.gateway.clone();
+        let card_parent = self.parent_message_id.clone();
+        let text_parent = card_parent.clone();
+        deliver_final_with(
+            content,
+            &self.run_id,
+            move |text, id| {
+                let gateway = card_gateway.clone();
+                let parent = card_parent.clone();
+                async move { gateway.reply_final_card(&parent, &text, &id).await }
+            },
+            move |text, id| {
+                let gateway = text_gateway.clone();
+                let parent = text_parent.clone();
+                async move { gateway.reply_final_text(&parent, &text, &id).await }
+            },
+        )
+        .await
     }
 
     pub(super) async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) -> bool {
@@ -813,6 +859,73 @@ fn bounded_cot_payload(mut content: Value) -> Option<Value> {
     (content.to_string().len() <= COT_EVENT_CONTENT_MAX_BYTES).then_some(content)
 }
 
+// Keep uncertain transport failures on the same idempotency key. Only an
+// explicit card-content rejection is safe to replace with a different message.
+async fn deliver_final_with<C, CF, T, TF>(
+    content: &str,
+    run_id: &str,
+    mut card: C,
+    mut text: T,
+) -> anyhow::Result<()>
+where
+    C: FnMut(String, String) -> CF,
+    CF: std::future::Future<Output = anyhow::Result<String>>,
+    T: FnMut(String, String) -> TF,
+    TF: std::future::Future<Output = anyhow::Result<String>>,
+{
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    match card(content.into(), run_id.into()).await {
+        Ok(id) => {
+            anyhow::ensure!(!id.is_empty(), "final card response missing message_id");
+            Ok(())
+        }
+        Err(error) => {
+            let reason = format!("{error:#}").to_ascii_lowercase();
+            let invalid_card = [
+                "error 230001",
+                "error 230099",
+                "invalid card",
+                "card content invalid",
+            ]
+            .iter()
+            .any(|value| reason.contains(value));
+            if !invalid_card || is_retryable_cot_error(&error) {
+                return Err(error);
+            }
+            warn!("Feishu rejected final card; delivering a plain-text fallback: {error:#}");
+            let card_value: Value = serde_json::from_str(&im_feishu::client::card_content(
+                &crate::render_structured_fallbacks(content),
+            ))?;
+            let mut plain = String::from("[回复卡片无法展示，以下为文字和数据内容]\n\n");
+            for element in card_value["body"]["elements"].as_array().unwrap() {
+                if element["tag"] == "img" {
+                    plain.push_str(&format!(
+                        "\n[图片：{}]\n",
+                        element["alt"]["content"].as_str().unwrap_or("图片")
+                    ));
+                } else if let Some(value) = element["content"].as_str() {
+                    plain.push_str(value);
+                }
+            }
+            let mut remaining = plain.as_str();
+            let mut index = 0;
+            while !remaining.is_empty() {
+                let mut end = remaining.len().min(8000);
+                while !remaining.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let id = text(remaining[..end].to_string(), format!("{run_id}-t{index}")).await?;
+                anyhow::ensure!(!id.is_empty(), "fallback text response missing message_id");
+                remaining = &remaining[end..];
+                index += 1;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -821,6 +934,90 @@ mod tests {
     };
     use im_feishu::FeishuGateway;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_delivery_keeps_the_final_for_recovery_and_exposes_the_error() {
+        let mut reply = FeishuReplyStream::new(
+            FeishuGateway::new("unused", "unused"),
+            "oc_test".into(),
+            "om_test".into(),
+        );
+        reply.pending_final_text = "valuable final".into();
+        reply.record_delivery_result(Err(anyhow::anyhow!("network unavailable")));
+        assert!(!reply.final_output_committed);
+        assert_eq!(reply.pending_final_text, "valuable final");
+        assert!(reply.delivery_result().is_err());
+        assert!(reply
+            .commit_final_output()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("network unavailable"));
+        reply.finish().await;
+        assert_eq!(reply.pending_final_text, "valuable final");
+        reply.record_delivery_result(Ok(()));
+        assert!(reply.final_output_committed);
+        assert!(reply.pending_final_text.is_empty());
+        assert!(reply.delivery_result().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_cards_fall_back_to_bounded_utf8_text_with_distinct_stable_ids() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let content = format!("{}\n![plot](img_v3_test)\n\n```remi-chart\n{{\"kind\":\"bar\",\"points\":[{{\"label\":\"observed\",\"value\":17}}]}}\n```", "数据".repeat(3000));
+        super::deliver_final_with(
+            &content,
+            "run-fixed",
+            |_, id| {
+                assert_eq!(id, "run-fixed");
+                std::future::ready(Err(anyhow::anyhow!(
+                    "reply_card error 230001: invalid card"
+                )))
+            },
+            |body, id| {
+                assert!(body.len() <= 8000);
+                sent.borrow_mut().push((body, id));
+                std::future::ready(Ok("om_text".into()))
+            },
+        )
+        .await
+        .unwrap();
+        let sent = sent.into_inner();
+        assert!(sent.len() > 1);
+        assert_eq!(sent[0].1, "run-fixed-t0");
+        assert_eq!(sent[1].1, "run-fixed-t1");
+        let combined = sent
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<String>();
+        assert!(combined.contains(&"数据".repeat(3000)));
+        assert!(combined.contains("[图片：plot]"));
+        assert!(combined.contains("observed |  | 17"));
+        assert!(!combined.contains("remi-chart"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_failures_do_not_send_a_second_message_and_fallback_failure_surfaces() {
+        let result = super::deliver_final_with(
+            "final",
+            "run-test",
+            |_, _| std::future::ready(Err(anyhow::anyhow!("service unavailable"))),
+            |_, _| async { panic!("must not create a duplicate message") },
+        )
+        .await;
+        assert!(result.is_err());
+        let result = super::deliver_final_with(
+            "final",
+            "run-test",
+            |_, _| std::future::ready(Err(anyhow::anyhow!("error 230001: invalid card"))),
+            |_, _| std::future::ready(Err(anyhow::anyhow!("permission denied"))),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("permission denied"));
+    }
 
     #[test]
     fn steer_resets_cot_and_final_reply_anchor() {

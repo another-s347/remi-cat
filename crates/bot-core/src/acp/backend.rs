@@ -11,13 +11,15 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, LoadSessionRequest, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification,
-    SessionUpdate as AcpSessionUpdate,
+    SessionUpdate as AcpSessionUpdate, ToolCall as AcpToolCall,
+    ToolCallContent as AcpToolCallContent, ToolCallStatus as AcpToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, SessionMessage};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::FutureExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -247,6 +249,10 @@ pub enum AcpToolTaskEvent {
     ToolCallStart {
         id: String,
         name: String,
+    },
+    ToolCallArguments {
+        id: String,
+        arguments: String,
     },
     ToolDelta {
         id: String,
@@ -1349,8 +1355,15 @@ async fn invoke_local_acp_stdio(
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
+                let resuming = external_session_id.is_some();
                 let (mut session, actual_external_session_id) =
                     if let Some(external_session_id) = external_session_id {
+                        // Register before loading so replay notifications are
+                        // dispatched before the load response completes.
+                        let session = connection.attach_session(
+                            NewSessionResponse::new(external_session_id.clone()),
+                            Vec::new(),
+                        )?;
                         connection
                             .send_request(LoadSessionRequest::new(
                                 external_session_id.clone(),
@@ -1358,10 +1371,6 @@ async fn invoke_local_acp_stdio(
                             ))
                             .block_task()
                             .await?;
-                        let session = connection.attach_session(
-                            NewSessionResponse::new(external_session_id.clone()),
-                            Vec::new(),
-                        )?;
                         (session, external_session_id)
                     } else {
                         let response = connection
@@ -1372,8 +1381,16 @@ async fn invoke_local_acp_stdio(
                         let session = connection.attach_session(response, Vec::new())?;
                         (session, external_session_id)
                     };
+                if resuming {
+                    // session/load replays old messages before its response.
+                    // They belong to history, not this prompt's streamed reply.
+                    while let Some(update) = session.read_update().now_or_never() {
+                        update?;
+                    }
+                }
                 session.send_prompt(prompt_text)?;
                 let mut output = String::new();
+                let mut tool_calls = HashMap::new();
                 let mut cancel_rx = cancel_rx;
                 loop {
                     let message = if let Some(mut cancel) = cancel_rx.take() {
@@ -1410,6 +1427,7 @@ async fn invoke_local_acp_stdio(
                         &actual_external_session_id,
                         &mut output,
                         event_tx.as_ref(),
+                        &mut tool_calls,
                     )
                     .await?;
                     if stopped {
@@ -1422,6 +1440,7 @@ async fn invoke_local_acp_stdio(
                                 &actual_external_session_id,
                                 &mut output,
                                 event_tx.as_ref(),
+                                &mut tool_calls,
                             )
                             .await?;
                         }
@@ -1502,11 +1521,107 @@ fn acp_permission_outcome(
     }
 }
 
+struct ExternalAcpToolState {
+    call: AcpToolCall,
+    announced: bool,
+    input_sent: bool,
+    completed: bool,
+    output: String,
+}
+
+impl ExternalAcpToolState {
+    fn new(call: AcpToolCall) -> Self {
+        Self {
+            call,
+            announced: false,
+            input_sent: false,
+            completed: false,
+            output: String::new(),
+        }
+    }
+
+    fn forward(&mut self, tx: Option<&mpsc::UnboundedSender<AcpToolTaskEvent>>) {
+        let Some(tx) = tx else {
+            return;
+        };
+        if self.completed {
+            return;
+        }
+        let id = self.call.tool_call_id.to_string();
+        let name = self.call.title.clone();
+        if !self.announced {
+            let _ = tx.send(AcpToolTaskEvent::ToolCallStart {
+                id: id.clone(),
+                name: name.clone(),
+            });
+            self.announced = true;
+        }
+        if !self.input_sent {
+            if let Some(input) = &self.call.raw_input {
+                let _ = tx.send(AcpToolTaskEvent::ToolCallArguments {
+                    id: id.clone(),
+                    arguments: input.to_string(),
+                });
+                self.input_sent = true;
+            }
+        }
+        let content: String = self
+            .call
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AcpToolCallContent::Content(content) => match &content.content {
+                    AcpContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = if content.is_empty() {
+            self.call
+                .raw_output
+                .as_ref()
+                .map(|output| {
+                    output
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| output.to_string())
+                })
+                .unwrap_or_default()
+        } else {
+            content
+        };
+        if matches!(
+            self.call.status,
+            AcpToolCallStatus::Completed | AcpToolCallStatus::Failed
+        ) {
+            let result = if self.call.status == AcpToolCallStatus::Failed {
+                serde_json::json!({"error": result}).to_string()
+            } else {
+                result
+            };
+            let _ = tx.send(AcpToolTaskEvent::ToolResult { id, name, result });
+            self.completed = true;
+        } else if result != self.output {
+            let delta = result
+                .strip_prefix(&self.output)
+                .unwrap_or(&result)
+                .to_owned();
+            self.output = result;
+            if !delta.is_empty() {
+                let _ = tx.send(AcpToolTaskEvent::ToolDelta { id, name, delta });
+            }
+        }
+    }
+}
+
 async fn handle_external_acp_session_message(
     message: SessionMessage,
     expected_session_id: &str,
     output: &mut String,
     event_tx: Option<&mpsc::UnboundedSender<AcpToolTaskEvent>>,
+    tool_calls: &mut HashMap<String, ExternalAcpToolState>,
 ) -> agent_client_protocol::Result<bool> {
     match message {
         SessionMessage::SessionMessage(dispatch) => {
@@ -1519,6 +1634,7 @@ async fn handle_external_acp_session_message(
                         expected_session_id,
                         output,
                         event_tx,
+                        tool_calls,
                     );
                     return Ok(false);
                 }
@@ -1537,6 +1653,7 @@ async fn handle_external_acp_session_message(
                     expected_session_id,
                     output,
                     event_tx,
+                    tool_calls,
                 );
             }
             Ok(false)
@@ -1551,6 +1668,7 @@ fn handle_external_acp_notification(
     expected_session_id: &str,
     output: &mut String,
     event_tx: Option<&mpsc::UnboundedSender<AcpToolTaskEvent>>,
+    tool_calls: &mut HashMap<String, ExternalAcpToolState>,
 ) {
     if notification.session_id.to_string() != expected_session_id {
         return;
@@ -1572,6 +1690,22 @@ fn handle_external_acp_notification(
             if let Some(tx) = event_tx {
                 let _ = tx.send(AcpToolTaskEvent::Thinking(text.text));
             }
+        }
+        AcpSessionUpdate::ToolCall(call) => {
+            let id = call.tool_call_id.to_string();
+            let state = tool_calls
+                .entry(id)
+                .or_insert_with(|| ExternalAcpToolState::new(call.clone()));
+            state.call = call;
+            state.forward(event_tx);
+        }
+        AcpSessionUpdate::ToolCallUpdate(update) => {
+            let id = update.tool_call_id.to_string();
+            let state = tool_calls
+                .entry(id.clone())
+                .or_insert_with(|| ExternalAcpToolState::new(AcpToolCall::new(id, "ACP tool")));
+            state.call.update(update.fields);
+            state.forward(event_tx);
         }
         _ => {}
     }
@@ -1844,6 +1978,47 @@ mod tests {
     use tokio::sync::mpsc;
 
     static ACP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn external_acp_tool_updates_preserve_lifecycle_without_duplicate_output() {
+        use super::{AcpContentBlock, AcpToolCall, AcpToolCallStatus, ExternalAcpToolState};
+        use agent_client_protocol::schema::v1::{TextContent, ToolCallUpdateFields};
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ExternalAcpToolState::new(
+            AcpToolCall::new("call", "Read source")
+                .raw_input(serde_json::json!({"path":"src/sub_session.rs"}))
+                .status(AcpToolCallStatus::InProgress),
+        );
+        state.forward(Some(&tx));
+        for text in ["one", "one", "one two"] {
+            state.call.update(
+                ToolCallUpdateFields::new()
+                    .content(vec![AcpContentBlock::Text(TextContent::new(text)).into()]),
+            );
+            state.forward(Some(&tx));
+        }
+        state
+            .call
+            .update(ToolCallUpdateFields::new().status(AcpToolCallStatus::Completed));
+        state.forward(Some(&tx));
+        state.forward(Some(&tx));
+        assert!(
+            matches!(rx.try_recv().unwrap(), AcpToolTaskEvent::ToolCallStart { id, .. } if id == "call")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), AcpToolTaskEvent::ToolCallArguments { arguments, .. } if arguments.contains("src/sub_session.rs"))
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), AcpToolTaskEvent::ToolDelta { delta, .. } if delta == "one")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), AcpToolTaskEvent::ToolDelta { delta, .. } if delta == " two")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), AcpToolTaskEvent::ToolResult { result, .. } if result == "one two")
+        );
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn external_acp_owns_its_session_history() {
@@ -2479,6 +2654,13 @@ for raw in sys.stdin:
     elif method == "session/load":
         log("session/load:" + params["sessionId"] + ":" + params["cwd"])
         print(json.dumps({{
+            "jsonrpc": "2.0", "method": "sessionUpdate",
+            "params": {{"sessionId": params["sessionId"], "update": {{
+                "sessionUpdate": "agent_message_chunk",
+                "content": {{"type": "text", "text": "REPLAY_OLD_REPLY"}},
+            }}}},
+        }}), flush=True)
+        print(json.dumps({{
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {{}},
@@ -2569,7 +2751,8 @@ for raw in sys.stdin:
             prepared.external_session_id.as_deref(),
             Some("external-session-resume")
         );
-        backend.run_prepared_tool_turn(prepared).await.unwrap();
+        let response = backend.run_prepared_tool_turn(prepared).await.unwrap();
+        assert_eq!(response.reply, "resume external saw: second external");
 
         let log = std::fs::read_to_string(&log_path).unwrap();
         let lines = log.lines().collect::<Vec<_>>();

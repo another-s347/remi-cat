@@ -665,7 +665,8 @@ fn default_container_name() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImConfig {
-    /// Automatically create IM channels for ACP, agent sub-sessions and forks.
+    /// Automatically create IM channels for ACP and agent sub-sessions.
+    /// Explicit forks always create their channel independently of this switch.
     #[serde(default)]
     pub auto_open_sub_session_channel: bool,
     #[serde(default)]

@@ -154,6 +154,14 @@ pub trait ImFileBridge: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move { Ok(()) })
     }
+
+    fn sub_session_reply_anchor<'a>(
+        &'a self,
+        _platform: &'a str,
+        _channel_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async { None })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1583,6 +1591,10 @@ fn guess_mime_type(path: &Path) -> String {
         "png" => "image/png".into(),
         "jpg" | "jpeg" => "image/jpeg".into(),
         "gif" => "image/gif".into(),
+        "webp" => "image/webp".into(),
+        "bmp" => "image/bmp".into(),
+        "ico" => "image/x-icon".into(),
+        "tif" | "tiff" => "image/tiff".into(),
         "zip" => "application/zip".into(),
         _ => "application/octet-stream".into(),
     }

@@ -1300,16 +1300,6 @@ pub(super) fn sub_session_kind(event: &SubSessionEvent) -> SubSessionKind {
     }
 }
 
-pub(super) fn sub_session_final_output(event: &ProtocolEvent) -> Option<String> {
-    match event {
-        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
-            .get("final_output")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
-        _ => None,
-    }
-}
-
 pub(super) fn sub_session_status_label(event: &ProtocolEvent) -> &'static str {
     match event {
         ProtocolEvent::Done => "done",
@@ -1339,44 +1329,9 @@ pub(super) fn sub_session_input(event: &SubSessionEvent) -> Option<String> {
         .map(|title| truncate_chars(&single_line(title), 96))
 }
 
+#[cfg(test)]
 pub(super) fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<Message> {
-    match event.event.as_ref() {
-        ProtocolEvent::RunStart { .. } => {
-            let input = event
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "Sub-session started: {} / {}",
-                        event.agent_name, event.sub_thread_id.0
-                    )
-                });
-            vec![Message::user(input)]
-        }
-        ProtocolEvent::Delta { content, .. } => {
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![Message::assistant(content.clone())]
-            }
-        }
-        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done" => {
-            sub_session_final_output(event.event.as_ref())
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| vec![Message::assistant(value.to_string())])
-                .unwrap_or_default()
-        }
-        ProtocolEvent::Error { message, .. } => {
-            vec![Message::assistant(format!("Error: {message}"))]
-        }
-        ProtocolEvent::Cancelled => vec![Message::assistant("Error: cancelled")],
-        _ => Vec::new(),
-    }
+    crate::sub_session::history_messages(event)
 }
 
 #[cfg(test)]

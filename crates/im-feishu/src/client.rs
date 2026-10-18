@@ -98,6 +98,32 @@ impl CotEvent {
     }
 }
 
+// Preserve deterministic API errors on HTTP 400 for format fallbacks, while
+// retaining HTTP status information for transport/rate-limit retries.
+async fn decode_message_response(response: reqwest::Response) -> Result<MessageResponse> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(anyhow!("message error {TOKEN_EXPIRED}: token expired"));
+    }
+    let response = if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        response.error_for_status()?
+    } else {
+        response
+    };
+    Ok(response
+        .json()
+        .await
+        .context("parse Feishu message response")?)
+}
+
+fn resource_message_content(key: &str, file_type: &str) -> (&'static str, serde_json::Value) {
+    match file_type {
+        "image" => ("image", serde_json::json!({ "image_key": key })),
+        "folder" => ("folder", serde_json::json!({ "file_key": key })),
+        _ => ("file", serde_json::json!({ "file_key": key })),
+    }
+}
+
 fn current_timestamp_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -333,7 +359,7 @@ impl FeishuClient {
             match request().await {
                 Ok(value) => return Ok(value),
                 Err(err) if is_token_expired_err(&err) && !token_refreshed => {
-                    warn!(api, "COT request token expired; refreshing and retrying");
+                    warn!(api, "Feishu request token expired; refreshing and retrying");
                     self.refresh_token().await?;
                     token_refreshed = true;
                 }
@@ -344,7 +370,7 @@ impl FeishuClient {
                         max_attempts = COT_MAX_ATTEMPTS,
                         delay_ms = backoff.as_millis() as u64,
                         error = %err,
-                        "transient COT request failure; backing off before retry"
+                        "transient Feishu request failure; backing off before retry"
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(COT_MAX_BACKOFF);
@@ -762,7 +788,7 @@ impl FeishuClient {
 
     /// Reply to an existing message with plain text. Returns the new `message_id`.
     pub async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
-        let res = self.reply_text_once(message_id, text).await;
+        let res = self.reply_text_once(message_id, text, None).await;
         if res
             .as_ref()
             .err()
@@ -771,29 +797,45 @@ impl FeishuClient {
         {
             warn!("reply_text: token expired, refreshing and retrying");
             self.refresh_token().await?;
-            return self.reply_text_once(message_id, text).await;
+            return self.reply_text_once(message_id, text, None).await;
         }
         res
     }
 
-    async fn reply_text_once(&self, message_id: &str, text: &str) -> Result<String> {
+    pub async fn reply_final_text(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.retry_cot_request("reply_final_text", || {
+            self.reply_text_once(message_id, text, Some(uuid))
+        })
+        .await
+    }
+
+    async fn reply_text_once(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: Option<&str>,
+    ) -> Result<String> {
         let content = serde_json::json!({ "text": text }).to_string();
         let token = self.token().await;
 
-        let resp: MessageResponse = self
+        let mut body = serde_json::json!({"msg_type": "text", "content": content});
+        if let Some(uuid) = uuid {
+            body["uuid"] = uuid.into();
+        }
+        let response = self
             .http
             .post(format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply"))
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "msg_type": "text",
-                "content": content,
-            }))
+            .json(&body)
             .send()
             .await
-            .context("reply_text")?
-            .json()
-            .await
-            .context("parse reply_text response")?;
+            .context("reply_text")?;
+        let resp = decode_message_response(response).await?;
 
         ensure_ok(resp.code, &resp.msg, "reply_text")?;
         debug!("Replied (text) to {message_id}");
@@ -829,12 +871,8 @@ impl FeishuClient {
         file_key: &str,
         file_type: &str,
     ) -> Result<String> {
-        let msg_type = if file_type == "folder" {
-            "folder"
-        } else {
-            "file"
-        };
-        let content = serde_json::json!({ "file_key": file_key }).to_string();
+        let (msg_type, content) = resource_message_content(file_key, file_type);
+        let content = content.to_string();
         let token = self.token().await;
 
         let resp: MessageResponse = self
@@ -887,12 +925,8 @@ impl FeishuClient {
         file_key: &str,
         file_type: &str,
     ) -> Result<String> {
-        let msg_type = if file_type == "folder" {
-            "folder"
-        } else {
-            "file"
-        };
-        let content = serde_json::json!({ "file_key": file_key }).to_string();
+        let (msg_type, content) = resource_message_content(file_key, file_type);
+        let content = content.to_string();
         let token = self.token().await;
 
         let resp: MessageResponse = self
@@ -941,6 +975,48 @@ impl FeishuClient {
         res
     }
 
+    /// Upload an image for use in native image messages (not file attachments).
+    async fn upload_image_once(
+        &self,
+        file_name: &str,
+        mime_type: &str,
+        content: &[u8],
+    ) -> Result<String> {
+        #[derive(Deserialize)]
+        struct ImageData {
+            image_key: String,
+        }
+        #[derive(Deserialize)]
+        struct ImageResponse {
+            code: i64,
+            msg: String,
+            data: Option<ImageData>,
+        }
+        let part = multipart::Part::bytes(content.to_vec())
+            .file_name(file_name.to_string())
+            .mime_str(mime_type)
+            .context("upload_image invalid mime_type")?;
+        let form = multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+        let resp: ImageResponse = self
+            .http
+            .post(format!("{FEISHU_BASE}/im/v1/images"))
+            .bearer_auth(self.token().await)
+            .multipart(form)
+            .send()
+            .await
+            .context("upload_image")?
+            .json()
+            .await
+            .context("parse upload_image response")?;
+        ensure_ok(resp.code, &resp.msg, "upload_image")?;
+        Ok(resp
+            .data
+            .ok_or_else(|| anyhow!("upload_image missing data"))?
+            .image_key)
+    }
+
     async fn upload_file_once(
         &self,
         file_name: &str,
@@ -948,6 +1024,9 @@ impl FeishuClient {
         content: &[u8],
         file_type: &str,
     ) -> Result<String> {
+        if file_type == "image" {
+            return self.upload_image_once(file_name, mime_type, content).await;
+        }
         #[derive(Deserialize)]
         struct UploadData {
             file_key: String,
@@ -1004,7 +1083,12 @@ impl FeishuClient {
         self.send_card_with_uuid(chat_id, text, None).await
     }
 
-    pub async fn send_card_with_uuid(&self, chat_id: &str, text: &str, uuid: Option<&str>) -> Result<String> {
+    pub async fn send_card_with_uuid(
+        &self,
+        chat_id: &str,
+        text: &str,
+        uuid: Option<&str>,
+    ) -> Result<String> {
         let res = self.send_card_once(chat_id, text, uuid).await;
         if res
             .as_ref()
@@ -1019,7 +1103,12 @@ impl FeishuClient {
         res
     }
 
-    async fn send_card_once(&self, chat_id: &str, text: &str, uuid: Option<&str>) -> Result<String> {
+    async fn send_card_once(
+        &self,
+        chat_id: &str,
+        text: &str,
+        uuid: Option<&str>,
+    ) -> Result<String> {
         let content = card_content(text);
         let token = self.token().await;
         let mut body = serde_json::json!({
@@ -1053,16 +1142,52 @@ impl FeishuClient {
     /// Reply to an existing message with an interactive card.
     /// Returns the new card `message_id` (used for subsequent [`update_card`] calls).
     pub async fn reply_card(&self, message_id: &str, text: &str) -> Result<String> {
-        self.reply_card_with_thread(message_id, text, false, None).await
+        self.reply_card_with_thread(message_id, text, false, None)
+            .await
     }
 
     /// Reply with an interactive card and force the reply into a topic thread.
     pub async fn reply_card_in_thread(&self, message_id: &str, text: &str) -> Result<String> {
-        self.reply_card_with_thread(message_id, text, true, None).await
+        self.reply_card_with_thread(message_id, text, true, None)
+            .await
     }
 
-    pub async fn reply_card_in_thread_with_uuid(&self, message_id: &str, text: &str, uuid: &str) -> Result<String> {
-        self.reply_card_with_thread(message_id, text, true, Some(uuid)).await
+    /// Final replies use a stable UUID across transient retries to prevent duplicates.
+    pub async fn reply_final_card(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        let payload = card_content(text);
+        if payload.len() > 28 * 1024 {
+            return Err(anyhow!(
+                "invalid card: final output exceeds the 28 KiB card budget"
+            ));
+        }
+        let card: serde_json::Value = serde_json::from_str(&payload)?;
+        if card["body"]["elements"]
+            .as_array()
+            .is_some_and(|elements| elements.len() > 180)
+        {
+            return Err(anyhow!(
+                "invalid card: final output exceeds the component budget"
+            ));
+        }
+        self.retry_cot_request("reply_final_card", || {
+            self.reply_card_with_thread(message_id, text, false, Some(uuid))
+        })
+        .await
+    }
+
+    pub async fn reply_card_in_thread_with_uuid(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: &str,
+    ) -> Result<String> {
+        self.reply_card_with_thread(message_id, text, true, Some(uuid))
+            .await
     }
 
     async fn reply_card_with_thread(
@@ -1108,17 +1233,15 @@ impl FeishuClient {
             body["uuid"] = serde_json::Value::String(uuid.to_string());
         }
 
-        let resp: MessageResponse = self
+        let response = self
             .http
             .post(format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply"))
             .bearer_auth(&token)
             .json(&body)
             .send()
             .await
-            .context("reply_card")?
-            .json()
-            .await
-            .context("parse reply_card response")?;
+            .context("reply_card")?;
+        let resp = decode_message_response(response).await?;
 
         ensure_ok(resp.code, &resp.msg, "reply_card")?;
         debug!("Replied (card) to {message_id}");
@@ -1906,12 +2029,15 @@ impl FeishuClient {
         #[derive(Deserialize)]
         struct GetBody {
             content: String,
+            #[serde(default)]
+            content_v2: Option<String>,
         }
 
         let token = self.token().await;
         let resp: GetResp = self
             .http
             .get(format!("{FEISHU_BASE}/im/v1/messages/{message_id}"))
+            .query(&[("card_msg_content_type", "user_card_content")])
             .bearer_auth(&token)
             .send()
             .await
@@ -1927,7 +2053,12 @@ impl FeishuClient {
         let Some(item) = data.items.into_iter().next() else {
             return Ok(None);
         };
-        Ok(Some((item.msg_type, item.body.content)))
+        let content = item
+            .body
+            .content_v2
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(item.body.content);
+        Ok(Some((item.msg_type, content)))
     }
 
     /// Delete (withdraw) a message sent by the bot.
@@ -2071,22 +2202,73 @@ impl FeishuClient {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a Feishu schema-2.0 interactive card JSON string from plain text.
+/// Build a Feishu Card 2.0 message from Markdown, uploaded images and validated data blocks.
 ///
 /// The returned `String` is used directly as the `"content"` field value in
 /// Feishu message APIs — Feishu expects the card to be a serialised JSON string,
 /// not a nested object.
 pub fn card_content(text: &str) -> String {
-    serde_json::json!({
-        "schema": "2.0",
-        "body": {
-            "elements": [{
-                "tag": "markdown",
-                "content": text
-            }]
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    use remi_output_protocol::StructuredOutput;
+    let mut parts = Vec::<(usize, usize, Vec<serde_json::Value>)>::new();
+    let mut image = None::<(usize, String, String)>;
+    for (event, range) in Parser::new_ext(text, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) if dest_url.starts_with("img_") => {
+                image = Some((range.start, dest_url.into_string(), String::new()))
+            }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some((_, _, alt)) = image.as_mut() {
+                    alt.push_str(&value);
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((start, key, alt)) = image.take() {
+                    parts.push((start, range.end, vec![serde_json::json!({"tag": "img", "img_key": key, "alt": {"tag": "plain_text", "content": alt}, "mode": "fit_horizontal", "preview": true})]));
+                }
+            }
+            _ => {}
         }
-    })
-    .to_string()
+    }
+    let mut tables = 0;
+    let mut charts = 0;
+    for span in remi_output_protocol::structured_spans(text) {
+        let elements = match span.result {
+            Ok(output) => {
+                let count = match &output {
+                    StructuredOutput::Table(_) => &mut tables,
+                    StructuredOutput::Chart(_) => &mut charts,
+                };
+                *count += 1;
+                if *count <= 5 {
+                    crate::structured_output::card_elements(&output)
+                } else {
+                    vec![serde_json::json!({"tag": "markdown", "content": output.markdown()})]
+                }
+            }
+            Err(error) => vec![
+                serde_json::json!({"tag": "markdown", "content": format!("**[结构化内容无效：{error}]**\n\n{}", &text[span.start..span.end])}),
+            ],
+        };
+        parts.push((span.start, span.end, elements));
+    }
+    parts.sort_by_key(|(start, _, _)| *start);
+    let mut elements = Vec::new();
+    let mut cursor = 0;
+    for (start, end, native) in parts {
+        if start < cursor {
+            continue;
+        }
+        if !text[cursor..start].trim().is_empty() {
+            elements.push(serde_json::json!({"tag": "markdown", "content": &text[cursor..start]}));
+        }
+        elements.extend(native);
+        cursor = end;
+    }
+    if !text[cursor..].trim().is_empty() || elements.is_empty() {
+        elements.push(serde_json::json!({"tag": "markdown", "content": &text[cursor..]}));
+    }
+    serde_json::json!({"schema": "2.0", "body": {"elements": elements}}).to_string()
 }
 
 fn ensure_ok(code: i64, msg: &str, api: &str) -> Result<()> {
@@ -2324,10 +2506,143 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        build_tool_approval_card, build_tool_approval_resolved_card, card_content, is_retryable_cot_error,
-        log_text_preview, preferred_contact_user_id_types, should_retry_contact_user_lookup,
-        ContactUserIdType, CotEvent, MessageResponse,
+        build_tool_approval_card, build_tool_approval_resolved_card, card_content,
+        is_retryable_cot_error, log_text_preview, preferred_contact_user_id_types,
+        should_retry_contact_user_lookup, ContactUserIdType, CotEvent, MessageResponse,
     };
+
+    #[tokio::test]
+    async fn oversized_final_cards_reject_before_network_for_text_fallback() {
+        let client = super::FeishuClient::new("unused", "unused");
+        let error = client
+            .reply_final_card("unused", &"x".repeat(29 * 1024), "fixed-id")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid card"));
+        let error = client
+            .reply_final_card("unused", &"![x](img_example)\n".repeat(181), "fixed-id")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("component budget"));
+    }
+
+    #[tokio::test]
+    async fn message_decode_keeps_card_rejections_and_transient_http_statuses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body, expected) in [
+            (
+                "400 Bad Request",
+                r#"{"code":230001,"msg":"invalid card"}"#,
+                "card",
+            ),
+            ("503 Service Unavailable", "upstream unavailable", "retry"),
+            ("401 Unauthorized", "expired", "token"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                stream.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}"))
+                .send()
+                .await
+                .unwrap();
+            let result = super::decode_message_response(response).await;
+            match expected {
+                "card" => {
+                    let response = result.unwrap();
+                    assert_eq!(response.code, 230001);
+                }
+                "retry" => assert!(super::is_retryable_cot_error(&result.unwrap_err())),
+                "token" => assert!(super::is_token_expired_err(&result.unwrap_err())),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_request_retries_transient_errors_but_stops_on_permission_errors() {
+        let client = super::FeishuClient::new("unused", "unused");
+        let attempts = std::cell::Cell::new(0);
+        let result = client
+            .retry_cot_request("reply_final_card", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                std::future::ready(if attempt < 3 {
+                    Err(anyhow::anyhow!("error 99991400: rate limit"))
+                } else {
+                    Ok("om_delivered")
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, "om_delivered");
+        assert_eq!(attempts.get(), 3);
+        attempts.set(0);
+        let result: anyhow::Result<()> = client
+            .retry_cot_request("reply_final_card", || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!("error 99991672: permission denied")))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+        attempts.set(0);
+        let result: anyhow::Result<()> = client
+            .retry_cot_request("reply_final_text", || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!("service unavailable")))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), super::COT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn native_image_payload_uses_image_key_and_keeps_files_and_folders() {
+        let (kind, body) = super::resource_message_content("img_test", "image");
+        assert_eq!(kind, "image");
+        assert_eq!(body, serde_json::json!({"image_key": "img_test"}));
+        for (file_type, expected) in [("folder", "folder"), ("stream", "file"), ("", "file")] {
+            let (kind, body) = super::resource_message_content("file_test", file_type);
+            assert_eq!(kind, expected);
+            assert_eq!(body, serde_json::json!({"file_key": "file_test"}));
+        }
+    }
+
+    #[test]
+    fn card_images_preserve_text_image_order_and_ignore_code_examples() {
+        let text = "前文\n\n![一](img_v3_first)\n\n中间\n\n![二](img_v3_second)\n\n后文";
+        let card: serde_json::Value = serde_json::from_str(&card_content(text)).unwrap();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 5);
+        assert_eq!(elements[0]["content"], "前文\n\n");
+        assert_eq!(elements[1]["tag"], "img");
+        assert_eq!(elements[1]["img_key"], "img_v3_first");
+        assert_eq!(elements[1]["alt"]["content"], "一");
+        assert_eq!(elements[2]["content"], "\n\n中间\n\n");
+        assert_eq!(elements[3]["img_key"], "img_v3_second");
+        assert_eq!(elements[4]["content"], "\n\n后文");
+        let code = "`![x](img_v3_code)`\n\n```md\n![x](img_v3_fenced)\n```";
+        let card: serde_json::Value = serde_json::from_str(&card_content(code)).unwrap();
+        assert_eq!(card["body"]["elements"].as_array().unwrap().len(), 1);
+        assert_eq!(card["body"]["elements"][0]["content"], code);
+        let card: serde_json::Value =
+            serde_json::from_str(&card_content("![x](img_v3_only)\n")).unwrap();
+        assert_eq!(card["body"]["elements"].as_array().unwrap().len(), 1);
+        assert_eq!(card["body"]["elements"][0]["tag"], "img");
+    }
 
     #[test]
     fn markdown_card_preserves_input_text() {

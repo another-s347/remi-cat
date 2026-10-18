@@ -181,7 +181,7 @@ impl Tool for AcpChatTool {
                         ProtocolEvent::RunStart {
                             thread_id: sub_thread_id.to_string(),
                             run_id: sub_run_id.to_string(),
-                            metadata: None,
+                            metadata: Some(serde_json::json!({"input": prepared.message})),
                         },
                     ));
                     yield ToolOutput::SubSession(SubSessionEvent::new(
@@ -403,6 +403,10 @@ fn acp_task_event_output(
         AcpToolTaskEvent::Delta(content) => ProtocolEvent::Delta {
             content,
             role: None,
+        },
+        AcpToolTaskEvent::ToolCallArguments { id, arguments } => ProtocolEvent::ToolCallDelta {
+            id,
+            arguments_delta: arguments,
         },
         AcpToolTaskEvent::Thinking(content) => ProtocolEvent::ThinkingEnd { content },
         AcpToolTaskEvent::ToolCallStart { id, name } => ProtocolEvent::ToolCallStart { id, name },
@@ -728,6 +732,71 @@ mod tests {
             parsed.working_directory.as_deref(),
             Some(std::path::Path::new("/tmp/project"))
         );
+    }
+
+    #[tokio::test]
+    async fn acp_sub_session_start_carries_the_actual_message() {
+        use crate::im_tools::{
+            AcpBindingDeleteRequest, AcpBindingUpsertRequest, DownloadedImFile, ImDownloadRequest,
+            ImFileBridge, ImUploadRequest, UploadedImFile,
+        };
+        use futures::StreamExt;
+        use remi_agentloop::prelude::ToolResult;
+        type BridgeFuture<'a, T> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+        struct BindingBridge;
+        impl ImFileBridge for BindingBridge {
+            fn download<'a>(&'a self, _: ImDownloadRequest) -> BridgeFuture<'a, DownloadedImFile> {
+                Box::pin(async { anyhow::bail!("unused file download") })
+            }
+            fn upload<'a>(&'a self, _: ImUploadRequest) -> BridgeFuture<'a, UploadedImFile> {
+                Box::pin(async { anyhow::bail!("unused file upload") })
+            }
+            fn acp_binding_upsert<'a>(
+                &'a self,
+                _: AcpBindingUpsertRequest,
+            ) -> BridgeFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn acp_binding_delete<'a>(
+                &'a self,
+                _: AcpBindingDeleteRequest,
+            ) -> BridgeFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let tool = AcpChatTool::codex(
+            Arc::new(AcpBackend::new(
+                directory.path().to_path_buf(),
+                Some(Arc::new(BindingBridge)),
+            )),
+            ToolApprovalManager::new(),
+        );
+        let result = tool
+            .execute(
+                serde_json::json!({"message":"Actual ACP request", "title":"Display title"}),
+                None,
+                tool_context(None),
+            )
+            .await
+            .unwrap();
+        let ToolResult::Output(stream) = result else {
+            panic!("expected streaming output");
+        };
+        let mut stream = Box::pin(stream);
+        let Some(ToolOutput::SubSession(event)) = stream.next().await else {
+            panic!("expected sub-session start");
+        };
+        let ProtocolEvent::RunStart {
+            metadata: Some(metadata),
+            ..
+        } = event.event.as_ref()
+        else {
+            panic!("missing input metadata");
+        };
+        assert_eq!(metadata["input"], "Actual ACP request");
+        assert_eq!(event.title.as_deref(), Some("Display title"));
     }
 
     #[tokio::test]

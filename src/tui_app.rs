@@ -13,14 +13,14 @@ use anyhow::Context;
 use base64::Engine as _;
 use bot_core::{
     model_profile_key_status, preserves_multiline_summary, tool_success, CatEvent, Content,
-    ContentPart, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus, Message,
+    ContentPart, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
     ModelProfileConfig, PrettyToolCall, PrettyToolStatus, ReasoningEffort, SteerSubmitResult,
     SupervisorTraceEvent, ThreadHistoryMessage, TokenUsage, ToolApprovalDecision,
     ToolApprovalRequest, UserQuestionRequest, UserQuestionResponse, UserQuestionStatus,
     WorkflowReport, WorkflowStatus,
 };
 #[cfg(test)]
-use bot_core::{AgentModelBindings, AgentProfile};
+use bot_core::{AgentModelBindings, AgentProfile, Message};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -3267,7 +3267,6 @@ impl TuiApp {
 
     async fn upsert_sub_session(&mut self, event: SubSessionEvent) {
         self.render_sub_session_event(&event);
-        self.persist_and_maybe_open_sub_session(event).await;
     }
 
     fn render_sub_session_event(&mut self, event: &SubSessionEvent) {
@@ -3414,18 +3413,6 @@ impl TuiApp {
         }
     }
 
-    async fn persist_and_maybe_open_sub_session(&mut self, event: SubSessionEvent) {
-        if let Err(error) = self
-            .channel
-            .record_sub_session(&self.session_id, event)
-            .await
-        {
-            self.cells.push(HistoryCell::error(format!(
-                "sub-session 记录失败: {error:#}"
-            )));
-        }
-    }
-
     async fn load_thread_history(&mut self) {
         let history = self
             .channel
@@ -3433,6 +3420,39 @@ impl TuiApp {
             .await
             .unwrap_or_default();
         self.loaded_thread_history_len = history.len();
+        if self.is_sub_session_view {
+            let mut events = Vec::new();
+            let mut offset = 0;
+            while let Ok(page) = self
+                .channel
+                .sub_session_events(&self.session_id, offset, 256)
+                .await
+            {
+                if page.events.is_empty() || page.next_offset == offset {
+                    break;
+                }
+                offset = page.next_offset;
+                events.extend(page.events);
+            }
+            if !events.is_empty() {
+                self.sub_session_event_log_offset = offset;
+                self.sub_session_event_log_lines = events.len();
+                for item in crate::sub_session::merge_history_with_events(history, events) {
+                    match item {
+                        crate::sub_session::HistoryReplayItem::Message(message) => {
+                            self.append_history_message(message)
+                        }
+                        crate::sub_session::HistoryReplayItem::Event(event) => {
+                            self.apply_sub_session_event_as_session_view(event).await
+                        }
+                    }
+                }
+                while self.cells.len() > MAX_HISTORY_CELLS {
+                    self.cells.remove(0);
+                }
+                return;
+            }
+        }
         if history.is_empty() {
             self.cells.push(HistoryCell::system("no previous messages"));
             return;
@@ -3480,251 +3500,46 @@ impl TuiApp {
         self.sub_session_event_log_offset = page.next_offset;
         for event in page.events {
             self.sub_session_event_log_lines += 1;
-            self.apply_sub_session_event_as_session_view(event);
+            self.apply_sub_session_event_as_session_view(event).await;
         }
     }
 
-    fn apply_sub_session_event_as_session_view(&mut self, event: SubSessionEvent) {
-        match *event.event {
-            ProtocolEvent::RunStart { .. } => {
-                self.status.state = "running".to_string();
-                self.status.elapsed_ms = 0;
-                self.status.last_error = None;
-            }
-            ProtocolEvent::Delta { content, .. } => {
-                self.status.state = "running".to_string();
-                self.push_assistant_delta(&content);
-            }
-            ProtocolEvent::ThinkingStart => {
-                self.status.state = "thinking".to_string();
-            }
-            ProtocolEvent::ThinkingEnd { content } => {
-                self.status.state = "running".to_string();
-                if !content.trim().is_empty() {
-                    self.push_thinking_delta(&content);
-                }
-            }
-            ProtocolEvent::TurnStart { turn } => {
-                self.status.state = format!("turn {turn}");
-            }
-            ProtocolEvent::ToolCallStart { id, name } => {
-                self.status.state = "running".to_string();
-                self.handle_bot_event_sync(BotEvent::ToolStart { id, name });
-            }
-            ProtocolEvent::ToolCallDelta {
-                id,
-                arguments_delta,
-            } => {
-                self.handle_bot_event_sync(BotEvent::ToolArgs {
-                    id,
-                    delta: arguments_delta,
-                });
-            }
-            ProtocolEvent::ToolDelta { id, name, delta } => {
-                self.status.state = "running".to_string();
-                self.handle_bot_event_sync(BotEvent::ToolDelta { id, name, delta });
-            }
-            ProtocolEvent::ToolResult { id, name, result } => {
-                self.handle_bot_event_sync(BotEvent::ToolDone {
-                    id,
-                    name,
-                    args: String::new(),
-                    success: bot_core::tool_success(&result),
-                    result,
-                    elapsed_ms: 0,
-                });
-            }
-            ProtocolEvent::Done => {
-                self.status.state = "idle".to_string();
-            }
-            ProtocolEvent::Custom { event_type, extra }
-                if matches!(
-                    event_type.as_str(),
-                    "sub_session_done" | "sub_session_handed_off"
-                ) =>
+    async fn apply_sub_session_event_as_session_view(&mut self, event: SubSessionEvent) {
+        if let ProtocolEvent::RunStart { metadata, .. } = event.event.as_ref() {
+            if let Some(input) =
+                crate::sub_session::run_input(metadata.as_ref()).or(event.title.clone())
             {
-                if let Some(output) = extra
-                    .get("final_output")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    let duplicate_last = self
-                        .cells
-                        .last()
-                        .filter(|cell| matches!(cell.kind, CellKind::Assistant))
-                        .is_some_and(|cell| cell.body.trim() == output);
-                    if !duplicate_last {
-                        self.push_assistant_delta(output);
-                    }
-                }
-                self.status.state = "idle".to_string();
+                self.cells.push(HistoryCell::user(input));
             }
-            ProtocolEvent::Error { message, .. } => {
-                self.status.state = "error".to_string();
-                self.status.last_error = Some(message.clone());
-                self.cells.push(HistoryCell::error(message));
-            }
-            ProtocolEvent::Cancelled => {
-                self.status.state = "error".to_string();
-                self.status.last_error = Some("cancelled".to_string());
-                self.cells.push(HistoryCell::error("cancelled"));
-            }
-            _ => {}
+            self.status.state = "running".to_string();
         }
-    }
-
-    fn handle_bot_event_sync(&mut self, event: BotEvent) {
-        match event {
-            BotEvent::ToolStart { id, name } => {
-                self.active_tool_args.insert(id.clone(), String::new());
-                self.active_tool_names.insert(id.clone(), name.clone());
-                self.active_tool_started_at
-                    .insert(id.clone(), Instant::now());
-                let meta = self
-                    .active_tool_started_at
-                    .get(&id)
-                    .map(|started| running_tool_meta(*started, None))
-                    .unwrap_or_else(|| format_elapsed(0));
-                let pretty = PrettyToolCall::started(&id, &name, &empty_tool_args());
-                let body = tool_body(&pretty);
-                if let Some(cell) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    cell.title = pretty.title;
-                    cell.body = body;
-                    cell.meta = preserve_token_meta(meta, &cell.meta);
-                    cell.status = ToolVisualStatus::Running;
-                } else {
-                    self.cells.push(HistoryCell::tool(
-                        id.clone(),
-                        pretty.title,
-                        body,
-                        meta,
-                        ToolVisualStatus::Running,
-                    ));
-                }
-                if let Some(index) = self
+        for output in crate::sub_session::output_events(&event, &self.active_tool_args) {
+            if let ApplicationEvent::ResponseCompleted { text, .. } = &output {
+                let has_assistant = self
                     .cells
                     .iter()
-                    .rposition(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    self.mark_token_cell(index);
-                }
-            }
-            BotEvent::ToolArgs { id, delta } => {
-                let args = self.active_tool_args.entry(id.clone()).or_default();
-                args.push_str(&delta);
-                if let Some(cell) = self
-                    .cells
-                    .iter_mut()
                     .rev()
-                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    if let (Some(name), Some(args_value)) =
-                        (self.active_tool_names.get(&id), parse_tool_args(args))
-                    {
-                        let pretty = PrettyToolCall::started(&id, name, &args_value);
-                        let title = pretty.title.clone();
-                        let body = tool_body(&pretty);
-                        cell.title = title;
-                        cell.body = body;
-                    }
+                    .take_while(|cell| !matches!(cell.kind, CellKind::User))
+                    .any(|cell| matches!(cell.kind, CellKind::Assistant));
+                if !has_assistant {
+                    Box::pin(self.handle_bot_event(BotEvent::Text(text.clone()))).await;
                 }
             }
-            BotEvent::ToolDelta { id, name, delta } => {
-                self.active_tool_names.insert(id.clone(), name.clone());
-                self.active_tool_started_at
-                    .entry(id.clone())
-                    .or_insert_with(Instant::now);
-                let meta = self
-                    .active_tool_started_at
-                    .get(&id)
-                    .map(|started| {
-                        running_tool_meta(
-                            *started,
-                            self.active_tool_execution_started_at.get(&id).copied(),
-                        )
-                    })
-                    .unwrap_or_else(|| format_elapsed(0));
-                if let Some(cell) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    cell.title = format!("调用 {name}");
-                    cell.body = truncate_chars(&delta, MAX_TOOL_BODY_CHARS);
-                    cell.meta = preserve_token_meta(meta, &cell.meta);
-                    cell.status = ToolVisualStatus::Running;
-                } else {
-                    self.cells.push(HistoryCell::tool(
-                        id,
-                        format!("调用 {name}"),
-                        truncate_chars(&delta, MAX_TOOL_BODY_CHARS),
-                        meta,
-                        ToolVisualStatus::Running,
-                    ));
-                }
+            let done = matches!(output, ApplicationEvent::Done);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            forward_application_event_to_tui(output, &tx, false);
+            while let Ok(event) = rx.try_recv() {
+                Box::pin(self.handle_bot_event(event)).await;
             }
-            BotEvent::ToolDone {
-                id,
-                name,
-                args,
-                result,
-                success,
-                elapsed_ms,
-            } => {
-                let args = if args.trim().is_empty() {
-                    self.active_tool_args.remove(&id).unwrap_or_default()
-                } else {
-                    self.active_tool_args.remove(&id);
-                    args
-                };
-                self.active_tool_names.remove(&id);
-                let started_at = self.active_tool_started_at.remove(&id);
-                let execution_started_at = self.active_tool_execution_started_at.remove(&id);
-                let args_value = parse_tool_args(&args).unwrap_or(serde_json::Value::Null);
-                let pretty = PrettyToolCall::completed(
-                    &id,
-                    &name,
-                    &args_value,
-                    &result,
-                    success,
-                    elapsed_ms,
-                );
-                let status = ToolVisualStatus::from_pretty(&pretty.status);
-                let meta = tool_elapsed_meta(started_at, execution_started_at, elapsed_ms);
-                if let Some(cell) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|cell| cell.tool_id().is_some_and(|tool_id| tool_id == id))
-                {
-                    let title = pretty.title.clone();
-                    let body = tool_body(&pretty);
-                    cell.title = title;
-                    cell.body = body;
-                    cell.meta = preserve_token_meta(meta, &cell.meta);
-                    cell.status = status;
-                } else {
-                    let title = pretty.title.clone();
-                    let body = tool_body(&pretty);
-                    self.cells
-                        .push(HistoryCell::tool(id, title, body, meta, status));
-                }
+            if done {
+                Box::pin(self.handle_bot_event(BotEvent::Done)).await;
             }
-            _ => {}
         }
     }
 
     fn append_history_message(&mut self, message: ThreadHistoryMessage) {
         if message.role == "assistant" && message.pretty.is_none() {
-            let text = message.text.trim();
-            if text.is_empty() {
+            if message.text.is_empty() {
                 return;
             }
             if let Some(cell) = self.cells.last_mut().filter(|cell| {
@@ -4152,6 +3967,34 @@ async fn run_bot_turn(
     let _ = tx.send(BotEvent::Done);
 }
 
+#[cfg(test)]
+pub(crate) async fn capture_live_sub_session_view(
+    channel: ChannelHandle,
+    session_id: String,
+) -> serde_json::Value {
+    let cli = CliConfig {
+        enabled: true,
+        tui: true,
+        resume: true,
+        resume_session_id: Some(session_id.clone()),
+        once: None,
+        pure_prompt: false,
+        channel_id: "live-acceptance".into(),
+        user_id: "live-acceptance".into(),
+        username: "Live acceptance".into(),
+        wait_background_tasks: false,
+        async_agent: false,
+        permissions: None,
+    };
+    let app = TuiApp::new(channel, cli, session_id).await;
+    serde_json::json!({
+        "users": app.cells.iter().filter(|cell| matches!(cell.kind, CellKind::User)).map(|cell| &cell.body).collect::<Vec<_>>(),
+        "assistants": app.cells.iter().filter(|cell| matches!(cell.kind, CellKind::Assistant)).map(|cell| &cell.body).collect::<Vec<_>>(),
+        "tool_ids": app.cells.iter().filter_map(|cell| cell.tool_id()).collect::<Vec<_>>(),
+        "event_log_lines": app.sub_session_event_log_lines,
+    })
+}
+
 fn build_tui_output_protocol(
     channel: &ChannelHandle,
     session_id: &str,
@@ -4216,6 +4059,8 @@ fn build_tui_output_protocol(
         files: OutputCapability::Native,
         math: OutputCapability::Disabled,
         html: OutputCapability::Disabled,
+        tables: OutputCapability::Text,
+        charts: OutputCapability::Text,
     };
     TuiOutputProtocol {
         context,
@@ -4437,6 +4282,9 @@ fn forward_application_event_to_tui(
 
 fn forward_cat_event_to_tui(event: CatEvent, tx: &mpsc::UnboundedSender<BotEvent>) -> bool {
     match event {
+        CatEvent::ToolDelta { id, name, delta } => {
+            let _ = tx.send(BotEvent::ToolDelta { id, name, delta });
+        }
         CatEvent::Text(delta) => {
             let _ = tx.send(BotEvent::Text(delta));
         }
@@ -5419,6 +5267,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a1", "a2"]
         );
+    }
+
+    #[test]
+    fn tui_structured_chart_uses_a_readable_data_table() {
+        let mut protocol = handoff_protocol();
+        protocol.context.capabilities.charts = OutputCapability::Text;
+        let rendered = protocol.render("before\n```remi-chart\n{\"kind\":\"bar\",\"points\":[{\"label\":\"A\",\"value\":7}]}\n```\nafter");
+        assert!(rendered.contains("A |  | 7"));
+        assert!(rendered.contains("before") && rendered.contains("after"));
+        assert!(!rendered.contains("remi-chart"));
     }
 
     #[test]
@@ -6872,6 +6730,162 @@ mod tests {
             ProtocolEvent::ToolCallStart { name, .. } if name == "bash"
         ));
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn reopening_sub_session_replays_tools_and_retains_direct_followup_after_multiple_pages()
+    {
+        use crate::application::{ApplicationBuilder, ChannelConfig};
+        use axum::routing::post;
+        use remi_agentloop::prelude::{RunId, ThreadId};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().route("/v1/chat/completions", post(|| async {
+                ([("content-type", "text/event-stream")], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"CONTINUED_REPLY\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            }))).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let model = bot_core::ModelProfileConfig {
+            id: "replay-test".into(),
+            name: "Replay test".into(),
+            model: "mock".into(),
+            base_url: Some(format!("http://{address}/v1")),
+            provider: Some("openai".into()),
+            thinking: None,
+            reasoning_effort: None,
+            max_output_tokens: 1024,
+            context_tokens: 16_384,
+            supports_images: false,
+            legacy_short_term_tokens: None,
+            overflow_bytes: 16_384,
+            context_compaction: bot_core::ContextCompactionMode::Off,
+            description: None,
+            extra_options: serde_json::Map::new(),
+        };
+        let agent = AgentProfile {
+            id: "default".into(),
+            name: "Default".into(),
+            description: String::new(),
+            model: Some("mock".into()),
+            base_url: None,
+            models: AgentModelBindings::default(),
+            tools: Vec::new(),
+            delegates: Vec::new(),
+            max_turns: Some(2),
+            persistent_sessions: true,
+            system_prompt: "Reply briefly.".into(),
+        };
+        let application = ApplicationBuilder::new(directory.path())
+            .workspace(directory.path())
+            .default_model("replay-test")
+            .model_profile(model)
+            .agent_profile(agent)
+            .credentials(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "test".into(),
+            )]))
+            .discover_hooks(false)
+            .include_default_skills(false)
+            .file_skills(false)
+            .spawn()
+            .await
+            .unwrap();
+        let channel = application.handle().channel(ChannelConfig::new("tui"));
+        let parent = channel.resolve_session("parent").await.unwrap();
+        let child_event = |protocol| {
+            SubSessionEvent::new(
+                "parent-tool",
+                ThreadId("child".into()),
+                RunId("run".into()),
+                "default",
+                Some("display title".into()),
+                1,
+                protocol,
+            )
+        };
+        let child_id = channel
+            .record_sub_session(
+                &parent.id,
+                child_event(ProtocolEvent::RunStart {
+                    thread_id: "child".into(),
+                    run_id: "run".into(),
+                    metadata: Some(serde_json::json!({"input":"Actual child task"})),
+                }),
+            )
+            .await
+            .unwrap();
+        for _ in 0..257 {
+            channel
+                .record_sub_session(
+                    &parent.id,
+                    child_event(ProtocolEvent::ThinkingEnd {
+                        content: String::new(),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        for event in [
+            ProtocolEvent::ToolCallStart {
+                id: "read".into(),
+                name: "fs_read".into(),
+            },
+            ProtocolEvent::ToolResult {
+                id: "read".into(),
+                name: "fs_read".into(),
+                result: "contents".into(),
+            },
+            ProtocolEvent::Delta {
+                content: "ORIGINAL_REPLY".into(),
+                role: None,
+            },
+            ProtocolEvent::Custom {
+                event_type: "sub_session_done".into(),
+                extra: serde_json::json!({"final_output":"ORIGINAL_REPLY"}),
+            },
+        ] {
+            channel
+                .record_sub_session(&parent.id, child_event(event))
+                .await
+                .unwrap();
+        }
+        let mut run = channel
+            .run(RunRequest::text(
+                &child_id,
+                "Continue the child conversation",
+            ))
+            .await
+            .unwrap();
+        while tokio::time::timeout(std::time::Duration::from_secs(10), run.recv())
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        let app = TuiApp::new(channel, test_cli_config(), child_id).await;
+        let users = app
+            .cells
+            .iter()
+            .filter(|cell| matches!(cell.kind, CellKind::User))
+            .map(|cell| cell.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            ["Actual child task", "Continue the child conversation"]
+        );
+        let text = app
+            .cells
+            .iter()
+            .filter(|cell| matches!(cell.kind, CellKind::Assistant))
+            .map(|cell| cell.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["ORIGINAL_REPLY", "CONTINUED_REPLY"]);
+        assert!(app.cells.iter().any(|cell| cell.tool_id() == Some("read")));
+        assert!(app.sub_session_event_log_lines > 256);
+        drop(app);
+        application.shutdown().await.unwrap();
+        server.abort();
     }
 
     #[test]

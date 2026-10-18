@@ -45,7 +45,7 @@ remi-cat codex doctor
 
 `codex setup --bin` selects a different ACP executable, and repeated `--arg` values pass startup arguments to it. Existing profiles keep their configured `acp.local_bin` until setup is run again.
 
-Automatic Feishu/Lark channel creation for ACP, agent sub-sessions and `/fork`
+Automatic Feishu/Lark channel creation for ACP and agent sub-sessions
 is disabled by default. To enable it, set this in the active profile's
 `runtime.yaml` and restart the runtime:
 
@@ -54,8 +54,13 @@ im:
   auto_open_sub_session_channel: true
 ```
 
-When disabled (or omitted), sub-session history and forked sessions are still
-saved, and existing channel bindings continue to work.
+When disabled (or omitted), sub-session history is still saved, and existing
+channel bindings continue to work. `/fork` creates its new channel independently
+of this setting.
+Created sub-session channels use the main conversation's native Feishu COT
+renderer for progress and tools, and send the final reply separately. Fork
+history is replayed through that same renderer, one turn at a time. Panels replay persisted
+sub-session events, including tool activity, without relying on a parent TUI.
 
 You can also enable it with
 `remi-cat config set im.auto_open_sub_session_channel=true`.

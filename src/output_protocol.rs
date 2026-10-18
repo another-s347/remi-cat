@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
+pub use remi_output_protocol::{
+    render_structured_fallbacks, ChartKind, ChartPoint, ColumnKind, OutputChart, OutputTable,
+    StructuredOutput, TableColumn,
+};
+
 pub const OUTPUT_PROTOCOL_VERSION: u8 = 1;
 pub const BROADCAST_ALL_REF: &str = "all";
 
@@ -28,6 +33,10 @@ pub struct OutputCapabilities {
     pub math: OutputCapability,
     #[serde(default)]
     pub html: OutputCapability,
+    #[serde(default)]
+    pub tables: OutputCapability,
+    #[serde(default)]
+    pub charts: OutputCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +134,13 @@ impl OutputProtocolContext {
             caps.push("html");
         }
 
+        if self.capabilities.tables != OutputCapability::Disabled {
+            caps.push("table");
+        }
+        if self.capabilities.charts != OutputCapability::Disabled {
+            caps.push("chart");
+        }
+
         let mut lines = vec![format!(
             "<remi-output v=\"{}\" self=\"{}\" caps=\"{}\">",
             self.version,
@@ -159,6 +175,12 @@ impl OutputProtocolContext {
         }
         if self.capabilities.html != OutputCapability::Disabled {
             lines.push("HTML visual: read `desktop-html` skill.".into());
+        }
+        if self.capabilities.tables != OutputCapability::Disabled {
+            lines.push(r#"Table: fenced remi-table JSON {title?,columns:[{id,label,kind:"text"|"number"}],rows:[{COLUMN_ID:value}],page_size?:1..10}; 1-20 columns, <=100 rows."#.into());
+        }
+        if self.capabilities.charts != OutputCapability::Disabled {
+            lines.push(r#"Chart: fenced remi-chart JSON {title?,kind:"bar"|"line"|"pie",points:[{label,value:number,series?:string}]}; 1-200 points; pie nonnegative, no series. Blocks <=16 KiB; JSON only."#.into());
         }
         if !self.entities.is_empty() {
             lines.push("entities:".into());
@@ -267,6 +289,14 @@ pub enum OutputNodeKind {
     },
     Html {
         html: String,
+    },
+    Table {
+        table: OutputTable,
+        mode: OutputCapability,
+    },
+    Chart {
+        chart: OutputChart,
+        mode: OutputCapability,
     },
 }
 
@@ -451,6 +481,43 @@ pub fn parse_output(text: &str, context: &OutputProtocolContext) -> OutputDocume
             _ => {}
         }
     }
+    for span in remi_output_protocol::structured_spans(text) {
+        match span.result {
+            Ok(StructuredOutput::Table(table))
+                if context.capabilities.tables != OutputCapability::Disabled =>
+            {
+                nodes.push(OutputNode {
+                    start: span.start,
+                    end: span.end,
+                    kind: OutputNodeKind::Table {
+                        table,
+                        mode: context.capabilities.tables,
+                    },
+                })
+            }
+            Ok(StructuredOutput::Chart(chart))
+                if context.capabilities.charts != OutputCapability::Disabled =>
+            {
+                nodes.push(OutputNode {
+                    start: span.start,
+                    end: span.end,
+                    kind: OutputNodeKind::Chart {
+                        chart,
+                        mode: context.capabilities.charts,
+                    },
+                })
+            }
+            result => diagnostics.push(OutputDiagnostic {
+                code: if result.is_err() {
+                    "invalid_structured_output"
+                } else {
+                    "structured_output_not_available"
+                },
+                start: span.start,
+                end: span.end,
+            }),
+        }
+    }
     nodes.sort_by_key(|node| node.start);
     OutputDocument {
         source: text.to_string(),
@@ -523,7 +590,18 @@ impl OutputDocument {
                     label,
                 } => entity(reference, *entity_kind, label),
                 OutputNodeKind::BroadcastAll { label } => all(label),
-                OutputNodeKind::Resource { .. } | OutputNodeKind::Html { .. } => None,
+                OutputNodeKind::Table {
+                    table,
+                    mode: OutputCapability::Text,
+                } => Some(StructuredOutput::Table(table.clone()).markdown()),
+                OutputNodeKind::Chart {
+                    chart,
+                    mode: OutputCapability::Text,
+                } => Some(StructuredOutput::Chart(chart.clone()).markdown()),
+                OutputNodeKind::Resource { .. }
+                | OutputNodeKind::Html { .. }
+                | OutputNodeKind::Table { .. }
+                | OutputNodeKind::Chart { .. } => None,
             };
             if let Some(replacement) = replacement {
                 rendered.replace_range(node.start..node.end, &replacement);
@@ -580,6 +658,8 @@ mod tests {
             files: OutputCapability::Native,
             math: OutputCapability::Disabled,
             html: OutputCapability::Disabled,
+            tables: OutputCapability::Disabled,
+            charts: OutputCapability::Disabled,
         };
         context.entities = vec![
             OutputEntity::new("a0", OutputEntityKind::Agent, "Self"),
@@ -682,6 +762,35 @@ mod tests {
             ),
             "Hi <u1:Alice> and <ALL>"
         );
+    }
+
+    #[test]
+    fn structured_nodes_respect_capabilities_and_text_rendering() {
+        let source =
+            "```remi-chart\n{\"kind\":\"bar\",\"points\":[{\"label\":\"A\",\"value\":7}]}\n```";
+        let mut context = context();
+        assert_eq!(
+            parse_output(source, &context).diagnostics[0].code,
+            "structured_output_not_available"
+        );
+        context.capabilities.charts = OutputCapability::Text;
+        let document = parse_output(source, &context);
+        assert!(matches!(
+            &document.nodes[0].kind,
+            OutputNodeKind::Chart {
+                mode: OutputCapability::Text,
+                ..
+            }
+        ));
+        assert!(document
+            .render_mentions(|_, _, _| None, |_| None)
+            .contains("A |  | 7"));
+        context.capabilities.charts = OutputCapability::Native;
+        assert_eq!(
+            parse_output(source, &context).render_mentions(|_, _, _| None, |_| None),
+            source
+        );
+        assert!(context.prompt().contains("remi-chart"));
     }
 
     #[test]

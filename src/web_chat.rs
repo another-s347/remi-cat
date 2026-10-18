@@ -1516,6 +1516,10 @@ impl WebCoreEventMapper {
                     }),
                 )
             }
+            CatEvent::ToolDelta { id, name, delta } => WebEventMap::Emit(
+                "tool_output_delta",
+                serde_json::json!({"call_id":id,"tool_name":name,"delta":delta}),
+            ),
             CatEvent::ToolCallArgumentsDelta { id, delta } => WebEventMap::Emit(
                 "tool_call_arguments_delta",
                 serde_json::json!({"call_id": id, "delta": delta}),

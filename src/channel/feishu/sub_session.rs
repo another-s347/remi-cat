@@ -40,7 +40,9 @@ pub(super) async fn record_sub_session_event(
     let sub_session_id =
         ensure_sub_session_channel_session(runtime, parent_session_id, platform, event).await;
     if let Some(session_id) = sub_session_id.as_deref() {
-        let messages = sub_session_history_messages(event);
+        let messages =
+            crate::sub_session::history_messages_for_run(&runtime.data_dir, session_id, event)
+                .await;
         if let Err(err) = runtime
             .bot
             .append_thread_messages(session_id, messages)
@@ -50,10 +52,15 @@ pub(super) async fn record_sub_session_event(
         }
     }
 
-    if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
-        if platform == FEISHU_CHANNEL || platform.starts_with("feishu:") {
-            forward_sub_session_event_to_bound_channel(runtime, parent_session_id, event).await;
+    if let Some(session_id) = sub_session_id.as_deref() {
+        if let Err(err) =
+            crate::sub_session::append_event_log(&runtime.data_dir, session_id, event).await
+        {
+            warn!("failed to append sub-session event log: {err:#}");
         }
+    }
+
+    if !matches!(event.event.as_ref(), ProtocolEvent::RunStart { .. }) {
         return;
     }
     if platform != FEISHU_CHANNEL && !platform.starts_with("feishu:") {
@@ -173,132 +180,4 @@ async fn ensure_sub_session_channel_session(
         }
     }
     Some(session.id)
-}
-
-async fn forward_sub_session_event_to_bound_channel(
-    runtime: &Runtime,
-    parent_session_id: &str,
-    event: &SubSessionEvent,
-) {
-    let Some(text) = sub_session_event_text(event) else {
-        return;
-    };
-    let Some(binding) = runtime
-        .sessions
-        .lock()
-        .await
-        .sub_session_channel_binding(parent_session_id, &event.sub_thread_id.0)
-    else {
-        return;
-    };
-    let done = matches!(
-        event.event.as_ref(),
-        ProtocolEvent::Done | ProtocolEvent::Error { .. } | ProtocolEvent::Cancelled
-    ) || matches!(
-        event.event.as_ref(),
-        ProtocolEvent::Custom { event_type, .. } if event_type == "sub_session_done"
-    );
-    if let Err(err) = runtime
-        .im_bridge
-        .sub_session_send_text(&binding.platform, &binding.channel_id, &text, done)
-        .await
-    {
-        warn!("failed to send sub-session event to IM channel: {err:#}");
-    }
-}
-
-fn sub_session_history_messages(event: &SubSessionEvent) -> Vec<remi_agentloop::prelude::Message> {
-    match event.event.as_ref() {
-        ProtocolEvent::RunStart { .. } => {
-            let input = event
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "Sub-session started: {} / {}",
-                        event.agent_name, event.sub_thread_id.0
-                    )
-                });
-            vec![remi_agentloop::prelude::Message::user(input)]
-        }
-        ProtocolEvent::Delta { content, .. } => {
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![remi_agentloop::prelude::Message::assistant(content.clone())]
-            }
-        }
-        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
-            .get("final_output")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                vec![remi_agentloop::prelude::Message::assistant(
-                    value.to_string(),
-                )]
-            })
-            .unwrap_or_default(),
-        ProtocolEvent::Error { message, .. } => {
-            vec![remi_agentloop::prelude::Message::assistant(format!(
-                "Error: {message}"
-            ))]
-        }
-        ProtocolEvent::Cancelled => {
-            vec![remi_agentloop::prelude::Message::assistant(
-                "Error: cancelled",
-            )]
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn sub_session_event_text(event: &SubSessionEvent) -> Option<String> {
-    let text = match event.event.as_ref() {
-        ProtocolEvent::RunStart { .. } => return None,
-        ProtocolEvent::Delta { content, .. } => content.clone(),
-        ProtocolEvent::ThinkingStart => "Thinking...".to_string(),
-        ProtocolEvent::ThinkingEnd { content } => {
-            if content.trim().is_empty() {
-                "Thinking complete.".to_string()
-            } else {
-                format!("Thinking:\n{content}")
-            }
-        }
-        ProtocolEvent::TurnStart { turn } => format!("Turn {turn}"),
-        ProtocolEvent::ToolCallStart { id, name } => {
-            format!("Tool `{name}` started ({id}).")
-        }
-        ProtocolEvent::ToolCallDelta {
-            id,
-            arguments_delta,
-        } => {
-            format!("Tool arguments `{id}`:\n{arguments_delta}")
-        }
-        ProtocolEvent::ToolDelta { id, name, delta } => {
-            format!("Tool `{name}` output ({id}):\n{delta}")
-        }
-        ProtocolEvent::ToolResult { id, name, result } => {
-            format!("Tool `{name}` result ({id}):\n{result}")
-        }
-        ProtocolEvent::Done => "Done.".to_string(),
-        ProtocolEvent::Custom { event_type, extra } if event_type == "sub_session_done" => extra
-            .get("final_output")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "Done.".to_string()),
-        ProtocolEvent::Error { message, .. } => format!("Error: {message}"),
-        ProtocolEvent::Cancelled => "Error: cancelled".to_string(),
-        other => format!("{other:?}"),
-    };
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
 }

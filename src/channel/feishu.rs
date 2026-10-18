@@ -10,7 +10,7 @@ use bot_core::im_tools::{encode_agent_file_key, ImUploadRequest, SubSessionBindi
 use bot_core::{
     CatEvent, Content, ContentPart, ContextMetrics, ImAttachment, ImDocument, TokenUsage,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use im_feishu::{FeishuEvent, FeishuGateway, FeishuMessage};
 use remi_agentloop::prelude::{CancellationToken, ProtocolEvent};
 use tracing::{debug, info, warn};
@@ -278,6 +278,7 @@ async fn process_feishu_message(
     );
     let mut replies =
         FeishuReplyStream::new(gateway.clone(), msg.chat_id.clone(), msg.message_id.clone());
+    replies.start().await;
     let result = collect_bot_reply(
         runtime,
         &platform,
@@ -475,7 +476,8 @@ async fn collect_bot_reply(
         }
     }
     if is_feishu_platform(platform) && is_fork_command(msg.text.trim()) {
-        let reply = handle_feishu_fork_command(&runtime, platform, &session_id, &msg).await?;
+        let reply =
+            handle_feishu_fork_command(&runtime, platform, &session_id, &msg, gateway).await?;
         append_reply_chunk(
             &mut String::new(),
             &mut replies,
@@ -484,7 +486,7 @@ async fn collect_bot_reply(
         )
         .await;
         if let Some(replies) = replies.as_deref_mut() {
-            replies.commit_final_output().await;
+            replies.commit_final_output().await?;
         }
         return Ok(reply);
     }
@@ -550,26 +552,236 @@ async fn collect_bot_reply(
         msg: &msg,
         session_id: &session_id,
         debug_enabled,
-        output: String::new(),
-        active_reply_message_id: msg.message_id.clone(),
+        gateway,
         replies: &mut replies,
-        streaming_tool_names: HashMap::new(),
-        streaming_tool_args: HashMap::new(),
-        narrative_kind: None,
-        background_task_count: 0,
-        had_visible_event: false,
-        supervisor_execution_started: false,
-        output_protocol,
+        state: FeishuForwarderState::new(output_protocol, msg.message_id.clone()),
     };
-    while let Some(event) = stream.next().await {
-        if forwarder.forward_core_event(event).await {
-            break;
+    'output: while let Some(event) = stream.next().await {
+        let mut batch = vec![event];
+        // Drain already-ready micro-chunks before persistence and COT updates.
+        // Tool, turn and terminal boundaries remain in their original order.
+        for _ in 0..127 {
+            let Some(Some(event)) = stream.next().now_or_never() else {
+                break;
+            };
+            if !merge_output_chunk(batch.last_mut().unwrap(), &event) {
+                batch.push(event);
+            }
+        }
+        for event in batch {
+            if forwarder.forward_core_event(event).await {
+                break 'output;
+            }
         }
     }
-    if should_emit_empty_fallback(&forwarder.output, forwarder.had_visible_event) {
+    if should_emit_empty_fallback(&forwarder.state.output, forwarder.state.had_visible_event) {
         forwarder.append(FeishuReplyKind::Text, "（无响应）").await;
     }
-    Ok(forwarder.output)
+    for child in forwarder.state.child_outputs.values_mut() {
+        child.replies.finish().await;
+        child.replies.delivery_result()?;
+    }
+    if let Some(replies) = forwarder.replies.as_deref() {
+        replies.delivery_result()?;
+    }
+    Ok(forwarder.state.output)
+}
+
+fn merge_output_chunk(previous: &mut CoreChatEvent, next: &CoreChatEvent) -> bool {
+    match (previous, next) {
+        (CoreChatEvent::Bot(CatEvent::Text(left)), CoreChatEvent::Bot(CatEvent::Text(right)))
+        | (
+            CoreChatEvent::Bot(CatEvent::Thinking(left)),
+            CoreChatEvent::Bot(CatEvent::Thinking(right)),
+        ) => {
+            left.push_str(right);
+            true
+        }
+        (
+            CoreChatEvent::Bot(CatEvent::SubSession(left)),
+            CoreChatEvent::Bot(CatEvent::SubSession(right)),
+        ) if left.sub_thread_id == right.sub_thread_id && left.sub_run_id == right.sub_run_id => {
+            match (left.event.as_mut(), right.event.as_ref()) {
+                (
+                    ProtocolEvent::Delta {
+                        content: left,
+                        role: left_role,
+                    },
+                    ProtocolEvent::Delta {
+                        content: right,
+                        role: right_role,
+                    },
+                ) if left_role == right_role => {
+                    left.push_str(right);
+                    true
+                }
+                (
+                    ProtocolEvent::ThinkingEnd { content: left },
+                    ProtocolEvent::ThinkingEnd { content: right },
+                ) => {
+                    left.push_str(right);
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+async fn replay_feishu_history(
+    runtime: &Runtime,
+    platform: &str,
+    channel_id: &str,
+    session_id: &str,
+    source: &FeishuMessage,
+    gateway: &FeishuGateway,
+    history: Vec<bot_core::ThreadHistoryMessage>,
+) -> anyhow::Result<()> {
+    let turns = feishu_history_turns(history);
+    for (input, events) in turns {
+        replay_feishu_history_turn(
+            runtime, platform, channel_id, session_id, source, gateway, input, events,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn feishu_history_turns(
+    history: Vec<bot_core::ThreadHistoryMessage>,
+) -> Vec<(String, Vec<CoreChatEvent>)> {
+    let mut turns: Vec<(String, Vec<CoreChatEvent>)> = Vec::new();
+    for message in history {
+        if message.role == "user" {
+            turns.push((message.text, Vec::new()));
+            continue;
+        }
+        if turns.is_empty() {
+            turns.push(("已复制历史对话。".into(), Vec::new()));
+        }
+        let events = &mut turns.last_mut().unwrap().1;
+        if message.role == "assistant" {
+            if !message.text.is_empty() {
+                events.push(CoreChatEvent::Bot(CatEvent::Text(message.text)));
+            }
+            if let Some(calls) = message
+                .tool_calls
+                .and_then(|value| value.as_array().cloned())
+            {
+                for call in calls {
+                    let id = call["id"].as_str().unwrap_or_default().to_string();
+                    let name = call["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = call["function"]["arguments"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str(text).ok())
+                        .unwrap_or_default();
+                    events.push(CoreChatEvent::Bot(CatEvent::ToolCall { id, name, args }));
+                }
+            }
+        } else if message.role == "tool" {
+            let (id, name, args, elapsed_ms) = if let Some(pretty) = message.pretty {
+                (
+                    pretty.id,
+                    pretty.tool_name,
+                    pretty.request,
+                    pretty.elapsed_ms.unwrap_or(0),
+                )
+            } else {
+                let id = message.tool_call_id.unwrap_or(message.id);
+                let name = events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        CoreChatEvent::Bot(CatEvent::ToolCall {
+                            id: call_id, name, ..
+                        }) if call_id == &id => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "tool".into());
+                (id, name, serde_json::Value::Null, 0)
+            };
+            events.push(CoreChatEvent::Bot(CatEvent::ToolCallResult {
+                id,
+                name,
+                args,
+                result: message.text.clone(),
+                success: bot_core::tool_success(&message.text),
+                elapsed_ms,
+            }));
+        }
+    }
+    for (_, events) in &mut turns {
+        let mut final_text = String::new();
+        for event in events.iter() {
+            match event {
+                CoreChatEvent::Bot(CatEvent::Text(text)) => final_text.push_str(text),
+                _ => final_text.clear(),
+            }
+        }
+        if !final_text.is_empty() {
+            events.push(CoreChatEvent::ResponseCompleted {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                text: final_text,
+            });
+        }
+    }
+    turns
+}
+
+async fn replay_feishu_history_turn(
+    runtime: &Runtime,
+    platform: &str,
+    channel_id: &str,
+    session_id: &str,
+    source: &FeishuMessage,
+    gateway: &FeishuGateway,
+    input: String,
+    events: Vec<CoreChatEvent>,
+) -> anyhow::Result<()> {
+    let chat_id = channel_id.split(":thread:").next().unwrap_or(channel_id);
+    let anchor = if channel_id.contains(":thread:") {
+        let anchor = runtime
+            .im_bridge
+            .sub_session_reply_anchor(platform, channel_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("fork topic has no reply anchor"))?;
+        gateway.reply_text(&anchor, &input).await?
+    } else {
+        gateway.send_text(chat_id, &input).await?
+    };
+    let mut message = source.clone();
+    message.chat_id = chat_id.to_string();
+    message.message_id = anchor.clone();
+    message.text = input;
+    message.mentions.clear();
+    message.images.clear();
+    message.files.clear();
+    message.documents.clear();
+    let protocol =
+        build_feishu_output_protocol(runtime, platform, session_id, &message, None, Some(gateway))
+            .await;
+    let mut replies = FeishuReplyStream::new(gateway.clone(), chat_id.to_string(), anchor.clone());
+    replies.start().await;
+    let mut reply_option = Some(&mut replies);
+    let mut forwarder = FeishuEventForwarder {
+        runtime,
+        platform,
+        msg: &message,
+        session_id,
+        debug_enabled: false,
+        gateway: Some(gateway),
+        replies: &mut reply_option,
+        state: FeishuForwarderState::new(protocol, anchor),
+    };
+    for event in events {
+        forwarder.forward_core_event(event).await;
+    }
+    forwarder.commit_final_output().await?;
+    Ok(())
 }
 
 fn is_feishu_platform(platform: &str) -> bool {
@@ -603,6 +815,7 @@ async fn handle_feishu_fork_command(
     platform: &str,
     source_session_id: &str,
     msg: &FeishuMessage,
+    gateway: Option<&FeishuGateway>,
 ) -> anyhow::Result<String> {
     if runtime.bot.is_thread_running(source_session_id).await {
         return Ok("当前 session 正在运行，结束或取消后再 fork。".to_string());
@@ -652,6 +865,12 @@ async fn handle_feishu_fork_command(
                 &binding.platform,
                 &binding.channel_id,
             )?;
+            if let Some(gateway) = gateway {
+                let history = runtime.bot.thread_history(&fork.id).await;
+                if let Err(error) = replay_feishu_history(runtime, &binding.platform, &binding.channel_id, &fork.id, msg, gateway, history).await {
+                    return Ok(format!("已 fork 当前 session 并创建新入口，但同步对话失败。\n\n新 session: `{}`\n错误: {error:#}", fork.id));
+                }
+            }
             Ok(format!(
                 "已 fork 当前 session。\n\n新 session: `{}`\n标题: {}\n已创建新的飞书子会话入口。",
                 fork.id,
@@ -701,23 +920,49 @@ impl FeishuOutputProtocol {
         )
     }
 
-    async fn render_final(&self, runtime: &Runtime, msg: &FeishuMessage, text: &str) -> String {
-        let document = parse_output(text, &self.context);
+    async fn render_final(
+        &self,
+        runtime: &Runtime,
+        msg: &FeishuMessage,
+        text: &str,
+        gateway: Option<&FeishuGateway>,
+    ) -> String {
+        let document = parse_feishu_image_output(text, &self.context);
         let mut rendered = text.to_string();
         for node in document.nodes.iter().rev() {
             let OutputNodeKind::Resource { path, label, image } = &node.kind else {
                 continue;
             };
+            if *image && path.starts_with("img_") {
+                continue;
+            }
             let kind = if *image { "图片" } else { "附件" };
-            let replacement = match crate::resolve_resource_path(path, &self.workspace, &[]) {
-                Ok(path) => match tokio::fs::read(&path).await {
-                    Ok(content) => {
-                        let file_name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("resource")
-                            .to_string();
-                        let mime_type = resource_mime_type(&path).to_string();
+            let replacement = match load_feishu_output_resource(path, *image, &self.workspace).await
+            {
+                Ok((file_name, mime_type, content)) => {
+                    if *image {
+                        // Upload only: the final card owns the image and its position.
+                        let result = match gateway {
+                            Some(gateway) => {
+                                gateway
+                                    .upload_file(&file_name, &mime_type, &content, "image")
+                                    .await
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "Feishu image upload gateway is unavailable"
+                            )),
+                        };
+                        match result {
+                            Ok(key) => format!(
+                                "![{}]({key})",
+                                compact_resource_label(label).replace('\\', "\\\\")
+                            ),
+                            Err(error) => {
+                                warn!("upload Feishu inline image failed: {error:#}");
+                                format!("**[图片发送失败：{}]**", compact_resource_label(label))
+                            }
+                        }
+                    } else {
                         match runtime
                             .im_bridge
                             .upload(ImUploadRequest {
@@ -735,18 +980,14 @@ impl FeishuOutputProtocol {
                                 format!("**[{kind}已发送：{}]**", compact_resource_label(label))
                             }
                             Err(error) => {
-                                warn!(path = %path.display(), "upload Feishu output resource failed: {error:#}");
+                                warn!("upload Feishu output resource failed: {error:#}");
                                 format!("**[{kind}发送失败：{}]**", compact_resource_label(label))
                             }
                         }
                     }
-                    Err(error) => {
-                        warn!(path = %path.display(), "read Feishu output resource failed: {error:#}");
-                        format!("**[{kind}读取失败：{}]**", compact_resource_label(label))
-                    }
-                },
+                }
                 Err(error) => {
-                    warn!(resource = path, "reject Feishu output resource: {error:#}");
+                    warn!("load Feishu output resource failed: {error:#}");
                     format!("**[{kind}不可用：{}]**", compact_resource_label(label))
                 }
             };
@@ -754,6 +995,105 @@ impl FeishuOutputProtocol {
         }
         self.render(&rendered)
     }
+}
+
+// Ordinary Markdown images need the same native upload as remi-resource images.
+// Parse Markdown rather than matching text so code examples remain untouched.
+fn parse_feishu_image_output(text: &str, context: &OutputProtocolContext) -> crate::OutputDocument {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut document = parse_output(text, context);
+    let mut image = None::<(usize, String, String)>;
+    for (event, range) in Parser::new_ext(text, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                image = Some((range.start, dest_url.into_string(), String::new()));
+            }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some((_, _, label)) = image.as_mut() {
+                    label.push_str(&value);
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((start, path, label)) = image.take() {
+                    if !path.starts_with("remi-resource:")
+                        && !document
+                            .nodes
+                            .iter()
+                            .any(|node| node.start <= start && node.end >= range.end)
+                    {
+                        document.nodes.push(crate::OutputNode {
+                            start,
+                            end: range.end,
+                            kind: OutputNodeKind::Resource {
+                                path,
+                                label,
+                                image: true,
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    document.nodes.sort_by_key(|node| node.start);
+    document
+}
+
+async fn load_feishu_output_resource(
+    path: &str,
+    image: bool,
+    workspace: &Path,
+) -> anyhow::Result<(String, String, Vec<u8>)> {
+    const MAX_OUTPUT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    if image && (path.starts_with("https://") || path.starts_with("http://")) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()?;
+        let mut response = client.get(path).send().await?.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_OUTPUT_IMAGE_BYTES as u64)
+        {
+            anyhow::bail!("output image exceeds 10 MiB");
+        }
+        let name = response
+            .url()
+            .path_segments()
+            .and_then(|mut parts| parts.next_back())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("image.png")
+            .to_string();
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+            .unwrap_or_else(|| resource_mime_type(Path::new(&name)).to_string());
+        if !mime.starts_with("image/") {
+            anyhow::bail!("remote resource is not an image");
+        }
+        let mut content = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if content.len().saturating_add(chunk.len()) > MAX_OUTPUT_IMAGE_BYTES {
+                anyhow::bail!("output image exceeds 10 MiB");
+            }
+            content.extend_from_slice(&chunk);
+        }
+        return Ok((name, mime, content));
+    }
+    let resolved = crate::resolve_resource_path(path, workspace, &[])?;
+    if image && tokio::fs::metadata(&resolved).await?.len() > MAX_OUTPUT_IMAGE_BYTES as u64 {
+        anyhow::bail!("output image exceeds 10 MiB");
+    }
+    let name = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("resource")
+        .to_string();
+    let mime = resource_mime_type(&resolved).to_string();
+    Ok((name, mime, tokio::fs::read(resolved).await?))
 }
 
 fn compact_resource_label(label: &str) -> String {
@@ -775,6 +1115,9 @@ fn resource_mime_type(path: &Path) -> &'static str {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("tif" | "tiff") => "image/tiff",
         Some("pdf") => "application/pdf",
         Some("txt" | "md") => "text/plain",
         Some("csv") => "text/csv",
@@ -814,6 +1157,8 @@ async fn build_feishu_output_protocol(
         files: OutputCapability::Native,
         math: OutputCapability::Disabled,
         html: OutputCapability::Disabled,
+        tables: OutputCapability::Native,
+        charts: OutputCapability::Native,
     };
     context.entities.push(OutputEntity::new(
         "a0",
@@ -909,25 +1254,183 @@ fn upsert_feishu_participant(
     });
 }
 
+struct ChildFeishuOutput {
+    session_id: String,
+    message: FeishuMessage,
+    replies: FeishuReplyStream,
+    state: FeishuForwarderState,
+}
+
+struct FeishuForwarderState {
+    output: String,
+    active_reply_message_id: String,
+    streaming_tool_names: HashMap<String, String>,
+    streaming_tool_args: HashMap<String, String>,
+    streaming_tool_output: HashMap<String, String>,
+    narrative_kind: Option<FeishuReplyKind>,
+    background_task_count: usize,
+    had_visible_event: bool,
+    supervisor_execution_started: bool,
+    output_protocol: FeishuOutputProtocol,
+    child_outputs: HashMap<String, ChildFeishuOutput>,
+}
+
+impl FeishuForwarderState {
+    fn new(output_protocol: FeishuOutputProtocol, anchor: String) -> Self {
+        Self {
+            output: String::new(),
+            active_reply_message_id: anchor,
+            streaming_tool_names: HashMap::new(),
+            streaming_tool_args: HashMap::new(),
+            streaming_tool_output: HashMap::new(),
+            narrative_kind: None,
+            background_task_count: 0,
+            had_visible_event: false,
+            supervisor_execution_started: false,
+            output_protocol,
+            child_outputs: HashMap::new(),
+        }
+    }
+}
+
 struct FeishuEventForwarder<'a, 'b> {
     runtime: &'a Runtime,
     platform: &'a str,
     msg: &'a FeishuMessage,
     session_id: &'a str,
     debug_enabled: bool,
-    output: String,
-    active_reply_message_id: String,
+    gateway: Option<&'a FeishuGateway>,
     replies: &'b mut Option<&'b mut FeishuReplyStream>,
-    streaming_tool_names: HashMap<String, String>,
-    streaming_tool_args: HashMap<String, String>,
-    narrative_kind: Option<FeishuReplyKind>,
-    background_task_count: usize,
-    had_visible_event: bool,
-    supervisor_execution_started: bool,
-    output_protocol: FeishuOutputProtocol,
+    state: FeishuForwarderState,
 }
 
 impl FeishuEventForwarder<'_, '_> {
+    async fn forward_sub_session_output(
+        &mut self,
+        event: &remi_agentloop::types::SubSessionEvent,
+    ) -> anyhow::Result<()> {
+        let Some(gateway) = self.gateway else {
+            return Ok(());
+        };
+        let binding = self
+            .runtime
+            .sessions
+            .lock()
+            .await
+            .sub_session_channel_binding(self.session_id, &event.sub_thread_id.0);
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        let key = format!("{}:{}", event.sub_thread_id.0, event.sub_run_id.0);
+        let child = if let Some(child) = self.state.child_outputs.remove(&key) {
+            child
+        } else {
+            let session_id = self
+                .runtime
+                .sessions
+                .lock()
+                .await
+                .channel_session_id(&binding.platform, &binding.channel_id)
+                .ok_or_else(|| anyhow::anyhow!("bound child channel has no session"))?;
+            let input = crate::sub_session::history_messages(event)
+                .into_iter()
+                .find(|message| matches!(message.role, remi_agentloop::prelude::Role::User))
+                .map(|message| message.content.text_content())
+                .or_else(|| event.title.clone())
+                .unwrap_or_else(|| format!("{} 子会话", event.agent_name));
+            let chat_id = binding
+                .channel_id
+                .split(":thread:")
+                .next()
+                .unwrap_or(&binding.channel_id)
+                .to_string();
+            let anchor = if binding.channel_id.contains(":thread:") {
+                let source = self
+                    .runtime
+                    .im_bridge
+                    .sub_session_reply_anchor(&binding.platform, &binding.channel_id)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("child topic has no reply anchor"))?;
+                gateway.reply_text(&source, &input).await?
+            } else {
+                gateway.send_text(&chat_id, &input).await?
+            };
+            let mut message = self.msg.clone();
+            message.message_id = anchor.clone();
+            message.chat_id = chat_id.clone();
+            message.text = input;
+            message.images.clear();
+            message.files.clear();
+            message.documents.clear();
+            message.mentions.clear();
+            message.parent_id = None;
+            message.thread_id = binding
+                .channel_id
+                .split_once(":thread:")
+                .map(|(_, thread)| thread.to_string());
+            let output_protocol = build_feishu_output_protocol(
+                self.runtime,
+                &binding.platform,
+                &session_id,
+                &message,
+                None,
+                Some(gateway),
+            )
+            .await;
+            ChildFeishuOutput {
+                session_id,
+                message,
+                replies: FeishuReplyStream::new(gateway.clone(), chat_id, anchor.clone()),
+                state: FeishuForwarderState::new(output_protocol, anchor),
+            }
+        };
+        let ChildFeishuOutput {
+            session_id,
+            message,
+            mut replies,
+            state,
+        } = child;
+        replies.start().await;
+        let events = crate::sub_session::output_events(event, &state.streaming_tool_args);
+        let state = {
+            let mut reply_option = Some(&mut replies);
+            let mut forwarder = FeishuEventForwarder {
+                runtime: self.runtime,
+                platform: &binding.platform,
+                msg: &message,
+                session_id: &session_id,
+                debug_enabled: self.debug_enabled,
+                gateway: Some(gateway),
+                replies: &mut reply_option,
+                state,
+            };
+            for event in events {
+                let output = match event {
+                    crate::ApplicationEvent::Cat(event) => CoreChatEvent::Bot(event),
+                    crate::ApplicationEvent::ResponseCompleted { message_id, text } => {
+                        CoreChatEvent::ResponseCompleted { message_id, text }
+                    }
+                    crate::ApplicationEvent::Done => CoreChatEvent::Done,
+                    crate::ApplicationEvent::Reply(text) => CoreChatEvent::Reply(text),
+                    crate::ApplicationEvent::Prefix(text) => CoreChatEvent::Prefix(text),
+                    crate::ApplicationEvent::SupervisorStarted => CoreChatEvent::SupervisorStarted,
+                };
+                Box::pin(forwarder.forward_core_event(output)).await;
+            }
+            forwarder.state
+        };
+        self.state.child_outputs.insert(
+            key,
+            ChildFeishuOutput {
+                session_id,
+                message,
+                replies,
+                state,
+            },
+        );
+        Ok(())
+    }
+
     async fn forward_core_event(&mut self, event: CoreChatEvent) -> bool {
         match event {
             CoreChatEvent::SupervisorStarted => false,
@@ -937,15 +1440,18 @@ impl FeishuEventForwarder<'_, '_> {
                 false
             }
             CoreChatEvent::Done => {
-                self.commit_final_output().await;
+                if let Err(error) = self.commit_final_output().await {
+                    warn!("failed to deliver Feishu final output: {error:#}");
+                }
                 true
             }
             CoreChatEvent::ResponseCompleted { text, .. } => {
                 let mut reply_msg = self.msg.clone();
-                reply_msg.message_id = self.active_reply_message_id.clone();
+                reply_msg.message_id = self.state.active_reply_message_id.clone();
                 let rendered = self
+                    .state
                     .output_protocol
-                    .render_final(self.runtime, &reply_msg, &text)
+                    .render_final(self.runtime, &reply_msg, &text, self.gateway)
                     .await;
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.set_pending_final_text(rendered);
@@ -958,32 +1464,62 @@ impl FeishuEventForwarder<'_, '_> {
 
     async fn forward_cat_event(&mut self, event: CatEvent) -> bool {
         match event {
+            CatEvent::ToolDelta { id, name, delta } => {
+                let output = self
+                    .state
+                    .streaming_tool_output
+                    .entry(id.clone())
+                    .or_default();
+                output.push_str(&delta);
+                let args = self
+                    .state
+                    .streaming_tool_args
+                    .get(&id)
+                    .and_then(|args| serde_json::from_str(args).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
+                let line = format!(
+                    "{}\n\n{}",
+                    format_feishu_tool_line(&pretty),
+                    fenced_block("text", output)
+                );
+                self.update_tool(&id, &line, false).await;
+            }
             CatEvent::Text(delta) => {
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
                 self.append_narrative(FeishuReplyKind::Text, &delta).await;
             }
             CatEvent::Thinking(content) => {
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
                 self.append_narrative(FeishuReplyKind::Thinking, &content)
                     .await;
             }
             CatEvent::ToolCallStart { id, name } => {
-                self.streaming_tool_names.insert(id.clone(), name.clone());
-                self.streaming_tool_args.entry(id.clone()).or_default();
+                self.state
+                    .streaming_tool_names
+                    .insert(id.clone(), name.clone());
+                self.state
+                    .streaming_tool_args
+                    .entry(id.clone())
+                    .or_default();
                 let pretty = bot_core::PrettyToolCall::started(
                     &id,
                     &name,
                     &serde_json::Value::Object(serde_json::Map::new()),
                 );
                 let line = format_feishu_tool_line(&pretty);
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
                 self.update_tool(&id, &line, false).await;
             }
             CatEvent::ToolCallArgumentsDelta { id, delta } => {
-                let args = self.streaming_tool_args.entry(id.clone()).or_default();
+                let args = self
+                    .state
+                    .streaming_tool_args
+                    .entry(id.clone())
+                    .or_default();
                 args.push_str(&delta);
                 if let (Some(name), Ok(value)) = (
-                    self.streaming_tool_names.get(&id),
+                    self.state.streaming_tool_names.get(&id),
                     serde_json::from_str::<serde_json::Value>(args),
                 ) {
                     let pretty = bot_core::PrettyToolCall::started(&id, name, &value);
@@ -992,12 +1528,15 @@ impl FeishuEventForwarder<'_, '_> {
                 }
             }
             CatEvent::ToolCall { id, name, args } => {
-                self.streaming_tool_names.insert(id.clone(), name.clone());
-                self.streaming_tool_args
+                self.state
+                    .streaming_tool_names
+                    .insert(id.clone(), name.clone());
+                self.state
+                    .streaming_tool_args
                     .insert(id.clone(), args.to_string());
                 let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
                 let line = format_feishu_tool_line(&pretty);
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
                 self.update_tool(&id, &line, false).await;
             }
             CatEvent::ToolCallResult {
@@ -1008,13 +1547,14 @@ impl FeishuEventForwarder<'_, '_> {
                 success,
                 elapsed_ms,
             } => {
-                self.streaming_tool_names.remove(&id);
-                self.streaming_tool_args.remove(&id);
+                self.state.streaming_tool_output.remove(&id);
+                self.state.streaming_tool_names.remove(&id);
+                self.state.streaming_tool_args.remove(&id);
                 let pretty = bot_core::PrettyToolCall::completed(
                     &id, &name, &args, &result, success, elapsed_ms,
                 );
                 let line = format_feishu_tool_line(&pretty);
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
                 self.update_tool(&id, &line, true).await;
             }
             CatEvent::SubSession(event) => {
@@ -1026,6 +1566,9 @@ impl FeishuEventForwarder<'_, '_> {
                     &event,
                 )
                 .await;
+                if let Err(error) = self.forward_sub_session_output(&event).await {
+                    warn!("failed to forward child through shared Feishu output: {error:#}");
+                }
                 if let Some(line) = format_feishu_sub_session_line(&event) {
                     let done = matches!(
                         event.event.as_ref(),
@@ -1041,7 +1584,7 @@ impl FeishuEventForwarder<'_, '_> {
                 }
             }
             CatEvent::BackgroundTasksWaiting { count } => {
-                self.background_task_count = count;
+                self.state.background_task_count = count;
                 self.update_background_status().await;
             }
             CatEvent::SupervisorProgress(progress) => {
@@ -1057,59 +1600,59 @@ impl FeishuEventForwarder<'_, '_> {
                     .unwrap_or(serde_json::Value::Null);
                 let chunk = bot_core::supervisor_workflow::format_prefix(&report, &context);
                 if self.finish_status("supervisor-decision", &chunk).await {
-                    self.output.push_str(&chunk);
+                    self.state.output.push_str(&chunk);
                 } else {
                     self.start_new_cell().await;
                     self.append_narrative(FeishuReplyKind::Supervisor, &chunk)
                         .await;
                 }
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::ContextCompaction(event) => {
                 let line = format_context_compaction_line(&event);
                 let done = !matches!(event.status, bot_core::ContextCompactionStatus::Started);
                 self.update_context_compaction(&event.id, &line, done).await;
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::ToolApprovalRequested(request) => {
                 if let Some(replies) = self.replies.as_deref_mut() {
-                    self.had_visible_event = true;
+                    self.state.had_visible_event = true;
                     replies.approval_requested(&request).await;
                 }
                 self.break_narrative();
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::ToolApprovalUpdated(request) => {
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.approval_updated(&request).await;
                 }
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::ToolApprovalResolved { request, decision } => {
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.approval_resolved(&request, decision).await;
                 }
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::UserQuestionRequested(request) => {
                 if let Some(replies) = self.replies.as_deref_mut() {
-                    self.had_visible_event = true;
+                    self.state.had_visible_event = true;
                     replies.user_question_requested(&request).await;
                 }
                 self.break_narrative();
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::UserQuestionUpdated(request) => {
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.user_question_updated(&request).await;
                 }
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::UserQuestionResolved { request, response } => {
                 if let Some(replies) = self.replies.as_deref_mut() {
                     replies.user_question_resolved(&request, &response).await;
                 }
-                self.supervisor_execution_started = false;
+                self.state.supervisor_execution_started = false;
             }
             CatEvent::SteerQueued(event) => {
                 // The queued message gets a short ordinary reply. Its COT is
@@ -1125,7 +1668,7 @@ impl FeishuEventForwarder<'_, '_> {
                     if let Some(replies) = self.replies.as_deref_mut() {
                         replies.switch_to_steer(message_id).await;
                     }
-                    self.active_reply_message_id = message_id.to_string();
+                    self.state.active_reply_message_id = message_id.to_string();
                 }
                 let preview = compact_preview(&event.preview, 120);
                 let line = if preview.is_empty() {
@@ -1168,11 +1711,11 @@ impl FeishuEventForwarder<'_, '_> {
                     task.elapsed_ms.unwrap_or(0),
                 );
                 let line = format_feishu_tool_line(&pretty);
-                self.streaming_tool_names.remove(&task.tool_call_id);
-                self.streaming_tool_args.remove(&task.tool_call_id);
+                self.state.streaming_tool_names.remove(&task.tool_call_id);
+                self.state.streaming_tool_args.remove(&task.tool_call_id);
                 self.update_tool(&task.tool_call_id, &line, true).await;
-                if self.background_task_count > 0 {
-                    self.background_task_count -= 1;
+                if self.state.background_task_count > 0 {
+                    self.state.background_task_count -= 1;
                     self.update_background_status().await;
                 }
             }
@@ -1212,8 +1755,8 @@ impl FeishuEventForwarder<'_, '_> {
                 }
             }
             CatEvent::Done => {
-                if self.background_task_count > 0 {
-                    self.background_task_count = 0;
+                if self.state.background_task_count > 0 {
+                    self.state.background_task_count = 0;
                     self.update_background_status().await;
                 }
             }
@@ -1225,8 +1768,8 @@ impl FeishuEventForwarder<'_, '_> {
     async fn forward_supervisor_progress(&mut self, progress: bot_core::SupervisorTraceEvent) {
         use bot_core::SupervisorTraceEvent;
 
-        if !self.supervisor_execution_started {
-            self.supervisor_execution_started = true;
+        if !self.state.supervisor_execution_started {
+            self.state.supervisor_execution_started = true;
         }
         match progress {
             SupervisorTraceEvent::Thinking { content } => {
@@ -1234,8 +1777,13 @@ impl FeishuEventForwarder<'_, '_> {
                     .await;
             }
             SupervisorTraceEvent::ToolCallStart { id, name } => {
-                self.streaming_tool_names.insert(id.clone(), name.clone());
-                self.streaming_tool_args.entry(id.clone()).or_default();
+                self.state
+                    .streaming_tool_names
+                    .insert(id.clone(), name.clone());
+                self.state
+                    .streaming_tool_args
+                    .entry(id.clone())
+                    .or_default();
                 let pretty = bot_core::PrettyToolCall::started(
                     &id,
                     &name,
@@ -1245,10 +1793,14 @@ impl FeishuEventForwarder<'_, '_> {
                     .await;
             }
             SupervisorTraceEvent::ToolCallArgumentsDelta { id, delta } => {
-                let args = self.streaming_tool_args.entry(id.clone()).or_default();
+                let args = self
+                    .state
+                    .streaming_tool_args
+                    .entry(id.clone())
+                    .or_default();
                 args.push_str(&delta);
                 if let (Some(name), Ok(value)) = (
-                    self.streaming_tool_names.get(&id),
+                    self.state.streaming_tool_names.get(&id),
                     serde_json::from_str::<serde_json::Value>(args),
                 ) {
                     let pretty = bot_core::PrettyToolCall::started(&id, name, &value);
@@ -1257,8 +1809,11 @@ impl FeishuEventForwarder<'_, '_> {
                 }
             }
             SupervisorTraceEvent::ToolCall { id, name, args } => {
-                self.streaming_tool_names.insert(id.clone(), name.clone());
-                self.streaming_tool_args
+                self.state
+                    .streaming_tool_names
+                    .insert(id.clone(), name.clone());
+                self.state
+                    .streaming_tool_args
                     .insert(id.clone(), args.to_string());
                 let pretty = bot_core::PrettyToolCall::started(&id, &name, &args);
                 self.update_tool(&id, &format_feishu_tool_line(&pretty), false)
@@ -1270,8 +1825,8 @@ impl FeishuEventForwarder<'_, '_> {
                 args,
                 result,
             } => {
-                self.streaming_tool_names.remove(&id);
-                self.streaming_tool_args.remove(&id);
+                self.state.streaming_tool_names.remove(&id);
+                self.state.streaming_tool_args.remove(&id);
                 let success = bot_core::tool_success(&result);
                 let pretty =
                     bot_core::PrettyToolCall::completed(&id, &name, &args, &result, success, 0);
@@ -1321,16 +1876,16 @@ impl FeishuEventForwarder<'_, '_> {
             "\n\n---\n**调试信息**\n\n**Stats** `tokens: {prompt_tokens}->{completion_tokens}` `context: {max_prompt_tokens}/{context_tokens} ({:.1}%)` `elapsed: {elapsed_ms}ms`",
             context.percent
         );
-        self.output.push_str(&chunk);
+        self.state.output.push_str(&chunk);
         if let Some(replies) = self.replies.as_deref_mut() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
             replies.push_auxiliary(FeishuReplyKind::Stats, &chunk).await;
         }
     }
 
     async fn finish_streaming_tools(&mut self, reason: &str) {
-        let tools = std::mem::take(&mut self.streaming_tool_names);
-        let mut args_by_id = std::mem::take(&mut self.streaming_tool_args);
+        let tools = std::mem::take(&mut self.state.streaming_tool_names);
+        let mut args_by_id = std::mem::take(&mut self.state.streaming_tool_args);
         for (id, name) in tools {
             let args = args_by_id
                 .remove(&id)
@@ -1343,26 +1898,29 @@ impl FeishuEventForwarder<'_, '_> {
     }
 
     async fn update_background_status(&mut self) {
-        if self.background_task_count == 0 {
+        if self.state.background_task_count == 0 {
             self.finish_status("background", "✅ 后台任务已完成").await;
         } else {
-            let line = format!("⏳ 正在等待 {} 个后台任务完成", self.background_task_count);
+            let line = format!(
+                "⏳ 正在等待 {} 个后台任务完成",
+                self.state.background_task_count
+            );
             self.update_status("background", &line).await;
         }
     }
 
     async fn append(&mut self, kind: FeishuReplyKind, chunk: &str) {
         if !chunk.is_empty() && self.replies.is_some() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
         }
-        append_reply_chunk(&mut self.output, self.replies, kind, chunk).await;
+        append_reply_chunk(&mut self.state.output, self.replies, kind, chunk).await;
     }
 
     async fn append_narrative(&mut self, kind: FeishuReplyKind, delta: &str) {
-        let Some(chunk) = format_narrative_delta(self.narrative_kind, kind, delta) else {
+        let Some(chunk) = format_narrative_delta(self.state.narrative_kind, kind, delta) else {
             return;
         };
-        self.narrative_kind = Some(kind);
+        self.state.narrative_kind = Some(kind);
         self.append(kind, &chunk).await;
     }
 
@@ -1370,16 +1928,16 @@ impl FeishuEventForwarder<'_, '_> {
         if content.is_empty() {
             return;
         }
-        self.narrative_kind = Some(kind);
-        self.output.push_str(content);
+        self.state.narrative_kind = Some(kind);
+        self.state.output.push_str(content);
         if let Some(replies) = self.replies.as_deref_mut() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
             replies.replace(kind, content).await;
         }
     }
 
     fn break_narrative(&mut self) {
-        self.narrative_kind = None;
+        self.state.narrative_kind = None;
     }
 
     async fn start_new_cell(&mut self) {
@@ -1389,10 +1947,11 @@ impl FeishuEventForwarder<'_, '_> {
         }
     }
 
-    async fn commit_final_output(&mut self) {
+    async fn commit_final_output(&mut self) -> anyhow::Result<()> {
         if let Some(replies) = self.replies.as_deref_mut() {
-            replies.commit_final_output().await;
+            replies.commit_final_output().await?;
         }
+        Ok(())
     }
 
     async fn interrupt_run(&mut self, reason: &str) {
@@ -1403,34 +1962,36 @@ impl FeishuEventForwarder<'_, '_> {
 
     async fn update_tool(&mut self, call_id: &str, line: &str, done: bool) {
         if self.replies.is_some() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
         }
-        if update_tool_reply(&mut self.output, self.replies, call_id, line, done).await {
+        if update_tool_reply(&mut self.state.output, self.replies, call_id, line, done).await {
             self.break_narrative();
         }
     }
 
     async fn update_context_compaction(&mut self, id: &str, line: &str, done: bool) {
         if self.replies.is_some() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
         }
-        if update_context_compaction_reply(&mut self.output, self.replies, id, line, done).await {
+        if update_context_compaction_reply(&mut self.state.output, self.replies, id, line, done)
+            .await
+        {
             self.break_narrative();
         }
     }
 
     async fn update_sub_session(&mut self, id: &str, line: &str, done: bool) {
         if self.replies.is_some() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
         }
-        if update_sub_session_reply(&mut self.output, self.replies, id, line, done).await {
+        if update_sub_session_reply(&mut self.state.output, self.replies, id, line, done).await {
             self.break_narrative();
         }
     }
 
     async fn update_status(&mut self, id: &str, line: &str) {
         if let Some(replies) = self.replies.as_deref_mut() {
-            self.had_visible_event = true;
+            self.state.had_visible_event = true;
             if replies.update_status(id, line).await {
                 self.break_narrative();
             }
@@ -1440,7 +2001,7 @@ impl FeishuEventForwarder<'_, '_> {
     async fn finish_status(&mut self, id: &str, line: &str) -> bool {
         if let Some(replies) = self.replies.as_deref_mut() {
             let finished = replies.finish_status(id, line).await;
-            self.had_visible_event |= finished;
+            self.state.had_visible_event |= finished;
             finished
         } else {
             false
@@ -1525,6 +2086,89 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn fork_history_runs_final_resources_through_response_completion_per_turn() {
+        let message = |role: &str, text: &str| bot_core::ThreadHistoryMessage {
+            id: "test".into(),
+            role: role.into(),
+            text: text.into(),
+            timestamp: None,
+            tool_call_id: None,
+            tool_calls: None,
+            pretty: None,
+        };
+        let mut tool_call = message("assistant", "process narrative");
+        tool_call.tool_calls =
+            Some(serde_json::json!([{"id":"call","function":{"name":"read","arguments":"{}"}}]));
+        let final_text = "![local](/workspace/a.png)\n![remote](https://example.com/b.png)\n[report](remi-resource:report.pdf)";
+        let turns = super::feishu_history_turns(vec![
+            message("user", "first request"),
+            tool_call,
+            message("assistant", "![probe](remi-resource:probe.png)"),
+            message("user", "second request"),
+            message("assistant", final_text),
+        ]);
+        assert_eq!(turns.len(), 2);
+        for (index, expected) in ["![probe](remi-resource:probe.png)", final_text]
+            .iter()
+            .enumerate()
+        {
+            let Some(crate::CoreChatEvent::ResponseCompleted { text, .. }) = turns[index].1.last()
+            else {
+                panic!("resource rendering completion missing")
+            };
+            assert_eq!(text, expected);
+            assert!(!text.contains("process narrative"));
+        }
+    }
+
+    #[test]
+    fn ready_child_chunks_merge_without_crossing_tool_or_run_boundaries() {
+        use crate::CoreChatEvent;
+        use bot_core::CatEvent;
+        use remi_agentloop::prelude::{ProtocolEvent, RunId, SubSessionEvent, ThreadId};
+        let event = |run: &str, protocol| {
+            CoreChatEvent::Bot(CatEvent::SubSession(SubSessionEvent::new(
+                "call",
+                ThreadId("child".into()),
+                RunId(run.into()),
+                "acp",
+                None,
+                1,
+                protocol,
+            )))
+        };
+        let delta = |text: &str| ProtocolEvent::Delta {
+            content: text.into(),
+            role: None,
+        };
+        let mut left = event("run", delta("hello"));
+        assert!(super::merge_output_chunk(
+            &mut left,
+            &event("run", delta(" world"))
+        ));
+        assert!(!super::merge_output_chunk(
+            &mut left,
+            &event("next-run", delta("new"))
+        ));
+        assert!(!super::merge_output_chunk(
+            &mut left,
+            &event(
+                "run",
+                ProtocolEvent::ToolCallStart {
+                    id: "tool".into(),
+                    name: "read".into()
+                }
+            )
+        ));
+        let CoreChatEvent::Bot(CatEvent::SubSession(left)) = left else {
+            panic!("child event lost");
+        };
+        assert!(
+            matches!(left.event.as_ref(), ProtocolEvent::Delta { content, .. } if content == "hello world")
+        );
+    }
 
     fn feishu_context_test_message(thread_id: Option<&str>) -> FeishuMessage {
         FeishuMessage {
@@ -1871,3 +2515,11 @@ fn build_message_content(
     };
     Content::text(fallback.to_string())
 }
+
+#[cfg(test)]
+#[path = "feishu/image_live_test.rs"]
+mod image_live_test;
+
+#[cfg(test)]
+#[path = "feishu/review_live_test.rs"]
+mod review_live_test;

@@ -254,10 +254,9 @@ impl Runtime {
                     SteerSubmitResult::NotRunning => {}
                 }
             }
-            let mut session_id = request.session_id.clone();
+            let session_id = request.session_id.clone();
             let mut content = request.content.clone();
             let mut skill_injections = Vec::new();
-            let mut persist_agent_child_turn = false;
 
             // Session-local runtime commands must be handled before a TUI
             // channel session is routed to its underlying sub-session. The
@@ -292,6 +291,7 @@ impl Runtime {
                 None
             };
 
+            let mut sub_session_agent_id = None;
             match sub_session_target {
                 Some(SubSessionInputTarget::Acp { acp_session_id, .. }) => {
                     match self.bot.acp_bound_message(&acp_session_id, user_text.trim()).await {
@@ -306,9 +306,11 @@ impl Runtime {
                     yield CoreChatEvent::Done;
                     return;
                 }
-                Some(SubSessionInputTarget::Agent { sub_thread_id, .. }) => {
-                    session_id = sub_thread_id;
-                    persist_agent_child_turn = true;
+                Some(SubSessionInputTarget::Agent { agent_name, .. }) => {
+                    // The channel session contains the mirrored conversation.
+                    // Continue it with the child agent instead of starting the
+                    // parent agent on the delegate's transport thread id.
+                    sub_session_agent_id = Some(agent_name);
                 }
                 None if request.command_preprocess => {
                     match process_runtime_commands(&self, &request.session_id, user_text.trim()).await {
@@ -405,7 +407,7 @@ impl Runtime {
             };
             let model_profile_id = request.model_profile_id.clone().or(stored_model_profile_id);
             let reasoning_effort = request.reasoning_effort.or(stored_reasoning_effort);
-            let agent_id = request.agent_id.clone().or(stored_agent_id);
+            let agent_id = request.agent_id.clone().or(sub_session_agent_id).or(stored_agent_id);
             let platform = request.platform();
             let opts = StreamOptions {
                 app_id: request.app_id.clone(),
@@ -425,8 +427,6 @@ impl Runtime {
                 async_agent: request.async_agent,
                 ..StreamOptions::default()
             };
-            let user_text_for_history = content.text_content();
-            let mut assistant_text_for_history = String::new();
             if self
                 .bot
                 .workflow_status(&session_id)
@@ -445,25 +445,11 @@ impl Runtime {
                     .stream_active_workflow_with_options(&session_id, content, opts),
             );
             while let Some(event) = stream.next().await {
-                if persist_agent_child_turn {
-                    if let CatEvent::Text(delta) = &event {
-                        assistant_text_for_history.push_str(delta);
-                    }
-                }
                 let done = matches!(event, CatEvent::Done);
                 yield CoreChatEvent::Bot(event);
                 if done {
                     break;
                 }
-            }
-            if persist_agent_child_turn {
-                append_direct_sub_session_turn(
-                    &self,
-                    &request.session_id,
-                    user_text_for_history.trim(),
-                    &assistant_text_for_history,
-                )
-                .await;
             }
             yield CoreChatEvent::Done;
         }

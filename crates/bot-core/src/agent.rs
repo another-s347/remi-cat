@@ -957,6 +957,18 @@ where
                                         }
                                     }
                                 }
+                                // A completed tool future can win select while its last
+                                // sub-session events are still queued. Deliver them before
+                                // dropping the receiver or handing it to the background.
+                                while let Ok(side_event) = side_rx.try_recv() {
+                                    let denied = is_denied_approval_event(&side_event);
+                                    yield side_event;
+                                    if denied {
+                                        yield stats_event(stats);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
+                                }
                                 if forward_background_side_events {
                                     spawn_background_side_event_forwarder(
                                         task_thread_id,
@@ -1408,6 +1420,18 @@ where
                                         }
                                     }
                                 }
+                                // A completed tool future can win select while its last
+                                // sub-session events are still queued. Deliver them before
+                                // dropping the receiver or handing it to the background.
+                                while let Ok(side_event) = side_rx.try_recv() {
+                                    let denied = is_denied_approval_event(&side_event);
+                                    yield side_event;
+                                    if denied {
+                                        yield stats_event(stats);
+                                        yield CatEvent::Done;
+                                        return;
+                                    }
+                                }
                                 if forward_background_side_events {
                                     spawn_background_side_event_forwarder(
                                         task_thread_id,
@@ -1605,9 +1629,11 @@ where
                             yield CatEvent::Done;
                             return;
                         }
+                        CoreDriveEvent::ToolDelta { id, name, delta } => {
+                            yield CatEvent::ToolDelta { id, name, delta };
+                        }
                         CoreDriveEvent::ToolResult { .. }
                         | CoreDriveEvent::SubSession(_)
-                        | CoreDriveEvent::ToolDelta { .. }
                         | CoreDriveEvent::Ignored => {}
                     }
                 }
@@ -2549,6 +2575,7 @@ async fn collect_result(
     result: Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
     side_event_tx: Option<mpsc::UnboundedSender<CatEvent>>,
     parent_tool_call_id: Option<&str>,
+    tool_name: &str,
     output_task: Option<(Arc<crate::tool_tasks::ToolTaskManager>, String)>,
 ) -> CollectedToolResult {
     match result {
@@ -2576,7 +2603,11 @@ async fn collect_result(
                                 }
                             }
                         }
-                        let event = CatEvent::Text(delta);
+                        let event = CatEvent::ToolDelta {
+                            id: parent_tool_call_id.unwrap_or_default().to_string(),
+                            name: tool_name.to_string(),
+                            delta,
+                        };
                         if let Some(tx) = &side_event_tx {
                             let _ = tx.send(event);
                         } else {
@@ -2666,7 +2697,14 @@ async fn collect_result_with_overflow(
     tool_name: &str,
     output_task: Option<(Arc<crate::tool_tasks::ToolTaskManager>, String)>,
 ) -> CollectedToolResult {
-    let collected = collect_result(result, side_event_tx, parent_tool_call_id, output_task).await;
+    let collected = collect_result(
+        result,
+        side_event_tx,
+        parent_tool_call_id,
+        tool_name,
+        output_task,
+    )
+    .await;
     if collected.content.is_multimodal() {
         return collected;
     }
@@ -3126,7 +3164,9 @@ mod tests {
 
         let input = steer_start_input(state, batch);
         match input {
-            LoopInput::Start { metadata, message, .. } => {
+            LoopInput::Start {
+                metadata, message, ..
+            } => {
                 let metadata = metadata.expect("runtime metadata");
                 assert_eq!(metadata["thread_id"], "session");
                 assert_eq!(metadata["message_id"], "new-message");
@@ -3437,7 +3477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_output_delta_streams_as_text_side_event() {
+    async fn tool_output_delta_streams_as_identified_tool_side_event() {
         let root = test_root();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let output = futures::stream::iter(vec![
@@ -3460,11 +3500,11 @@ mod tests {
         assert!(collected.side_events.is_empty());
         assert!(matches!(
             rx.try_recv(),
-            Ok(CatEvent::Text(text)) if text == "part 1"
+            Ok(CatEvent::ToolDelta {id,name,delta}) if id == "call" && name == "agent__worker" && delta == "part 1"
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok(CatEvent::Text(text)) if text == "part 2"
+            Ok(CatEvent::ToolDelta {id,name,delta}) if id == "call" && name == "agent__worker" && delta == "part 2"
         ));
     }
 
@@ -4472,7 +4512,7 @@ mod tests {
                 )
                 .await;
                 let get_result = get_results.pop().unwrap().1;
-                let get_collected = collect_result(get_result, None, None, None).await;
+                let get_collected = collect_result(get_result, None, None, "tool_task__get", None).await;
                 let running: serde_json::Value =
                     serde_json::from_str(&get_collected.preview).unwrap();
                 assert_eq!(running["status"], crate::tool_tasks::TOOL_TASK_RUNNING);
@@ -4503,7 +4543,7 @@ mod tests {
                 )
                 .await;
                 let cancel_result = cancel_results.pop().unwrap().1;
-                let cancel_collected = collect_result(cancel_result, None, None, None).await;
+                let cancel_collected = collect_result(cancel_result, None, None, "tool_task__cancel", None).await;
                 let cancelled: serde_json::Value =
                     serde_json::from_str(&cancel_collected.preview).unwrap();
                 assert_eq!(cancelled["status"], crate::tool_tasks::TOOL_TASK_CANCELLED);

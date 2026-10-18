@@ -18,3 +18,5 @@ tracing = "0.1"
 anyhow = "1"
 futures-util = "0.3"
 prost = "0.13"
+pulldown-cmark = "0.13"
+remi-output-protocol = { path = "../output-protocol" }

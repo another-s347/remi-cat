@@ -137,6 +137,7 @@ impl StreamingCard {
                 }
                 Err(e) => {
                     warn!("card update failed: {e:#}");
+                    return Err(e);
                 }
             }
         }

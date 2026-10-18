@@ -1,6 +1,6 @@
 [package]
 name = "remi-cat"
-version = "0.2.46"
+version = "0.2.47"
 description = "A multi-agent AI assistant with IM platform support, TUI, and web interface"
 edition = "2021"
 license = "MIT"
@@ -19,6 +19,7 @@ bin-dir = "{ name }/{ bin }{ binary-ext }"
 members = [
     ".",
     "crates/im-feishu",
+    "crates/output-protocol",
     "crates/user-store",
     "crates/bot-runtime-core",
     "crates/bot-core",
@@ -37,6 +38,7 @@ a2a-server = { package = "a2a-server-lf", version = "0.4.1", default-features = 
 async-trait = "0.1"
 bot-core = { path = "crates/bot-core" }
 im-feishu = { path = "crates/im-feishu" }
+remi-output-protocol = { path = "crates/output-protocol" }
 user-store = { path = "crates/user-store" }
 agent-client-protocol = { version = "1.0.1", features = ["unstable_elicitation"] }
 remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "eb2f30f5ff07845ee9e44427f32e8b8cec582ffa", features = [

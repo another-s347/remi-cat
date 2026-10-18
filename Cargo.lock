@@ -2623,6 +2623,8 @@ dependencies = [
  "axum",
  "futures-util",
  "prost 0.13.5",
+ "pulldown-cmark",
+ "remi-output-protocol",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5015,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.46"
+version = "0.2.47"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
@@ -5046,6 +5048,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "remi-agentloop",
+ "remi-output-protocol",
  "reqwest 0.12.28",
  "semver",
  "sentry",
@@ -5071,6 +5074,15 @@ dependencies = [
  "weaver-store",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "remi-output-protocol"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
