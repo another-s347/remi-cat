@@ -629,7 +629,7 @@ impl FeishuClient {
         res
     }
 
-    /// Send a plain-text message intended to start a new topic in a topic-enabled group.
+    /// Start a topic in either a topic-enabled or an ordinary group.
     /// Returns `(message_id, thread_id)`.
     pub async fn send_topic_text(&self, chat_id: &str, text: &str) -> Result<(String, String)> {
         let res = self.send_topic_text_once(chat_id, text).await;
@@ -673,7 +673,7 @@ impl FeishuClient {
             .data
             .ok_or_else(|| anyhow!("send_topic_text response missing data"))?;
         let message_id = data.message_id;
-        let thread_id = match data.thread_id {
+        let mut thread_id = match data.thread_id {
             Some(thread_id) if !thread_id.trim().is_empty() => Some(thread_id),
             _ => self.get_message_thread_id(&message_id).await?,
         }
@@ -684,6 +684,26 @@ impl FeishuClient {
                 None
             }
         });
+        if thread_id.is_none() {
+            // Ordinary groups allocate a thread only on the first threaded
+            // reply. Use the returned ID rather than inventing one from the
+            // root message ID, which would break later session routing.
+            let uuid = format!("topic-{message_id}");
+            let reply = self
+                .retry_cot_request("initialize_topic", || {
+                    self.reply_text_data_once(
+                        &message_id,
+                        "后续对话将在此话题中继续。",
+                        Some(&uuid),
+                        true,
+                    )
+                })
+                .await?;
+            thread_id = match reply.thread_id.filter(|id| !id.trim().is_empty()) {
+                Some(id) => Some(id),
+                None => self.get_message_thread_id(&reply.message_id).await?,
+            };
+        }
         let thread_id = thread_id
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow!("send_topic_text response missing thread_id"))?;
@@ -820,12 +840,28 @@ impl FeishuClient {
         text: &str,
         uuid: Option<&str>,
     ) -> Result<String> {
+        Ok(self
+            .reply_text_data_once(message_id, text, uuid, false)
+            .await?
+            .message_id)
+    }
+
+    async fn reply_text_data_once(
+        &self,
+        message_id: &str,
+        text: &str,
+        uuid: Option<&str>,
+        reply_in_thread: bool,
+    ) -> Result<MessageData> {
         let content = serde_json::json!({ "text": text }).to_string();
         let token = self.token().await;
 
         let mut body = serde_json::json!({"msg_type": "text", "content": content});
         if let Some(uuid) = uuid {
             body["uuid"] = uuid.into();
+        }
+        if reply_in_thread {
+            body["reply_in_thread"] = true.into();
         }
         let response = self
             .http
@@ -839,7 +875,8 @@ impl FeishuClient {
 
         ensure_ok(resp.code, &resp.msg, "reply_text")?;
         debug!("Replied (text) to {message_id}");
-        Ok(message_id_from(resp.data))
+        resp.data
+            .ok_or_else(|| anyhow!("reply_text response missing data"))
     }
 
     // ── File messages ─────────────────────────────────────────────────────────
