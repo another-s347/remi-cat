@@ -16,9 +16,9 @@ use crate::profile_command::{
 };
 use crate::secret_store::SecretStore;
 use bot_core::{
-    install_embedded_agent_profiles, install_embedded_model_profiles,
-    validate_model_profile_api_key, AgentProfile, AgentRegistry, CatBotBuilder, CatEvent, Content,
-    ModelProfileConfig, ModelProfileRegistry, StreamOptions,
+    install_embedded_agent_profiles, install_embedded_model_profiles, validate_model_profile_auth,
+    AgentProfile, AgentRegistry, CatBotBuilder, CatEvent, Content, ModelProfileConfig,
+    ModelProfileRegistry, StreamOptions,
 };
 
 pub(crate) async fn run_setup(
@@ -143,20 +143,27 @@ pub(crate) async fn run_setup(
         default_feishu_transport,
     )?;
 
-    let current_api_key = api_key_env_keys_for_profile(selected_model_profile)
-        .into_iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
-    let api_key = prompt_secret(current_api_key.as_deref())?;
-    if !api_key.trim().is_empty() {
-        unsafe {
-            std::env::set_var(&api_key_env_key, api_key.trim());
+    let api_key = if selected_model_profile.provider.as_deref() == Some("chatgpt") {
+        bot_core::chatgpt::ChatGptAuthManager::new(&*data_dir).ensure_configured()?;
+        String::new()
+    } else {
+        let current_api_key = api_key_env_keys_for_profile(selected_model_profile)
+            .into_iter()
+            .find_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+        let api_key = prompt_secret(current_api_key.as_deref())?;
+        if !api_key.trim().is_empty() {
+            unsafe {
+                std::env::set_var(&api_key_env_key, api_key.trim());
+            }
         }
-    }
-    validate_model_profile_api_key(selected_model_profile).await?;
+
+        api_key
+    };
+    validate_model_profile_auth(selected_model_profile, data_dir).await?;
 
     let previous_config = existing_config.clone();
     let mut config = existing_config.unwrap_or_else(|| RuntimeConfig::default_for(data_dir));
@@ -349,6 +356,16 @@ fn api_key_env_key_for_profile(profile: &ModelProfileConfig) -> String {
 }
 
 fn model_key_status_label(profile: &ModelProfileConfig) -> String {
+    if profile.provider.as_deref() == Some("chatgpt") {
+        return if bot_core::chatgpt::ChatGptAuthManager::from_env()
+            .ensure_configured()
+            .is_ok()
+        {
+            "ChatGPT authorized".into()
+        } else {
+            "run chatgpt login".into()
+        };
+    }
     let keys = api_key_env_keys_for_profile(profile);
     if keys.iter().any(|key| {
         std::env::var(key)

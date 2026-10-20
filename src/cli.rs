@@ -10,6 +10,7 @@ pub(crate) enum AppCommand {
     Run(CliConfig),
     Setup(Vec<String>),
     Doctor,
+    ChatGpt(crate::command::chatgpt::ChatGptCommand),
     Tools(ToolsArgs),
     Tasks(TasksCommand),
     Hooks(HooksCommand),
@@ -181,6 +182,14 @@ struct RunArgs {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    #[command(
+        name = "chatgpt",
+        about = "Use your ChatGPT subscription for model requests"
+    )]
+    ChatGpt {
+        #[command(subcommand)]
+        command: crate::command::chatgpt::ChatGptCommand,
+    },
     #[command(about = "Inject and deliver an assistant message to an existing session")]
     Message {
         #[command(subcommand)]
@@ -1436,6 +1445,7 @@ fn validate_positive_usize_arg(value: &str) -> Result<usize, String> {
 
 fn cli_command_to_app(command: Option<CliCommand>, run: RunArgs) -> anyhow::Result<AppCommand> {
     match command {
+        Some(CliCommand::ChatGpt { command }) => Ok(AppCommand::ChatGpt(command)),
         Some(CliCommand::Message { command }) => Ok(AppCommand::Message(match command {
             MessageCliCommand::Send {
                 session_id,

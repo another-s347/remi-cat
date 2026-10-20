@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use bot_core::{
-    install_embedded_agent_profiles, install_embedded_model_profiles,
-    validate_model_profile_api_key, AgentProfile, AgentRegistry, ModelProfileConfig,
-    ModelProfileRegistry, WorkflowDefinition,
+    install_embedded_agent_profiles, install_embedded_model_profiles, validate_model_profile_auth,
+    AgentProfile, AgentRegistry, ModelProfileConfig, ModelProfileRegistry, WorkflowDefinition,
 };
 
 use crate::instance_profile::{
@@ -2052,7 +2051,7 @@ pub async fn apply_runtime_config_entries(
         let model_profile = registry.get(&config.model_profile).ok_or_else(|| {
             anyhow::anyhow!("model profile `{}` does not exist", config.model_profile)
         })?;
-        validate_model_profile_api_key(model_profile).await?;
+        validate_model_profile_auth(model_profile, &profile.data_dir).await?;
     }
     let path = crate::runtime_config::write_runtime_config_at(&profile.runtime_config, &config)?;
     println!(

@@ -38,6 +38,19 @@ An A2A `contextId` maps to a persisted remi-cat channel session. An A2A
 are stored separately from remi-cat sessions because a context can contain
 multiple tasks.
 
+Named delegates retain their conversation context across turns, but an active
+task binding lasts only for that run. Completing, cancelling, or dropping a
+delegate output stream clears its active task and cancellation registration.
+The delegate uses a child cancellation token, so stopping it does not cancel
+its parent. Disconnecting an in-memory A2A consumer also cancels and removes
+the corresponding application run.
+
+If a follow-up races with task completion, an explicit "A2A task is not active"
+reply clears the stale binding and starts a new task in the same named
+conversation. Authentication failures, unknown HTTP routes, and transport
+errors remain failures; they do not trigger replay. Cancelled application
+runs emit a canceled terminal state rather than completed.
+
 ## Configuration
 
 - `REMI_A2A_ENABLED`: enable the inbound server explicitly. Managed local

@@ -9,7 +9,6 @@ use futures::StreamExt;
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
     Agent, AgentBuilder, AgentConfig, AgentError, LoopInput, Message, OpenAIClient,
-    ReqwestTransport,
 };
 use remi_agentloop::types::AgentEvent;
 
@@ -39,6 +38,7 @@ pub struct LlmCompressor {
     context_tokens: u32,
     max_output_tokens: u32,
     extra_options: serde_json::Map<String, serde_json::Value>,
+    provider: Option<(crate::ModelProfileConfig, std::path::PathBuf)>,
 }
 
 impl LlmCompressor {
@@ -57,17 +57,45 @@ impl LlmCompressor {
             context_tokens,
             max_output_tokens,
             extra_options,
+            provider: None,
         }
     }
 
-    fn build_loop(&self, output_tokens: u32) -> AgentLoop<OpenAIClient<ReqwestTransport>> {
-        let mut oai = OpenAIClient::new(self.api_key.clone()).with_model(self.model.clone());
-        if let Some(url) = self.base_url.clone() {
-            oai = oai.with_base_url(url);
-        }
-        let agent_config = AgentConfig::default().with_max_tokens(output_tokens);
+    pub(crate) fn with_provider(
+        mut self,
+        profile: crate::ModelProfileConfig,
+        data_dir: std::path::PathBuf,
+    ) -> Self {
+        self.provider = Some((profile, data_dir));
+        self
+    }
+
+    fn build_loop(
+        &self,
+        output_tokens: u32,
+    ) -> AgentLoop<crate::runtime::model_provider::ProviderClient> {
+        let model = if let Some((profile, dir)) = &self.provider {
+            crate::runtime::model_provider::build_provider_client_with_auth(
+                &self.api_key,
+                profile,
+                self.base_url.clone(),
+                dir,
+            )
+        } else {
+            let mut oai = OpenAIClient::new(self.api_key.clone()).with_model(self.model.clone());
+            if let Some(url) = self.base_url.clone() {
+                oai = oai.with_base_url(url);
+            }
+            crate::runtime::model_provider::ProviderClient::OpenAI {
+                client: oai,
+                supports_multimodal: false,
+            }
+        };
+        let agent_config = AgentConfig::default()
+            .with_model(&self.model)
+            .with_max_tokens(output_tokens);
         let mut builder = AgentBuilder::new()
-            .model(oai)
+            .model(model)
             .config(agent_config)
             .system(COMPRESSION_SYSTEM)
             .max_turns(1);

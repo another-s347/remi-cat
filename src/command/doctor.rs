@@ -8,7 +8,7 @@ use crate::config::{
 use crate::core::Runtime;
 use crate::instance_profile::InstanceProfile;
 use crate::profile_command::apply_runtime_config_entries;
-use bot_core::{api_key_from_env, AgentRegistry, CatBot, ModelProfileRegistry};
+use bot_core::{model_auth_key_from_env, AgentRegistry, CatBot, ModelProfileRegistry};
 
 pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::Result<()> {
     let setup_state = detect_setup_state_at(&profile.runtime_config, data_dir);
@@ -68,15 +68,15 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
     let api_key_present = match &setup_state {
         SetupState::Initialized { config, .. } => model_registry
             .get(&config.model_profile)
-            .map(|profile| api_key_from_env(profile).is_ok())
+            .map(|profile| model_auth_key_from_env(profile).is_ok())
             .unwrap_or(false),
         _ => model_registry
             .default_profile()
-            .map(|profile| api_key_from_env(profile).is_ok())
+            .map(|profile| model_auth_key_from_env(profile).is_ok())
             .unwrap_or(false),
     };
     println!(
-        "api_key: {}",
+        "model_auth: {}",
         if api_key_present {
             "present"
         } else {

@@ -163,7 +163,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         parsed.profile,
         explicit_data_dir.clone(),
         tui_mode,
-        acp_agent_mode,
+        acp_agent_mode || matches!(&command, AppCommand::ChatGpt(_)),
     )?;
     selected_profile.apply_resource_env();
     if let Some(path) = explicit_runtime_config {
@@ -292,6 +292,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let mut offline_message: Option<(DeliveryRequest, bool)> = None;
     match command {
+        AppCommand::ChatGpt(command) => {
+            crate::command::chatgpt::run(&selected_profile, &command).await?;
+            return Ok(());
+        }
         AppCommand::Setup(entries) => {
             if entries.is_empty() {
                 run_setup(&selected_profile, &mut data_dir, Arc::clone(&secret_store)).await?;

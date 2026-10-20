@@ -7,6 +7,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub(crate) const ACTIVITY_ARTIFACT_ID: &str = "remi-activity";
+pub(crate) const TASK_NOT_ACTIVE: &str = "A2A task is not active";
 pub(crate) const ACTIVITY_EXTENSION: &str = "urn:remi:a2a:activity-stream:v1";
 pub(crate) const INTERACTIVE_EXTENSION: &str = "urn:remi:a2a:interactive-input:v1";
 pub(crate) const HANDOFF_EXTENSION: &str = "urn:remi:a2a:handoff:v1";
@@ -337,6 +338,9 @@ impl A2aDelegateClient {
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND && body.trim() == TASK_NOT_ACTIVE {
+                return Err(TASK_NOT_ACTIVE.into());
+            }
             Err(format!("A2A steer returned HTTP {status}: {body}"))
         }
     }
@@ -471,6 +475,34 @@ fn message_text(message: &Message) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn steer_normalizes_only_explicit_inactive_task_responses() {
+        let app = axum::Router::new().route(
+            "/tasks/{id}/remi:steer",
+            axum::routing::post(
+                |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    match id.as_str() {
+                        "finished" => (axum::http::StatusCode::NOT_FOUND, TASK_NOT_ACTIVE),
+                        "missing-route" => (axum::http::StatusCode::NOT_FOUND, "unknown endpoint"),
+                        "forbidden" => (axum::http::StatusCode::FORBIDDEN, TASK_NOT_ACTIVE),
+                        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, TASK_NOT_ACTIVE),
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = A2aDelegateClient::for_test(endpoint);
+        for id in ["finished", "missing-route", "forbidden", "transient"] {
+            let error = client
+                .steer(id, bot_runtime_core::Content::text("continue"))
+                .await
+                .unwrap_err();
+            assert_eq!(error == TASK_NOT_ACTIVE, id == "finished");
+        }
+        server.abort();
+    }
     use a2a::{
         AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill, Artifact,
         TaskArtifactUpdateEvent, TaskStatus, TaskStatusUpdateEvent, TRANSPORT_PROTOCOL_HTTP_JSON,

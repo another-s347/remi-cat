@@ -12,7 +12,11 @@ use crate::{context_budget_tokens, ModelProfileConfig, ModelProfileRegistry, Sha
 use super::{sentry_tracer, AgentTracingOptions, DEFAULT_AUTO_COMPRESS_CONTEXT_PERCENT};
 
 #[derive(Clone)]
-pub(super) enum ProviderClient {
+pub(crate) enum ProviderClient {
+    ChatGpt {
+        client: crate::chatgpt::ChatGptResponsesClient,
+        supports_multimodal: bool,
+    },
     OpenAI {
         client: OpenAIClient<ReqwestTransport>,
         supports_multimodal: bool,
@@ -37,7 +41,11 @@ impl Agent for ProviderClient {
     {
         async move {
             let supports_multimodal = match self {
-                Self::OpenAI {
+                Self::ChatGpt {
+                    supports_multimodal,
+                    ..
+                }
+                | Self::OpenAI {
                     supports_multimodal,
                     ..
                 }
@@ -46,7 +54,21 @@ impl Agent for ProviderClient {
                     ..
                 } => *supports_multimodal,
             };
-            if !supports_multimodal {
+            let subscription = matches!(self, Self::ChatGpt { .. });
+            if subscription {
+                for message in &req.messages {
+                    if let Content::Parts(parts) = &message.content {
+                        for part in parts {
+                            match part {
+                                ContentPart::Text { .. } => {},
+                                ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. } if supports_multimodal => {},
+                                _ => return Err(AgentError::other("ChatGPT model/profile does not support this input type; only text and enabled user images are accepted")),
+                            }
+                        }
+                    }
+                }
+            }
+            if !supports_multimodal && !subscription {
                 let lowered_messages = lower_messages_for_text_model(&mut req.messages);
                 if lowered_messages > 0 {
                     tracing::info!(
@@ -57,6 +79,7 @@ impl Agent for ProviderClient {
                 }
             }
             match self {
+                Self::ChatGpt { client, .. } => client.chat(ctx, req).await,
                 Self::OpenAI { client, .. } => client.chat(ctx, req).await.map(|stream| {
                     Box::pin(stream.filter_map(|chunk| async { valid_tool_call_chunk(chunk) }))
                         as Pin<Box<dyn Stream<Item = ChatResponseChunk> + '_>>
@@ -217,6 +240,7 @@ pub(super) fn resolve_effective_model_profile(
 pub(super) fn build_inner_agent(
     api_key: &str,
     profile: &ModelProfileConfig,
+    auth_data_dir: &std::path::Path,
     system_prompt: String,
     max_turns: Option<usize>,
     extra_options: serde_json::Map<String, serde_json::Value>,
@@ -224,7 +248,8 @@ pub(super) fn build_inner_agent(
     agent_name: &str,
     redactor: &SharedRedactor,
 ) -> InnerAgent {
-    let model = build_provider_client(api_key, profile, profile.base_url.clone());
+    let model =
+        build_provider_client_with_auth(api_key, profile, profile.base_url.clone(), auth_data_dir);
     let mut builder = AgentBuilder::new()
         .model(model)
         .config(
@@ -243,11 +268,33 @@ pub(super) fn build_inner_agent(
     builder.build_loop()
 }
 
-pub(super) fn build_provider_client(
+#[cfg(test)]
+pub(crate) fn build_provider_client(
     api_key: &str,
     profile: &ModelProfileConfig,
     base_url: Option<String>,
 ) -> ProviderClient {
+    let dir = std::env::var_os("REMI_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| ".remi-cat".into());
+    build_provider_client_with_auth(api_key, profile, base_url, &dir)
+}
+
+pub(crate) fn build_provider_client_with_auth(
+    api_key: &str,
+    profile: &ModelProfileConfig,
+    base_url: Option<String>,
+    auth_data_dir: &std::path::Path,
+) -> ProviderClient {
+    if profile.provider.as_deref() == Some("chatgpt") {
+        return ProviderClient::ChatGpt {
+            client: crate::chatgpt::ChatGptResponsesClient::new(
+                crate::chatgpt::ChatGptAuthManager::new(auth_data_dir),
+            )
+            .with_profile(profile),
+            supports_multimodal: profile.supports_images,
+        };
+    }
     if profile.provider.as_deref() == Some("mimo") {
         let mut client = MiMoClient::new(api_key.to_string()).with_model(profile.model.clone());
         if let Some(url) = base_url {

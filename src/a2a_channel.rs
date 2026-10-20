@@ -54,6 +54,51 @@ pub(crate) struct ApplicationA2aExecutor {
     active: Arc<RwLock<HashMap<String, (String, RunControl)>>>,
 }
 
+struct ActiveApplicationTask {
+    task_id: String,
+    control: RunControl,
+    active: Arc<RwLock<HashMap<String, (String, RunControl)>>>,
+    finished: bool,
+}
+
+impl ActiveApplicationTask {
+    async fn finish(&mut self) {
+        let mut active = self.active.write().await;
+        if active
+            .get(&self.task_id)
+            .is_some_and(|(_, control)| control.id() == self.control.id())
+        {
+            active.remove(&self.task_id);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveApplicationTask {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let active = Arc::clone(&self.active);
+        let task_id = self.task_id.clone();
+        let control = self.control.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                {
+                    let mut active = active.write().await;
+                    if active
+                        .get(&task_id)
+                        .is_some_and(|(_, current)| current.id() == control.id())
+                    {
+                        active.remove(&task_id);
+                    }
+                }
+                let _ = control.cancel().await;
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ApplicationMemoryA2aTransport {
     executor: ApplicationA2aExecutor,
@@ -109,7 +154,22 @@ impl bot_core::A2aDelegateTransport for ApplicationMemoryA2aTransport {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             use futures::StreamExt;
-            while let Some(event) = stream.next().await {
+            // Consume the first event so a just-started run obtains its cleanup
+            // guard; afterwards disconnects must not wait for another model event.
+            let mut first = true;
+            loop {
+                let event = if first {
+                    first = false;
+                    stream.next().await
+                } else {
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        event = stream.next() => event,
+                    }
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 if tx
                     .send(event.map_err(|error| error.to_string()))
                     .await
@@ -222,6 +282,9 @@ impl AgentExecutor for ApplicationA2aExecutor {
                 .await
                 .map_err(|error| A2AError::internal(error.to_string()))?;
             active.write().await.insert(ctx.task_id.clone(), (session.id, run.control()));
+            let mut registration = ActiveApplicationTask {
+                task_id: ctx.task_id.clone(), control: run.control(), active: Arc::clone(&active), finished: false,
+            };
             yield status_event(&ctx, TaskState::Working, None);
 
             let mut final_output = String::new();
@@ -244,6 +307,7 @@ impl AgentExecutor for ApplicationA2aExecutor {
                                 terminal = TaskState::Failed;
                                 terminal_message = data.get("message").and_then(serde_json::Value::as_str).map(str::to_string);
                             }
+                            if kind == "cancelled" { terminal = TaskState::Canceled; }
                             yield activity_event(&ctx, activity_value(kind, data));
                         }
                     }
@@ -254,7 +318,7 @@ impl AgentExecutor for ApplicationA2aExecutor {
                     ApplicationEvent::SupervisorStarted => {}
                 }
             }
-            active.write().await.remove(&ctx.task_id);
+            registration.finish().await;
             if terminal == TaskState::Completed {
                 yield completed_task(&ctx, input_message, final_output);
             } else {
@@ -356,6 +420,7 @@ fn application_cat_activity(
         bot_core::CatEvent::Error(error) => {
             Some(("error", serde_json::json!({"message": error.to_string()})))
         }
+        bot_core::CatEvent::Cancelled => Some(("cancelled", serde_json::json!({}))),
         _ => None,
     }
 }

@@ -24,8 +24,8 @@ use crate::sandbox::SandboxConfig;
 use crate::skill::store::SkillStore;
 use crate::tools::{BashMode, SecretRedactor};
 use crate::{
-    acp, api_key_from_env, desktop_html_skill, embedded_agent_profile, goal,
-    install_embedded_agent_profiles, install_embedded_model_profiles, model_usage, remi_skill,
+    acp, desktop_html_skill, embedded_agent_profile, goal, install_embedded_agent_profiles,
+    install_embedded_model_profiles, model_auth_key_from_env, model_usage, remi_skill,
     resolve_model_profile_from_env, sandbox, skill, supervisor_workflow, todo, AccountUsage,
     AgentModelBindings, AgentProfile, AgentRegistry, BuiltinSkillStore, CatAgent, CatEvent,
     Content, ContentPart, ContextCompactionEvent, ContextCompactionMode, ContextCompactionSource,
@@ -40,7 +40,7 @@ use crate::{
 mod approval_markers;
 mod environment_context;
 mod memory_runtime;
-mod model_provider;
+pub(crate) mod model_provider;
 mod partial_turn;
 mod prompting;
 mod supervisor_agent;
@@ -57,7 +57,7 @@ use environment_context::{
 };
 use memory_runtime::{persist_intermediate_user_state, persist_turn};
 use model_provider::{
-    auto_compress_context_percent, build_inner_agent, build_provider_client,
+    auto_compress_context_percent, build_inner_agent, build_provider_client_with_auth,
     context_percent_tokens, resolve_effective_model_profile, tool_output_overflow_bytes_from_env,
     InnerAgent,
 };
@@ -1110,13 +1110,14 @@ impl CatBot {
             .merged_extra_options(None, profile.reasoning_effort)
             .map_err(|err| AgentError::other(err.to_string()))?;
         Ok(LlmCompressor::new(
-            runtime_api_key_for_profile(profile, self.api_keys.as_deref()),
+            runtime_api_key_for_profile(profile, self.api_keys.as_deref(), &self.memory.data_dir),
             profile.base_url.clone(),
             profile.model.clone(),
             profile.context_tokens,
             profile.max_output_tokens,
             extra_options,
-        ))
+        )
+        .with_provider(profile.clone(), self.memory.data_dir.clone()))
     }
 
     /// Estimate the next request from persisted context without starting a model turn.
@@ -1434,11 +1435,18 @@ impl CatBot {
         effective
     }
 
+    pub fn ensure_model_authenticated(&self, profile: &ModelProfileConfig) -> anyhow::Result<()> {
+        crate::resolve_model_credential(profile, &self.memory.data_dir, self.api_keys.as_deref())
+            .map(|_| ())
+    }
+
     pub async fn account_usage(&self) -> anyhow::Result<AccountUsage> {
-        let api_key = match self.api_keys.as_deref() {
-            Some(values) => crate::model_profile::api_key_from_values(&self.model_profile, values)?,
-            None => api_key_from_env(&self.model_profile)?,
-        };
+        let api_key = crate::resolve_model_credential(
+            &self.model_profile,
+            &self.memory.data_dir,
+            self.api_keys.as_deref(),
+        )?
+        .legacy_api_key();
         model_usage::query_account_usage(&self.model_profile, &api_key).await
     }
 
@@ -1447,10 +1455,12 @@ impl CatBot {
         session_model_profile_id: Option<&str>,
     ) -> anyhow::Result<AccountUsage> {
         let effective = self.effective_model_profile(session_model_profile_id);
-        let api_key = match self.api_keys.as_deref() {
-            Some(values) => crate::model_profile::api_key_from_values(&effective.profile, values)?,
-            None => api_key_from_env(&effective.profile)?,
-        };
+        let api_key = crate::resolve_model_credential(
+            &effective.profile,
+            &self.memory.data_dir,
+            self.api_keys.as_deref(),
+        )?
+        .legacy_api_key();
         model_usage::query_account_usage(&effective.profile, &api_key).await
     }
 
@@ -1460,6 +1470,15 @@ impl CatBot {
         } else {
             self.model_agents.get(profile_id).unwrap_or(&self.inner)
         }
+    }
+
+    /// Effective reviewer for the selected model, including automatic role bindings.
+    pub fn approval_model_for(&self, session_model_profile_id: Option<&str>) -> Option<&str> {
+        let effective = self.effective_model_profile(session_model_profile_id);
+        self.agent_for_model_profile(&effective.profile.id)
+            .approval_reviewer
+            .as_deref()
+            .map(ModelApprovalReviewer::model)
     }
 
     fn runtime_for_agent_and_model(
@@ -4736,7 +4755,7 @@ impl CatBotBuilder {
         install_embedded_model_profiles(&models_dir)?;
         let model_registry = Arc::new(ModelProfileRegistry::load(&models_dir)?);
         let resolved_model = resolve_model_profile_from_env(&models_dir)?;
-        let api_key = api_key_from_env(&resolved_model.profile)?;
+        let api_key = model_auth_key_from_env(&resolved_model.profile)?;
         let jev_approval = std::env::var("REMI_JEV_APPROVAL_PROFILE")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -4882,10 +4901,8 @@ impl CatBotBuilder {
                 anyhow::anyhow!("no default model profile found in {}", models_dir.display())
             })?
         };
-        let api_key = match api_keys {
-            Some(values) => crate::model_profile::api_key_from_values(&model_profile, values)?,
-            None => api_key_from_env(&model_profile)?,
-        };
+        let api_key =
+            crate::resolve_model_credential(&model_profile, &data_dir, api_keys)?.legacy_api_key();
         let extra_options = model_profile.merged_extra_options(None, None)?;
         let sandbox_config = SandboxConfig::from_env(data_dir.clone(), BashMode::Local);
         Ok(Self {
@@ -5105,7 +5122,7 @@ impl CatBotBuilder {
                     anyhow::anyhow!("approval model profile `{profile_id}` was not found")
                 })?
         } else {
-            profile.clone()
+            crate::approval::default_chatgpt_approval_profile(&profile)
         };
         let approval_reviewer =
             if let Some((decision_profile, key, threshold_bps)) = self.jev_approval.as_ref() {
@@ -5115,22 +5132,51 @@ impl CatBotBuilder {
                     f64::from(*threshold_bps) / 10_000.0,
                 )?)
             } else {
-                let approval_api_key = match self.api_keys.as_deref() {
-                    Some(values) => {
-                        crate::model_profile::api_key_from_values(&approval_profile, values)?
-                    }
-                    None => api_key_from_env(&approval_profile)?,
-                };
-                Arc::new(ModelApprovalReviewer::new(
-                    approval_profile.clone(),
-                    approval_api_key,
-                ))
+                let approval_api_key = crate::resolve_model_credential(
+                    &approval_profile,
+                    &self.data_dir,
+                    self.api_keys.as_deref(),
+                )?
+                .legacy_api_key();
+                Arc::new(
+                    ModelApprovalReviewer::new(approval_profile.clone(), approval_api_key)
+                        .with_auth_data_dir(&self.data_dir),
+                )
             };
+        let automatic_approval =
+            self.jev_approval.is_none() && self.approval_model_profile_id.is_none();
+        let luna_reviewer = if !automatic_approval {
+            None
+        } else if profile.provider.as_deref() == Some("chatgpt") {
+            Some(Arc::clone(&approval_reviewer))
+        } else {
+            self.model_registry
+                .list()
+                .into_iter()
+                .find(|model| model.provider.as_deref() == Some("chatgpt"))
+                .map(|model| {
+                    Arc::new(
+                        ModelApprovalReviewer::new(
+                            crate::approval::default_chatgpt_approval_profile(model),
+                            String::new(),
+                        )
+                        .with_auth_data_dir(&self.data_dir),
+                    )
+                })
+        };
+        let reviewer_for_model = |model: &ModelProfileConfig| {
+            if model.provider.as_deref() == Some("chatgpt") {
+                Arc::clone(luna_reviewer.as_ref().unwrap_or(&approval_reviewer))
+            } else {
+                Arc::clone(&approval_reviewer)
+            }
+        };
 
         tracing::debug!(
             model = %profile.model,
             profile = %profile.id,
             approval_model_profile = %self.jev_approval.as_ref().map(|(profile, _, _)| profile.id.as_str()).unwrap_or(&approval_profile.id),
+            approval_model = %approval_reviewer.model(),
             helper_model_profile = self.model_bindings.helper.as_deref().unwrap_or(""),
             vision_model_profile = self.model_bindings.vision.as_deref().unwrap_or(""),
             context_tokens = profile.context_tokens,
@@ -5151,7 +5197,12 @@ impl CatBotBuilder {
         }
 
         let redactor: SharedRedactor = Arc::new(std::sync::RwLock::new(SecretRedactor::empty()));
-        let model = build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
+        let model = build_provider_client_with_auth(
+            &self.api_key,
+            &profile,
+            resolved_base_url.clone(),
+            &self.data_dir,
+        );
         let extra_options = self.extra_options.clone();
         let agent_config = AgentConfig::default()
             .with_model(profile.model.clone())
@@ -5184,7 +5235,8 @@ impl CatBotBuilder {
             profile.context_tokens,
             profile.max_output_tokens,
             extra_options,
-        );
+        )
+        .with_provider(profile.clone(), self.data_dir.clone());
 
         let memory = Arc::new(MemoryStore {
             data_dir: self.data_dir,
@@ -5251,8 +5303,12 @@ impl CatBotBuilder {
             data_dir.clone(),
             self.im_bridge.clone(),
         ));
-        let acp_local_model =
-            build_provider_client(&self.api_key, &profile, resolved_base_url.clone());
+        let acp_local_model = build_provider_client_with_auth(
+            &self.api_key,
+            &profile,
+            resolved_base_url.clone(),
+            &data_dir,
+        );
         let mut acp_local_builder = AgentBuilder::new()
             .model(acp_local_model)
             .config(
@@ -5392,11 +5448,15 @@ impl CatBotBuilder {
                 if model_profile.id == profile.id && variant.key == model_profile.id {
                     continue;
                 }
-                let model_api_key =
-                    runtime_api_key_for_profile(&variant.profile, self.api_keys.as_deref());
+                let model_api_key = runtime_api_key_for_profile(
+                    &variant.profile,
+                    self.api_keys.as_deref(),
+                    &data_dir,
+                );
                 let model_inner = build_inner_agent(
                     &model_api_key,
                     &variant.profile,
+                    &data_dir,
                     system_prompt.clone(),
                     self.max_turns,
                     variant.extra_options.clone(),
@@ -5404,9 +5464,11 @@ impl CatBotBuilder {
                     &active_agent_id,
                     &redactor,
                 );
-                let model_tools = tool_deps
-                    .with_api_key(model_api_key)
-                    .build_model_tools(&variant.profile, variant.extra_options);
+                let model_reviewer = reviewer_for_model(&variant.profile);
+                let mut model_deps = tool_deps.with_api_key(model_api_key);
+                model_deps.approval_reviewer = Some(Arc::clone(&model_reviewer));
+                let model_tools =
+                    model_deps.build_model_tools(&variant.profile, variant.extra_options);
                 let model_overflow_bytes = self
                     .overflow_bytes
                     .unwrap_or(variant.profile.overflow_bytes);
@@ -5427,7 +5489,7 @@ impl CatBotBuilder {
                         im_bridge: self.im_bridge.clone(),
                         tool_allowlist: self.tool_allowlist.clone(),
                         approval_manager: Arc::clone(&approval_manager),
-                        approval_reviewer: Some(Arc::clone(&approval_reviewer)),
+                        approval_reviewer: Some(model_reviewer),
                         user_question_manager: Arc::clone(&user_question_manager),
                         hook_manager: Arc::clone(&hook_manager),
                         tool_tasks: Arc::clone(&tool_tasks),
@@ -5530,11 +5592,15 @@ impl CatBotBuilder {
             let mut by_model = HashMap::new();
             for model_profile in self.model_registry.list() {
                 for variant in model_runtime_variants(model_profile)? {
-                    let model_api_key =
-                        runtime_api_key_for_profile(&variant.profile, self.api_keys.as_deref());
+                    let model_api_key = runtime_api_key_for_profile(
+                        &variant.profile,
+                        self.api_keys.as_deref(),
+                        &data_dir,
+                    );
                     let model_inner = build_inner_agent(
                         &model_api_key,
                         &variant.profile,
+                        &data_dir,
                         agent_profile.system_prompt.clone(),
                         agent_profile.max_turns,
                         variant.extra_options.clone(),
@@ -5542,9 +5608,11 @@ impl CatBotBuilder {
                         &agent_profile.id,
                         &redactor,
                     );
-                    let model_tools = agent_tool_deps
-                        .with_api_key(model_api_key)
-                        .build_model_tools(&variant.profile, variant.extra_options);
+                    let model_reviewer = reviewer_for_model(&variant.profile);
+                    let mut model_deps = agent_tool_deps.with_api_key(model_api_key);
+                    model_deps.approval_reviewer = Some(Arc::clone(&model_reviewer));
+                    let model_tools =
+                        model_deps.build_model_tools(&variant.profile, variant.extra_options);
                     let agent_tool_allowlist = agent_tool_allowlist(agent_profile);
                     let model_overflow_bytes = self
                         .overflow_bytes
@@ -5566,7 +5634,7 @@ impl CatBotBuilder {
                             im_bridge: self.im_bridge.clone(),
                             tool_allowlist: Some(agent_tool_allowlist),
                             approval_manager: Arc::clone(&approval_manager),
-                            approval_reviewer: Some(Arc::clone(&approval_reviewer)),
+                            approval_reviewer: Some(model_reviewer),
                             user_question_manager: Arc::clone(&user_question_manager),
                             hook_manager: Arc::clone(&hook_manager),
                             tool_tasks: Arc::clone(&tool_tasks),
@@ -5678,11 +5746,10 @@ fn validate_host_tool_names<'a>(
 fn runtime_api_key_for_profile(
     profile: &ModelProfileConfig,
     api_keys: Option<&std::collections::BTreeMap<String, String>>,
+    data_dir: &std::path::Path,
 ) -> String {
-    let result = match api_keys {
-        Some(values) => crate::model_profile::api_key_from_values(profile, values),
-        None => api_key_from_env(profile),
-    };
+    let result =
+        crate::resolve_model_credential(profile, data_dir, api_keys).map(|c| c.legacy_api_key());
     match result {
         Ok(api_key) => api_key,
         Err(err) => {
@@ -5846,6 +5913,7 @@ impl SubagentSessionCoordinator {
         SubagentCancelRegistration {
             thread_id: thread_id.to_string(),
             cancellations: Arc::clone(&self.cancellations),
+            remote_tasks: Arc::clone(&self.remote_tasks),
         }
     }
 
@@ -5891,18 +5959,40 @@ impl SubagentSessionCoordinator {
             .expect("active A2A sub-agent task lock poisoned")
             .remove(thread_id);
     }
+
+    fn clear_remote_task(&self, thread_id: &str, task_id: &str) {
+        let mut tasks = self
+            .remote_tasks
+            .lock()
+            .expect("active A2A sub-agent task lock poisoned");
+        if tasks
+            .get(thread_id)
+            .is_some_and(|task| task.task_id == task_id)
+        {
+            tasks.remove(thread_id);
+        }
+    }
 }
 
 struct SubagentCancelRegistration {
     thread_id: String,
     cancellations: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+    remote_tasks: Arc<std::sync::Mutex<HashMap<String, RemoteDelegateTask>>>,
 }
 
 impl Drop for SubagentCancelRegistration {
     fn drop(&mut self) {
-        self.cancellations
+        let cancel = self
+            .cancellations
             .lock()
             .expect("active sub-agent cancellation lock poisoned")
+            .remove(&self.thread_id);
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+        self.remote_tasks
+            .lock()
+            .expect("active A2A sub-agent task lock poisoned")
             .remove(&self.thread_id);
     }
 }
@@ -5961,7 +6051,7 @@ impl RemiSubAgentTool {
         let sub_thread_id = ThreadId(format!("subagent:{agent_name}:{named}"));
         let sub_run_id = RunId(uuid::Uuid::new_v4().to_string());
         let parent_thread_id = ctx.thread_id().0;
-        let cancel = ctx.runtime().cancellation();
+        let cancel = ctx.runtime().cancellation().child_token();
         let sessions = Arc::clone(&self.sessions);
         let approval_manager = Arc::clone(&self.approval_manager);
         let user_question_manager = Arc::clone(&self.user_question_manager);
@@ -5981,11 +6071,17 @@ impl RemiSubAgentTool {
             permission_mode: None,
         };
         if let Some(active) = sessions.remote(&sub_thread_id.0) {
-            active
+            let result = active
                 .client
                 .steer(&active.task_id, Content::text(task.clone()))
-                .await
-                .map_err(|error| AgentError::tool("sub-agent", error))?;
+                .await;
+            if let Err(error) = result {
+                if error != crate::a2a_delegate::TASK_NOT_ACTIVE {
+                    return Err(AgentError::tool("sub-agent", error));
+                }
+                sessions.clear_remote_task(&sub_thread_id.0, &active.task_id);
+                tracing::debug!(task_id = %active.task_id, sub_session_id = %sub_thread_id.0, "finished A2A task binding cleared; starting a new turn");
+            }
         }
         let session_lock = sessions.session_lock(&sub_thread_id.0).await;
         let output: remi_agentloop::tool::BoxedToolStream = Box::pin(stream! {
@@ -6062,6 +6158,9 @@ impl RemiSubAgentTool {
                         tracing::debug!(%task_id, %context_id, sub_session_id = %sub_thread_id.0, "A2A delegate task assigned");
                     }
                     crate::a2a_delegate::DelegateWireEvent::Terminal { state, message } => {
+                        if let Some(task_id) = remote_task_id.as_deref() {
+                            sessions.clear_remote_task(&sub_thread_id.0, task_id);
+                        }
                         terminal_state = Some(state);
                         terminal_error = message;
                     }
@@ -6624,6 +6723,9 @@ fn register_delegate_agent_tools(
         });
     }
 }
+
+#[cfg(test)]
+mod a2a_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

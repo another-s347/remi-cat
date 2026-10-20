@@ -1,5 +1,7 @@
 use anyhow::Context;
 
+pub(crate) mod chatgpt;
+mod chatgpt_login;
 mod doctor;
 mod feedback;
 mod feishu;
@@ -37,8 +39,8 @@ use crate::app::{
 use crate::cli::parse_secret_command;
 use crate::core::Runtime;
 use bot_core::{
-    api_key_from_env, model_profile_key_status, AccountBalance, AccountUsage, AccountUsageStatus,
-    CatBot, GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument, SkillLoadDiagnostic,
+    model_profile_key_status, AccountBalance, AccountUsage, AccountUsageStatus, CatBot,
+    GoalMaxRounds, ModelProfileConfig, ReasoningEffort, SkillDocument, SkillLoadDiagnostic,
     SkillLoadDiagnosticSeverity, ToolTaskRecord,
 };
 
@@ -899,7 +901,7 @@ async fn switch_model_profile(
         anyhow::bail!("unknown model profile `{id}`. Use `/model list` to see available profiles.");
     };
     let profile_id = profile.id.clone();
-    api_key_from_env(profile)?;
+    runtime.bot.ensure_model_authenticated(profile)?;
     let stored_reasoning_before_switch = runtime
         .sessions
         .lock()
@@ -1080,13 +1082,19 @@ fn format_model_list(bot: &CatBot, stored_model_profile_id: Option<&str>) -> Str
             format!(" [{}]", markers.join(", "))
         };
         let key_status = model_profile_key_status(profile);
-        let key_label = if key_status.configured {
+        let key_label = if profile.provider.as_deref() == Some("chatgpt") {
+            if key_status.configured {
+                "ChatGPT authorized".to_string()
+            } else {
+                "run chatgpt login".to_string()
+            }
+        } else if key_status.configured {
             "ok".to_string()
         } else {
             format!("missing ({})", key_status.env_keys.join(" or "))
         };
         lines.push(format!(
-            "- `{}`{}: {} / `{}` / context={} / images={} / reasoning={} / key={}",
+            "- `{}`{}: {} / `{}` / context={} / images={} / reasoning={} / auth={}",
             profile.id,
             marker,
             profile.provider.as_deref().unwrap_or("unknown"),

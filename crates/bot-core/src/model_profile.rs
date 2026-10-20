@@ -283,6 +283,20 @@ impl<'de> Deserialize<'de> for ContextCompactionMode {
 
 impl ModelProfileConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.provider.as_deref() == Some("chatgpt") {
+            if self
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.trim_end_matches('/') != crate::chatgpt::API_BASE)
+            {
+                bail!("ChatGPT subscription provider requires the official API endpoint");
+            }
+            for key in self.extra_options.keys() {
+                if !matches!(key.as_str(), "reasoning" | "reasoning_effort") {
+                    bail!("unsupported ChatGPT model option: {key}");
+                }
+            }
+        }
         if self.id.trim().is_empty() {
             bail!("model profile id is required");
         }
@@ -385,6 +399,16 @@ fn apply_reasoning_options(
         || lower.contains("kimi")
     {
         return apply_kimi_reasoning_options(profile, thinking, effort, options);
+    }
+
+    if provider == "chatgpt" {
+        if thinking.is_some_and(|v| v != ThinkingMode::Auto) {
+            bail!("ChatGPT uses reasoning_effort rather than thinking.type");
+        }
+        if let Some(value) = effort.and_then(ReasoningEffort::request_value) {
+            options.insert("reasoning".into(), serde_json::json!({"effort": value}));
+        }
+        return Ok(());
     }
 
     if provider == "openai"
@@ -719,6 +743,14 @@ pub struct ModelProfileKeyStatus {
 }
 
 pub fn model_profile_key_status(profile: &ModelProfileConfig) -> ModelProfileKeyStatus {
+    if profile.provider.as_deref() == Some("chatgpt") {
+        return ModelProfileKeyStatus {
+            env_keys: vec![],
+            configured: crate::chatgpt::ChatGptAuthManager::from_env()
+                .ensure_configured()
+                .is_ok(),
+        };
+    }
     let env_keys = api_key_env_keys_for_profile(profile);
     let configured = env_keys.iter().any(|key| {
         std::env::var(key)
@@ -761,6 +793,31 @@ pub fn api_key_from_values(
 }
 
 pub async fn validate_model_profile_api_key(profile: &ModelProfileConfig) -> Result<()> {
+    let dir = std::env::var_os("REMI_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".remi-cat".into());
+    validate_model_profile_auth(profile, &dir).await
+}
+
+pub async fn validate_model_profile_auth(
+    profile: &ModelProfileConfig,
+    data_dir: &Path,
+) -> Result<()> {
+    if profile.provider.as_deref() == Some("chatgpt") {
+        profile.validate()?;
+        let client = crate::chatgpt::ChatGptResponsesClient::new(
+            crate::chatgpt::ChatGptAuthManager::new(data_dir),
+        );
+        client
+            .complete_text(
+                &profile.model,
+                "Reply briefly.",
+                "Say hello.",
+                profile.merged_extra_options(None, None)?,
+            )
+            .await?;
+        return Ok(());
+    }
     let api_key = api_key_from_env(profile)?;
     let endpoint = format!(
         "{}/models",

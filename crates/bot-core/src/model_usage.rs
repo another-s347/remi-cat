@@ -34,6 +34,12 @@ pub async fn query_account_usage(
 ) -> anyhow::Result<AccountUsage> {
     let provider = infer_provider(profile);
     let status = match provider.as_str() {
+        "chatgpt" => AccountUsageStatus::Unknown {
+            reason: format!(
+                "ChatGPT subscription usage is managed at {}",
+                crate::chatgpt::USAGE_URL
+            ),
+        },
         "deepseek" => query_deepseek_balance(profile, api_key).await?,
         "kimi" | "moonshot" => query_kimi_balance(profile, api_key).await?,
         _ => AccountUsageStatus::Unknown {

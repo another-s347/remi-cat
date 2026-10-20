@@ -121,3 +121,7 @@ older sessions without one fail safely until another topic message arrives.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### ChatGPT subscription
+
+Run `remi-cat chatgpt setup` to open the browser, authorize an eligible ChatGPT plan, select a model, verify a real reply, and save the default. WSL automatically receives the browser callback in Windows; no callback URLs need to be copied or shared. Then start `remi-cat tui`. See [setup, remote login, and preview limitations](docs/chatgpt-subscription.md).

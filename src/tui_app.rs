@@ -2849,7 +2849,13 @@ impl TuiApp {
         for profile in model_profiles {
             let reasoning = model_reasoning_effort_label(&profile);
             let key_status = model_profile_key_status(&profile);
-            let key_label = if key_status.configured {
+            let key_label = if profile.provider.as_deref() == Some("chatgpt") {
+                if key_status.configured {
+                    "ChatGPT authorized".to_string()
+                } else {
+                    "ChatGPT login required".to_string()
+                }
+            } else if key_status.configured {
                 "key ok".to_string()
             } else {
                 format!("key missing: {}", key_status.env_keys.join(" or "))

@@ -19,6 +19,7 @@ mod a2a_delegate;
 pub mod acp;
 pub mod agent;
 pub mod approval;
+pub mod chatgpt;
 pub mod decision_model;
 pub mod desktop_html_skill;
 pub mod events;
@@ -54,12 +55,15 @@ pub use approval::{
     ApprovalResolution, ModelApprovalReviewer, ToolApprovalDecision, ToolApprovalManager,
     ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
+pub use bot_runtime_core::{AgentError, Content, ContentPart, Message, ToolOutput, ToolResult};
+pub use bot_runtime_core::{DynamicTool, DynamicToolRisk};
+pub use chatgpt::{
+    model_auth_key_from_env, model_auth_key_from_values, resolve_model_credential, ModelCredential,
+};
 pub use decision_model::{
     install_embedded_decision_model_profiles, load_decision_model_profile,
     DecisionModelProfileConfig,
 };
-pub use bot_runtime_core::{AgentError, Content, ContentPart, Message, ToolOutput, ToolResult};
-pub use bot_runtime_core::{DynamicTool, DynamicToolRisk};
 pub use events::{
     CatEvent, ContextCompactionEvent, ContextCompactionSource, ContextCompactionStatus,
     ModelInputSegment, ModelInputSegmentCategory, ModelInputSnapshot, ModelInputTotals, SkillEvent,
@@ -75,8 +79,8 @@ pub use memory::{MemoryStore, ThreadHistoryMessage};
 pub use model_profile::{
     api_key_from_env, api_key_from_values, install_embedded_model_profiles,
     model_profile_key_status, resolve_model_profile_from_env, validate_model_profile_api_key,
-    ContextCompactionMode, ModelProfileConfig, ModelProfileKeyStatus, ModelProfileRegistry,
-    ModelProfileSource, ReasoningEffort, ThinkingMode,
+    validate_model_profile_auth, ContextCompactionMode, ModelProfileConfig, ModelProfileKeyStatus,
+    ModelProfileRegistry, ModelProfileSource, ReasoningEffort, ThinkingMode,
 };
 pub use model_usage::{AccountBalance, AccountUsage, AccountUsageStatus};
 pub use profile::{

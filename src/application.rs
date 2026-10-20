@@ -3055,6 +3055,188 @@ mod tests {
         drop(reserved_a2a_port);
     }
 
+    #[tokio::test]
+    async fn cancelled_a2a_worker_can_retry_same_name_and_return_to_parent() {
+        use axum::{
+            body::{Body, Bytes},
+            extract::State,
+            routing::post,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let disconnected = Arc::new(tokio::sync::Notify::new());
+        struct DisconnectNotice(Arc<tokio::sync::Notify>);
+        impl Drop for DisconnectNotice {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let state = ApplicationE2eModel {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(StdMutex::new(VecDeque::from([
+                application_e2e_sse_tool_call(),
+                "__hold_child__".into(),
+                application_e2e_sse_tool_call().replace("call-memory-worker", "call-retry-worker"),
+                application_e2e_sse_text("CHILD_RETRY_OK"),
+                application_e2e_sse_text("PARENT_RETRY_OK"),
+            ]))),
+        };
+        let scripted_responses = Arc::clone(&state.responses);
+        let notice = Arc::clone(&started);
+        let closed = Arc::clone(&disconnected);
+        let app = axum::Router::new().route("/v1/chat/completions", post(
+            move |State(state): State<ApplicationE2eModel>, body: Bytes| {
+                let notice = Arc::clone(&notice);
+                let closed = Arc::clone(&closed);
+                async move {
+                    state.requests.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+                    let text = state.responses.lock().unwrap().pop_front().expect("unexpected extra model request");
+                    let body = if text == "__hold_child__" {
+                        Body::from_stream(async_stream::stream! {
+                            let _guard = DisconnectNotice(closed);
+                            notice.notify_one();
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"working\"},\"finish_reason\":null}]}\n\n"));
+                            std::future::pending::<()>().await;
+                        })
+                    } else { Body::from(text) };
+                    axum::response::Response::builder().header("content-type", "text/event-stream").body(body).unwrap()
+                }
+            }
+        )).with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let model: bot_core::ModelProfileConfig = serde_yaml::from_str(&format!(
+            "id: retry-test\nname: Retry test\nmodel: mock-model\nprovider: openai\nbase_url: http://{address}/v1\ncontext_tokens: 32768\nmax_output_tokens: 1024\nsupports_images: false\noverflow_bytes: 32768\ncontext_compaction: off\n"
+        )).unwrap();
+        let root = bot_core::AgentProfile::from_markdown("---\nid: default\nname: Parent\ndescription: Parent\ntools: []\ndelegates: [worker]\nmax_turns: 2\n---\nUse the worker, then report its result.\n").unwrap();
+        let worker = bot_core::AgentProfile::from_markdown("---\nid: worker\nname: Worker\ndescription: Worker\ntools: []\ndelegates: []\nmax_turns: 2\npersistent_sessions: true\n---\nReturn the requested marker.\n").unwrap();
+        let application = ApplicationBuilder::new(dir.path())
+            .workspace(dir.path())
+            .default_model("retry-test")
+            .model_profile(model)
+            .agent_profile(root)
+            .agent_profile(worker)
+            .credentials(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "test-only".into(),
+            )]))
+            .discover_hooks(false)
+            .include_default_skills(false)
+            .file_skills(false)
+            .spawn()
+            .await
+            .unwrap();
+        let channel = application
+            .handle()
+            .channel(ChannelConfig::new("a2a-retry-test"));
+        let session = channel.resolve_session("conversation").await.unwrap();
+        let mut run = channel
+            .run(RunRequest::text(&session.id, "Ask the worker to inspect."))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        assert!(run.cancel().await.unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = run.recv().await {
+                if matches!(event, ApplicationEvent::Done) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), disconnected.notified())
+            .await
+            .expect("cancel must close the worker's model stream");
+        let mut retry = channel
+            .run(RunRequest::text(
+                &session.id,
+                "Continue using the same named worker.",
+            ))
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        let mut child_reply = false;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = retry.recv().await {
+                match event {
+                    ApplicationEvent::Cat(bot_core::CatEvent::Text(text)) => reply.push_str(&text),
+                    ApplicationEvent::Cat(bot_core::CatEvent::SubSession(event)) => {
+                        child_reply |= serde_json::to_string(&event)
+                            .unwrap()
+                            .contains("CHILD_RETRY_OK")
+                    }
+                    ApplicationEvent::Cat(bot_core::CatEvent::Error(error)) => {
+                        panic!("retry failed: {error}")
+                    }
+                    ApplicationEvent::Done => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reply.contains("PARENT_RETRY_OK"), "{reply}");
+        assert!(child_reply, "worker result must reach parent");
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 5);
+        assert!(captured[4].contains("CHILD_RETRY_OK"));
+        assert!(!captured[4].contains("A2A task is not active"));
+        drop(captured);
+        // A consumer disconnect must also stop a child that emits no more events.
+        scripted_responses
+            .lock()
+            .unwrap()
+            .push_back("__hold_child__".into());
+        let transport =
+            crate::a2a_channel::ApplicationMemoryA2aTransport::new(application.handle());
+        let mut message = a2a::Message::new(
+            a2a::Role::User,
+            vec![a2a::Part::text("Inspect until cancelled.")],
+        );
+        message.context_id = Some("disconnect-test".into());
+        message.metadata = Some(std::collections::HashMap::from([(
+            "urn:remi:a2a:invocation-context:v1".into(),
+            serde_json::json!({"agentId":"worker"}),
+        )]));
+        let mut receiver = bot_core::A2aDelegateTransport::invoke(
+            &transport,
+            a2a::SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+        let task_id = match receiver.recv().await.unwrap().unwrap() {
+            a2a::StreamResponse::StatusUpdate(event) => event.task_id,
+            other => panic!("unexpected first event: {other:?}"),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        drop(receiver);
+        tokio::time::timeout(std::time::Duration::from_secs(10), disconnected.notified())
+            .await
+            .expect("disconnect must cancel a silent child");
+        let error = bot_core::A2aDelegateTransport::steer(
+            &transport,
+            &task_id,
+            bot_core::Content::text("late input"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "A2A task is not active");
+        application.shutdown().await.unwrap();
+        server.abort();
+    }
+
     #[test]
     fn embedding_sources_are_independent() {
         let builder = ApplicationBuilder::new("/tmp/ferret-runtime")

@@ -40,3 +40,5 @@ fetch/
 # ── Scratch files ─────────────────────────────────────────────────────────────
 test.md
 *.bak
+# ChatGPT OAuth credentials and encrypted protocol state
+**/auth/chatgpt/
