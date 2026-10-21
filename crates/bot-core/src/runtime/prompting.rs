@@ -278,12 +278,12 @@ pub(crate) fn model_input_snapshot_from_loop_input(
             for (index, message) in history.iter().enumerate() {
                 append_message_model_input_segments(&mut segments, index, message);
             }
-            append_segment(
+            append_content_segment(
                 &mut segments,
                 ModelInputSegmentCategory::CurrentUser,
                 Some("user".to_string()),
                 "Current user input".to_string(),
-                content_to_model_input_text(&message.content),
+                &message.content,
             );
             if let Some(metadata) = metadata {
                 append_json_segment(
@@ -404,12 +404,12 @@ fn append_message_model_input_segments(
         ModelInputSegmentCategory::History
     };
 
-    append_segment(
+    append_content_segment(
         segments,
         category,
         Some(role_name(&message.role)),
         message_segment_title(index, message),
-        content_to_model_input_text(&message.content),
+        &message.content,
     );
     if let Some(reasoning) = &message.reasoning_content {
         append_segment(
@@ -481,31 +481,28 @@ fn append_segment(
     });
 }
 
-fn content_to_model_input_text(content: &Content) -> String {
-    match content {
-        Content::Text(text) => text.clone(),
-        Content::Parts(parts) => parts
-            .iter()
-            .map(content_part_to_model_input_text)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+fn append_content_segment(
+    segments: &mut Vec<ModelInputSegment>,
+    category: ModelInputSegmentCategory,
+    role: Option<String>,
+    title: String,
+    content: &Content,
+) {
+    append_segment(
+        segments,
+        category,
+        role,
+        title,
+        content_to_model_input_text(content),
+    );
+    segments
+        .last_mut()
+        .expect("segment just appended")
+        .token_estimate = crate::token_usage::estimate_content_tokens(content);
 }
 
-fn content_part_to_model_input_text(part: &ContentPart) -> String {
-    match part {
-        ContentPart::Text { text } => text.clone(),
-        ContentPart::ImageUrl { image_url } => {
-            format!("[image_url] {}", image_url.url)
-        }
-        ContentPart::ImageBase64 { media_type, data } => {
-            format!("[image_base64] {media_type}, {} bytes", data.len())
-        }
-        ContentPart::Audio { .. } => "[audio]".to_string(),
-        ContentPart::File { .. } => {
-            serde_json::to_string(part).unwrap_or_else(|_| "[file]".to_string())
-        }
-    }
+fn content_to_model_input_text(content: &Content) -> String {
+    crate::token_usage::content_accounting_text(content)
 }
 
 pub(crate) fn append_thread_todo_system_prompt(

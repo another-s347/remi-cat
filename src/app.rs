@@ -92,6 +92,19 @@ pub(crate) fn parse_session_reasoning_effort(
         .filter(|effort| *effort != bot_core::ReasoningEffort::Auto)
 }
 
+// Service/CLI startup inherits the resolved runtime configuration. Only the
+// TUI owns an explicit async/sync selection (including its async default).
+fn apply_cli_async_agent_override(cli: &CliConfig) {
+    if cli.tui {
+        unsafe {
+            std::env::set_var(
+                "REMI_ASYNC_AGENT",
+                if cli.async_agent { "true" } else { "false" },
+            );
+        }
+    }
+}
+
 fn apply_runtime_env_defaults(data_dir: &mut PathBuf, tui_mode: bool) {
     let config_path = std::env::var_os("REMI_RUNTIME_CONFIG")
         .map(PathBuf::from)
@@ -464,15 +477,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 std::env::set_var("REMI_DATA_DIR", &data_dir);
             }
             apply_runtime_env_defaults(&mut data_dir, cli.tui);
-            if cli.async_agent {
-                unsafe {
-                    std::env::set_var("REMI_ASYNC_AGENT", "true");
-                }
-            } else {
-                unsafe {
-                    std::env::set_var("REMI_ASYNC_AGENT", "false");
-                }
-            }
+            apply_cli_async_agent_override(cli);
             if cli.tui && selected_profile.workspace.is_none() {
                 let workspace_dir =
                     std::env::current_dir().context("resolving current workspace")?;
@@ -1203,6 +1208,39 @@ mod cli_tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn service_startup_preserves_async_config_and_tui_can_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("REMI_ASYNC_AGENT");
+        for configured in ["true", "false"] {
+            unsafe {
+                std::env::set_var("REMI_ASYNC_AGENT", configured);
+            }
+            let AppCommand::Run(cli) = parse_command(&args(&[])).unwrap() else {
+                panic!("expected service command");
+            };
+            super::apply_cli_async_agent_override(&cli);
+            assert_eq!(std::env::var("REMI_ASYNC_AGENT").unwrap(), configured);
+        }
+        for (arguments, expected) in [
+            (vec!["tui"], "true"),
+            (vec!["tui", "--sync"], "false"),
+            (vec!["tui", "--async"], "true"),
+        ] {
+            let AppCommand::Run(cli) = parse_command(&args(&arguments)).unwrap() else {
+                panic!("expected TUI command");
+            };
+            super::apply_cli_async_agent_override(&cli);
+            assert_eq!(std::env::var("REMI_ASYNC_AGENT").unwrap(), expected);
+        }
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("REMI_ASYNC_AGENT", value),
+                None => std::env::remove_var("REMI_ASYNC_AGENT"),
+            };
+        }
     }
 
     #[test]

@@ -148,16 +148,19 @@ impl OutputProtocolContext {
             caps.join(",")
         )];
         lines.push("Markdown.".into());
+        if self.surface == "feishu" {
+            lines.push("IM: never write plain @names. Use exactly the listed mention REF (u0, u1, ...), never a platform ID. If unavailable, explain without a mention.".into());
+        }
         if self.capabilities.user_mentions != OutputCapability::Disabled
             || self.capabilities.agent_mentions != OutputCapability::Disabled
         {
             if self.capabilities.broadcast_all != OutputCapability::Disabled {
                 lines.push(
-                    "@[n](remi-mention:REF); all @[所有人](remi-mention:all); listed refs only."
+                    "@[n](remi-mention:REF); all @[所有人](remi-mention:all). Refs only; no bare @name; unknown: no @."
                         .into(),
                 );
             } else {
-                lines.push("@[n](remi-mention:REF); listed refs only.".into());
+                lines.push("@[n](remi-mention:REF). Listed refs only; bare @name forbidden; unknown: cannot notify.".into());
             }
         } else if self.capabilities.broadcast_all != OutputCapability::Disabled {
             lines.push("All @[所有人](remi-mention:all).".into());

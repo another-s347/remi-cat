@@ -1,4 +1,4 @@
-use remi_agentloop::prelude::Message;
+use remi_agentloop::prelude::{Content, ContentPart, Message};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
@@ -66,15 +66,89 @@ pub fn estimate_model_input_tokens(text: &str) -> u32 {
     units.ceil().max(1.0) as u32
 }
 
+// Provider-independent planning allowance, not a measurement of vision tokens.
+// Encoded bytes are transport data, not text tokens. Actual API usage remains
+// authoritative; this allowance prevents both base64 inflation and zero-cost images.
+pub(crate) const IMAGE_INPUT_TOKEN_ALLOWANCE: u32 = 4_096;
+
+pub(crate) fn content_accounting_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => text.clone(),
+                ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. } => {
+                    "[image: visual input]".to_string()
+                }
+                ContentPart::Audio { .. } => "[audio]".to_string(),
+                ContentPart::File { .. } => {
+                    serde_json::to_string(part).unwrap_or_else(|_| "[file]".into())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+pub(crate) fn estimate_content_tokens(content: &Content) -> u32 {
+    match content {
+        Content::Text(text) => estimate_model_input_tokens(text),
+        Content::Parts(parts) => parts.iter().fold(0_u32, |total, part| {
+            let tokens = match part {
+                ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. } => {
+                    IMAGE_INPUT_TOKEN_ALLOWANCE
+                }
+                ContentPart::Text { text } => estimate_model_input_tokens(text),
+                _ => estimate_model_input_tokens(&content_accounting_text(&Content::parts(vec![
+                    part.clone(),
+                ]))),
+            };
+            total.saturating_add(tokens)
+        }),
+    }
+}
+
 pub fn estimate_memory_message_tokens(msgs: &[Message]) -> usize {
     msgs.iter()
-        .map(|m| m.content.text_content().len() / 4 + 10)
+        .map(|m| estimate_content_tokens(&m.content) as usize + 10)
         .sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_accounting_ignores_encoding_size_and_representation() {
+        let url = Content::parts(vec![
+            ContentPart::text("inspect"),
+            ContentPart::image_url(format!("data:image/png;base64,{}", "A".repeat(2_000_000))),
+        ]);
+        let encoded = Content::parts(vec![
+            ContentPart::text("inspect"),
+            ContentPart::image_base64("image/png", "B".repeat(4_000_000)),
+        ]);
+        assert_eq!(
+            estimate_content_tokens(&url),
+            estimate_content_tokens(&encoded)
+        );
+        assert_eq!(
+            estimate_content_tokens(&url),
+            IMAGE_INPUT_TOKEN_ALLOWANCE + estimate_model_input_tokens("inspect")
+        );
+        assert!(content_accounting_text(&url).len() < 100);
+        assert!(content_accounting_text(&encoded).len() < 100);
+        assert!(!content_accounting_text(&url).contains("base64"));
+        let two = Content::parts(vec![
+            ContentPart::image_url("https://example.test/1"),
+            ContentPart::image_base64("image/png", "AA=="),
+        ]);
+        assert_eq!(
+            estimate_content_tokens(&two),
+            2 * IMAGE_INPUT_TOKEN_ALLOWANCE
+        );
+    }
 
     #[test]
     fn context_metrics_use_max_prompt_tokens_and_clamp() {

@@ -34,6 +34,8 @@ mod actions;
 mod bridge;
 #[path = "feishu/format.rs"]
 mod format;
+#[path = "feishu/mentions.rs"]
+mod mentions;
 #[path = "feishu/reply_stream.rs"]
 mod reply_stream;
 #[path = "feishu/routing.rs"]
@@ -331,7 +333,7 @@ async fn prepare_feishu_input(
     gateway: Option<&FeishuGateway>,
     msg: &FeishuMessage,
 ) -> PreparedFeishuInput {
-    let mut text = msg.text.clone();
+    let mut text = mentions::incoming_mention_text(&msg.text, &msg.mentions);
     let mut image_refs = msg
         .images
         .iter()
@@ -907,7 +909,26 @@ struct FeishuOutputParticipant {
 }
 
 impl FeishuOutputProtocol {
+    fn rejects_mentions(&self, text: &str) -> bool {
+        mentions::has_plain_mentions(text)
+            || parse_output(text, &self.context)
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    matches!(
+                        diagnostic.code,
+                        "invalid_mention_syntax"
+                            | "unknown_entity"
+                            | "mention_not_available"
+                            | "broadcast_not_available"
+                    )
+                })
+    }
+
     fn render(&self, text: &str) -> String {
+        if self.rejects_mentions(text) {
+            return "回复包含不允许的人员提及，已拦截。请使用有效的结构化提及后重试。".into();
+        }
         parse_output(text, &self.context).render_mentions(
             |reference, kind, label| match kind {
                 OutputEntityKind::User => self
@@ -927,6 +948,10 @@ impl FeishuOutputProtocol {
         text: &str,
         gateway: Option<&FeishuGateway>,
     ) -> String {
+        // Reject invalid mentions before uploading resources or delivering attachments.
+        if self.rejects_mentions(text) {
+            return self.render(text);
+        }
         let document = parse_feishu_image_output(text, &self.context);
         let mut rendered = text.to_string();
         for node in document.nodes.iter().rev() {
@@ -1193,16 +1218,33 @@ async fn build_feishu_output_protocol(
             .iter()
             .any(|participant| participant.user_id == user_id)
         {
+            if let Some(name) = mention
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                upsert_feishu_participant(&mut participants, user_id, name);
+            }
             continue;
         }
-        let label = match gateway {
-            Some(gateway) => gateway
-                .get_user_name(user_id)
-                .await
-                .ok()
-                .flatten()
-                .filter(|value| !value.trim().is_empty()),
-            None => None,
+        let label = if let Some(name) = mention
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name.to_string())
+        } else {
+            match gateway {
+                Some(gateway) => gateway
+                    .get_user_name(user_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty()),
+                None => None,
+            }
         }
         .unwrap_or_else(|| format!("会话用户{}", participants.len()));
         upsert_feishu_participant(&mut participants, user_id, &label);
@@ -1445,7 +1487,14 @@ impl FeishuEventForwarder<'_, '_> {
                 }
                 true
             }
-            CoreChatEvent::ResponseCompleted { text, .. } => {
+            CoreChatEvent::ResponseCompleted { message_id, text } => {
+                if self
+                    .replies
+                    .as_deref()
+                    .is_some_and(|replies| !replies.accepts_response(&message_id))
+                {
+                    return false;
+                }
                 let mut reply_msg = self.msg.clone();
                 reply_msg.message_id = self.state.active_reply_message_id.clone();
                 let rendered = self
@@ -1454,7 +1503,12 @@ impl FeishuEventForwarder<'_, '_> {
                     .render_final(self.runtime, &reply_msg, &text, self.gateway)
                     .await;
                 if let Some(replies) = self.replies.as_deref_mut() {
-                    replies.set_pending_final_text(rendered);
+                    if replies.set_pending_response(message_id, rendered) {
+                        if let Err(error) = replies.commit_response_output().await {
+                            warn!("failed to deliver Feishu response: {error:#}");
+                            return true;
+                        }
+                    }
                 }
                 false
             }
@@ -2250,9 +2304,20 @@ mod tests {
             workspace: PathBuf::from("/workspace"),
         };
         assert_eq!(
-            protocol.render("@[Alice](remi-mention:u0) @[所有人](remi-mention:all) plain @Alice"),
-            "<at id=ou_alice></at> <at id=all></at> plain @Alice"
+            protocol.render("@[Alice](remi-mention:u0) @[所有人](remi-mention:all)"),
+            "<at id=ou_alice></at> <at id=all></at>"
         );
+        for invalid in [
+            "@Alice",
+            "@Unknown",
+            "@[Unknown](remi-mention:ou_unknown)",
+            "@[Alice](remi-mention:u0) plain @Alice",
+        ] {
+            let blocked = protocol.render(invalid);
+            assert!(blocked.contains("已拦截"));
+            assert!(!blocked.contains("<at"));
+            assert!(!blocked.contains('@'));
+        }
     }
 
     #[test]
@@ -2264,7 +2329,7 @@ mod tests {
             workspace: PathBuf::from("/workspace"),
         };
         let source = "@[所有人](remi-mention:all)";
-        assert_eq!(protocol.render(source), source);
+        assert!(protocol.render(source).contains("已拦截"));
     }
 
     #[test]
@@ -2523,3 +2588,11 @@ mod image_live_test;
 #[cfg(test)]
 #[path = "feishu/review_live_test.rs"]
 mod review_live_test;
+
+#[cfg(test)]
+#[path = "feishu/async_live_test.rs"]
+mod async_live_test;
+
+#[cfg(test)]
+#[path = "feishu/mention_live_test.rs"]
+mod mention_live_test;

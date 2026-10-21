@@ -66,6 +66,8 @@ pub(super) struct FeishuReplyStream {
     run_id: String,
     pending_final_text: String,
     final_output_committed: bool,
+    final_response_id: Option<String>,
+    delivered_response_ids: HashSet<String>,
     final_delivery_error: Option<String>,
     cot: Option<CotMessage>,
     cot_create_failed: bool,
@@ -91,6 +93,8 @@ impl FeishuReplyStream {
             run_id: format!("run-{}", uuid::Uuid::new_v4()),
             pending_final_text: String::new(),
             final_output_committed: false,
+            final_response_id: None,
+            delivered_response_ids: HashSet::new(),
             final_delivery_error: None,
             cot: None,
             cot_create_failed: false,
@@ -118,6 +122,13 @@ impl FeishuReplyStream {
             return;
         }
         if kind == FeishuReplyKind::Error {
+            if self.final_delivery_error.is_some() {
+                return;
+            }
+            // An error after a delivered foreground answer is a distinct
+            // message too; never reuse that answer's idempotency key.
+            self.final_response_id = Some(format!("error-{}", uuid::Uuid::new_v4()));
+            self.final_output_committed = false;
             self.flush_pending_as_process().await;
             self.fail_run("AGENT_ERROR", chunk).await;
             self.pending_final_text = chunk.to_string();
@@ -147,8 +158,7 @@ impl FeishuReplyStream {
     }
 
     pub(super) async fn finish(&mut self) {
-        if self.final_output_committed || self.cot_completed || self.final_delivery_error.is_some()
-        {
+        if self.cot_completed || self.final_delivery_error.is_some() {
             return;
         }
         self.flush_pending_as_process().await;
@@ -158,6 +168,14 @@ impl FeishuReplyStream {
     }
 
     pub(super) async fn commit_final_output(&mut self) -> anyhow::Result<()> {
+        self.commit_response_output().await?;
+        self.finish_run("done").await;
+        Ok(())
+    }
+
+    // A completed foreground response is deliverable while background tools
+    // keep this COT run alive. Only terminal Done completes the process view.
+    pub(super) async fn commit_response_output(&mut self) -> anyhow::Result<()> {
         if self.final_output_committed || self.final_delivery_error.is_some() {
             return self.delivery_result();
         }
@@ -165,9 +183,7 @@ impl FeishuReplyStream {
         let result = self.send_final(&self.pending_final_text).await;
         let delivered = result.is_ok();
         self.record_delivery_result(result);
-        if delivered {
-            self.finish_run("done").await;
-        } else {
+        if !delivered {
             self.fail_run(
                 "DELIVERY_FAILED",
                 "最终回复发送失败，回复内容已保留。请重试。",
@@ -181,6 +197,9 @@ impl FeishuReplyStream {
         match result {
             Ok(()) => {
                 self.final_output_committed = true;
+                if let Some(id) = &self.final_response_id {
+                    self.delivered_response_ids.insert(id.clone());
+                }
                 self.pending_final_text.clear();
                 self.final_delivery_error = None;
             }
@@ -205,6 +224,20 @@ impl FeishuReplyStream {
         }
     }
 
+    pub(super) fn accepts_response(&self, id: &str) -> bool {
+        self.final_delivery_error.is_none() && !self.delivered_response_ids.contains(id)
+    }
+
+    pub(super) fn set_pending_response(&mut self, id: String, text: String) -> bool {
+        if !self.accepts_response(&id) {
+            return false;
+        }
+        self.final_response_id = Some(id);
+        self.final_output_committed = false;
+        self.pending_final_text = text;
+        true
+    }
+
     /// End the current process view and start a new one anchored to the
     /// message that supplied the injected steer. The final reply follows the
     /// same anchor rather than the message that started the original run.
@@ -225,6 +258,8 @@ impl FeishuReplyStream {
         self.run_id = format!("run-{}", uuid::Uuid::new_v4());
         self.pending_final_text.clear();
         self.final_output_committed = false;
+        self.final_response_id = None;
+        self.delivered_response_ids.clear();
         self.final_delivery_error = None;
         self.cot = None;
         self.cot_create_failed = false;
@@ -528,7 +563,7 @@ impl FeishuReplyStream {
         let text_parent = card_parent.clone();
         deliver_final_with(
             content,
-            &self.run_id,
+            self.final_response_id.as_deref().unwrap_or(&self.run_id),
             move |text, id| {
                 let gateway = card_gateway.clone();
                 let parent = card_parent.clone();
@@ -909,13 +944,11 @@ where
                     plain.push_str(value);
                 }
             }
+            let plain = super::mentions::card_mentions_for_text(&plain);
             let mut remaining = plain.as_str();
             let mut index = 0;
             while !remaining.is_empty() {
-                let mut end = remaining.len().min(8000);
-                while !remaining.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = super::mentions::text_chunk_end(remaining, 8000);
                 let id = text(remaining[..end].to_string(), format!("{run_id}-t{index}")).await?;
                 anyhow::ensure!(!id.is_empty(), "fallback text response missing message_id");
                 remaining = &remaining[end..];
@@ -934,6 +967,31 @@ mod tests {
     };
     use im_feishu::FeishuGateway;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn delivered_foreground_response_allows_distinct_background_response() {
+        let mut reply = FeishuReplyStream::new(
+            FeishuGateway::new("unused", "unused"),
+            "oc_test".into(),
+            "om_test".into(),
+        );
+        assert!(reply.set_pending_response("foreground-id".into(), "started".into()));
+        reply.record_delivery_result(Ok(()));
+        assert!(reply.final_output_committed);
+        assert!(
+            !reply.cot_completed,
+            "foreground delivery must not end the background process view"
+        );
+        assert!(!reply.set_pending_response("foreground-id".into(), "duplicate".into()));
+        assert!(reply.set_pending_response("background-id".into(), "finished".into()));
+        assert!(!reply.final_output_committed);
+        assert_eq!(reply.final_response_id.as_deref(), Some("background-id"));
+        assert_eq!(reply.pending_final_text, "finished");
+        reply.record_delivery_result(Ok(()));
+        reply.commit_final_output().await.unwrap();
+        assert_eq!(reply.delivered_response_ids.len(), 2);
+        assert!(!reply.set_pending_response("background-id".into(), "duplicate".into()));
+    }
 
     #[tokio::test]
     async fn failed_delivery_keeps_the_final_for_recovery_and_exposes_the_error() {

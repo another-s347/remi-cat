@@ -35,7 +35,7 @@ use crate::token_usage::estimate_memory_message_tokens;
 use crate::tool_pretty::{tool_success, PrettyToolCall};
 use crate::ContextCompactionEvent;
 
-use super::compress::{compression_input_text, LlmCompressor};
+use super::compress::LlmCompressor;
 use super::tier::{make_preview, MemoryEntry, MemoryIndex};
 use crate::search_query::{tokenized_search_query, TokenizedSearchQuery};
 
@@ -829,7 +829,7 @@ impl MemoryStore {
         } else {
             String::new()
         };
-        let source = compression_input_text(active);
+        let source = compressor.input_content(active);
         let summary = if active.is_empty() {
             if previous_summary.trim().is_empty() {
                 return Err(AgentError::other(
@@ -844,12 +844,12 @@ impl MemoryStore {
             }
             value
         } else {
-            if source.trim().is_empty() {
+            if crate::token_usage::estimate_content_tokens(&source) == 0 {
                 return Err(AgentError::other(
                     "uncovered history has no text to summarize",
                 ));
             }
-            fold_compression_source(compressor, &previous_summary, &source).await?
+            fold_compression_content(compressor, &previous_summary, source).await?
         };
         let covered_id = ledger
             .get(start.saturating_sub(1))
@@ -1081,7 +1081,7 @@ impl MemoryStore {
         let tokens = |context: &MemoryContext| -> u32 {
             super::build_injected_history(context)
                 .iter()
-                .map(|message| crate::estimate_model_input_tokens(&message.content.text_content()))
+                .map(|message| crate::token_usage::estimate_content_tokens(&message.content))
                 .sum()
         };
         while tokens(&after) >= tokens(&before) && !after.retained_user_inputs.is_empty() {
@@ -1089,7 +1089,7 @@ impl MemoryStore {
             draft.retained_user_budget = after
                 .retained_user_inputs
                 .iter()
-                .map(|message| crate::estimate_model_input_tokens(&message.content.text_content()))
+                .map(|message| crate::token_usage::estimate_content_tokens(&message.content))
                 .sum();
         }
         if tokens(&after) >= tokens(&before) {
@@ -1473,7 +1473,7 @@ fn visible_ledger_messages(
         .rev()
         .filter(|m| m.role == Role::User)
     {
-        let tokens = crate::estimate_model_input_tokens(&message.content.text_content());
+        let tokens = crate::token_usage::estimate_content_tokens(&message.content);
         if used.saturating_add(tokens) > user_budget {
             break;
         }
@@ -1489,20 +1489,78 @@ async fn fold_compression_source(
     previous_summary: &str,
     source: &str,
 ) -> Result<String, AgentError> {
+    fold_compression_content(
+        compressor,
+        previous_summary,
+        remi_agentloop::prelude::Content::text(source),
+    )
+    .await
+}
+
+async fn fold_compression_content(
+    compressor: &LlmCompressor,
+    previous_summary: &str,
+    source: remi_agentloop::prelude::Content,
+) -> Result<String, AgentError> {
+    use remi_agentloop::prelude::{Content, ContentPart};
+    // Only text may be split. Each image remains an intact typed content part;
+    // never split or tokenize its URL/base64 transport representation.
+    let mut pending: std::collections::VecDeque<_> = match source {
+        Content::Text(text) => vec![ContentPart::text(text)].into(),
+        Content::Parts(parts) => parts.into(),
+    };
     let mut summary = previous_summary.to_string();
-    let mut remaining = source;
-    let mut summary_reductions = 0_u8;
-    while !remaining.is_empty() {
+    let mut reductions = 0_u8;
+    while !pending.is_empty() {
         let prefix = if summary.is_empty() {
             String::new()
         } else {
             format!("[Previous committed summary]\n{summary}\n\n[New source]\n")
         };
-        if !compressor.input_text_fits(&format!("{prefix}x")) {
-            if summary_reductions >= 8 {
-                return Err(AgentError::other(
-                    "compression summary still cannot admit more source after eight reductions",
-                ));
+        let mut chunk = vec![ContentPart::text(prefix)];
+        let mut consumed = false;
+        while let Some(part) = pending.front() {
+            let mut candidate = chunk.clone();
+            candidate.push(part.clone());
+            if compressor.input_content_fits(&Content::parts(candidate)) {
+                chunk.push(pending.pop_front().unwrap());
+                consumed = true;
+                continue;
+            }
+            if let ContentPart::Text { text } = part {
+                let boundaries = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(text.len()))
+                    .collect::<Vec<_>>();
+                let (mut low, mut high, mut fitted) =
+                    (1_usize, boundaries.len().saturating_sub(1), 0);
+                while low <= high {
+                    let middle = low + (high - low) / 2;
+                    let mut candidate = chunk.clone();
+                    candidate.push(ContentPart::text(&text[..boundaries[middle]]));
+                    if compressor.input_content_fits(&Content::parts(candidate)) {
+                        fitted = boundaries[middle];
+                        low = middle + 1;
+                    } else {
+                        high = middle.saturating_sub(1);
+                    }
+                }
+                if fitted > 0 {
+                    chunk.push(ContentPart::text(&text[..fitted]));
+                    let remainder = text[fitted..].to_string();
+                    pending.pop_front();
+                    if !remainder.is_empty() {
+                        pending.push_front(ContentPart::text(remainder));
+                    }
+                    consumed = true;
+                }
+            }
+            break;
+        }
+        if !consumed {
+            if summary.is_empty() || reductions >= 8 {
+                return Err(AgentError::other("compression source part cannot fit the model context; coverage was not committed"));
             }
             let reduced = compressor.compress_text(&summary).await?;
             if crate::estimate_model_input_tokens(&reduced)
@@ -1513,42 +1571,19 @@ async fn fold_compression_source(
                 ));
             }
             summary = reduced;
-            summary_reductions += 1;
+            reductions += 1;
             continue;
         }
-        summary_reductions = 0;
-        let mut boundaries = remaining
-            .char_indices()
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        boundaries.push(remaining.len());
-        let mut low = 1_usize;
-        let mut high = boundaries.len() - 1;
-        let mut fitted = 0_usize;
-        while low <= high {
-            let middle = low + (high - low) / 2;
-            let end = boundaries[middle];
-            if compressor.input_text_fits(&format!("{prefix}{}", &remaining[..end])) {
-                fitted = end;
-                low = middle + 1;
-            } else {
-                high = middle.saturating_sub(1);
-            }
-        }
-        if fitted == 0 {
-            return Err(AgentError::other(
-                "no source text fits the compressor context",
-            ));
-        }
-        let input = format!("{prefix}{}", &remaining[..fitted]);
-        let next = compressor.compress_text(&input).await?;
-        if crate::estimate_model_input_tokens(&next) >= crate::estimate_model_input_tokens(&input) {
+        reductions = 0;
+        let input = Content::parts(chunk);
+        let input_tokens = crate::token_usage::estimate_content_tokens(&input);
+        let next = compressor.compress_content(input).await?;
+        if crate::estimate_model_input_tokens(&next) >= input_tokens {
             return Err(AgentError::other(
                 "compressor output did not reduce its input",
             ));
         }
         summary = next;
-        remaining = &remaining[fitted..];
     }
     Ok(summary)
 }

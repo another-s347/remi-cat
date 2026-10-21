@@ -3597,7 +3597,7 @@ impl CatBot {
                         if !refreshed.retained_user_inputs.is_empty() {
                             refreshed.retained_user_inputs.remove(0);
                             draft.retained_user_budget = refreshed.retained_user_inputs.iter()
-                                .map(|message| crate::estimate_model_input_tokens(&message.content.text_content()))
+                                .map(|message| crate::token_usage::estimate_content_tokens(&message.content))
                                 .sum();
                         } else if !refreshed.short_term.is_empty() {
                             refreshed.short_term.clear();
@@ -10321,6 +10321,210 @@ You are Remi.
             assert_eq!(requests.len(), 2);
             assert!(requests[0].contains("call-1") && requests[0].contains("2026-07-14T00:00:01Z"));
             assert!(requests[1].contains("LATEST COMPRESSED MEMORY"));
+        });
+    }
+
+    #[test]
+    fn large_inline_image_does_not_trigger_false_compaction() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "80");
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text("image received"),
+                sse_text("image follow-up"),
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot_with_mode(
+                &data_dir,
+                base_url,
+                true,
+                4,
+                Vec::new(),
+                None,
+                ContextCompactionMode::Hard,
+                Some(64_000),
+            );
+            let image = format!("data:image/png;base64,{}", "A".repeat(2_000_000));
+            let events = collect_stream(bot.stream_content(
+                "large-image",
+                Content::parts(vec![ContentPart::image_url(&image)]),
+            ))
+            .await;
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, CatEvent::ContextCompaction(_))));
+            let snapshot = events
+                .iter()
+                .find_map(|event| match event {
+                    CatEvent::ModelInputSnapshot(snapshot) => Some(snapshot),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(snapshot.totals.estimated_tokens < 40_000);
+            assert!(!snapshot
+                .segments
+                .iter()
+                .any(|segment| segment.content.contains(&image)));
+            let restored = bot
+                .persisted_context_estimate("large-image", None, None)
+                .await
+                .unwrap();
+            assert!(
+                restored < 40_000,
+                "persisted estimate must not count base64: {restored}"
+            );
+            let followup = collect_stream(bot.stream("large-image", "what did you see?")).await;
+            assert!(!followup
+                .iter()
+                .any(|event| matches!(event, CatEvent::ContextCompaction(_))));
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests.iter().all(|request| request.contains(&image)),
+                "both real HTTP request bodies retain the full image"
+            );
+        });
+    }
+
+    #[test]
+    fn forced_compaction_sends_history_images_and_preserves_current_image() {
+        run_large_stack_local_test(|| async {
+            std::env::set_var("REMI_AUTO_COMPRESS_CONTEXT_PERCENT", "80");
+            let (base_url, requests) = start_openai_mock_server(vec![
+                sse_text(
+                    "The screenshot contains a red square. Continue the image task."
+                );
+                20
+            ])
+            .await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot_with_mode(
+                &data_dir,
+                base_url,
+                true,
+                4,
+                Vec::new(),
+                None,
+                ContextCompactionMode::Hard,
+                Some(64_000),
+            );
+            let old_url = "data:image/png;base64,OLD_IMAGE_BYTES";
+            let old_base64 = "HISTORY_BASE64_BYTES";
+            bot.memory
+                .append_failed_turn(
+                    "image-compaction",
+                    vec![
+                        Message::user_content(Content::parts(vec![
+                            ContentPart::image_url(old_url),
+                            ContentPart::image_base64("image/png", old_base64),
+                        ])),
+                        Message::assistant("The screenshot contains a red square."),
+                        Message::user("context evidence ".repeat(16_000)),
+                        Message::assistant("The image task remains pending."),
+                    ],
+                )
+                .await
+                .unwrap();
+            let current_image = "data:image/png;base64,CURRENT_IMAGE_BYTES";
+            let events = collect_stream(bot.stream_content(
+                "image-compaction",
+                Content::parts(vec![
+                    ContentPart::text("Compare this with the earlier screenshot."),
+                    ContentPart::image_url(current_image),
+                ]),
+            ))
+            .await;
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CatEvent::ContextCompaction(ContextCompactionEvent {
+                    status: ContextCompactionStatus::Completed,
+                    ..
+                })
+            )));
+            let requests = requests.lock().unwrap();
+            let compression = requests
+                .iter()
+                .filter(|request| request.contains("You are a memory compression assistant."))
+                .collect::<Vec<_>>();
+            assert!(!compression.is_empty());
+            assert!(compression.iter().any(|request| request.contains(old_url)));
+            assert!(compression
+                .iter()
+                .any(|request| request.contains(old_base64)));
+            assert!(
+                compression
+                    .iter()
+                    .all(|request| !request.contains(current_image)),
+                "current request is never summarized before inference"
+            );
+            let final_request = requests.last().unwrap();
+            assert!(final_request.contains(current_image));
+            assert!(final_request.contains("LATEST COMPRESSED MEMORY"));
+            assert!(final_request.contains("red square"));
+        });
+    }
+
+    #[test]
+    fn image_only_history_compacts_in_bounded_multimodal_batches() {
+        run_large_stack_local_test(|| async {
+            let (base_url, requests) =
+                start_openai_mock_server(vec![sse_text("Visual details preserved."); 10]).await;
+            let data_dir = tempfile::tempdir().unwrap();
+            let bot = build_mock_bot_with_mode(
+                &data_dir,
+                base_url,
+                true,
+                4,
+                Vec::new(),
+                None,
+                ContextCompactionMode::Hard,
+                Some(16_000),
+            );
+            let images = (0..6)
+                .map(|i| format!("data:image/png;base64,IMAGE_{i}_PAYLOAD"))
+                .collect::<Vec<_>>();
+            let message = Message::user_content(Content::parts(
+                images.iter().map(ContentPart::image_url).collect(),
+            ));
+            bot.memory
+                .append_failed_turn("image-only-batches", vec![message.clone()])
+                .await
+                .unwrap();
+            let compressor = bot.compressor_for_profile(&bot.model_profile).unwrap();
+            let draft = bot
+                .memory
+                .prepare_compaction("image-only-batches", &compressor)
+                .await
+                .unwrap();
+            assert!(draft.summary.contains("Visual details preserved"));
+            assert_eq!(draft.covered_messages, 1);
+            assert_eq!(
+                serde_json::to_value(
+                    &bot.memory
+                        .load_context("image-only-batches")
+                        .await
+                        .unwrap()
+                        .short_term[0]
+                        .content
+                )
+                .unwrap(),
+                serde_json::to_value(&message.content).unwrap()
+            );
+            let requests = requests.lock().unwrap();
+            assert!(
+                requests.len() >= 2,
+                "image batches must obey the compression context window"
+            );
+            for image in &images {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.matches(image).count())
+                        .sum::<usize>(),
+                    1,
+                    "each intact image must reach exactly one compression call"
+                );
+            }
         });
     }
 

@@ -8,7 +8,8 @@ use futures::StreamExt;
 
 use remi_agentloop::agent_loop::AgentLoop;
 use remi_agentloop::prelude::{
-    Agent, AgentBuilder, AgentConfig, AgentError, LoopInput, Message, OpenAIClient,
+    Agent, AgentBuilder, AgentConfig, AgentError, Content, ContentPart, LoopInput, Message,
+    OpenAIClient,
 };
 use remi_agentloop::types::AgentEvent;
 
@@ -25,7 +26,7 @@ it appears unrelated to the latest goal. \
 Return a concise, information-dense summary. Choose whatever structure best preserves the source. \
 Retain the latest user intent, constraints, confirmed facts and decisions, completed work and evidence, \
 current state, pending work, failures and uncertainties, and exact references whenever present. \
-For tool activity retain the tool name, concise arguments, success status, duration, key result, \
+For images retain the visible content, labels, relationships, and details relevant to the conversation; never invent unreadable details. For tool activity retain the tool name, concise arguments, success status, duration, key result, \
 errors, paths, IDs, and exact values. Output only the summary.";
 
 // ── LlmCompressor ────────────────────────────────────────────────────────────
@@ -139,12 +140,15 @@ impl LlmCompressor {
     }
 
     pub fn input_fits(&self, messages: &[Message]) -> bool {
-        let text = compression_input_text(messages);
-        self.input_text_fits(&text)
+        self.input_content_fits(&self.input_content(messages))
     }
 
     pub(crate) fn input_text_fits(&self, text: &str) -> bool {
-        let source = crate::estimate_model_input_tokens(text);
+        self.input_content_fits(&Content::text(text))
+    }
+
+    pub(crate) fn input_content_fits(&self, content: &Content) -> bool {
+        let source = crate::token_usage::estimate_content_tokens(content);
         let output = self.output_budget(source);
         if output < self.max_output_tokens.min(4_096) {
             return false;
@@ -166,29 +170,64 @@ impl LlmCompressor {
             return Ok(String::new());
         }
 
-        // Tool results are part of the durable evidence. Bound only the input
-        // presented to the compressor; the ledger always retains full content.
-        let text = compression_input_text(messages);
+        self.compress_content(self.input_content(messages)).await
+    }
 
-        if text.is_empty() {
-            tracing::warn!(
-                "LlmCompressor: all {} messages empty, nothing to compress",
-                messages.len(),
-            );
-            return Ok(String::new());
+    pub(crate) fn input_content(&self, messages: &[Message]) -> Content {
+        let supports_images = self
+            .provider
+            .as_ref()
+            .is_some_and(|(profile, _)| profile.supports_images);
+        let mut parts = Vec::new();
+        for message in messages {
+            parts.push(ContentPart::text(compression_input_text(
+                std::slice::from_ref(message),
+            )));
+            if let Content::Parts(source) = &message.content {
+                for part in source {
+                    if matches!(
+                        part,
+                        ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. }
+                    ) {
+                        if supports_images {
+                            parts.push(part.clone());
+                        } else {
+                            parts.push(ContentPart::text("[Visual content unavailable to this text-only compression model; do not infer image details.]"));
+                        }
+                    }
+                }
+            }
         }
-
-        self.compress_text(&text).await
+        if parts
+            .iter()
+            .all(|part| matches!(part, ContentPart::Text { .. }))
+        {
+            return Content::text(
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            );
+        }
+        Content::parts(parts)
     }
 
     pub(crate) async fn compress_text(&self, text: &str) -> Result<String, AgentError> {
-        let source_tokens = crate::estimate_model_input_tokens(text);
-        if !self.input_text_fits(text) {
+        self.compress_content(Content::text(text)).await
+    }
+
+    pub(crate) async fn compress_content(&self, content: Content) -> Result<String, AgentError> {
+        let source_tokens = crate::token_usage::estimate_content_tokens(&content);
+        if !self.input_content_fits(&content) {
             return Err(AgentError::other(format!(
                 "LlmCompressor: compression input does not fit model context (estimated {source_tokens} source tokens)"
             )));
         }
-        let input = LoopInput::start(text.to_string());
+        let input = LoopInput::start_content(content);
         let inner = self.build_loop(self.output_budget(source_tokens));
         let stream = inner
             .chat(bot_runtime_core::chat_ctx_from_input(&input, None), input)
@@ -298,7 +337,7 @@ pub(crate) fn compression_input_text(messages: &[Message]) -> String {
         .iter()
         .map(|m| {
             let role = format!("{:?}", m.role);
-            let raw = m.content.text_content();
+            let raw = crate::token_usage::content_accounting_text(&m.content);
             let body = truncate_tool_body(&role, &raw, 12_000);
             if body.is_empty() {
                 return String::new();
@@ -548,6 +587,50 @@ mod tests {
 
         assert!(!summary.trim().is_empty());
         assert!(summary.to_ascii_lowercase().contains("staging"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KIMI_API_KEY, REMI_TEST_IMAGE_PATH and REMI_TEST_IMAGE_MARKER; calls the live Moonshot API"]
+    async fn live_image_compression_preserves_visible_marker() {
+        use base64::Engine;
+        let api_key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY must be set");
+        let path = std::env::var("REMI_TEST_IMAGE_PATH").expect("test PNG path must be set");
+        let expected =
+            std::env::var("REMI_TEST_IMAGE_MARKER").expect("visible test marker must be set");
+        let profile: crate::ModelProfileConfig =
+            serde_yaml::from_str(include_str!("../../../../.remi-cat/models/kimi-k2.6.yaml"))
+                .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let compressor = LlmCompressor::new(
+            api_key,
+            profile.base_url.clone(),
+            profile.model.clone(),
+            100_000,
+            4_096,
+            serde_json::Map::new(),
+        )
+        .with_provider(profile, data_dir.path().to_path_buf());
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(std::fs::read(path).unwrap());
+        let input = vec![Message::user_content(Content::parts(vec![
+            ContentPart::text("Record the exact alphanumeric code and the left-to-right block colors visible in this image so a future assistant can recall them without the image."),
+            ContentPart::image_url(format!("data:image/png;base64,{encoded}")),
+        ]))];
+        assert!(compressor.input_fits(&input));
+        let summary = compressor.compress(&input).await.unwrap();
+        assert!(
+            summary.contains(&expected),
+            "summary lost visible marker: {summary}"
+        );
+        let lower = summary.to_ascii_lowercase();
+        for color in ["red", "green", "blue"] {
+            assert!(
+                lower.contains(color),
+                "summary lost color {color}: {summary}"
+            );
+        }
+        assert!(!summary.contains(&encoded));
+        println!("Live image compression preserved marker and colors: {summary}");
     }
 
     #[tokio::test]

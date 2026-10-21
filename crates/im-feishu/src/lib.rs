@@ -131,6 +131,8 @@ pub struct FeishuDocument {
 #[derive(Debug, Clone, Default)]
 pub struct FeishuMention {
     pub key: String,
+    /// Display name supplied by Feishu alongside the bound user ID.
+    pub name: Option<String>,
     pub open_id: Option<String>,
     pub user_id: Option<String>,
 }
@@ -283,6 +285,8 @@ struct RawMessage {
 struct RawMention {
     /// Placeholder key in the text, e.g. `"@_user_1"`.
     key: String,
+    #[serde(default)]
+    name: Option<String>,
     id: RawSenderId,
 }
 
@@ -696,6 +700,7 @@ impl FeishuGateway {
                     .filter(|mention| mention.id.open_id.as_deref() != bot_open_id)
                     .map(|mention| FeishuMention {
                         key: mention.key.clone(),
+                        name: mention.name.clone(),
                         open_id: mention.id.open_id.clone(),
                         user_id: mention.id.user_id.clone(),
                     })
@@ -1621,6 +1626,23 @@ mod tests {
         let by_id =
             serde_json::to_vec(&event(json!({"sender_id": {"open_id": "ou_bot"}}))).unwrap();
         assert!(FeishuGateway::extract_event(&by_id, Some("ou_bot")).is_none());
+    }
+
+    #[test]
+    fn incoming_mentions_keep_provider_names_bound_to_ids() {
+        let payload = json!({"header":{"event_type":"im.message.receive_v1"},"event":{
+            "sender":{"sender_type":"user","sender_id":{"open_id":"ou_sender"}},
+            "message":{"message_id":"om_test","chat_id":"oc_test","chat_type":"group","message_type":"text","content":"{\"text\":\"@_user_1 请通知 @_user_2\"}",
+                "mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"Bot"},{"key":"@_user_2","id":{"open_id":"ou_target"},"name":"张三"}]}
+        }});
+        let Some(FeishuEvent::MessageReceived(message)) =
+            FeishuGateway::extract_event(&serde_json::to_vec(&payload).unwrap(), Some("ou_bot"))
+        else {
+            panic!("expected real message payload");
+        };
+        assert_eq!(message.mentions.len(), 1);
+        assert_eq!(message.mentions[0].name.as_deref(), Some("张三"));
+        assert_eq!(message.mentions[0].open_id.as_deref(), Some("ou_target"));
     }
 
     #[test]

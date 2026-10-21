@@ -5044,7 +5044,7 @@ dependencies = [
 
 [[package]]
 name = "remi-cat"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
