@@ -42,6 +42,7 @@ a2a = { package = "a2a-lf", version = "0.3.0" }
 async-trait = "0.1"
 fs2 = "0.4"
 jsonwebtoken = "9"
+httpdate = "1"
 aho-corasick = "1"
 html2md = "0.2.15"
 libc = "0.2"

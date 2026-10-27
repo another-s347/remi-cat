@@ -131,15 +131,27 @@ impl Agent for ChatGptResponsesClient {
                     Ok(Ok(r)) if r.status().is_success() => { response = Some(r); break; }
                     Ok(Ok(r)) => {
                         let status = r.status();
+                        let delay = retry_delay(attempt, r.headers());
                         let request_id = r.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
                         let value = match tokio::time::timeout(Duration::from_secs(15), r.json::<Value>()).await { Ok(Ok(v)) => v, _ => Value::Null };
                         let error = api_error(status.as_u16(), &value, &request_id);
-                        if attempt < 2 && matches!(status.as_u16(), 502 | 503 | 504) && !is_terminal_code(error_code(&value)) {
-                            tokio::time::sleep(Duration::from_millis(250 << attempt)).await; continue;
+                        if attempt < 2 && matches!(status.as_u16(), 500 | 502 | 503 | 504 | 520) && !is_terminal_code(error_code(&value)) {
+                            if let Some(delay) = delay {
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => { yield ChatResponseChunk::Error(AgentError::other("ChatGPT request cancelled")); return; },
+                                    _ = tokio::time::sleep(delay) => {},
+                                }
+                                continue;
+                            }
                         }
                         yield ChatResponseChunk::Error(error); return;
                     }
-                    _ if attempt < 2 => { tokio::time::sleep(Duration::from_millis(250 << attempt)).await; }
+                    _ if attempt < 2 => {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => { yield ChatResponseChunk::Error(AgentError::other("ChatGPT request cancelled")); return; },
+                            _ = tokio::time::sleep(Duration::from_secs(1 << attempt)) => {},
+                        }
+                    }
                     _ => { yield ChatResponseChunk::Error(AgentError::other("ChatGPT request transport failed before stream opened")); return; }
                 }
             }
@@ -180,6 +192,30 @@ impl Agent for ChatGptResponsesClient {
 }
 fn agent_error(e: anyhow::Error) -> AgentError {
     AgentError::other(e.to_string())
+}
+
+/// Do not retry sooner than the server requests, or keep a turn waiting indefinitely.
+/// Returning None leaves long Retry-After responses to the user instead of shortening them.
+fn retry_delay(attempt: u32, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let backoff = Duration::from_secs(1 << attempt.min(2));
+    let requested = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.trim()
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    httpdate::parse_http_date(v).ok().map(|date| {
+                        date.duration_since(std::time::SystemTime::now())
+                            .unwrap_or_default()
+                    })
+                })
+        })
+        .unwrap_or_default();
+    let delay = requested.max(backoff);
+    (delay <= Duration::from_secs(60)).then_some(delay)
 }
 
 fn wire_name(name: &str) -> String {
@@ -873,6 +909,23 @@ mod tests {
         requests.push(body);
         let request_number = requests.len();
         drop(requests);
+        let mode = state.mode.load(Ordering::SeqCst);
+        if matches!(mode, 4..=7) && (mode != 4 || request_number <= 2) {
+            let body = if mode == 6 {
+                json!({"error":{"code":"subscription_sharing_usage_limit_exceeded"}}).to_string()
+            } else {
+                "<html>unknown origin error</html>".into()
+            };
+            return (
+                axum::http::StatusCode::from_u16(520).unwrap(),
+                [("retry-after", if mode == 7 { "60" } else { "0" })],
+                body,
+            )
+                .into_response();
+        }
+        if mode == 8 {
+            return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
         if state.mode.load(Ordering::SeqCst) == 2 {
             return (
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -921,6 +974,88 @@ mod tests {
         let mut client = ChatGptResponsesClient::new(auth);
         client.endpoint = Some(endpoint_url);
         (dir, client, state, h)
+    }
+    #[tokio::test]
+    async fn http_520_retries_before_stream_and_recovers() {
+        let (_dir, client, state, h) = server().await;
+        state.mode.store(4, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .complete_text("test", "system", "hello", Default::default())
+                .await
+                .unwrap(),
+            "hello"
+        );
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request == &requests[0]));
+        h.abort();
+    }
+    #[tokio::test]
+    async fn http_520_stops_after_three_attempts_and_preserves_terminal_errors() {
+        let (_dir, client, state, h) = server().await;
+        state.mode.store(5, Ordering::SeqCst);
+        let error = client
+            .complete_text("test", "system", "hello", Default::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("HTTP 520"));
+        assert_eq!(state.requests.lock().await.len(), 3);
+        for mode in [6, 8] {
+            state.requests.lock().await.clear();
+            state.mode.store(mode, Ordering::SeqCst);
+            assert!(client
+                .complete_text("test", "system", "hello", Default::default())
+                .await
+                .is_err());
+            assert_eq!(state.requests.lock().await.len(), 1);
+        }
+        h.abort();
+    }
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_after_without_another_request() {
+        let (_dir, client, state, h) = server().await;
+        state.mode.store(7, Ordering::SeqCst);
+        let ctx = ChatCtx::default();
+        let mut stream = client.chat(ctx.clone(), request()).await.unwrap();
+        let cancel = async {
+            while state.requests.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ctx.cancel();
+        };
+        let (_, chunk) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(cancel, stream.next())
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(chunk, Some(ChatResponseChunk::Error(e)) if e.to_string().contains("cancelled"))
+        );
+        assert_eq!(state.requests.lock().await.len(), 1);
+        h.abort();
+    }
+    #[test]
+    fn retry_after_seconds_dates_invalid_and_long_delays() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_delay(0, &headers), Some(Duration::from_secs(1)));
+        assert_eq!(retry_delay(1, &headers), Some(Duration::from_secs(2)));
+        headers.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(retry_delay(0, &headers), Some(Duration::from_secs(5)));
+        headers.insert("retry-after", "61".parse().unwrap());
+        assert_eq!(retry_delay(0, &headers), None);
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert_eq!(retry_delay(1, &headers), Some(Duration::from_secs(2)));
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(10));
+        headers.insert("retry-after", date.parse().unwrap());
+        let delay = retry_delay(0, &headers).unwrap();
+        assert!(delay > Duration::from_secs(8) && delay <= Duration::from_secs(10));
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_delay(0, &headers), Some(Duration::from_secs(1)));
     }
     #[tokio::test]
     async fn http_success_disconnect_quota_cancel_and_logout() {

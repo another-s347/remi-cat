@@ -48,6 +48,10 @@ remi-cat config set model_profile=chatgpt-main
 
 An existing chat can use `/model chatgpt-main`. TUI, CLI, Web, Feishu, ACP, local sub-agents, approval review and memory compression share the selected model/provider path. Sub-agents with their own model bindings retain those bindings. Independent API-key-only features, including decision-model APIs and external ACP providers, retain their own authentication.
 
+## Temporary request failures
+
+Before a response stream opens, temporary HTTP 500, 502, 503, 504 and 520 failures are retried at most twice (three requests total), with 1s/2s backoff. `Retry-After` seconds and HTTP dates are respected; delays over 60 seconds stop automatic retry rather than retrying early. Cancelling interrupts the wait. Subscription eligibility, authorization and quota errors are not retried. Once the response stream opens, failures are never automatically replayed, including partial tool calls. Retries use the same subscription provider and never fall back to paid API billing.
+
 ## Remote terminals and login lifecycle
 
 On a remote machine, first forward a chosen loopback port **from the machine running the browser**:
