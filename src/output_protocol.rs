@@ -539,13 +539,14 @@ fn is_escaped(text: &str, index: usize) -> bool {
         == 1
 }
 
-/// Resolve a model-authored resource without allowing it to escape the roots
-/// the embedding host has explicitly exposed.
-pub fn resolve_resource_path(
-    raw_path: &str,
-    workspace: &Path,
-    readable_roots: &[PathBuf],
-) -> anyhow::Result<PathBuf> {
+/// Resolve a local image using the host's filesystem permissions.
+/// Relative paths are based on the workspace; absolute paths and symlinks may
+/// point outside it. The target must still exist and be a regular file.
+pub fn resolve_image_resource_path(raw_path: &str, workspace: &Path) -> anyhow::Result<PathBuf> {
+    canonical_resource_file(raw_path, workspace)
+}
+
+fn canonical_resource_file(raw_path: &str, workspace: &Path) -> anyhow::Result<PathBuf> {
     let raw_path = raw_path.trim();
     if raw_path.is_empty() {
         anyhow::bail!("resource path is empty");
@@ -562,6 +563,16 @@ pub fn resolve_resource_path(
     if !resolved.is_file() {
         anyhow::bail!("resource is not a file: {}", resolved.display());
     }
+    Ok(resolved)
+}
+
+/// Resolve a model-authored attachment within the roots exposed by the host.
+pub fn resolve_resource_path(
+    raw_path: &str,
+    workspace: &Path,
+    readable_roots: &[PathBuf],
+) -> anyhow::Result<PathBuf> {
+    let resolved = canonical_resource_file(raw_path, workspace)?;
     let roots = if readable_roots.is_empty() {
         vec![workspace.to_path_buf()]
     } else {
@@ -794,6 +805,20 @@ mod tests {
             source
         );
         assert!(context.prompt().contains("remi-chart"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_resource_resolution_allows_symlinks_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = workspace.path().join("linked.png");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert_eq!(
+            resolve_image_resource_path("linked.png", workspace.path()).unwrap(),
+            outside.path().canonicalize().unwrap()
+        );
+        assert!(resolve_resource_path("linked.png", workspace.path(), &[]).is_err());
     }
 
     #[test]

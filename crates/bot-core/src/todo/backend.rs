@@ -68,29 +68,52 @@ impl HybridTodoBackend {
     }
 
     pub async fn complete(&self, ctx: ToolContext, id: u64) -> Result<String, AgentError> {
-        let mut user_state = self.load_user_state(&ctx).await;
-        let mut todos = todos_from_user_state(&user_state);
-        let Some(index) = todos.iter().position(|todo| todo.id == id) else {
-            store_user_state(ctx, user_state);
-            return Ok(format!("Todo #{id} not found."));
-        };
+        self.complete_many(ctx, &[id]).await
+    }
 
-        todos[index].done = true;
-        write_todos_to_user_state(&mut user_state, &todos);
-        let batch_id = todos[index].batch_id;
-        prune_stale_todos(&mut user_state);
-        let batch_cleared = batch_id.is_some()
-            && !todos_from_user_state(&user_state)
-                .iter()
-                .any(|todo| todo.batch_id == batch_id);
-        store_user_state(ctx, user_state);
-        if batch_cleared {
-            Ok(format!(
-                "Todo #{id} marked as done; completed batch cleared."
-            ))
-        } else {
-            Ok(format!("Todo #{id} marked as done."))
+    pub async fn complete_many(&self, ctx: ToolContext, ids: &[u64]) -> Result<String, AgentError> {
+        if ids.is_empty() {
+            return Err(AgentError::tool("todo__complete", "ids must not be empty"));
         }
+        // Validate and commit together: a batch cannot be partly completed or
+        // lose another parallel completion through a load/store race.
+        Ok(ctx.update_user_state(|user_state| {
+            let mut todos = todos_from_user_state(user_state);
+            for id in ids {
+                if !todos.iter().any(|todo| todo.id == *id) {
+                    return format!("Todo #{id} not found.");
+                }
+            }
+            let mut affected_batches = HashSet::new();
+            for todo in &mut todos {
+                if ids.contains(&todo.id) {
+                    todo.done = true;
+                    affected_batches.extend(todo.batch_id);
+                }
+            }
+            write_todos_to_user_state(user_state, &todos);
+            prune_stale_todos(user_state);
+            let remaining = todos_from_user_state(user_state);
+            let batch_cleared = affected_batches
+                .iter()
+                .any(|id| !remaining.iter().any(|todo| todo.batch_id == Some(*id)));
+            let subject = if ids.len() == 1 {
+                format!("Todo #{}", ids[0])
+            } else {
+                format!(
+                    "Todos {}",
+                    ids.iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            if batch_cleared {
+                format!("{subject} marked as done; completed batch cleared.")
+            } else {
+                format!("{subject} marked as done.")
+            }
+        }))
     }
 
     pub async fn update(
@@ -207,6 +230,58 @@ mod tests {
             batch_title: None,
             batch_index: None,
         }
+    }
+
+    #[tokio::test]
+    async fn complete_many_validates_all_ids_before_changing_state() {
+        let backend = backend();
+        let ctx = test_ctx(json!({"__todos":[todo(1,"first"),todo(2,"second")],"unrelated":true}));
+        let before = ctx.user_state();
+        assert_eq!(
+            backend.complete_many(ctx.clone(), &[1, 99]).await.unwrap(),
+            "Todo #99 not found."
+        );
+        assert_eq!(ctx.user_state(), before);
+        backend.complete_many(ctx.clone(), &[1, 2]).await.unwrap();
+        assert!(todos_from_user_state(&ctx.user_state())
+            .iter()
+            .all(|t| t.done));
+        assert_eq!(ctx.user_state()["unrelated"], true);
+    }
+
+    #[tokio::test]
+    async fn parallel_completions_preserve_both_changes_and_clear_finished_batch() {
+        let backend = backend();
+        let ctx = test_ctx(json!({}));
+        let request = TodoBatchAddRequest {
+            title: "Batch".into(),
+            items: vec![
+                TodoBatchAddItemRequest {
+                    title: "first".into(),
+                    description: None,
+                },
+                TodoBatchAddItemRequest {
+                    title: "second".into(),
+                    description: None,
+                },
+            ],
+        };
+        backend
+            .add_batch(ctx.clone(), request.clone())
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            backend.complete(ctx.clone(), 1),
+            backend.complete(ctx.clone(), 2)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert!(todos_from_user_state(&ctx.user_state()).is_empty());
+        let next = backend.add_batch(ctx.clone(), request).await.unwrap();
+        assert_eq!(next.todo_ids, vec![3, 4]);
+        backend.complete_many(ctx.clone(), &[3, 4]).await.unwrap();
+        assert!(todos_from_user_state(&ctx.user_state()).is_empty());
+        assert_eq!(ctx.user_state()["__todo_next_id"], 5);
     }
 
     #[tokio::test]

@@ -537,8 +537,7 @@ impl DeliveryService {
             };
             if let Err(error) = gateway.ensure_authenticated().await {
                 record.receipt.state = "failed".into();
-                record.receipt.error =
-                    Some(format!("Feishu authentication failed: {error:#}"));
+                record.receipt.error = Some(format!("Feishu authentication failed: {error:#}"));
                 self.save(&record)?;
                 return Ok(record.receipt);
             }

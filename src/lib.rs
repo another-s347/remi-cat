@@ -51,11 +51,11 @@ pub use instance_profile::{
     PROFILE_FILE_NAME, PROFILE_SCHEMA_VERSION,
 };
 pub use output_protocol::{
-    parse_output, render_structured_fallbacks, resolve_resource_path, A2aConversationContext,
-    ChartKind, ChartPoint, ColumnKind, OutputCapabilities, OutputCapability, OutputChart,
-    OutputDiagnostic, OutputDocument, OutputEntity, OutputEntityKind, OutputNode, OutputNodeKind,
-    OutputProtocolContext, OutputTable, StructuredOutput, TableColumn, BROADCAST_ALL_REF,
-    OUTPUT_PROTOCOL_VERSION,
+    parse_output, render_structured_fallbacks, resolve_image_resource_path, resolve_resource_path,
+    A2aConversationContext, ChartKind, ChartPoint, ColumnKind, OutputCapabilities,
+    OutputCapability, OutputChart, OutputDiagnostic, OutputDocument, OutputEntity,
+    OutputEntityKind, OutputNode, OutputNodeKind, OutputProtocolContext, OutputTable,
+    StructuredOutput, TableColumn, BROADCAST_ALL_REF, OUTPUT_PROTOCOL_VERSION,
 };
 pub use profile_registry::{ProfileRegistry, RegisteredProfile};
 pub use runtime_config::{

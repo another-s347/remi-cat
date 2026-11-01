@@ -2,7 +2,9 @@ use std::io::Write;
 use std::path::Path;
 
 pub(crate) fn write(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let permissions = std::fs::metadata(destination).ok().map(|meta| meta.permissions());
+    let permissions = std::fs::metadata(destination)
+        .ok()
+        .map(|meta| meta.permissions());
     let temporary = destination.with_extension(format!(
         "{}.{}.tmp",
         destination
@@ -119,7 +121,11 @@ mod tests {
 
         write(&destination, b"new").unwrap();
 
-        let mode = std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 }

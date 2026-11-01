@@ -1,0 +1,2296 @@
+{
+  "default-dsh": {
+    "mode": "default",
+    "harness": "dsh",
+    "strict_passed": 1,
+    "clarified_passed": 4,
+    "completed": 4,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 182,
+      "api_rounds": 182,
+      "aux_rounds": 6,
+      "prompt_tokens": 3094850,
+      "completion_tokens": 76080,
+      "cached_tokens": 2789376,
+      "aux_input": 1510,
+      "aux_output": 53,
+      "peak_prompt_tokens": 45697,
+      "main_rounds": 176,
+      "todo_calls": 31,
+      "todo_rounds": 31,
+      "todo_only_rounds": 31,
+      "uncached_input": 305474
+    },
+    "transport_errors": {},
+    "rows": [
+      {
+        "id": "dsh-scheduler-1",
+        "harness": "dsh",
+        "task": "scheduler",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 326.43612982500053,
+        "passed": false,
+        "totals": {
+          "api_attempts": 33,
+          "api_rounds": 33,
+          "aux_rounds": 1,
+          "prompt_tokens": 384696,
+          "completion_tokens": 9763,
+          "cached_tokens": 348160,
+          "aux_input": 252,
+          "aux_output": 10,
+          "peak_prompt_tokens": 17654,
+          "main_rounds": 32,
+          "todo_calls": 8,
+          "todo_rounds": 8,
+          "todo_only_rounds": 8,
+          "uncached_input": 36536
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 134593,
+          "system": 17815,
+          "user": 9007,
+          "assistant": 192971,
+          "tool": 89588
+        },
+        "tool_calls": {
+          "get_goal": 1,
+          "create_goal": 1,
+          "working_directory": 1,
+          "glob": 1,
+          "read": 8,
+          "todo_write": 8,
+          "write": 5,
+          "bash": 12,
+          "update_goal": 1
+        },
+        "todo_trace": [
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_12_1b3cfe4d",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"pending\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"pending\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"pending\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 8,
+            "calls": [
+              {
+                "id": "todo_write_13_293a73bb",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"in_progress\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"pending\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"pending\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 10,
+            "calls": [
+              {
+                "id": "todo_write_15_6f483e57",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"in_progress\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"pending\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 12,
+            "calls": [
+              {
+                "id": "todo_write_17_e5728059",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"in_progress\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"pending\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 14,
+            "calls": [
+              {
+                "id": "todo_write_19_59a1fe56",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"in_progress\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 16,
+            "calls": [
+              {
+                "id": "todo_write_21_59f31156",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"completed\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"in_progress\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 18,
+            "calls": [
+              {
+                "id": "todo_write_23_2b9e9bd5",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"completed\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"completed\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"in_progress\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 31,
+            "calls": [
+              {
+                "id": "todo_write_36_86325625",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency waiting, failure propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes, JSON output)\",\"status\":\"completed\"},{\"content\":\"Add regression tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"completed\"},{\"content\":\"Run all tests and fix issues\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4408
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 0,
+            "delayMs": 1
+          },
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "dsh-scheduler-2",
+        "harness": "dsh",
+        "task": "scheduler",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 380.7014793039998,
+        "passed": false,
+        "totals": {
+          "api_attempts": 18,
+          "peak_prompt_tokens": 18120,
+          "api_rounds": 18,
+          "main_rounds": 17,
+          "prompt_tokens": 174882,
+          "completion_tokens": 10687,
+          "cached_tokens": 139264,
+          "aux_rounds": 1,
+          "aux_input": 252,
+          "aux_output": 11,
+          "todo_calls": 8,
+          "todo_rounds": 8,
+          "todo_only_rounds": 8,
+          "uncached_input": 35618
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 71503,
+          "system": 9520,
+          "user": 4852,
+          "assistant": 78984,
+          "tool": 34960
+        },
+        "tool_calls": {
+          "read": 8,
+          "glob": 1,
+          "todo_write": 8,
+          "write": 5,
+          "bash": 1
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_write_9_61d53f34",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"pending\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"pending\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"pending\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_write_10_a4afd94e",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"in_progress\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"pending\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"pending\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_12_0e6e0124",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"in_progress\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"pending\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"pending\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 9,
+            "calls": [
+              {
+                "id": "todo_write_14_2eb9eb19",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"in_progress\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"pending\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_write_16_c9513a80",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"in_progress\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 13,
+            "calls": [
+              {
+                "id": "todo_write_18_8e60e1c8",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"completed\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"in_progress\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 15,
+            "calls": [
+              {
+                "id": "todo_write_20_682bb6ad",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"completed\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"completed\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"in_progress\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 17,
+            "calls": [
+              {
+                "id": "todo_write_22_b5a319c9",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement validateGraph in src/graph.mjs (duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency)\",\"status\":\"completed\"},{\"content\":\"Implement runGraph in src/runner.mjs (concurrency, dependency resolution, error handling, skip propagation, abort signal, onEvent)\",\"status\":\"completed\"},{\"content\":\"Implement fromPlan in src/handlers.mjs (value, delay, fail, sum kinds with validation)\",\"status\":\"completed\"},{\"content\":\"Implement CLI in bin/run.mjs (args parsing, validation, JSON output, exit codes)\",\"status\":\"completed\"},{\"content\":\"Add regression tests covering scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\",\"status\":\"completed\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4408
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "dsh-stockroom-1",
+        "harness": "dsh",
+        "task": "stockroom",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 221.35766020699884,
+        "passed": false,
+        "totals": {
+          "api_attempts": 16,
+          "api_rounds": 16,
+          "aux_rounds": 1,
+          "prompt_tokens": 135741,
+          "completion_tokens": 7496,
+          "cached_tokens": 112640,
+          "aux_input": 247,
+          "aux_output": 8,
+          "peak_prompt_tokens": 14006,
+          "main_rounds": 15,
+          "todo_calls": 7,
+          "todo_rounds": 7,
+          "todo_only_rounds": 7,
+          "uncached_input": 23101
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 63091,
+          "system": 8414,
+          "user": 4234,
+          "assistant": 52454,
+          "tool": 30298
+        },
+        "tool_calls": {
+          "read": 8,
+          "glob": 1,
+          "todo_write": 7,
+          "write": 4,
+          "bash": 1
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_write_9_bb7d396e",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"pending\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"pending\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"pending\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_write_10_346caa0a",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"in_progress\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"pending\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"pending\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_12_161d096f",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"completed\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"in_progress\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"pending\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 9,
+            "calls": [
+              {
+                "id": "todo_write_14_6f29eb3c",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"completed\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"completed\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"in_progress\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_write_16_5917f5d4",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"completed\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"completed\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"completed\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"in_progress\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 13,
+            "calls": [
+              {
+                "id": "todo_write_18_69dedcf2",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"completed\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"completed\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"completed\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"completed\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"in_progress\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 15,
+            "calls": [
+              {
+                "id": "todo_write_20_9dd95162",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement open_db with schema version 2, migration from v1, and future-version rejection\",\"status\":\"completed\"},{\"content\":\"Implement service functions: add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"completed\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"completed\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"completed\"},{\"content\":\"Run tests and fix any issues\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4403
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 0,
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "dsh-stockroom-2",
+        "harness": "dsh",
+        "task": "stockroom",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 429.431989566001,
+        "passed": true,
+        "totals": {
+          "api_attempts": 29,
+          "peak_prompt_tokens": 24824,
+          "api_rounds": 29,
+          "main_rounds": 28,
+          "prompt_tokens": 454081,
+          "completion_tokens": 12002,
+          "cached_tokens": 403456,
+          "aux_rounds": 1,
+          "aux_input": 247,
+          "aux_output": 8,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 50625
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 117769,
+          "system": 15603,
+          "user": 7783,
+          "assistant": 224251,
+          "tool": 160182
+        },
+        "tool_calls": {
+          "read": 11,
+          "glob": 1,
+          "todo_write": 2,
+          "write": 4,
+          "bash": 11,
+          "edit": 5
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_write_9_8f2b51c1",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement db.open_db with migration v1->v2, foreign keys, version checks\",\"status\":\"in_progress\"},{\"content\":\"Implement service.add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"pending\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"pending\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"pending\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 28,
+            "calls": [
+              {
+                "id": "todo_write_33_54818f19",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement db.open_db with migration v1->v2, foreign keys, version checks\",\"status\":\"completed\"},{\"content\":\"Implement service.add_stock, get_stock, reserve, commit, cancel with validation and concurrency safety\",\"status\":\"completed\"},{\"content\":\"Implement CLI in __main__.py for add, reserve, commit, cancel, show with JSON output and error handling\",\"status\":\"completed\"},{\"content\":\"Write regression tests covering migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\",\"status\":\"completed\"},{\"content\":\"Run tests and fix any failures\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4403
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "dsh-trailindex-1",
+        "harness": "dsh",
+        "task": "trailindex",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 395.12978803999795,
+        "passed": false,
+        "totals": {
+          "api_attempts": 39,
+          "api_rounds": 39,
+          "aux_rounds": 1,
+          "prompt_tokens": 741558,
+          "completion_tokens": 15669,
+          "cached_tokens": 671744,
+          "aux_input": 256,
+          "aux_output": 8,
+          "peak_prompt_tokens": 32800,
+          "main_rounds": 38,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 69814
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 159829,
+          "system": 21133,
+          "user": 10901,
+          "assistant": 372231,
+          "tool": 296995
+        },
+        "tool_calls": {
+          "read": 13,
+          "working_directory": 1,
+          "glob": 1,
+          "todo_write": 3,
+          "write": 6,
+          "bash": 15,
+          "edit": 6
+        },
+        "todo_trace": [
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_write_11_f8297cd0",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement codec escape/unescape with backslash, tab, CR, LF handling\",\"status\":\"in_progress\"},{\"content\":\"Implement store save/load with TRAIL1 header, TSV rows, validation, atomic write\",\"status\":\"pending\"},{\"content\":\"Implement scan build with recursive directory traversal, filtering, UTF-8 reading, line counting\",\"status\":\"pending\"},{\"content\":\"Implement query with index load/validation and substring search\",\"status\":\"pending\"},{\"content\":\"Implement CLI main with build and query subcommands, error handling\",\"status\":\"pending\"},{\"content\":\"Add regression tests covering escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"pending\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_write_17_1dfb11bc",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement codec escape/unescape with backslash, tab, CR, LF handling\",\"status\":\"completed\"},{\"content\":\"Implement store save/load with TRAIL1 header, TSV rows, validation, atomic write\",\"status\":\"completed\"},{\"content\":\"Implement scan build with recursive directory traversal, filtering, UTF-8 reading, line counting\",\"status\":\"completed\"},{\"content\":\"Implement query with index load/validation and substring search\",\"status\":\"completed\"},{\"content\":\"Implement CLI main with build and query subcommands, error handling\",\"status\":\"completed\"},{\"content\":\"Add regression tests covering escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"in_progress\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 38,
+            "calls": [
+              {
+                "id": "todo_write_44_57ea431c",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement codec escape/unescape with backslash, tab, CR, LF handling\",\"status\":\"completed\"},{\"content\":\"Implement store save/load with TRAIL1 header, TSV rows, validation, atomic write\",\"status\":\"completed\"},{\"content\":\"Implement scan build with recursive directory traversal, filtering, UTF-8 reading, line counting\",\"status\":\"completed\"},{\"content\":\"Implement query with index load/validation and substring search\",\"status\":\"completed\"},{\"content\":\"Implement CLI main with build and query subcommands, error handling\",\"status\":\"completed\"},{\"content\":\"Add regression tests covering escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"completed\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4414
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "dsh-trailindex-2",
+        "harness": "dsh",
+        "task": "trailindex",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 594.361080753999,
+        "passed": false,
+        "totals": {
+          "api_attempts": 47,
+          "peak_prompt_tokens": 45697,
+          "api_rounds": 47,
+          "main_rounds": 46,
+          "prompt_tokens": 1203892,
+          "completion_tokens": 20463,
+          "cached_tokens": 1114112,
+          "aux_rounds": 1,
+          "aux_input": 256,
+          "aux_output": 8,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 89780
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 193477,
+          "system": 25557,
+          "user": 13165,
+          "assistant": 580254,
+          "tool": 580912
+        },
+        "tool_calls": {
+          "read": 17,
+          "glob": 1,
+          "todo_write": 3,
+          "write": 9,
+          "bash": 20,
+          "edit": 3
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_write_10_3a55834f",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement codec escape/unescape with backslash/tab/CR/LF handling\",\"status\":\"in_progress\"},{\"content\":\"Implement store save/load with validation and atomic write\",\"status\":\"pending\"},{\"content\":\"Implement scan/build with recursive filesystem scanning and UTF-8 reading\",\"status\":\"pending\"},{\"content\":\"Implement query with index loading and substring search\",\"status\":\"pending\"},{\"content\":\"Implement CLI main with build and query subcommands\",\"status\":\"pending\"},{\"content\":\"Add regression tests for escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"pending\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 14,
+            "calls": [
+              {
+                "id": "todo_write_20_a9a622d3",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Implement codec escape/unescape with backslash/tab/CR/LF handling\",\"status\":\"completed\"},{\"content\":\"Implement store save/load with validation and atomic write\",\"status\":\"completed\"},{\"content\":\"Implement scan/build with recursive filesystem scanning and UTF-8 reading\",\"status\":\"completed\"},{\"content\":\"Implement query with index loading and substring search\",\"status\":\"completed\"},{\"content\":\"Implement CLI main with build and query subcommands\",\"status\":\"completed\"},{\"content\":\"Add regression tests for escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"in_progress\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 46,
+            "calls": [
+              {
+                "id": "todo_write_52_74035fc4",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement codec escape/unescape with backslash/tab/CR/LF handling\",\"status\":\"completed\"},{\"content\":\"Implement store save/load with validation and atomic write\",\"status\":\"completed\"},{\"content\":\"Implement scan/build with recursive filesystem scanning and UTF-8 reading\",\"status\":\"completed\"},{\"content\":\"Implement query with index loading and substring search\",\"status\":\"completed\"},{\"content\":\"Implement CLI main with build and query subcommands\",\"status\":\"completed\"},{\"content\":\"Add regression tests for escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI\",\"status\":\"completed\"},{\"content\":\"Run cargo test --offline and fix any issues\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4414
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      }
+    ],
+    "standard_components_estimate": {
+      "tool_schema": 740262,
+      "system": 98042,
+      "user": 49942,
+      "assistant": 1501145,
+      "tool": 1192935
+    },
+    "tool_calls": {
+      "get_goal": 1,
+      "create_goal": 1,
+      "working_directory": 2,
+      "glob": 6,
+      "read": 65,
+      "todo_write": 31,
+      "write": 33,
+      "bash": 60,
+      "update_goal": 1,
+      "edit": 14
+    }
+  },
+  "default-opencode": {
+    "mode": "default",
+    "harness": "opencode",
+    "strict_passed": 4,
+    "clarified_passed": 5,
+    "completed": 4,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 227,
+      "api_rounds": 225,
+      "aux_rounds": 6,
+      "prompt_tokens": 6372615,
+      "completion_tokens": 119391,
+      "cached_tokens": 5928192,
+      "aux_input": 3322,
+      "aux_output": 52,
+      "peak_prompt_tokens": 76474,
+      "main_rounds": 219,
+      "missing_usage": 2,
+      "uncached_input": 444423
+    },
+    "transport_errors": {
+      "200": 2
+    },
+    "rows": [
+      {
+        "id": "opencode-scheduler-1",
+        "harness": "opencode",
+        "task": "scheduler",
+        "repeat": 1,
+        "exit_code": 130,
+        "timed_out": true,
+        "elapsed": 900.3143339790004,
+        "passed": false,
+        "totals": {
+          "api_attempts": 60,
+          "api_rounds": 59,
+          "aux_rounds": 1,
+          "prompt_tokens": 2379889,
+          "completion_tokens": 38794,
+          "cached_tokens": 2245632,
+          "aux_input": 554,
+          "aux_output": 9,
+          "peak_prompt_tokens": 76474,
+          "main_rounds": 58,
+          "missing_usage": 1,
+          "uncached_input": 134257
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 162227,
+          "system": 218685,
+          "user": 7225,
+          "assistant": 1289613,
+          "tool": 963689
+        },
+        "tool_calls": {
+          "read": 17,
+          "write": 27,
+          "shell": 23,
+          "edit": 3
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6077
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "opencode-scheduler-2",
+        "harness": "opencode",
+        "task": "scheduler",
+        "repeat": 2,
+        "exit_code": 130,
+        "timed_out": true,
+        "elapsed": 900.3646055049976,
+        "passed": false,
+        "totals": {
+          "api_attempts": 66,
+          "api_rounds": 65,
+          "aux_rounds": 1,
+          "prompt_tokens": 2216536,
+          "completion_tokens": 29170,
+          "cached_tokens": 2097152,
+          "aux_input": 554,
+          "aux_output": 9,
+          "peak_prompt_tokens": 59968,
+          "main_rounds": 64,
+          "missing_usage": 1,
+          "uncached_input": 119384
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 179009,
+          "system": 241263,
+          "user": 7957,
+          "assistant": 1138212,
+          "tool": 915526
+        },
+        "tool_calls": {
+          "read": 22,
+          "write": 6,
+          "shell": 22,
+          "edit": 25,
+          "execute": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6077
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 0,
+            "delayMs": 1
+          },
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "opencode-stockroom-1",
+        "harness": "opencode",
+        "task": "stockroom",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 283.23666037699877,
+        "passed": true,
+        "totals": {
+          "api_attempts": 16,
+          "api_rounds": 16,
+          "aux_rounds": 1,
+          "prompt_tokens": 228088,
+          "completion_tokens": 9855,
+          "cached_tokens": 192000,
+          "aux_input": 549,
+          "aux_output": 9,
+          "peak_prompt_tokens": 24279,
+          "main_rounds": 15,
+          "uncached_input": 36088
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 41956,
+          "system": 56876,
+          "user": 1915,
+          "assistant": 91229,
+          "tool": 67955
+        },
+        "tool_calls": {
+          "read": 12,
+          "glob": 1,
+          "write": 4,
+          "shell": 2,
+          "edit": 4
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6072
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "opencode-stockroom-2",
+        "harness": "opencode",
+        "task": "stockroom",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 343.5698135320017,
+        "passed": true,
+        "totals": {
+          "api_attempts": 19,
+          "api_rounds": 19,
+          "aux_rounds": 1,
+          "prompt_tokens": 233588,
+          "completion_tokens": 12582,
+          "cached_tokens": 193536,
+          "aux_input": 549,
+          "aux_output": 9,
+          "peak_prompt_tokens": 23358,
+          "main_rounds": 18,
+          "uncached_input": 40052
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 50347,
+          "system": 68165,
+          "user": 2269,
+          "assistant": 96916,
+          "tool": 47513
+        },
+        "tool_calls": {
+          "read": 9,
+          "glob": 1,
+          "write": 4,
+          "shell": 3,
+          "edit": 4
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6072
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "opencode-trailindex-1",
+        "harness": "opencode",
+        "task": "trailindex",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 531.0553234850013,
+        "passed": true,
+        "totals": {
+          "api_attempts": 43,
+          "api_rounds": 43,
+          "aux_rounds": 1,
+          "prompt_tokens": 985349,
+          "completion_tokens": 16679,
+          "cached_tokens": 910848,
+          "aux_input": 558,
+          "aux_output": 8,
+          "peak_prompt_tokens": 34028,
+          "main_rounds": 42,
+          "uncached_input": 74501
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 117475,
+          "system": 158561,
+          "user": 5445,
+          "assistant": 555027,
+          "tool": 307200
+        },
+        "tool_calls": {
+          "read": 18,
+          "write": 8,
+          "shell": 20,
+          "edit": 8,
+          "execute": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3448,
+          "api_input": 6083
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "opencode-trailindex-2",
+        "harness": "opencode",
+        "task": "trailindex",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 334.2639825410006,
+        "passed": true,
+        "totals": {
+          "api_attempts": 23,
+          "api_rounds": 23,
+          "aux_rounds": 1,
+          "prompt_tokens": 329165,
+          "completion_tokens": 12311,
+          "cached_tokens": 289024,
+          "aux_input": 558,
+          "aux_output": 8,
+          "peak_prompt_tokens": 23640,
+          "main_rounds": 22,
+          "uncached_input": 40141
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 61535,
+          "system": 83261,
+          "user": 2925,
+          "assistant": 165352,
+          "tool": 62328
+        },
+        "tool_calls": {
+          "read": 9,
+          "glob": 1,
+          "edit": 14,
+          "shell": 5
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3448,
+          "api_input": 6083
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      }
+    ],
+    "standard_components_estimate": {
+      "tool_schema": 612549,
+      "system": 826811,
+      "user": 27736,
+      "assistant": 3336349,
+      "tool": 2364211
+    },
+    "tool_calls": {
+      "read": 87,
+      "write": 49,
+      "shell": 75,
+      "edit": 58,
+      "execute": 2,
+      "glob": 3
+    }
+  },
+  "default-remi": {
+    "mode": "default",
+    "harness": "remi",
+    "strict_passed": 2,
+    "clarified_passed": 3,
+    "completed": 3,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 91,
+      "peak_prompt_tokens": 18772,
+      "api_rounds": 89,
+      "main_rounds": 89,
+      "prompt_tokens": 864951,
+      "completion_tokens": 53910,
+      "cached_tokens": 698368,
+      "todo_calls": 18,
+      "todo_rounds": 17,
+      "todo_only_rounds": 17,
+      "missing_usage": 2,
+      "uncached_input": 166583
+    },
+    "transport_errors": {
+      "200": 2
+    },
+    "rows": [
+      {
+        "id": "remi-scheduler-1",
+        "harness": "remi",
+        "task": "scheduler",
+        "repeat": 1,
+        "exit_code": 1,
+        "timed_out": false,
+        "elapsed": 300.1047104370009,
+        "passed": false,
+        "totals": {
+          "api_attempts": 13,
+          "peak_prompt_tokens": 17630,
+          "api_rounds": 12,
+          "main_rounds": 12,
+          "prompt_tokens": 109920,
+          "completion_tokens": 11860,
+          "cached_tokens": 83968,
+          "todo_calls": 4,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "missing_usage": 1,
+          "uncached_input": 25952
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 38796,
+          "system": 16536,
+          "user": 1452,
+          "assistant": 47734,
+          "tool": 21197
+        },
+        "tool_calls": {
+          "todo": 4,
+          "fs_read": 8,
+          "fs_ls": 4,
+          "fs_write": 6,
+          "bash": 3
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_e335065a",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Understand SPEC and existing codebase\", \"items\": [{\"title\":\"Read SPEC.md and understand requirements\"},{\"title\":\"Explore workspace structure and existing code\"},{\"title\":\"Identify gaps between spec and implementation\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_13_3d4217a8",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement library core\", \"items\": [{\"title\":\"Implement graph validation in graph.mjs\"},{\"title\":\"Implement async runner in runner.mjs\"},{\"title\":\"Implement CLI handlers in handlers.mjs\"},{\"title\":\"Implement CLI in bin/run.mjs\"}]}"
+              },
+              {
+                "id": "todo_14_427a2a6a",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Tests and verification\", \"items\": [{\"title\":\"Add comprehensive regression tests\"},{\"title\":\"Run tests and fix issues\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_19_80ad910a",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [4,5,6,7]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4193
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "remi-scheduler-2",
+        "harness": "remi",
+        "task": "scheduler",
+        "repeat": 2,
+        "exit_code": 1,
+        "timed_out": false,
+        "elapsed": 300.1001854310016,
+        "passed": false,
+        "totals": {
+          "api_attempts": 14,
+          "peak_prompt_tokens": 13684,
+          "api_rounds": 14,
+          "main_rounds": 14,
+          "prompt_tokens": 113518,
+          "completion_tokens": 7290,
+          "cached_tokens": 88064,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 25454
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 45262,
+          "system": 19292,
+          "user": 1694,
+          "assistant": 44241,
+          "tool": 20771
+        },
+        "tool_calls": {
+          "todo": 3,
+          "fs_read": 8,
+          "fs_ls": 4,
+          "fs_write": 5,
+          "bash": 3
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_e56affa5",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Understand project structure and SPEC.md\", \"items\": [{\"title\":\"Read SPEC.md and understand requirements\"},{\"title\":\"Explore existing codebase structure\"},{\"title\":\"Identify gaps between spec and implementation\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_13_a836e191",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement core library\", \"items\": [{\"title\":\"Implement validateGraph in graph.mjs (validation before side effects)\"},{\"title\":\"Implement runGraph in runner.mjs (async scheduling, concurrency, abort, events)\"},{\"title\":\"Implement fromPlan in handlers.mjs (kind: value, delay, fail, sum)\"},{\"title\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes)\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 10,
+            "calls": [
+              {
+                "id": "todo_18_5ed541bd",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Write comprehensive tests\", \"items\": [{\"title\":\"Write regression tests covering validation, scheduling, failure, abort, CLI\"},{\"title\":\"Run tests and fix issues\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4193
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "remi-stockroom-1",
+        "harness": "remi",
+        "task": "stockroom",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 207.87637648099917,
+        "passed": true,
+        "totals": {
+          "api_attempts": 12,
+          "peak_prompt_tokens": 13269,
+          "api_rounds": 12,
+          "main_rounds": 12,
+          "prompt_tokens": 108381,
+          "completion_tokens": 6630,
+          "cached_tokens": 86016,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 22365
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 38796,
+          "system": 16536,
+          "user": 1404,
+          "assistant": 48447,
+          "tool": 20978
+        },
+        "tool_calls": {
+          "fs_read": 5,
+          "fs_ls": 3,
+          "todo": 2,
+          "fs_write": 5,
+          "bash": 2,
+          "apply_patch": 2
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_8_e0bc601b",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement stockroom package\", \"items\": [{\"title\":\"Implement db.py: migration v1->v2, foreign keys, user_version\",\"description\":\"Update open_db to enable FKs, create v2 schema, migrate v1 without data loss, reject future versions.\"},{\"title\":\"Implement service.py: add_stock, get_stock, reserve, commit, cancel\",\"description\":\"Transactional lifecycle, idempotency, concurrent safety, validation.\"},{\"title\":\"Implement CLI in __main__.py\",\"description\":\"Persistent DB, JSON stdout/stderr, commands add/reserve/commit/cancel/show.\"},{\"title\":\"Add regression tests\",\"description\":\"Migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips.\"},{\"title\":\"Run tests and verify\",\"description\":\"python3 -m unittest discover -v\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_18_52b773e7",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4188
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-stockroom-2",
+        "harness": "remi",
+        "task": "stockroom",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 238.5232853460002,
+        "passed": true,
+        "totals": {
+          "api_attempts": 13,
+          "peak_prompt_tokens": 16679,
+          "api_rounds": 13,
+          "main_rounds": 13,
+          "prompt_tokens": 131530,
+          "completion_tokens": 9590,
+          "cached_tokens": 106496,
+          "todo_calls": 4,
+          "todo_rounds": 4,
+          "todo_only_rounds": 4,
+          "uncached_input": 25034
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 42029,
+          "system": 17914,
+          "user": 1521,
+          "assistant": 65556,
+          "tool": 26046
+        },
+        "tool_calls": {
+          "todo": 4,
+          "fs_read": 7,
+          "fs_ls": 3,
+          "fs_write": 6,
+          "bash": 2
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_9eaa5fdb",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement SQLite stock-reservation package\", \"items\": [{\"title\":\"Read SPEC.md and understand requirements\",\"description\":\"Understand migration, transactional inventory/reservation lifecycle, concurrent safety, persistent JSON CLI, existing APIs\"},{\"title\":\"Explore existing codebase structure\",\"description\":\"Find existing files, APIs, data, tests\"},{\"title\":\"Implement migration system\",\"description\":\"Create migration scripts for schema versioning\"},{\"title\":\"Implement transactional inventory/reservation lifecycle\",\"description\":\"Stock in, reserve, fulfill, cancel with ACID guarantees\"},{\"title\":\"Implement concurrent safety\",\"description\":\"Use SQLite transactions, row-level locking, proper isolation\"},{\"title\":\"Implement persistent JSON CLI\",\"description\":\"Command-line interface with JSON output, preserving existing APIs\"},{\"title\":\"Add regression tests\",\"description\":\"Test all functionality including edge cases and concurrency\"},{\"title\":\"Run tests and verify\",\"description\":\"Ensure all tests pass\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_11_5efbbec5",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2]}"
+              }
+            ]
+          },
+          {
+            "request": 8,
+            "calls": [
+              {
+                "id": "todo_16_158de925",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [3,4,5,6,7]}"
+              }
+            ]
+          },
+          {
+            "request": 12,
+            "calls": [
+              {
+                "id": "todo_21_6c6c6e76",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [8]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4188
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-trailindex-1",
+        "harness": "remi",
+        "task": "trailindex",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 299.15891118199943,
+        "passed": false,
+        "totals": {
+          "api_attempts": 23,
+          "peak_prompt_tokens": 18772,
+          "api_rounds": 23,
+          "main_rounds": 23,
+          "prompt_tokens": 264521,
+          "completion_tokens": 8845,
+          "cached_tokens": 227328,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 37193
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 74359,
+          "system": 31717,
+          "user": 2875,
+          "assistant": 126711,
+          "tool": 74318
+        },
+        "tool_calls": {
+          "fs_read": 11,
+          "fs_ls": 3,
+          "todo": 3,
+          "fs_write": 6,
+          "bash": 5,
+          "apply_patch": 3
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_12_59c67123",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement trail-index project\", \"items\": [{\"title\":\"Implement codec.rs (escape/unescape)\",\"description\":\"Escape backslash, tab, CR, LF. Reject unknown/dangling escapes.\"},{\"title\":\"Implement scan.rs (build)\",\"description\":\"Recursive scan .txt/.md, skip symlinks/dot/target/node_modules, UTF-8 strict, relative paths with '/'.\"},{\"title\":\"Implement store.rs (save/load)\",\"description\":\"TRAIL1 header, escaped TSV rows, validate on load, deterministic, atomic replace.\"},{\"title\":\"Implement query.rs (query)\",\"description\":\"Load index, case-sensitive substring match, empty term error, sort by path then line.\"},{\"title\":\"Implement main.rs (CLI)\",\"description\":\"build and query subcommands, correct output format, errors to stderr, exit nonzero.\"},{\"title\":\"Add regression tests\",\"description\":\"Cover escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI.\"},{\"title\":\"Run cargo test --offline\",\"description\":\"Verify all tests pass.\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_19_814f59ad",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5]}"
+              }
+            ]
+          },
+          {
+            "request": 22,
+            "calls": [
+              {
+                "id": "todo_30_2024d0dd",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [6,7]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1300,
+          "api_input": 4198
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-trailindex-2",
+        "harness": "remi",
+        "task": "trailindex",
+        "repeat": 2,
+        "exit_code": 1,
+        "timed_out": false,
+        "elapsed": 300.10154616,
+        "passed": false,
+        "totals": {
+          "api_attempts": 16,
+          "peak_prompt_tokens": 17496,
+          "api_rounds": 15,
+          "main_rounds": 15,
+          "prompt_tokens": 137081,
+          "completion_tokens": 9695,
+          "cached_tokens": 106496,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "missing_usage": 1,
+          "uncached_input": 30585
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 48495,
+          "system": 20685,
+          "user": 1875,
+          "assistant": 56034,
+          "tool": 33444
+        },
+        "tool_calls": {
+          "todo": 2,
+          "fs_ls": 3,
+          "fs_read": 9,
+          "fs_write": 9,
+          "bash": 1
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_dbe45458",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Explore workspace and read SPEC.md\", \"items\": [{\"title\":\"List workspace contents\",\"description\":\"Understand project structure\"},{\"title\":\"Read SPEC.md\",\"description\":\"Extract all requirements\"},{\"title\":\"Read existing Cargo.toml and source files\",\"description\":\"Understand current state\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_13_87f2f07b",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement all modules and CLI\", \"items\": [{\"title\":\"Implement codec.rs (escape/unescape)\",\"description\":\"Handle \\\\, \\\\t, \\\\r, \\\\n; reject unknown/dangling escapes\"},{\"title\":\"Implement scan.rs (build)\",\"description\":\"Recursive scan .txt/.md, skip symlinks/dot/target/node_modules, UTF-8 strict, relative /-separated paths, text.lines() semantics, deterministic order\"},{\"title\":\"Implement store.rs (save/load)\",\"description\":\"TRAIL1 header, escaped TSV rows, validate on load, deterministic, atomic replace, create parent dir\"},{\"title\":\"Implement query.rs (query)\",\"description\":\"Load index, case-sensitive substring match, empty term error, sort by path then line\"},{\"title\":\"Implement main.rs (CLI)\",\"description\":\"build and query subcommands, proper exit codes, stderr messages\"},{\"title\":\"Add regression tests\",\"description\":\"Cover escaping, Unicode, refresh, corrupt input, failed-build preservation, CLI\"},{\"title\":\"Run cargo test --offline\",\"description\":\"Verify all tests pass\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1300,
+          "api_input": 4198
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "unambiguous_exit": 1,
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      }
+    ],
+    "standard_components_estimate": {
+      "tool_schema": 287737,
+      "system": 122680,
+      "user": 10821,
+      "assistant": 388723,
+      "tool": 196754
+    },
+    "tool_calls": {
+      "todo": 18,
+      "fs_read": 48,
+      "fs_ls": 20,
+      "fs_write": 37,
+      "bash": 16,
+      "apply_patch": 5
+    }
+  },
+  "waiting-remi": {
+    "mode": "waiting",
+    "harness": "remi",
+    "strict_passed": 3,
+    "clarified_passed": 3,
+    "completed": 3,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 290,
+      "peak_prompt_tokens": 52664,
+      "api_rounds": 288,
+      "main_rounds": 288,
+      "prompt_tokens": 7273495,
+      "completion_tokens": 91307,
+      "cached_tokens": 6809600,
+      "todo_calls": 14,
+      "todo_rounds": 14,
+      "todo_only_rounds": 14,
+      "uncached_input": 463895,
+      "missing_usage": 2,
+      "unfinished_requests": 1
+    },
+    "transport_errors": {
+      "200": 1,
+      "unfinished": 1
+    },
+    "rows": [
+      {
+        "id": "remi-scheduler-1",
+        "harness": "remi",
+        "task": "scheduler",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 269.6845120209982,
+        "passed": false,
+        "totals": {
+          "api_attempts": 17,
+          "peak_prompt_tokens": 17003,
+          "api_rounds": 17,
+          "main_rounds": 17,
+          "prompt_tokens": 169080,
+          "completion_tokens": 9001,
+          "cached_tokens": 135168,
+          "todo_calls": 4,
+          "todo_rounds": 4,
+          "todo_only_rounds": 4,
+          "uncached_input": 33912
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 54961,
+          "system": 25517,
+          "user": 2091,
+          "assistant": 75484,
+          "tool": 35083
+        },
+        "tool_calls": {
+          "todo": 4,
+          "fs_read": 9,
+          "fs_ls": 4,
+          "fs_write": 5,
+          "bash": 2,
+          "apply_patch": 1
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_bf775a16",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Explore workspace and understand SPEC.md\", \"items\": [{\"title\":\"Read SPEC.md and understand requirements\"},{\"title\":\"Explore existing project structure and files\"},{\"title\":\"Identify gaps between spec and implementation\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_13_22992c36",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement core library\", \"items\": [{\"title\":\"Implement validateGraph in graph.mjs (validation before side effects)\"},{\"title\":\"Implement runGraph in runner.mjs (async scheduling, concurrency, abort, events)\"},{\"title\":\"Implement fromPlan in handlers.mjs (value, delay, fail, sum kinds)\"},{\"title\":\"Implement CLI in bin/run.mjs (args parsing, validation, exit codes)\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 10,
+            "calls": [
+              {
+                "id": "todo_18_346474fb",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Write comprehensive tests\", \"items\": [{\"title\":\"Write regression tests for scheduling, validation, failures, abort, CLI\"},{\"title\":\"Run tests and fix issues\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 16,
+            "calls": [
+              {
+                "id": "todo_24_d972b83b",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5,6,7,8,9]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1409,
+          "api_input": 4309
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-scheduler-2",
+        "harness": "remi",
+        "task": "scheduler",
+        "repeat": 2,
+        "exit_code": -15,
+        "timed_out": true,
+        "elapsed": 900.0039691539932,
+        "passed": false,
+        "totals": {
+          "api_attempts": 57,
+          "peak_prompt_tokens": 44014,
+          "api_rounds": 56,
+          "main_rounds": 56,
+          "prompt_tokens": 1611275,
+          "completion_tokens": 30729,
+          "cached_tokens": 1517568,
+          "todo_calls": 1,
+          "todo_rounds": 1,
+          "todo_only_rounds": 1,
+          "missing_usage": 1,
+          "uncached_input": 93707
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 181048,
+          "system": 84056,
+          "user": 16599,
+          "assistant": 1171937,
+          "tool": 355741
+        },
+        "tool_calls": {
+          "fs_read": 9,
+          "fs_ls": 4,
+          "todo": 1,
+          "fs_write": 10,
+          "bash": 35,
+          "tool_tasks": 5,
+          "apply_patch": 1
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_12_faddb318",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement task-graph package\", \"items\": [{\"title\":\"Implement graph validation in src/graph.mjs\",\"description\":\"Validate duplicate IDs, unknown/repeated deps, cycles, malformed tasks, concurrency\"},{\"title\":\"Implement runner in src/runner.mjs\",\"description\":\"Async scheduling with concurrency, abort signal, events, dependency results mapping, skip propagation\"},{\"title\":\"Implement CLI handlers in src/handlers.mjs\",\"description\":\"fromPlan with value/delay/fail/sum kinds, validation of unknown kind and malformed delay\"},{\"title\":\"Implement CLI bin/run.mjs\",\"description\":\"Parse args, validate plan/graph, run graph, print JSON summary, exit codes 0/1/2\"},{\"title\":\"Add regression tests\",\"description\":\"Tests for scheduling, validation-before-side-effects, failure propagation, cancellation, CLI\"},{\"title\":\"Run all tests and verify\",\"description\":\"node --test\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1409,
+          "api_input": 4309
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "duration_field_exit_codes": {
+            "ms": 1,
+            "delay": 1,
+            "delayMs": 1
+          },
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "remi-stockroom-1",
+        "harness": "remi",
+        "task": "stockroom",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 310.5915023369962,
+        "passed": true,
+        "totals": {
+          "api_attempts": 16,
+          "peak_prompt_tokens": 20223,
+          "api_rounds": 16,
+          "main_rounds": 16,
+          "prompt_tokens": 187301,
+          "completion_tokens": 10097,
+          "cached_tokens": 151552,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 35749
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 51728,
+          "system": 24016,
+          "user": 8552,
+          "assistant": 94468,
+          "tool": 40524
+        },
+        "tool_calls": {
+          "fs_read": 6,
+          "fs_ls": 3,
+          "todo": 2,
+          "fs_write": 8,
+          "bash": 3,
+          "tool_tasks": 2
+        },
+        "todo_trace": [
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_9_6d17f45a",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement stockroom package\", \"items\": [{\"title\":\"Implement db.py: open_db with migration v1→v2, FK, user_version\",\"description\":\"Create schema, handle migration, reject future versions\"},{\"title\":\"Implement service.py: add_stock, get_stock, reserve, commit, cancel\",\"description\":\"Transactional lifecycle, idempotency, concurrency safety, validation\"},{\"title\":\"Implement __main__.py CLI: add, reserve, commit, cancel, show\",\"description\":\"JSON output on stdout, errors as JSON on stderr, exit codes\"},{\"title\":\"Write regression tests covering migration, lifecycle, rollback, concurrency, CLI\",\"description\":\"Run python3 -m unittest discover -v and ensure all pass\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 15,
+            "calls": [
+              {
+                "id": "todo_23_48a58fe9",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1409,
+          "api_input": 4304
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-stockroom-2",
+        "harness": "remi",
+        "task": "stockroom",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 340.2112764429985,
+        "passed": true,
+        "totals": {
+          "api_attempts": 22,
+          "peak_prompt_tokens": 20926,
+          "api_rounds": 22,
+          "main_rounds": 22,
+          "prompt_tokens": 271056,
+          "completion_tokens": 12704,
+          "cached_tokens": 231424,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 39632
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 71126,
+          "system": 33022,
+          "user": 2618,
+          "assistant": 157819,
+          "tool": 55332
+        },
+        "tool_calls": {
+          "todo": 3,
+          "fs_read": 9,
+          "fs_ls": 3,
+          "fs_write": 7,
+          "bash": 3,
+          "apply_patch": 3
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_8640dd46",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Understand workspace and SPEC.md\", \"items\": [{\"title\":\"Read SPEC.md and understand requirements\",\"description\":\"Migration, transactional inventory/reservation lifecycle, concurrent safety, persistent JSON CLI, regression tests\"},{\"title\":\"Explore existing workspace files and structure\",\"description\":\"Identify existing APIs, data, and code to preserve\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_11_a5108b17",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement stockroom package\", \"items\": [{\"title\":\"Rewrite db.py with migration, schema v2, foreign keys\",\"description\":\"Handle v1->v2 migration, reject future versions, enable foreign keys, set user_version=2\"},{\"title\":\"Rewrite service.py with full lifecycle and concurrency safety\",\"description\":\"add_stock, get_stock, reserve, commit, cancel with atomicity, idempotency, and no overbooking\"},{\"title\":\"Rewrite __main__.py CLI with all commands and JSON output\",\"description\":\"add, reserve, commit, cancel, show; JSON on stdout, errors to stderr as JSON\"},{\"title\":\"Write comprehensive regression tests\",\"description\":\"Test migration, lifecycle, rollback, idempotency, concurrency, CLI round-trips\"},{\"title\":\"Run tests and verify\",\"description\":\"python3 -m unittest discover -v\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 21,
+            "calls": [
+              {
+                "id": "todo_27_9739331d",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5,6,7]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1409,
+          "api_input": 4304
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "concurrency_repetitions": 10,
+          "concurrency_passed": 10,
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "final_reply_observed": true
+      },
+      {
+        "id": "remi-trailindex-1",
+        "harness": "remi",
+        "task": "trailindex",
+        "repeat": 1,
+        "exit_code": -15,
+        "timed_out": true,
+        "elapsed": 900.0041179929976,
+        "passed": false,
+        "totals": {
+          "api_attempts": 142,
+          "peak_prompt_tokens": 52664,
+          "api_rounds": 141,
+          "main_rounds": 141,
+          "prompt_tokens": 4447165,
+          "completion_tokens": 16594,
+          "cached_tokens": 4243456,
+          "todo_calls": 1,
+          "todo_rounds": 1,
+          "todo_only_rounds": 1,
+          "missing_usage": 1,
+          "unfinished_requests": 1,
+          "uncached_input": 203709
+        },
+        "transport_errors": {
+          "unfinished": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 455853,
+          "system": 211782,
+          "user": 17907,
+          "assistant": 1977601,
+          "tool": 2537149
+        },
+        "tool_calls": {
+          "fs_read": 13,
+          "fs_ls": 3,
+          "todo": 1,
+          "fs_write": 7,
+          "bash": 125,
+          "apply_patch": 1
+        },
+        "todo_trace": [
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_13_fb686112",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement trail-index project\", \"items\": [{\"title\":\"Implement codec (escape/unescape)\",\"description\":\"Backslash, tab, CR, LF escaping with validation\"},{\"title\":\"Implement scan (build)\",\"description\":\"Recursive .txt/.md scan, skip symlinks/dots/target/node_modules, UTF-8 strict, relative paths\"},{\"title\":\"Implement store (save/load)\",\"description\":\"TRAIL1 header, TSV rows, deterministic, validate on load\"},{\"title\":\"Implement query\",\"description\":\"Substring search, empty term error, sort by path then line\"},{\"title\":\"Implement CLI main\",\"description\":\"build and query subcommands with proper output/errors\"},{\"title\":\"Add regression tests\",\"description\":\"Cover escaping, Unicode, refresh, corrupt input, failed-build preservation, CLI\"},{\"title\":\"Run cargo test --offline\",\"description\":\"Verify all tests pass\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1410,
+          "api_input": 4314
+        },
+        "spec_unchanged": true,
+        "clarified_passed": false,
+        "normal_completed": false,
+        "supplementary": {
+          "unambiguous_exit": 1,
+          "unambiguous_passed": false
+        },
+        "final_reply_observed": false
+      },
+      {
+        "id": "remi-trailindex-2",
+        "harness": "remi",
+        "task": "trailindex",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 397.3819895310007,
+        "passed": true,
+        "totals": {
+          "api_attempts": 36,
+          "peak_prompt_tokens": 25529,
+          "api_rounds": 36,
+          "main_rounds": 36,
+          "prompt_tokens": 587618,
+          "completion_tokens": 12182,
+          "cached_tokens": 530432,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 57186
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 116388,
+          "system": 54072,
+          "user": 4572,
+          "assistant": 321488,
+          "tool": 190356
+        },
+        "tool_calls": {
+          "fs_read": 11,
+          "fs_ls": 3,
+          "todo": 3,
+          "fs_write": 7,
+          "bash": 17,
+          "apply_patch": 3
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_12_f0d97875",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement trail-index project\", \"items\": [{\"title\":\"Implement codec.rs: escape/unescape with \\\\, \\\\t, \\\\r, \\\\n\",\"description\":\"Handle backslash, tab, CR, LF. Reject unknown/dangling escapes.\"},{\"title\":\"Implement scan.rs: recursive filesystem scanning for .txt/.md\",\"description\":\"Ignore symlinks, dot entries, target/node_modules. UTF-8 strict. Collect lines with text.lines() semantics.\"},{\"title\":\"Implement store.rs: save/load with TRAIL1 header, escaped TSV, validation\",\"description\":\"Validate header, rows, paths, line numbers. Deterministic ordering.\"},{\"title\":\"Implement query.rs: substring search, empty term error\",\"description\":\"Load index, filter hits containing term case-sensitively, sort by path then line.\"},{\"title\":\"Implement main.rs: CLI build and query subcommands\",\"description\":\"build prints files=N lines=N. query prints escaped TSV rows. Errors to stderr, nonzero exit.\"},{\"title\":\"Add regression tests\",\"description\":\"Cover escaping, Unicode, deterministic refresh, corrupt input, failed-build preservation, CLI.\"},{\"title\":\"Run cargo test --offline and fix issues\",\"description\":\"Ensure all tests pass.\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 12,
+            "calls": [
+              {
+                "id": "todo_20_a7b54a9d",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5]}"
+              }
+            ]
+          },
+          {
+            "request": 35,
+            "calls": [
+              {
+                "id": "todo_43_720957f5",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [6,7]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1410,
+          "api_input": 4314
+        },
+        "spec_unchanged": true,
+        "clarified_passed": true,
+        "normal_completed": true,
+        "supplementary": {
+          "unambiguous_exit": 0,
+          "unambiguous_passed": true
+        },
+        "final_reply_observed": true
+      }
+    ],
+    "standard_components_estimate": {
+      "tool_schema": 931104,
+      "system": 432465,
+      "user": 52339,
+      "assistant": 3798797,
+      "tool": 3214185
+    },
+    "tool_calls": {
+      "todo": 14,
+      "fs_read": 57,
+      "fs_ls": 20,
+      "fs_write": 44,
+      "bash": 185,
+      "apply_patch": 9,
+      "tool_tasks": 7
+    }
+  }
+}

@@ -2399,7 +2399,7 @@ impl CatBot {
         *self.redactor.write().unwrap() = new_redactor;
     }
 
-    /// Return `(name, description)` pairs for every registered tool.
+    /// Return `(name, description)` pairs for the active model-facing tools.
     ///
     /// Useful for the `/tools` slash command — lets users see what the agent
     /// can do without reading source code.
@@ -2449,7 +2449,7 @@ impl CatBot {
     /// an agent can inspect unavailable tools and decide how to update its
     /// profile allowlist or runtime configuration.
     pub fn registered_tool_statuses(&self) -> Vec<RegisteredToolStatus> {
-        let enabled_defs = cat_agent_tool_definitions(&self.inner);
+        let enabled_defs = cat_agent_registered_tool_definitions(&self.inner);
         let mut by_name: HashMap<String, RegisteredToolStatus> = HashMap::new();
         for definition in enabled_defs {
             let name = definition.function.name;
@@ -4508,6 +4508,12 @@ fn preview_url_header(url: &str) -> &str {
 fn cat_agent_tool_definitions(
     agent: &CatAgent<InnerAgent>,
 ) -> Vec<remi_agentloop::tool::ToolDefinition> {
+    agent.tool_definitions_for_input(&LoopInput::start(""), None)
+}
+
+fn cat_agent_registered_tool_definitions(
+    agent: &CatAgent<InnerAgent>,
+) -> Vec<remi_agentloop::tool::ToolDefinition> {
     use remi_agentloop::tool::registry::ToolRegistry;
 
     let mut definitions = agent.local_tools.definitions(&serde_json::Value::Null);
@@ -4538,11 +4544,13 @@ fn cat_agent_tool_available(agent: &CatAgent<InnerAgent>, name: &str) -> bool {
 }
 
 fn skill_prompt_tool_availability(agent: &CatAgent<InnerAgent>) -> SkillPromptToolAvailability {
+    let search = cat_agent_tool_available(agent, "search");
     SkillPromptToolAvailability::new(
-        cat_agent_tool_available(agent, "skill__search"),
+        !search && cat_agent_tool_available(agent, "skill__search"),
         cat_agent_tool_available(agent, "skill__get"),
         cat_agent_tool_available(agent, "fs_read"),
     )
+    .with_search(search)
 }
 
 struct LocalToolDeps {
@@ -5087,7 +5095,7 @@ impl CatBotBuilder {
         self.active_agent_id = profile.id.clone();
         self.system = profile.system_prompt;
         let mut tools = profile.tools;
-        expand_skill_discovery_tools(&mut tools);
+        expand_tool_aliases(&mut tools);
         for delegate in &profile.delegates {
             let name = delegate_tool_name(delegate);
             if !tools.iter().any(|tool| tool == &name) {
@@ -5842,7 +5850,7 @@ fn delegate_tool_name(agent_id: &str) -> String {
 
 fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
     let mut tools = profile.tools.clone();
-    expand_skill_discovery_tools(&mut tools);
+    expand_tool_aliases(&mut tools);
     for delegate in &profile.delegates {
         let name = delegate_tool_name(delegate);
         if !tools.iter().any(|tool| tool == &name) {
@@ -5852,12 +5860,58 @@ fn agent_tool_allowlist(profile: &AgentProfile) -> Vec<String> {
     tools
 }
 
-fn expand_skill_discovery_tools(tools: &mut Vec<String>) {
-    if tools.iter().any(|tool| tool == "search")
+fn expand_tool_aliases(tools: &mut Vec<String>) {
+    if !tools.iter().any(|tool| tool == "search")
         && tools.iter().any(|tool| tool == "skill__get")
         && !tools.iter().any(|tool| tool == "skill__search")
     {
         tools.push("skill__search".to_string());
+    }
+    // Full legacy plans migrate to the compact surface; partial allowlists keep
+    // their narrower permissions. Old handlers remain allowed for saved calls.
+    if tools.iter().any(|tool| tool == "todo")
+        || todo::LEGACY_TOOLS
+            .iter()
+            .all(|name| tools.iter().any(|tool| tool == *name))
+    {
+        for name in std::iter::once("todo").chain(todo::LEGACY_TOOLS.iter().copied()) {
+            if !tools.iter().any(|tool| tool == name) {
+                tools.push(name.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_tool_alias_tests {
+    use super::expand_tool_aliases;
+    #[test]
+    fn skill_search_falls_back_only_without_unified_search() {
+        for search in [true, false] {
+            let mut tools = vec!["skill__get".to_string()];
+            if search {
+                tools.push("search".into());
+            }
+            expand_tool_aliases(&mut tools);
+            assert_eq!(tools.iter().any(|t| t == "skill__search"), !search);
+        }
+    }
+    #[test]
+    fn full_legacy_todos_migrate_but_partial_permissions_do_not_expand() {
+        let mut full = crate::todo::LEGACY_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        expand_tool_aliases(&mut full);
+        assert!(full.iter().any(|s| s == "todo"));
+        let mut partial = vec!["todo__list".to_string()];
+        expand_tool_aliases(&mut partial);
+        assert_eq!(partial, vec!["todo__list"]);
+        let mut modern = vec!["todo".to_string()];
+        expand_tool_aliases(&mut modern);
+        assert!(crate::todo::LEGACY_TOOLS
+            .iter()
+            .all(|name| modern.iter().any(|s| s == *name)));
     }
 }
 
@@ -9675,7 +9729,7 @@ You are Remi.
         assert_eq!(contents[4], "previous assistant");
         assert_eq!(
             contents[5],
-            "[CURRENT TODO BATCH]\nThis thread still has unfinished work under \"Release launch\".\nKeep progress synchronized with todo__complete/update/remove.\nWhen this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.\n- #1 Draft changelog"
+            "[CURRENT TODO BATCH]\nThis thread still has unfinished work under \"Release launch\".\nDefer intermediate completions to the next useful work round or one final batch; avoid Todo-only progress rounds. Skip unchanged updates and redundant lists. Never complete an item before observing its verification result.\nWhen this thread has an active plan, try to complete multiple todo items in one pass whenever feasible. Only stop early if the user explicitly cancels, changes direction, or you need user input/help to proceed. Finish each individual todo item's work before marking it complete.\n- #1 Draft changelog"
         );
     }
 
@@ -9944,8 +9998,17 @@ You are Remi.
         });
     }
 
-    #[tokio::test]
-    async fn pinned_skill_prompt_is_sent_to_model_end_to_end() {
+    #[test]
+    fn pinned_skill_prompt_is_sent_to_model_end_to_end() {
+        run_large_stack_local_test(|| check_pinned_skill_discovery_request(true));
+    }
+
+    #[test]
+    fn pinned_skill_prompt_uses_legacy_search_when_unified_search_is_disabled() {
+        run_large_stack_local_test(|| check_pinned_skill_discovery_request(false));
+    }
+
+    async fn check_pinned_skill_discovery_request(unified_search: bool) {
         std::env::set_var("OPENAI_API_KEY", "test");
         let responses = vec![sse_text("pinned prompt observed")];
         let (base_url, requests) = start_openai_mock_server(responses).await;
@@ -9990,7 +10053,8 @@ You are Remi.
             },
             im_bridge: None,
             extra_options: serde_json::Map::new(),
-            tool_allowlist: None,
+            tool_allowlist: (!unified_search)
+                .then(|| vec!["skill__get".into(), "skill__search".into()]),
             delegate_ids: Vec::new(),
             active_agent_id: DEFAULT_AGENT_ID.to_string(),
             model_bindings: AgentModelBindings::default(),
@@ -10032,15 +10096,16 @@ You are Remi.
         assert!(
             system_messages
                 .iter()
-                .any(|content| content.contains("Pinned skills are only a curated subset")),
+                .any(|content| content.contains("curated subset")),
             "request should contain updated default system prompt: {system_messages:#?}"
         );
         assert!(
             system_messages
                 .iter()
-                .any(|content| content.contains("Before starting substantive work, search for")
-                    && content.contains("relevant skills and memory")),
-            "request should tell the model to search relevant skills and memory: {system_messages:#?}"
+                .any(|content| content.contains("builtin")
+                    && content.contains("remi")
+                    && content.contains("skill__get")),
+            "request should direct self-management to the builtin skill: {system_messages:#?}"
         );
         let pinned_prompt = messages
             .iter()
@@ -10064,7 +10129,24 @@ You are Remi.
             !pinned_prompt.contains("Unpinned discovery description"),
             "{pinned_prompt}"
         );
-        assert!(pinned_prompt.contains("`skill__search`"), "{pinned_prompt}");
+        assert_eq!(
+            pinned_prompt.contains("`search`"),
+            unified_search,
+            "{pinned_prompt}"
+        );
+        assert_eq!(
+            pinned_prompt.contains("`skill__search`"),
+            !unified_search,
+            "{pinned_prompt}"
+        );
+        let names = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names.contains(&"search"), unified_search);
+        assert_eq!(names.contains(&"skill__search"), !unified_search);
         assert!(pinned_prompt.contains("`skill__get`"), "{pinned_prompt}");
         assert!(!pinned_prompt.contains("scope=skills"), "{pinned_prompt}");
     }
@@ -11218,19 +11300,18 @@ fn default_system_prompt() -> String {
      saved details, or anything phrased like \"my ...\", you MUST call search with scope=memory \
      and distinctive keywords from the question before giving the final answer. Do not say prior \
      information is unavailable until you have searched memory. \
-     Pinned skills are only a curated subset of available skills. More relevant skills may exist \
-     beyond the pinned list; use search to discover skill catalog entries and saved memory. Before \
-     starting substantive work, search for relevant skills and memory so the answer is informed by \
-     reusable procedures and prior context instead of relying only on the visible pinned skills or \
-     the current conversation. \
+     Pinned skills are a curated subset. Follow the pinned-skill guidance for the available discovery route; \
+     load relevant skill instructions with skill__get when needed. \
      If the user asks you to remember, store, keep, or use a long note, transcript, document excerpt, \
      or historical conversation as future context, use memory__upsert_named to save a concise but \
      complete named memory before acknowledging it; do not rely only on short-term chat history. \
      When editing files, prefer apply_patch for focused changes to existing files. Use fs_write \
      only to create a new file or when you intentionally replace a whole file after reading it. \
-    Use skill__get to inspect reusable procedures; use fs_read with the returned resource_root_path for related resources. Use todo tools \
-     (todo__add/list/complete/update/remove) to track multi-step work per thread; \
-     todo__add creates a titled batch of child todos and returns their IDs, \
+    Use skill__get to inspect reusable procedures; use fs_read with the returned resource_root_path for related resources. \
+     Before using manage_yourself, load the builtin remi skill for CLI syntax and examples. \
+     Use the available todo tools for substantial multi-step work: plan major outcomes once, skip unchanged updates, \
+     defer intermediate completions to the next useful work round or one final verified batch. \
+     Never complete an item alongside its own verification. Use \
      memory__upsert_named to save stable facts, preferences, and project conventions, \
      and memory__get_detail to read full compressed memory blocks. \
      Use them when appropriate."

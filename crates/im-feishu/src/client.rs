@@ -230,6 +230,146 @@ impl FeishuClient {
         }
     }
 
+    /// Copy visible Feishu history as native forwarded records, never replay it.
+    pub async fn forward_fork_history(
+        &self,
+        source_chat: &str,
+        source_thread: Option<&str>,
+        start_time: i64,
+        cutoff_message: &str,
+        target_channel: &str,
+        fork_id: &str,
+    ) -> Result<()> {
+        let (target_type, target_id) = match target_channel.split_once(":thread:") {
+            Some((_, thread)) => ("thread_id", thread),
+            None => ("chat_id", target_channel),
+        };
+        anyhow::ensure!(!target_id.is_empty(), "empty fork destination");
+        if let Some(thread) = source_thread.filter(|id| !id.is_empty()) {
+            self.forward_history_request(
+                &format!("/im/v1/threads/{thread}/forward"),
+                target_type,
+                serde_json::json!({"receive_id":target_id,"uuid":fork_id}),
+            )
+            .await?;
+            return Ok(());
+        }
+        // Freeze the range before sending anything to the destination. Pagination
+        // must reach the triggering command; otherwise do not forward a partial range.
+        let mut ids = Vec::new();
+        let mut page_token = String::new();
+        let mut seen_tokens = std::collections::HashSet::new();
+        let end_time = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 1)
+        .to_string();
+        loop {
+            let query = vec![
+                ("container_id_type", "chat".to_string()),
+                ("container_id", source_chat.to_string()),
+                ("start_time", start_time.to_string()),
+                ("end_time", end_time.clone()),
+                ("sort_type", "ByCreateTimeAsc".to_string()),
+                ("page_size", "50".to_string()),
+                ("page_token", page_token.clone()),
+            ];
+            let page = self
+                .history_api_request(reqwest::Method::GET, "/im/v1/messages", &query, None)
+                .await?;
+            let data = page.get("data").context("missing history data")?;
+            let items = data["items"]
+                .as_array()
+                .context("missing history messages")?;
+            let reached_cutoff = collect_forwardable_history(items, cutoff_message, &mut ids);
+            if reached_cutoff {
+                break;
+            }
+            anyhow::ensure!(
+                data["has_more"].as_bool() == Some(true),
+                "fork command missing from Feishu history; history was not forwarded"
+            );
+            page_token = data["page_token"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("missing history page token")?
+                .to_string();
+            anyhow::ensure!(
+                seen_tokens.insert(page_token.clone()),
+                "repeated history page token"
+            );
+        }
+        for (index, batch) in ids.chunks(100).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            self.forward_history_request(
+                "/im/v1/messages/merge_forward", target_type,
+                serde_json::json!({"receive_id":target_id,"message_id_list":batch,"uuid":format!("{fork_id}-{index}")}),
+            ).await?;
+        }
+        Ok(())
+    }
+
+    async fn forward_history_request(
+        &self,
+        path: &str,
+        target_type: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let (query, body) = native_forward_parameters(target_type, body)?;
+        let response = self
+            .history_api_request(reqwest::Method::POST, path, &query, Some(body))
+            .await?;
+        anyhow::ensure!(
+            response["data"]["message_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "forward succeeded without a message ID"
+        );
+        Ok(())
+    }
+
+    async fn history_api_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.ensure_authenticated().await?;
+        for attempt in 0..2 {
+            let mut request = self
+                .http
+                .request(method.clone(), format!("{FEISHU_BASE}{path}"))
+                .bearer_auth(self.token().await)
+                .query(query);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            let response = request
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<serde_json::Value>()
+                .await?;
+            let code = response["code"]
+                .as_i64()
+                .context("missing Feishu response code")?;
+            if code == TOKEN_EXPIRED && attempt == 0 {
+                self.refresh_token().await?;
+                continue;
+            }
+            ensure_ok(
+                code,
+                response["msg"].as_str().unwrap_or(""),
+                "forward fork history",
+            )?;
+            return Ok(response);
+        }
+        unreachable!()
+    }
+
     /// Create one native Feishu Chain-of-Thought message for an assistant run.
     pub async fn create_cot(
         &self,
@@ -3241,4 +3381,101 @@ pub fn build_user_question_resolved_card(
             "template": template
         }
     })
+}
+
+// Retain only ordinary, existing messages, stopping before the fork command.
+fn collect_forwardable_history(
+    items: &[serde_json::Value],
+    cutoff: &str,
+    ids: &mut Vec<String>,
+) -> bool {
+    for item in items {
+        let Some(id) = item["message_id"].as_str() else {
+            continue;
+        };
+        if id == cutoff {
+            return true;
+        }
+        if item["deleted"].as_bool() == Some(true)
+            || item["msg_type"].as_str() == Some("system")
+            || item["thread_id"].as_str().is_some_and(|s| !s.is_empty())
+            || item["upper_message_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        {
+            continue;
+        }
+        if !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod fork_forward_tests {
+    #[test]
+    fn forward_idempotency_is_in_query_and_native_content_is_in_body() {
+        let (query, body) = super::native_forward_parameters(
+            "thread_id",
+            serde_json::json!({
+                "uuid":"fork-0", "receive_id":"omt_target", "message_id_list":["om_a", "om_b"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            query,
+            vec![
+                ("receive_id_type", "thread_id".to_string()),
+                ("uuid", "fork-0".to_string())
+            ]
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({"receive_id":"omt_target","message_id_list":["om_a","om_b"]})
+        );
+    }
+
+    #[test]
+    fn history_selection_keeps_order_and_excludes_topics_deleted_and_post_fork_messages() {
+        let mut ids = Vec::new();
+        let page = serde_json::json!([
+            {"message_id":"a"}, {"message_id":"topic","thread_id":"omt_1"},
+            {"message_id":"deleted","deleted":true}, {"message_id":"sys","msg_type":"system"},
+            {"message_id":"child","upper_message_id":"parent"}, {"message_id":"a"}
+        ]);
+        assert!(!super::collect_forwardable_history(
+            page.as_array().unwrap(),
+            "fork",
+            &mut ids
+        ));
+        let next =
+            serde_json::json!([{"message_id":"b"},{"message_id":"fork"},{"message_id":"after"}]);
+        assert!(super::collect_forwardable_history(
+            next.as_array().unwrap(),
+            "fork",
+            &mut ids
+        ));
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+}
+
+fn native_forward_parameters(
+    target_type: &str,
+    mut body: serde_json::Value,
+) -> Result<(Vec<(&'static str, String)>, serde_json::Value)> {
+    let uuid = body
+        .as_object_mut()
+        .context("invalid forward body")?
+        .remove("uuid")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("missing forward idempotency key")?;
+    anyhow::ensure!(
+        !uuid.is_empty() && uuid.len() <= 50,
+        "invalid forward idempotency key"
+    );
+    Ok((
+        vec![("receive_id_type", target_type.to_string()), ("uuid", uuid)],
+        body,
+    ))
 }

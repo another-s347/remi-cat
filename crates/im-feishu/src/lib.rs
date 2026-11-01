@@ -1066,6 +1066,28 @@ impl FeishuGateway {
             .file_resource_url(message_id, file_key, file_type)
     }
 
+    /// Forward fork history into a chat or topic using native Feishu forwarding.
+    pub async fn forward_fork_history(
+        &self,
+        source_chat: &str,
+        source_thread: Option<&str>,
+        start_time: i64,
+        cutoff_message: &str,
+        target_channel: &str,
+        fork_id: &str,
+    ) -> Result<()> {
+        self.client
+            .forward_fork_history(
+                source_chat,
+                source_thread,
+                start_time,
+                cutoff_message,
+                target_channel,
+                fork_id,
+            )
+            .await
+    }
+
     /// Delete (withdraw) a message sent by the bot.
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
         self.client.delete_message(message_id).await

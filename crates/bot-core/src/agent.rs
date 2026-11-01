@@ -153,22 +153,26 @@ fn is_denied_approval_event(event: &CatEvent) -> bool {
     )
 }
 
-/// Returns true when the event indicates an approval or user question is now
-/// pending (waiting for human response). While pending, foreground tool
-/// timeouts must be suppressed so the tool is not moved to the background
-/// before the human can respond.
-fn is_approval_request_event(event: &CatEvent) -> bool {
-    matches!(
-        event,
-        CatEvent::ToolApprovalRequested(..) | CatEvent::UserQuestionRequested(..)
-    )
-}
-
-fn is_approval_resolved_event(event: &CatEvent) -> bool {
-    matches!(
-        event,
-        CatEvent::ToolApprovalResolved { .. } | CatEvent::UserQuestionResolved { .. }
-    )
+/// Track interrupts per tool, before forwarding them to the UI. A batch may
+/// contain multiple approvals/questions; resolving one must not resume the
+/// timeout while another is still waiting for the user.
+fn track_pending_interaction(event: &CatEvent, pending: &mut HashSet<(bool, String)>) {
+    let (key, waiting) = match event {
+        CatEvent::ToolApprovalRequested(request) | CatEvent::ToolApprovalUpdated(request) => {
+            ((false, request.id.clone()), true)
+        }
+        CatEvent::ToolApprovalResolved { request, .. } => ((false, request.id.clone()), false),
+        CatEvent::UserQuestionRequested(request) | CatEvent::UserQuestionUpdated(request) => {
+            ((true, request.id.clone()), true)
+        }
+        CatEvent::UserQuestionResolved { request, .. } => ((true, request.id.clone()), false),
+        _ => return,
+    };
+    if waiting {
+        pending.insert(key);
+    } else {
+        pending.remove(&key);
+    }
 }
 
 // ── CatAgent ─────────────────────────────────────────────────────────────────
@@ -514,6 +518,7 @@ where
 
                             let tool_ctx =
                                 tool_ctx_from_state_with_cancel(&state, cancel_signal.clone());
+                            crate::tools::set_fs_read_output_budget(&tool_ctx, overflow_bytes);
                             let mut all_outcomes: Vec<ToolCallOutcome> = completed_results;
                             let mut context_operation: Option<ContextOperation> = None;
 
@@ -814,16 +819,10 @@ where
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
-                                let mut approval_pending = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
-                                            if is_approval_request_event(&side_event) {
-                                                approval_pending = true;
-                                            } else if is_approval_resolved_event(&side_event) {
-                                                approval_pending = false;
-                                            }
                                             yield side_event;
                                             if denied {
                                                 tracing::info!(
@@ -839,12 +838,6 @@ where
                                         }
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
-                                                ForegroundToolOutcome::TimedOut { .. } if approval_pending => {
-                                                    // A human-facing interrupt (approval / user
-                                                    // question) is pending – do not move the tool to
-                                                    // the background while waiting for a response.
-                                                    continue;
-                                                }
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_local.iter().find(|t| t.id == call_id).unwrap();
@@ -1281,16 +1274,10 @@ where
                                 );
                                 let mut completed_contents: HashMap<String, Content> = HashMap::new();
                                 let mut forward_background_side_events = false;
-                                let mut approval_pending = false;
                                 while !pending_results.is_empty() {
                                     tokio::select! {
                                         Some(side_event) = side_rx.recv() => {
                                             let denied = is_denied_approval_event(&side_event);
-                                            if is_approval_request_event(&side_event) {
-                                                approval_pending = true;
-                                            } else if is_approval_resolved_event(&side_event) {
-                                                approval_pending = false;
-                                            }
                                             yield side_event;
                                             if denied {
                                                 tracing::info!(
@@ -1306,12 +1293,6 @@ where
                                         }
                                         Some(outcome) = pending_results.next() => {
                                             let (call_id, mut collected, timed_out_task_id) = match outcome {
-                                                ForegroundToolOutcome::TimedOut { .. } if approval_pending => {
-                                                    // A human-facing interrupt (approval / user
-                                                    // question) is pending – do not move the tool to
-                                                    // the background while waiting for a response.
-                                                    continue;
-                                                }
                                                 ForegroundToolOutcome::Completed { call_id, collected } => (call_id, collected, None),
                                                 ForegroundToolOutcome::TimedOut { call_id, task_id } => {
                                                     let tc = approved_dynamic.iter().find(|t| t.id == call_id).unwrap();
@@ -1896,7 +1877,15 @@ fn merge_runtime_tool_definitions(
     }
     defs.extend(dynamic_tools.definitions_with_context(ctx));
     defs.extend_from_slice(external_defs);
-    filter_tool_allowlist(tool_allowlist, defs)
+    let mut defs = filter_tool_allowlist(tool_allowlist, defs);
+    // Select the discovery route after allowlist filtering, including overrides.
+    let has_search = defs.iter().any(|d| d.function.name == "search");
+    let has_todo = defs.iter().any(|d| d.function.name == "todo");
+    defs.retain(|d| {
+        !(has_search && d.function.name == "skill__search")
+            && !(has_todo && todo::LEGACY_TOOLS.contains(&d.function.name.as_str()))
+    });
+    defs
 }
 
 fn refresh_runtime_tool_definitions(
@@ -2459,7 +2448,33 @@ fn collect_tool_result_futures_with_timeout(
                     .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
                 let collect_task_id = task_id.clone();
                 let collect_tool_tasks = Arc::clone(&tool_tasks);
+                let (interaction_tx, mut interaction_rx) = tokio::sync::watch::channel(false);
                 let collect = async move {
+                    // Keep the observer in the tracked collector so events continue
+                    // to flow even if ordinary execution later goes background.
+                    let result = result.map(|result| match result {
+                        ToolResult::Output(output) => {
+                            let mut pending = HashSet::new();
+                            let observed: remi_agentloop::tool::BoxedToolStream = Box::pin(
+                                output.map(move |out| {
+                                    if let ToolOutput::SubSession(event) = &out {
+                                        if let Some(event) = crate::cat_event_from_subagent_approval_marker(event) {
+                                            track_pending_interaction(&event, &mut pending);
+                                            interaction_tx.send_if_modified(|waiting| {
+                                                let next = !pending.is_empty();
+                                                if *waiting == next { return false; }
+                                                *waiting = next;
+                                                true
+                                            });
+                                        }
+                                    }
+                                    out
+                                }),
+                            );
+                            ToolResult::Output(observed)
+                        }
+                        ToolResult::Interrupt(interrupt) => ToolResult::Interrupt(interrupt),
+                    });
                     let collected = collect_result_with_overflow(
                         result,
                         &data_dir,
@@ -2484,27 +2499,34 @@ fn collect_tool_result_futures_with_timeout(
                     collect.boxed_local(),
                     Some(completed_tx),
                 );
-                tokio::select! {
-                    completed = &mut completed_rx => {
-                        let (completed_call_id, collected) = completed.unwrap_or_else(|_| {
-                            (
-                                call_id.clone(),
-                                CollectedToolResult::text("error: background tool task was cancelled"),
-                            )
-                        });
-                        tool_tasks.remove_foreground(&task_id).await;
-                        ForegroundToolOutcome::Completed {
-                            call_id: completed_call_id,
-                            collected,
+                let timeout = tokio::time::sleep(foreground_timeout);
+                tokio::pin!(timeout);
+                let mut interaction_open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        completed = &mut completed_rx => {
+                            let (completed_call_id, collected) = completed.unwrap_or_else(|_| {
+                                (
+                                    call_id.clone(),
+                                    CollectedToolResult::text("error: background tool task was cancelled"),
+                                )
+                            });
+                            tool_tasks.remove_foreground(&task_id).await;
+                            break ForegroundToolOutcome::Completed {
+                                call_id: completed_call_id,
+                                collected,
+                            };
                         }
-                    }
-                    _ = tokio::time::sleep(foreground_timeout) => {
-                        tool_tasks
-                            .promote_to_background(&task_id, async_agent)
-                            .await;
-                        ForegroundToolOutcome::TimedOut {
-                            call_id,
-                            task_id,
+                        changed = interaction_rx.changed(), if interaction_open => {
+                            interaction_open = changed.is_ok();
+                            // Human response time is not tool execution time. Give
+                            // execution a fresh window after the last response.
+                            timeout.as_mut().reset(tokio::time::Instant::now() + foreground_timeout);
+                        }
+                        _ = &mut timeout, if !*interaction_rx.borrow() => {
+                            tool_tasks.promote_to_background(&task_id, async_agent).await;
+                            break ForegroundToolOutcome::TimedOut { call_id, task_id };
                         }
                     }
                 }
@@ -2912,6 +2934,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_tool_surface_selects_discovery_after_allowlist_filtering() {
+        let defs = [
+            "search",
+            "skill__search",
+            "skill__get",
+            "todo",
+            "todo__add",
+            "todo__list",
+        ]
+        .iter()
+        .map(|name| {
+            serde_json::from_value(serde_json::json!({
+                "type":"function","function":{"name":name,"description":"test",
+                "parameters":{"type":"object"},"extra_prompt":null}
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<remi_agentloop::tool::ToolDefinition>>();
+        let local = DefaultToolRegistry::new();
+        let dynamic = DefaultToolRegistry::new();
+        let ctx = super::ToolDefinitionContext {
+            thread_id: None,
+            run_id: None,
+            metadata: None,
+            user_state: serde_json::Value::Null,
+        };
+        for (allowed, expected) in [
+            (
+                vec![
+                    "search",
+                    "skill__search",
+                    "skill__get",
+                    "todo",
+                    "todo__add",
+                    "todo__list",
+                ],
+                vec!["search", "skill__get", "todo"],
+            ),
+            (
+                vec!["skill__search", "skill__get", "todo__add"],
+                vec!["skill__search", "skill__get", "todo__add"],
+            ),
+        ] {
+            let allowed = allowed.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let visible = super::merge_runtime_tool_definitions(
+                &local,
+                None,
+                &dynamic,
+                &ctx,
+                &defs,
+                Some(&allowed),
+            );
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|d| d.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let visible =
+            super::merge_runtime_tool_definitions(&local, None, &dynamic, &ctx, &defs, None);
+        assert!(!visible
+            .iter()
+            .any(|d| d.function.name == "skill__search" || d.function.name.starts_with("todo__")));
+    }
     #[test]
     fn malformed_model_tool_calls_are_rejected_before_dispatch() {
         assert!(!has_malformed_tool_calls(&[test_parsed_tool_call(
@@ -4667,6 +4756,183 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_tool_waits_for_all_human_responses_without_losing_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for async_agent in [false, true] {
+                    let root = test_root();
+                    let tool_tasks = test_tool_tasks();
+                    let (output_tx, output_rx) = mpsc::unbounded_channel();
+                    let (side_tx, mut side_rx) = mpsc::unbounded_channel();
+                    let output: BoxedToolStream =
+                        Box::pin(futures::stream::unfold(output_rx, |mut rx| async move {
+                            rx.recv().await.map(|event| (event, rx))
+                        }));
+                    let calls = vec![ParsedToolCall {
+                        id: "parent-call".into(),
+                        name: "sub_agent".into(),
+                        arguments: serde_json::json!({}),
+                    }];
+                    let names = HashMap::from([("parent-call".into(), "sub_agent".into())]);
+                    let request = crate::ToolApprovalRequest {
+                        id: "approval-1".into(),
+                        session_id: "thread-1".into(),
+                        run_id: "run-1".into(),
+                        tool_call_id: "child-call".into(),
+                        tool_name: "bash".into(),
+                        risk: crate::ToolRiskLevel::High,
+                        args_summary: "command".into(),
+                        command_key: None,
+                        model_review_reason: None,
+                        platform: Some("tui".into()),
+                        app_id: None,
+                        review: None,
+                    };
+                    let question = crate::UserQuestionRequest {
+                        // Deliberately use the same ID: questions and approvals are distinct.
+                        id: request.id.clone(),
+                        session_id: "thread-1".into(),
+                        run_id: "run-1".into(),
+                        tool_call_id: "question-call".into(),
+                        app_id: None,
+                        question: "Continue?".into(),
+                        reason: None,
+                        options: vec![],
+                        allow_free_text: true,
+                        placeholder: None,
+                        default_option_id: None,
+                        created_at: String::new(),
+                    };
+                    let thread = remi_agentloop::prelude::ThreadId("child-thread".into());
+                    let run = remi_agentloop::prelude::RunId("child-run".into());
+                    output_tx
+                        .send(crate::tool_approval_requested_marker(
+                            &thread, &run, &request,
+                        ))
+                        .unwrap();
+                    output_tx
+                        .send(crate::tool_approval_updated_marker(&thread, &run, &request))
+                        .unwrap();
+                    output_tx
+                        .send(crate::user_question_requested_marker(&question))
+                        .unwrap();
+                    output_tx
+                        .send(crate::user_question_updated_marker(&question))
+                        .unwrap();
+                    let mut pending = collect_tool_result_futures_with_timeout(
+                        vec![("parent-call".into(), Ok(ToolResult::Output(output)))],
+                        &calls,
+                        &names,
+                        &root,
+                        8_192,
+                        Some(side_tx),
+                        Arc::clone(&tool_tasks),
+                        "thread-1".into(),
+                        "run-1".into(),
+                        None,
+                        HashMap::new(),
+                        Duration::from_millis(20),
+                        async_agent,
+                    );
+                    // Poll the real collector past several foreground windows. It must
+                    // keep both the result receiver and the original call ID alive.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), pending.next())
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(pending.len(), 1);
+                    assert!(matches!(
+                        side_rx.recv().await,
+                        Some(CatEvent::ToolApprovalRequested(_))
+                    ));
+                    output_tx
+                        .send(crate::tool_approval_resolved_marker(
+                            &thread,
+                            &run,
+                            &request,
+                            crate::ToolApprovalDecision::AllowOnce,
+                        ))
+                        .unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), pending.next())
+                            .await
+                            .is_err(),
+                        "resolving approval must not end the outstanding question wait"
+                    );
+                    let response = crate::UserQuestionResponse {
+                        question_id: question.id.clone(),
+                        status: crate::UserQuestionStatus::Answered,
+                        selected_option_ids: vec![],
+                        free_text: Some("yes".into()),
+                        answer_text: Some("yes".into()),
+                        answered_at: None,
+                        source: None,
+                    };
+                    output_tx
+                        .send(crate::user_question_resolved_marker(&question, &response))
+                        .unwrap();
+                    output_tx
+                        .send(ToolOutput::text("approved tool result"))
+                        .unwrap();
+                    drop(output_tx);
+                    let outcome = tokio::time::timeout(Duration::from_secs(1), pending.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let ForegroundToolOutcome::Completed { call_id, collected } = outcome else {
+                        panic!("human response must resume the original foreground result");
+                    };
+                    assert_eq!(call_id, "parent-call");
+                    assert_eq!(collected.preview, "approved tool result");
+                    assert!(
+                        tool_tasks.list(Some("thread-1")).await.is_empty(),
+                        "waiting must not promote the task"
+                    );
+                    assert!(pending.next().await.is_none());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_timeout_resumes_after_human_response() {
+        tokio::task::LocalSet::new().run_until(async {
+            let root = test_root();
+            let tool_tasks = test_tool_tasks();
+            let (output_tx, output_rx) = mpsc::unbounded_channel();
+            let output: BoxedToolStream = Box::pin(futures::stream::unfold(output_rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            }));
+            let calls = vec![ParsedToolCall {
+                id: "parent-call".into(), name: "sub_agent".into(), arguments: serde_json::json!({}),
+            }];
+            let names = HashMap::from([("parent-call".into(), "sub_agent".into())]);
+            let request = crate::ToolApprovalRequest {
+                id: "approval-1".into(), session_id: "thread-1".into(), run_id: "run-1".into(),
+                tool_call_id: "child-call".into(), tool_name: "bash".into(),
+                risk: crate::ToolRiskLevel::High, args_summary: "command".into(), command_key: None,
+                model_review_reason: None, platform: Some("tui".into()), app_id: None, review: None,
+            };
+            let thread = remi_agentloop::prelude::ThreadId("child-thread".into());
+            let run = remi_agentloop::prelude::RunId("child-run".into());
+            output_tx.send(crate::tool_approval_requested_marker(&thread, &run, &request)).unwrap();
+            let mut pending = collect_tool_result_futures_with_timeout(
+                vec![("parent-call".into(), Ok(ToolResult::Output(output)))], &calls, &names,
+                &root, 8_192, None, Arc::clone(&tool_tasks), "thread-1".into(), "run-1".into(),
+                None, HashMap::new(), Duration::from_millis(20), false,
+            );
+            assert!(tokio::time::timeout(Duration::from_millis(100), pending.next()).await.is_err());
+            output_tx.send(crate::tool_approval_resolved_marker(
+                &thread, &run, &request, crate::ToolApprovalDecision::AllowOnce,
+            )).unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), pending.next()).await.unwrap().unwrap();
+            assert!(matches!(outcome, ForegroundToolOutcome::TimedOut { ref call_id, .. } if call_id == "parent-call"));
+            drop(output_tx);
+        }).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

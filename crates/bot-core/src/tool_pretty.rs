@@ -208,6 +208,10 @@ fn describe_started(name: &str, args: &Value) -> (String, String) {
             )
         }
         "context__manage" => ("整理上下文".to_string(), describe_content_bytes(args)),
+        "todo" => describe_todo(
+            &format!("todo__{}", string_arg(args, "action").unwrap_or("list")),
+            args,
+        ),
         value if value.starts_with("todo__") => describe_todo(value, args),
         "tool_tasks" => describe_tool_tasks(args),
         "ask_user_question" => {
@@ -286,7 +290,7 @@ fn describe_completed(name: &str, args: &Value, result: &str, success: bool) -> 
         ),
         "memory__upsert_named" => structured_result_summary(result)
             .unwrap_or_else(|| format!("已更新记忆 {}", string_arg(args, "name").unwrap_or(""))),
-        value if value.starts_with("todo__") || value == "tool_tasks" => {
+        value if value.starts_with("todo__") || value == "todo" || value == "tool_tasks" => {
             structured_result_summary(result).unwrap_or(started)
         }
         "ask_user_question" => {
@@ -329,13 +333,20 @@ fn describe_todo(name: &str, args: &Value) -> (String, String) {
             )
         }
         "todo__list" => ("查看 Todo".to_string(), "列出当前待办事项".to_string()),
-        "todo__complete" => (
-            format!(
-                "完成 Todo #{}",
-                id.map_or("?".to_string(), |id| id.to_string())
-            ),
-            "标记待办为已完成".to_string(),
-        ),
+        "todo__complete" => {
+            let ids = args
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_u64)
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| id.map_or("#?".into(), |id| format!("#{id}")));
+            (format!("完成 Todo {ids}"), "标记待办为已完成".into())
+        }
         "todo__update" => (
             format!(
                 "更新 Todo #{}",
@@ -968,6 +979,14 @@ mod tests {
                 "todo__add",
                 json!({"title":"Release","items":[{"title":"Test"}]}),
             ),
+            (
+                "todo",
+                json!({"action":"add","title":"Plan","items":[{"title":"Test"}]}),
+            ),
+            ("todo", json!({"action":"list"})),
+            ("todo", json!({"action":"complete","ids":[1,2]})),
+            ("todo", json!({"action":"update","id":1,"content":"Ship"})),
+            ("todo", json!({"action":"remove","id":1})),
             ("todo__list", json!({})),
             ("todo__complete", json!({"id":1})),
             ("todo__update", json!({"id":1,"content":"Ship"})),

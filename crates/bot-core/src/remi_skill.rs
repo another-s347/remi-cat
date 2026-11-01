@@ -57,7 +57,15 @@ Tool call example:
 {"command":"profile list"}
 {"command":"tools --json"}
 {"command":"profile agent --help"}
+{"command":"profile current"}
+{"command":"profile show @travel --sources"}
+{"command":"profile resource list @travel"}
+{"command":"profile channel list @travel --format json"}
+{"command":"--profile @travel config set auto_compress_context_percent=70"}
+{"command":"profile model set @travel --context-tokens 65536 --max-output-tokens 32768"}
 ```
+
+Each JSON object above is a separate `manage_yourself` call. Replace `@travel` with the requested profile. Read the model/context rules below before changing budgets; omitting a model ID targets the runtime-selected model, not necessarily the literal ID `default`.
 
 Inspect profiles:
 

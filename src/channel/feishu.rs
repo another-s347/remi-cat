@@ -631,161 +631,6 @@ fn merge_output_chunk(previous: &mut CoreChatEvent, next: &CoreChatEvent) -> boo
     }
 }
 
-async fn replay_feishu_history(
-    runtime: &Runtime,
-    platform: &str,
-    channel_id: &str,
-    session_id: &str,
-    source: &FeishuMessage,
-    gateway: &FeishuGateway,
-    history: Vec<bot_core::ThreadHistoryMessage>,
-) -> anyhow::Result<()> {
-    let turns = feishu_history_turns(history);
-    for (input, events) in turns {
-        replay_feishu_history_turn(
-            runtime, platform, channel_id, session_id, source, gateway, input, events,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn feishu_history_turns(
-    history: Vec<bot_core::ThreadHistoryMessage>,
-) -> Vec<(String, Vec<CoreChatEvent>)> {
-    let mut turns: Vec<(String, Vec<CoreChatEvent>)> = Vec::new();
-    for message in history {
-        if message.role == "user" {
-            turns.push((message.text, Vec::new()));
-            continue;
-        }
-        if turns.is_empty() {
-            turns.push(("已复制历史对话。".into(), Vec::new()));
-        }
-        let events = &mut turns.last_mut().unwrap().1;
-        if message.role == "assistant" {
-            if !message.text.is_empty() {
-                events.push(CoreChatEvent::Bot(CatEvent::Text(message.text)));
-            }
-            if let Some(calls) = message
-                .tool_calls
-                .and_then(|value| value.as_array().cloned())
-            {
-                for call in calls {
-                    let id = call["id"].as_str().unwrap_or_default().to_string();
-                    let name = call["function"]["name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let args = call["function"]["arguments"]
-                        .as_str()
-                        .and_then(|text| serde_json::from_str(text).ok())
-                        .unwrap_or_default();
-                    events.push(CoreChatEvent::Bot(CatEvent::ToolCall { id, name, args }));
-                }
-            }
-        } else if message.role == "tool" {
-            let (id, name, args, elapsed_ms) = if let Some(pretty) = message.pretty {
-                (
-                    pretty.id,
-                    pretty.tool_name,
-                    pretty.request,
-                    pretty.elapsed_ms.unwrap_or(0),
-                )
-            } else {
-                let id = message.tool_call_id.unwrap_or(message.id);
-                let name = events
-                    .iter()
-                    .rev()
-                    .find_map(|event| match event {
-                        CoreChatEvent::Bot(CatEvent::ToolCall {
-                            id: call_id, name, ..
-                        }) if call_id == &id => Some(name.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "tool".into());
-                (id, name, serde_json::Value::Null, 0)
-            };
-            events.push(CoreChatEvent::Bot(CatEvent::ToolCallResult {
-                id,
-                name,
-                args,
-                result: message.text.clone(),
-                success: bot_core::tool_success(&message.text),
-                elapsed_ms,
-            }));
-        }
-    }
-    for (_, events) in &mut turns {
-        let mut final_text = String::new();
-        for event in events.iter() {
-            match event {
-                CoreChatEvent::Bot(CatEvent::Text(text)) => final_text.push_str(text),
-                _ => final_text.clear(),
-            }
-        }
-        if !final_text.is_empty() {
-            events.push(CoreChatEvent::ResponseCompleted {
-                message_id: uuid::Uuid::new_v4().to_string(),
-                text: final_text,
-            });
-        }
-    }
-    turns
-}
-
-async fn replay_feishu_history_turn(
-    runtime: &Runtime,
-    platform: &str,
-    channel_id: &str,
-    session_id: &str,
-    source: &FeishuMessage,
-    gateway: &FeishuGateway,
-    input: String,
-    events: Vec<CoreChatEvent>,
-) -> anyhow::Result<()> {
-    let chat_id = channel_id.split(":thread:").next().unwrap_or(channel_id);
-    let anchor = if channel_id.contains(":thread:") {
-        let anchor = runtime
-            .im_bridge
-            .sub_session_reply_anchor(platform, channel_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("fork topic has no reply anchor"))?;
-        gateway.reply_text(&anchor, &input).await?
-    } else {
-        gateway.send_text(chat_id, &input).await?
-    };
-    let mut message = source.clone();
-    message.chat_id = chat_id.to_string();
-    message.message_id = anchor.clone();
-    message.text = input;
-    message.mentions.clear();
-    message.images.clear();
-    message.files.clear();
-    message.documents.clear();
-    let protocol =
-        build_feishu_output_protocol(runtime, platform, session_id, &message, None, Some(gateway))
-            .await;
-    let mut replies = FeishuReplyStream::new(gateway.clone(), chat_id.to_string(), anchor.clone());
-    replies.start().await;
-    let mut reply_option = Some(&mut replies);
-    let mut forwarder = FeishuEventForwarder {
-        runtime,
-        platform,
-        msg: &message,
-        session_id,
-        debug_enabled: false,
-        gateway: Some(gateway),
-        replies: &mut reply_option,
-        state: FeishuForwarderState::new(protocol, anchor),
-    };
-    for event in events {
-        forwarder.forward_core_event(event).await;
-    }
-    forwarder.commit_final_output().await?;
-    Ok(())
-}
-
 fn is_feishu_platform(platform: &str) -> bool {
     platform == FEISHU_CHANNEL || platform.starts_with("feishu:")
 }
@@ -868,9 +713,14 @@ async fn handle_feishu_fork_command(
                 &binding.channel_id,
             )?;
             if let Some(gateway) = gateway {
-                let history = runtime.bot.thread_history(&fork.id).await;
-                if let Err(error) = replay_feishu_history(runtime, &binding.platform, &binding.channel_id, &fork.id, msg, gateway, history).await {
-                    return Ok(format!("已 fork 当前 session 并创建新入口，但同步对话失败。\n\n新 session: `{}`\n错误: {error:#}", fork.id));
+                let source = runtime.sessions.lock().await.get(source_session_id)
+                    .ok_or_else(|| anyhow::anyhow!("source session disappeared"))?;
+                let start_time = chrono::DateTime::parse_from_rfc3339(&source.created_at)?.timestamp();
+                if let Err(error) = gateway.forward_fork_history(
+                    &msg.chat_id, msg.thread_id.as_deref(), start_time,
+                    &msg.message_id, &binding.channel_id, &fork.id,
+                ).await {
+                    return Ok(format!("已 fork 当前 session 并创建新入口，但历史转发未完成（部分批次可能已送达）。Agent 上下文已复制，可在新入口继续对话。\n\n新 session: `{}`\n错误: {error:#}", fork.id));
                 }
             }
             Ok(format!(
@@ -1108,7 +958,11 @@ async fn load_feishu_output_resource(
         }
         return Ok((name, mime, content));
     }
-    let resolved = crate::resolve_resource_path(path, workspace, &[])?;
+    let resolved = if image {
+        crate::resolve_image_resource_path(path, workspace)?
+    } else {
+        crate::resolve_resource_path(path, workspace, &[])?
+    };
     if image && tokio::fs::metadata(&resolved).await?.len() > MAX_OUTPUT_IMAGE_BYTES as u64 {
         anyhow::bail!("output image exceeds 10 MiB");
     }
@@ -2127,6 +1981,52 @@ fn format_narrative_delta(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn local_output_images_can_be_read_outside_the_workspace() {
+        use super::load_feishu_output_resource;
+        use base64::Engine as _;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = root.path().join("outside.png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGZkAAAAASUVORK5CYII=")
+            .unwrap();
+        std::fs::write(&image, &png).unwrap();
+        for path in [image.to_str().unwrap(), "../outside.png"] {
+            let (name, mime, bytes) = load_feishu_output_resource(path, true, &workspace)
+                .await
+                .unwrap();
+            assert_eq!(name, "outside.png");
+            assert_eq!(mime, "image/png");
+            assert_eq!(bytes, png);
+        }
+        assert!(
+            load_feishu_output_resource(image.to_str().unwrap(), false, &workspace)
+                .await
+                .is_err()
+        );
+        assert!(
+            load_feishu_output_resource("../missing.png", true, &workspace)
+                .await
+                .is_err()
+        );
+        assert!(
+            load_feishu_output_resource(root.path().to_str().unwrap(), true, &workspace)
+                .await
+                .is_err()
+        );
+        let large = root.path().join("large.png");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(10 * 1024 * 1024 + 1)
+            .unwrap();
+        let error = load_feishu_output_resource(large.to_str().unwrap(), true, &workspace)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 10 MiB"));
+    }
+
     use bot_core::{Content, ContentPart};
     use im_feishu::FeishuMessage;
 
@@ -2140,42 +2040,6 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
-
-    #[test]
-    fn fork_history_runs_final_resources_through_response_completion_per_turn() {
-        let message = |role: &str, text: &str| bot_core::ThreadHistoryMessage {
-            id: "test".into(),
-            role: role.into(),
-            text: text.into(),
-            timestamp: None,
-            tool_call_id: None,
-            tool_calls: None,
-            pretty: None,
-        };
-        let mut tool_call = message("assistant", "process narrative");
-        tool_call.tool_calls =
-            Some(serde_json::json!([{"id":"call","function":{"name":"read","arguments":"{}"}}]));
-        let final_text = "![local](/workspace/a.png)\n![remote](https://example.com/b.png)\n[report](remi-resource:report.pdf)";
-        let turns = super::feishu_history_turns(vec![
-            message("user", "first request"),
-            tool_call,
-            message("assistant", "![probe](remi-resource:probe.png)"),
-            message("user", "second request"),
-            message("assistant", final_text),
-        ]);
-        assert_eq!(turns.len(), 2);
-        for (index, expected) in ["![probe](remi-resource:probe.png)", final_text]
-            .iter()
-            .enumerate()
-        {
-            let Some(crate::CoreChatEvent::ResponseCompleted { text, .. }) = turns[index].1.last()
-            else {
-                panic!("resource rendering completion missing")
-            };
-            assert_eq!(text, expected);
-            assert!(!text.contains("process narrative"));
-        }
-    }
 
     #[test]
     fn ready_child_chunks_merge_without_crossing_tool_or_run_boundaries() {

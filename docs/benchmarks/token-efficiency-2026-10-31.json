@@ -1,0 +1,1588 @@
+{
+  "aggregates": {
+    "opencode": {
+      "runs": 6,
+      "passed": 5,
+      "usage": {
+        "requests": 62,
+        "prompt_tokens": 543635,
+        "completion_tokens": 7616,
+        "total_tokens": 551251,
+        "cached_tokens": 431872,
+        "uncached_prompt_tokens": 111763,
+        "reasoning_tokens": 62
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 156638,
+        "system": 211970,
+        "user": 7272,
+        "assistant": 49362,
+        "tool": 177377
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 857,
+        "reasoning_text": 0,
+        "tool_arguments": 6125,
+        "tool_names": 59
+      },
+      "tool_calls": {
+        "read": 17,
+        "glob": 11,
+        "edit": 9,
+        "write": 9,
+        "shell": 11,
+        "grep": 2
+      },
+      "median_seconds": 57.14832845650005
+    },
+    "remi": {
+      "runs": 6,
+      "passed": 5,
+      "usage": {
+        "requests": 81,
+        "prompt_tokens": 512773,
+        "completion_tokens": 8814,
+        "total_tokens": 521587,
+        "cached_tokens": 401408,
+        "uncached_prompt_tokens": 111365,
+        "reasoning_tokens": 81
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 324486,
+        "system": 101007,
+        "user": 9573,
+        "assistant": 81105,
+        "tool": 94978
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 832,
+        "reasoning_text": 0,
+        "tool_arguments": 6894,
+        "tool_names": 181
+      },
+      "tool_calls": {
+        "todo__add": 4,
+        "fs_read": 21,
+        "fs_ls": 12,
+        "rg": 4,
+        "todo__complete": 16,
+        "todo__update": 1,
+        "apply_patch": 5,
+        "fs_mkdir": 3,
+        "fs_write": 11,
+        "bash": 7
+      },
+      "median_seconds": 78.58600563199991
+    },
+    "dsh": {
+      "runs": 6,
+      "passed": 5,
+      "usage": {
+        "requests": 98,
+        "prompt_tokens": 789705,
+        "completion_tokens": 13615,
+        "total_tokens": 803320,
+        "cached_tokens": 638976,
+        "uncached_prompt_tokens": 150729,
+        "reasoning_tokens": 98
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 386958,
+        "system": 51590,
+        "user": 23979,
+        "assistant": 150398,
+        "tool": 295763
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 1337,
+        "reasoning_text": 0,
+        "tool_arguments": 11239,
+        "tool_names": 106
+      },
+      "tool_calls": {
+        "read": 23,
+        "glob": 11,
+        "write": 10,
+        "bash": 26,
+        "edit": 8,
+        "todo_write": 12,
+        "grep": 2,
+        "working_directory": 1
+      },
+      "median_seconds": 96.31188573149996
+    },
+    "remi-lean": {
+      "runs": 6,
+      "passed": 6,
+      "usage": {
+        "requests": 69,
+        "prompt_tokens": 191680,
+        "completion_tokens": 10125,
+        "total_tokens": 201805,
+        "cached_tokens": 133632,
+        "uncached_prompt_tokens": 58048,
+        "reasoning_tokens": 69
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 83421,
+        "system": 10695,
+        "user": 8265,
+        "assistant": 65728,
+        "tool": 58588
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 1413,
+        "reasoning_text": 0,
+        "tool_arguments": 7841,
+        "tool_names": 122
+      },
+      "tool_calls": {
+        "fs_read": 21,
+        "fs_ls": 13,
+        "fs_write": 15,
+        "bash": 16,
+        "apply_patch": 3,
+        "rg": 2
+      },
+      "median_seconds": 76.501371608
+    },
+    "remi-no-todo": {
+      "runs": 3,
+      "passed": 3,
+      "usage": {
+        "requests": 32,
+        "prompt_tokens": 193967,
+        "completion_tokens": 4911,
+        "total_tokens": 198878,
+        "cached_tokens": 151552,
+        "uncached_prompt_tokens": 42415,
+        "reasoning_tokens": 32
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 116480,
+        "system": 37856,
+        "user": 3917,
+        "assistant": 28592,
+        "tool": 40829
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 538,
+        "reasoning_text": 0,
+        "tool_arguments": 3927,
+        "tool_names": 63
+      },
+      "tool_calls": {
+        "fs_read": 12,
+        "fs_ls": 6,
+        "fs_write": 7,
+        "bash": 4,
+        "apply_patch": 2,
+        "rg": 2,
+        "fs_mkdir": 1
+      },
+      "median_seconds": 66.07473306199995
+    }
+  },
+  "runs": [
+    {
+      "id": "opencode-csv-1",
+      "harness": "opencode",
+      "task": "csv",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 88.38329935699994,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 15,
+        "prompt_tokens": 109714,
+        "completion_tokens": 1701,
+        "total_tokens": 111415,
+        "cached_tokens": 90368,
+        "uncached_prompt_tokens": 19346,
+        "reasoning_tokens": 15
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 39159,
+        "system": 52777,
+        "user": 1557,
+        "assistant": 15068,
+        "tool": 15514
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 85,
+        "reasoning_text": 0,
+        "tool_arguments": 1461,
+        "tool_names": 14
+      },
+      "tool_calls": {
+        "read": 4,
+        "glob": 3,
+        "edit": 3,
+        "write": 1,
+        "shell": 3
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 536,
+        "completion_tokens": 10,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 15,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "opencode-csv-2",
+      "harness": "opencode",
+      "task": "csv",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 67.46787332300005,
+      "passed": false,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 14,
+        "prompt_tokens": 103012,
+        "completion_tokens": 1932,
+        "total_tokens": 104944,
+        "cached_tokens": 84224,
+        "uncached_prompt_tokens": 18788,
+        "reasoning_tokens": 14
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 36362,
+        "system": 49038,
+        "user": 1455,
+        "assistant": 21296,
+        "tool": 9409
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 80,
+        "reasoning_text": 0,
+        "tool_arguments": 1715,
+        "tool_names": 14
+      },
+      "tool_calls": {
+        "read": 2,
+        "glob": 1,
+        "write": 2,
+        "shell": 5,
+        "edit": 4
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 536,
+        "completion_tokens": 14,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 14,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "opencode-logs-1",
+      "harness": "opencode",
+      "task": "logs",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 41.067395038000086,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 6,
+        "prompt_tokens": 100256,
+        "completion_tokens": 421,
+        "total_tokens": 100677,
+        "cached_tokens": 71936,
+        "uncached_prompt_tokens": 28320,
+        "reasoning_tokens": 6
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 13986,
+        "system": 19126,
+        "user": 633,
+        "assistant": 909,
+        "tool": 72842
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 185,
+        "reasoning_text": 0,
+        "tool_arguments": 177,
+        "tool_names": 5
+      },
+      "tool_calls": {
+        "read": 3,
+        "grep": 1,
+        "write": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 533,
+        "completion_tokens": 12,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 6,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "opencode-logs-2",
+      "harness": "opencode",
+      "task": "logs",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 28.15610099599985,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 6,
+        "prompt_tokens": 100626,
+        "completion_tokens": 478,
+        "total_tokens": 101104,
+        "cached_tokens": 76032,
+        "uncached_prompt_tokens": 24594,
+        "reasoning_tokens": 6
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 13986,
+        "system": 19126,
+        "user": 633,
+        "assistant": 921,
+        "tool": 73204
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 233,
+        "reasoning_text": 0,
+        "tool_arguments": 187,
+        "tool_names": 5
+      },
+      "tool_calls": {
+        "read": 3,
+        "grep": 1,
+        "write": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 533,
+        "completion_tokens": 11,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 6,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "opencode-retry-1",
+      "harness": "opencode",
+      "task": "retry",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 58.99082250200013,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 11,
+        "prompt_tokens": 68351,
+        "completion_tokens": 1535,
+        "total_tokens": 69886,
+        "cached_tokens": 57600,
+        "uncached_prompt_tokens": 10751,
+        "reasoning_tokens": 11
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 27971,
+        "system": 37821,
+        "user": 1567,
+        "assistant": 5615,
+        "tool": 3567
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 221,
+        "reasoning_text": 0,
+        "tool_arguments": 1182,
+        "tool_names": 11
+      },
+      "tool_calls": {
+        "glob": 4,
+        "read": 3,
+        "write": 2,
+        "edit": 1,
+        "shell": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 573,
+        "completion_tokens": 13,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 11,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "opencode-retry-2",
+      "harness": "opencode",
+      "task": "retry",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 55.30583441099998,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 10,
+        "prompt_tokens": 61676,
+        "completion_tokens": 1549,
+        "total_tokens": 63225,
+        "cached_tokens": 51712,
+        "uncached_prompt_tokens": 9964,
+        "reasoning_tokens": 10
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 25174,
+        "system": 34082,
+        "user": 1427,
+        "assistant": 5553,
+        "tool": 2841
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 53,
+        "reasoning_text": 0,
+        "tool_arguments": 1403,
+        "tool_names": 10
+      },
+      "tool_calls": {
+        "glob": 3,
+        "read": 2,
+        "shell": 2,
+        "write": 2,
+        "edit": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 573,
+        "completion_tokens": 13,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 10,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-csv-1",
+      "harness": "remi",
+      "task": "csv",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 87.98377712700017,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 20,
+        "prompt_tokens": 126295,
+        "completion_tokens": 2038,
+        "total_tokens": 128333,
+        "cached_tokens": 100352,
+        "uncached_prompt_tokens": 25943,
+        "reasoning_tokens": 20
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 80120,
+        "system": 24940,
+        "user": 2020,
+        "assistant": 26294,
+        "tool": 20029
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 97,
+        "reasoning_text": 0,
+        "tool_arguments": 1657,
+        "tool_names": 48
+      },
+      "tool_calls": {
+        "todo__add": 1,
+        "fs_read": 5,
+        "fs_ls": 3,
+        "rg": 1,
+        "todo__complete": 4,
+        "todo__update": 1,
+        "apply_patch": 2,
+        "fs_mkdir": 1,
+        "fs_write": 2,
+        "bash": 2
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {
+        "requests": 6,
+        "prompt_tokens": 37524,
+        "completion_tokens": 782,
+        "cached_tokens": 30720
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 20,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-csv-2",
+      "harness": "remi",
+      "task": "csv",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 74.91811702199993,
+      "passed": false,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 10,
+        "prompt_tokens": 54684,
+        "completion_tokens": 1422,
+        "total_tokens": 56106,
+        "cached_tokens": 45056,
+        "uncached_prompt_tokens": 9628,
+        "reasoning_tokens": 10
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 40060,
+        "system": 12470,
+        "user": 1010,
+        "assistant": 8150,
+        "tool": 3860
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 165,
+        "reasoning_text": 0,
+        "tool_arguments": 1129,
+        "tool_names": 23
+      },
+      "tool_calls": {
+        "fs_read": 1,
+        "fs_ls": 2,
+        "todo__add": 1,
+        "todo__complete": 3,
+        "apply_patch": 1,
+        "fs_write": 1,
+        "bash": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {
+        "requests": 4,
+        "prompt_tokens": 21704,
+        "completion_tokens": 509,
+        "cached_tokens": 18432
+      },
+      "errors": [],
+      "workspace_tests": [
+        "project/test_csvio.py"
+      ],
+      "request_files": 10,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-logs-1",
+      "harness": "remi",
+      "task": "logs",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 18.987823157000093,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 7,
+        "prompt_tokens": 55863,
+        "completion_tokens": 497,
+        "total_tokens": 56360,
+        "cached_tokens": 40960,
+        "uncached_prompt_tokens": 14903,
+        "reasoning_tokens": 7
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 28042,
+        "system": 8729,
+        "user": 700,
+        "assistant": 1823,
+        "tool": 23787
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 189,
+        "reasoning_text": 0,
+        "tool_arguments": 227,
+        "tool_names": 13
+      },
+      "tool_calls": {
+        "fs_read": 5,
+        "rg": 1,
+        "fs_write": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 7,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-logs-2",
+      "harness": "remi",
+      "task": "logs",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 31.658566522,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 7,
+        "prompt_tokens": 55241,
+        "completion_tokens": 383,
+        "total_tokens": 55624,
+        "cached_tokens": 45056,
+        "uncached_prompt_tokens": 10185,
+        "reasoning_tokens": 7
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 28042,
+        "system": 8729,
+        "user": 700,
+        "assistant": 1484,
+        "tool": 23444
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 142,
+        "reasoning_text": 0,
+        "tool_arguments": 158,
+        "tool_names": 13
+      },
+      "tool_calls": {
+        "fs_read": 5,
+        "rg": 1,
+        "fs_write": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 7,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-retry-1",
+      "harness": "remi",
+      "task": "retry",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 113.2621915000002,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 20,
+        "prompt_tokens": 121014,
+        "completion_tokens": 2408,
+        "total_tokens": 123422,
+        "cached_tokens": 94208,
+        "uncached_prompt_tokens": 26806,
+        "reasoning_tokens": 20
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 80120,
+        "system": 24940,
+        "user": 2780,
+        "assistant": 24976,
+        "tool": 13360
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 118,
+        "reasoning_text": 0,
+        "tool_arguments": 1999,
+        "tool_names": 43
+      },
+      "tool_calls": {
+        "todo__add": 1,
+        "fs_ls": 4,
+        "fs_read": 3,
+        "bash": 3,
+        "todo__complete": 4,
+        "fs_write": 3,
+        "apply_patch": 1,
+        "fs_mkdir": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {
+        "requests": 5,
+        "prompt_tokens": 31788,
+        "completion_tokens": 1118,
+        "cached_tokens": 24576
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 20,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-retry-2",
+      "harness": "remi",
+      "task": "retry",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 82.25389424199989,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 17,
+        "prompt_tokens": 99676,
+        "completion_tokens": 2066,
+        "total_tokens": 101742,
+        "cached_tokens": 75776,
+        "uncached_prompt_tokens": 23900,
+        "reasoning_tokens": 17
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 68102,
+        "system": 21199,
+        "user": 2363,
+        "assistant": 18378,
+        "tool": 10498
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 121,
+        "reasoning_text": 0,
+        "tool_arguments": 1724,
+        "tool_names": 41
+      },
+      "tool_calls": {
+        "todo__add": 1,
+        "fs_ls": 3,
+        "fs_read": 2,
+        "rg": 1,
+        "todo__complete": 5,
+        "fs_write": 3,
+        "apply_patch": 1,
+        "fs_mkdir": 1,
+        "bash": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {
+        "requests": 5,
+        "prompt_tokens": 30710,
+        "completion_tokens": 985,
+        "cached_tokens": 24576
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 17,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-csv-1",
+      "harness": "dsh",
+      "task": "csv",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 161.68091692899998,
+      "passed": false,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 21,
+        "prompt_tokens": 168932,
+        "completion_tokens": 4093,
+        "total_tokens": 173025,
+        "cached_tokens": 143360,
+        "uncached_prompt_tokens": 25572,
+        "reasoning_tokens": 21
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 84121,
+        "system": 11179,
+        "user": 4905,
+        "assistant": 50315,
+        "tool": 46710
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 172,
+        "reasoning_text": 0,
+        "tool_arguments": 3701,
+        "tool_names": 22
+      },
+      "tool_calls": {
+        "read": 6,
+        "glob": 3,
+        "write": 2,
+        "bash": 8,
+        "edit": 3
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 236,
+        "completion_tokens": 9,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 21,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-csv-2",
+      "harness": "dsh",
+      "task": "csv",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 185.073805794,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 31,
+        "prompt_tokens": 252747,
+        "completion_tokens": 4075,
+        "total_tokens": 256822,
+        "cached_tokens": 217088,
+        "uncached_prompt_tokens": 35659,
+        "reasoning_tokens": 31
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 126181,
+        "system": 16709,
+        "user": 7295,
+        "assistant": 68035,
+        "tool": 79285
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 155,
+        "reasoning_text": 0,
+        "tool_arguments": 3585,
+        "tool_names": 31
+      },
+      "tool_calls": {
+        "read": 6,
+        "glob": 3,
+        "bash": 13,
+        "todo_write": 2,
+        "write": 2,
+        "edit": 3
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 236,
+        "completion_tokens": 9,
+        "requests": 1
+      },
+      "todo_only_followups": {
+        "requests": 2,
+        "prompt_tokens": 18428,
+        "completion_tokens": 628,
+        "cached_tokens": 16384
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 31,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-logs-1",
+      "harness": "dsh",
+      "task": "logs",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 30.15620690700007,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 6,
+        "prompt_tokens": 92577,
+        "completion_tokens": 483,
+        "total_tokens": 93060,
+        "cached_tokens": 69632,
+        "uncached_prompt_tokens": 22945,
+        "reasoning_tokens": 6
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 21031,
+        "system": 2884,
+        "user": 1314,
+        "assistant": 946,
+        "tool": 73818
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 231,
+        "reasoning_text": 0,
+        "tool_arguments": 196,
+        "tool_names": 5
+      },
+      "tool_calls": {
+        "read": 3,
+        "grep": 1,
+        "write": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 233,
+        "completion_tokens": 10,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 6,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-logs-2",
+      "harness": "dsh",
+      "task": "logs",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 41.82196921700006,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 7,
+        "prompt_tokens": 97039,
+        "completion_tokens": 528,
+        "total_tokens": 97567,
+        "cached_tokens": 73728,
+        "uncached_prompt_tokens": 23311,
+        "reasoning_tokens": 7
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 25237,
+        "system": 3437,
+        "user": 1552,
+        "assistant": 1292,
+        "tool": 73761
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 235,
+        "reasoning_text": 0,
+        "tool_arguments": 225,
+        "tool_names": 6
+      },
+      "tool_calls": {
+        "glob": 1,
+        "read": 3,
+        "grep": 1,
+        "write": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 233,
+        "completion_tokens": 10,
+        "requests": 1
+      },
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 7,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-retry-1",
+      "harness": "dsh",
+      "task": "retry",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 116.87018117899993,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 18,
+        "prompt_tokens": 98278,
+        "completion_tokens": 2269,
+        "total_tokens": 100547,
+        "cached_tokens": 75776,
+        "uncached_prompt_tokens": 22502,
+        "reasoning_tokens": 18
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 71503,
+        "system": 9520,
+        "user": 4872,
+        "assistant": 16154,
+        "tool": 13276
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 269,
+        "reasoning_text": 0,
+        "tool_arguments": 1807,
+        "tool_names": 23
+      },
+      "tool_calls": {
+        "working_directory": 1,
+        "glob": 3,
+        "read": 3,
+        "bash": 2,
+        "todo_write": 5,
+        "write": 2,
+        "edit": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 273,
+        "completion_tokens": 9,
+        "requests": 1
+      },
+      "todo_only_followups": {
+        "requests": 5,
+        "prompt_tokens": 32722,
+        "completion_tokens": 1640,
+        "cached_tokens": 24576
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 18,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "dsh-retry-2",
+      "harness": "dsh",
+      "task": "retry",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 75.75359028399998,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 15,
+        "prompt_tokens": 80132,
+        "completion_tokens": 2167,
+        "total_tokens": 82299,
+        "cached_tokens": 59392,
+        "uncached_prompt_tokens": 20740,
+        "reasoning_tokens": 15
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 58885,
+        "system": 7861,
+        "user": 4041,
+        "assistant": 13656,
+        "tool": 8913
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 275,
+        "reasoning_text": 0,
+        "tool_arguments": 1725,
+        "tool_names": 19
+      },
+      "tool_calls": {
+        "bash": 3,
+        "read": 2,
+        "glob": 1,
+        "todo_write": 5,
+        "write": 2,
+        "edit": 1
+      },
+      "auxiliary_candidates": {
+        "prompt_tokens": 273,
+        "completion_tokens": 11,
+        "requests": 1
+      },
+      "todo_only_followups": {
+        "requests": 5,
+        "prompt_tokens": 30820,
+        "completion_tokens": 1573,
+        "cached_tokens": 24576
+      },
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 15,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-csv-1",
+      "harness": "remi-lean",
+      "task": "csv",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 78.46553507399994,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 13,
+        "prompt_tokens": 37642,
+        "completion_tokens": 2336,
+        "total_tokens": 39978,
+        "cached_tokens": 24576,
+        "uncached_prompt_tokens": 13066,
+        "reasoning_tokens": 13
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 15717,
+        "system": 2015,
+        "user": 1352,
+        "assistant": 18823,
+        "tool": 8193
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 154,
+        "reasoning_text": 0,
+        "tool_arguments": 2017,
+        "tool_names": 25
+      },
+      "tool_calls": {
+        "fs_read": 4,
+        "fs_ls": 3,
+        "fs_write": 3,
+        "bash": 3,
+        "apply_patch": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 13,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-csv-2",
+      "harness": "remi-lean",
+      "task": "csv",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 79.12392296100006,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 14,
+        "prompt_tokens": 27729,
+        "completion_tokens": 1539,
+        "total_tokens": 29268,
+        "cached_tokens": 20480,
+        "uncached_prompt_tokens": 7249,
+        "reasoning_tokens": 14
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 16926,
+        "system": 2170,
+        "user": 1456,
+        "assistant": 10012,
+        "tool": 3838
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 224,
+        "reasoning_text": 0,
+        "tool_arguments": 1149,
+        "tool_names": 22
+      },
+      "tool_calls": {
+        "fs_read": 2,
+        "fs_ls": 4,
+        "rg": 1,
+        "fs_write": 3,
+        "bash": 3
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_csvio.py"
+      ],
+      "request_files": 14,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-logs-1",
+      "harness": "remi-lean",
+      "task": "logs",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 36.56331943200007,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 6,
+        "prompt_tokens": 11332,
+        "completion_tokens": 606,
+        "total_tokens": 11938,
+        "cached_tokens": 8192,
+        "uncached_prompt_tokens": 3140,
+        "reasoning_tokens": 6
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 7254,
+        "system": 930,
+        "user": 618,
+        "assistant": 1721,
+        "tool": 2609
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 168,
+        "reasoning_text": 0,
+        "tool_arguments": 373,
+        "tool_names": 10
+      },
+      "tool_calls": {
+        "fs_read": 3,
+        "bash": 2,
+        "fs_write": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 6,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-logs-2",
+      "harness": "remi-lean",
+      "task": "logs",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 23.951645807999967,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 7,
+        "prompt_tokens": 42436,
+        "completion_tokens": 756,
+        "total_tokens": 43192,
+        "cached_tokens": 29184,
+        "uncached_prompt_tokens": 13252,
+        "reasoning_tokens": 7
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 8463,
+        "system": 1085,
+        "user": 721,
+        "assistant": 2203,
+        "tool": 33005
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 416,
+        "reasoning_text": 0,
+        "tool_arguments": 261,
+        "tool_names": 13
+      },
+      "tool_calls": {
+        "fs_read": 5,
+        "rg": 1,
+        "fs_write": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 7,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-retry-1",
+      "harness": "remi-lean",
+      "task": "retry",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 87.07713919999992,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 13,
+        "prompt_tokens": 33494,
+        "completion_tokens": 2379,
+        "total_tokens": 35873,
+        "cached_tokens": 23552,
+        "uncached_prompt_tokens": 9942,
+        "reasoning_tokens": 13
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 15717,
+        "system": 2015,
+        "user": 1846,
+        "assistant": 15152,
+        "tool": 5345
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 184,
+        "reasoning_text": 0,
+        "tool_arguments": 2044,
+        "tool_names": 23
+      },
+      "tool_calls": {
+        "fs_ls": 3,
+        "fs_read": 2,
+        "fs_write": 4,
+        "bash": 3,
+        "apply_patch": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 13,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-lean-retry-2",
+      "harness": "remi-lean",
+      "task": "retry",
+      "repeat": 2,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 74.53720814200005,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 16,
+        "prompt_tokens": 39047,
+        "completion_tokens": 2509,
+        "total_tokens": 41556,
+        "cached_tokens": 27648,
+        "uncached_prompt_tokens": 11399,
+        "reasoning_tokens": 16
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 19344,
+        "system": 2480,
+        "user": 2272,
+        "assistant": 17817,
+        "tool": 5598
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 267,
+        "reasoning_text": 0,
+        "tool_arguments": 1997,
+        "tool_names": 29
+      },
+      "tool_calls": {
+        "fs_ls": 3,
+        "fs_read": 5,
+        "bash": 5,
+        "fs_write": 3,
+        "apply_patch": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 16,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-no-todo-csv-1",
+      "harness": "remi-no-todo",
+      "task": "csv",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 66.07473306199995,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 11,
+        "prompt_tokens": 62675,
+        "completion_tokens": 1994,
+        "total_tokens": 64669,
+        "cached_tokens": 49152,
+        "uncached_prompt_tokens": 13523,
+        "reasoning_tokens": 11
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 40040,
+        "system": 13013,
+        "user": 1166,
+        "assistant": 12892,
+        "tool": 8241
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 140,
+        "reasoning_text": 0,
+        "tool_arguments": 1729,
+        "tool_names": 24
+      },
+      "tool_calls": {
+        "fs_read": 4,
+        "fs_ls": 3,
+        "fs_write": 3,
+        "bash": 2,
+        "apply_patch": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "project/test_csvio.py"
+      ],
+      "request_files": 11,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-no-todo-logs-1",
+      "harness": "remi-no-todo",
+      "task": "logs",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 35.85948507599983,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 7,
+        "prompt_tokens": 58123,
+        "completion_tokens": 555,
+        "total_tokens": 58678,
+        "cached_tokens": 45056,
+        "uncached_prompt_tokens": 13067,
+        "reasoning_tokens": 7
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 25480,
+        "system": 8281,
+        "user": 735,
+        "assistant": 1923,
+        "tool": 28380
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 215,
+        "reasoning_text": 0,
+        "tool_arguments": 257,
+        "tool_names": 13
+      },
+      "tool_calls": {
+        "fs_read": 5,
+        "rg": 1,
+        "fs_write": 1
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [],
+      "request_files": 7,
+      "unfinished_requests": 0
+    },
+    {
+      "id": "remi-no-todo-retry-1",
+      "harness": "remi-no-todo",
+      "task": "retry",
+      "repeat": 1,
+      "exit_code": 0,
+      "timed_out": false,
+      "elapsed": 95.08914731300001,
+      "passed": true,
+      "acceptance_version": 2,
+      "usage": {
+        "requests": 14,
+        "prompt_tokens": 73169,
+        "completion_tokens": 2362,
+        "total_tokens": 75531,
+        "cached_tokens": 57344,
+        "uncached_prompt_tokens": 15825,
+        "reasoning_tokens": 14
+      },
+      "components_cl100k_estimate": {
+        "tool_schema": 50960,
+        "system": 16562,
+        "user": 2016,
+        "assistant": 13777,
+        "tool": 4208
+      },
+      "output_cl100k_estimate": {
+        "visible_text": 183,
+        "reasoning_text": 0,
+        "tool_arguments": 1941,
+        "tool_names": 26
+      },
+      "tool_calls": {
+        "fs_ls": 3,
+        "fs_read": 3,
+        "rg": 1,
+        "fs_write": 3,
+        "apply_patch": 1,
+        "fs_mkdir": 1,
+        "bash": 2
+      },
+      "auxiliary_candidates": {},
+      "todo_only_followups": {},
+      "errors": [],
+      "workspace_tests": [
+        "tests/test_retry.py"
+      ],
+      "request_files": 14,
+      "unfinished_requests": 0
+    }
+  ],
+  "settings": {
+    "model": "kimi-k2.6",
+    "max_tokens": 8192,
+    "thinking": "disabled",
+    "temperature": 0.6,
+    "tokenizer": "cl100k_base estimates only",
+    "repeats": 2,
+    "workers": 3,
+    "remi_sha256": "2dafc0cd8ec122fcea55a539d10a8bd990f3f2c112e18013b66e88bf07a509f3",
+    "remi_head": "9541d0018846f5b820f8023448e4743ede323e02",
+    "dirty": " M src/channel/feishu.rs\n M src/lib.rs\n M src/output_protocol.rs\n M src/tui_app.rs\n?? scripts/token_efficiency/\n"
+  },
+  "versions": {
+    "opencode_source": {
+      "url": "https://github.com/anomalyco/opencode",
+      "head": "8b4d98c33a75bc2404154486eadaffa8891493aa",
+      "path": "/tmp/remi-token-bench/upstreams/opencode-http1",
+      "runtime": "@opencode/cli-linux-x64@2.2.5"
+    },
+    "deepseek_source": {
+      "url": "https://github.com/deepseek-ai/deepseek-harness",
+      "head": "ce7073d51254c26cd63b22a60835b8f948deb447",
+      "path": "/tmp/remi-token-bench/upstreams/deepseek-harness-http1",
+      "runtime": "@deepseek-ai/dsh@0.2.1-rc.5"
+    },
+    "node": "24.22.2"
+  },
+  "smoke_usage": {
+    "requests_with_meta": 49,
+    "requests_with_usage": 47,
+    "prompt_tokens": 390195,
+    "completion_tokens": 4518,
+    "total_tokens": 394713,
+    "cached_tokens": 297984,
+    "without_usage": 2
+  }
+}

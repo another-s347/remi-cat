@@ -15,6 +15,7 @@ const PINNED_SKILLS_GET_HINT: &str =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SkillPromptToolAvailability {
+    pub(crate) search: bool,
     pub(crate) skill_search: bool,
     pub(crate) skill_get: bool,
     pub(crate) fs_read: bool,
@@ -23,14 +24,21 @@ pub(crate) struct SkillPromptToolAvailability {
 impl SkillPromptToolAvailability {
     pub(crate) const fn new(skill_search: bool, skill_get: bool, fs_read: bool) -> Self {
         Self {
+            search: false,
             skill_search,
             skill_get,
             fs_read,
         }
     }
 
+    pub(crate) const fn with_search(mut self, available: bool) -> Self {
+        self.search = available;
+        self
+    }
+
     const fn without_skill_discovery(self) -> Self {
         Self {
+            search: false,
             skill_search: false,
             skill_get: false,
             fs_read: self.fs_read,
@@ -194,6 +202,13 @@ fn skill_resource_hint(
 fn pinned_skills_discovery_hint(
     tool_availability: SkillPromptToolAvailability,
 ) -> Option<&'static str> {
+    if tool_availability.search {
+        return Some(if tool_availability.skill_get {
+            "Discover more skills with `search` using scope=\"skills\", then load instructions with `skill__get`."
+        } else {
+            "Discover more skills with `search` using scope=\"skills\"."
+        });
+    }
     match (tool_availability.skill_search, tool_availability.skill_get) {
         (true, true) => Some(PINNED_SKILLS_SEARCH_AND_GET_HINT),
         (true, false) => Some(PINNED_SKILLS_SEARCH_HINT),
@@ -691,6 +706,20 @@ mod tests {
         assert!(prompt.contains("beta"));
         assert!(prompt.contains("..."));
         assert!(estimate_model_input_tokens(&prompt) <= 40);
+    }
+
+    #[test]
+    fn pinned_skill_prompt_prefers_unified_search_when_both_routes_exist() {
+        let prompt = pinned_skill_prompt(
+            &[skill("alpha", "Pinned", true)],
+            128000,
+            SkillPromptToolAvailability::new(true, true, true).with_search(true),
+        )
+        .unwrap();
+        assert!(prompt.contains("`search`"));
+        assert!(prompt.contains("scope=\"skills\""));
+        assert!(prompt.contains("`skill__get`"));
+        assert!(!prompt.contains("`skill__search`"));
     }
 
     #[test]

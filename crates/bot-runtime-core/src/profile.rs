@@ -230,13 +230,10 @@ You are ephemeral.
         let profile = embedded_agent_profile("default")
             .unwrap()
             .expect("default profile should exist");
-        assert!(profile
-            .system_prompt
-            .contains("Pinned skills are only a curated subset"));
-        assert!(profile
-            .system_prompt
-            .contains("Before starting substantive work, search for"));
-        assert!(profile.system_prompt.contains("relevant skills and memory"));
+        assert!(profile.system_prompt.contains("pinned-skill guidance"));
+        assert!(profile.system_prompt.contains("scope=\"memory\""));
+        assert!(profile.allows_tool("search"));
+        assert!(profile.allows_tool("skill__get"));
         assert!(profile.allows_tool("tool_tasks"));
     }
 

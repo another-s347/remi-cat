@@ -868,7 +868,11 @@ impl TuiOutputProtocol {
         let document = crate::parse_output(text, &self.context);
         let with_resources = document.render_resources(|path, image, label| {
             Some(
-                match crate::resolve_resource_path(path, &self.workspace, &[]) {
+                match if image {
+                    crate::resolve_image_resource_path(path, &self.workspace)
+                } else {
+                    crate::resolve_resource_path(path, &self.workspace, &[])
+                } {
                     Ok(path) if image => {
                         format!("![{}](<{}>)", markdown_label(label), path.display())
                     }
@@ -5215,6 +5219,23 @@ fn recall_input_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_resource_rendering_allows_paths_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = root.path().join("outside.png");
+        std::fs::write(&image, b"image").unwrap();
+        let mut protocol = handoff_protocol();
+        protocol.workspace = workspace;
+        protocol.context.capabilities.images = OutputCapability::Native;
+        let rendered = protocol.render("![outside](remi-resource:../outside.png)");
+        assert_eq!(
+            rendered,
+            format!("![outside](<{}>)", image.canonicalize().unwrap().display())
+        );
+    }
 
     fn handoff_protocol() -> TuiOutputProtocol {
         let mut context = OutputProtocolContext::new("tui", "c1", "p2p", "a0");

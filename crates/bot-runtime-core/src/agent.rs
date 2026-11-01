@@ -144,7 +144,11 @@ impl CoreSteerQueue {
     /// Recover inputs that were accepted but never consumed when a run ends
     /// unexpectedly. The caller must first stop new submissions to this queue.
     pub fn drain_pending(&self) -> Vec<CoreSteerInput> {
-        self.pending.lock().expect("steer queue lock poisoned").drain(..).collect()
+        self.pending
+            .lock()
+            .expect("steer queue lock poisoned")
+            .drain(..)
+            .collect()
     }
 }
 
@@ -590,7 +594,9 @@ You are a markdown agent.
                 .and_then(serde_json::Value::as_str),
             Some("message-2")
         );
-        let background = queue.drain_batch().expect("background turn should be present");
+        let background = queue
+            .drain_batch()
+            .expect("background turn should be present");
         assert!(background.is_background_only());
     }
 

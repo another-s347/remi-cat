@@ -24,6 +24,111 @@ const TODO_BATCH_EXECUTION_GUIDANCE: &str = "When this thread has an active plan
 
 // ── Todo item ────────────────────────────────────────────────────────────────
 
+/// Compact model-facing entry point; legacy tools remain callable for saved sessions.
+pub struct TodoTool {
+    backend: Arc<HybridTodoBackend>,
+}
+
+impl TodoTool {
+    pub fn new(backend: Arc<HybridTodoBackend>) -> Self {
+        Self { backend }
+    }
+}
+
+impl Tool for TodoTool {
+    fn name(&self) -> &str {
+        "todo"
+    }
+    fn description(&self) -> &str {
+        "Manage thread todo batches. Add requires title and items. List, rename, remove, or batch-complete verified IDs. Defer intermediate completions to the next useful work round or a final batch; never complete alongside verification."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{
+            "action":{"type":"string","enum":["add","list","complete","update","remove"]},
+            "title":{"type":"string","description":"Required batch title for add"},
+            "items":{"type":"array","minItems":1,"items":{"type":"object","properties":{
+                "title":{"type":"string"},"description":{"type":"string"}
+            },"required":["title"],"additionalProperties":false}},
+            "ids":{"type":"array","minItems":1,"items":{"type":"integer"},"description":"Finished IDs for complete"},
+            "id":{"type":"integer","description":"Item ID for update/remove"},
+            "content":{"type":"string","description":"New title for update"}
+        },"required":["action"],"additionalProperties":false})
+    }
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        _resume: Option<ResumePayload>,
+        ctx: ToolContext,
+    ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
+        let text = match arguments["action"].as_str() {
+            Some("add") => serde_json::to_string_pretty(
+                &self
+                    .backend
+                    .add_batch(ctx, parse_add_request(arguments)?)
+                    .await?,
+            )
+            .map_err(|e| AgentError::tool("todo", e.to_string()))?,
+            Some("list") => fmt_todos(&self.backend.list(ctx).await),
+            Some("complete") => {
+                self.backend
+                    .complete_many(ctx, &parse_completion_ids(&arguments)?)
+                    .await?
+            }
+            Some(action @ ("update" | "remove")) => {
+                let id = arguments["id"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::tool("todo", "provide integer id"))?;
+                if action == "remove" {
+                    self.backend.remove(ctx, id).await?
+                } else {
+                    let content = normalize_required_text(
+                        "todo",
+                        "content",
+                        arguments["content"].as_str().unwrap_or_default(),
+                    )?;
+                    self.backend.update(ctx, id, content).await?
+                }
+            }
+            _ => {
+                return Err(AgentError::tool(
+                    "todo",
+                    "action must be add, list, complete, update or remove",
+                ))
+            }
+        };
+        Ok(ToolResult::Output(
+            stream! { yield ToolOutput::text(text); },
+        ))
+    }
+}
+
+fn parse_completion_ids(arguments: &serde_json::Value) -> Result<Vec<u64>, AgentError> {
+    let mut ids = Vec::new();
+    if let Some(value) = arguments.get("id") {
+        ids.push(value.as_u64().ok_or_else(|| {
+            AgentError::tool("todo__complete", "id must be a non-negative integer")
+        })?);
+    }
+    if let Some(value) = arguments.get("ids") {
+        let values = value
+            .as_array()
+            .filter(|ids| !ids.is_empty())
+            .ok_or_else(|| AgentError::tool("todo__complete", "ids must be a non-empty array"))?;
+        for value in values {
+            let id = value.as_u64().ok_or_else(|| {
+                AgentError::tool("todo__complete", "ids must contain non-negative integers")
+            })?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Err(AgentError::tool("todo__complete", "provide id or ids"));
+    }
+    Ok(ids)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: u64,
@@ -330,7 +435,7 @@ pub fn latest_unfinished_batch_system_prompt(user_state: &serde_json::Value) -> 
             "This thread still has unfinished work under \"{}\".",
             batch.title
         ),
-        "Keep progress synchronized with todo__complete/update/remove.".to_string(),
+        "Defer intermediate completions to the next useful work round or one final batch; avoid Todo-only progress rounds. Skip unchanged updates and redundant lists. Never complete an item before observing its verification result.".to_string(),
         TODO_BATCH_EXECUTION_GUIDANCE.to_string(),
     ];
     for todo in batch.items.into_iter().filter(|todo| !todo.done) {
@@ -481,15 +586,16 @@ impl Tool for TodoCompleteTool {
         "todo__complete"
     }
     fn description(&self) -> &str {
-        "Mark a todo item as completed by its ID."
+        "Mark finished todo items completed. Pass ids to complete several together, or id for one. Only complete work after its tool results confirm success."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "The todo item ID to mark as done" }
+                "id": { "type": "integer", "description": "One finished todo ID (legacy single-item form)" },
+                "ids": { "type": "array", "items": { "type": "integer" }, "minItems": 1, "description": "Finished todo IDs to complete together" }
             },
-            "required": ["id"]
+            "anyOf": [{ "required": ["id"] }, { "required": ["ids"] }]
         })
     }
     async fn execute(
@@ -498,10 +604,8 @@ impl Tool for TodoCompleteTool {
         _resume: Option<ResumePayload>,
         ctx: ToolContext,
     ) -> Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError> {
-        let id = arguments["id"]
-            .as_u64()
-            .ok_or_else(|| AgentError::tool("todo__complete", "missing 'id'"))?;
-        let msg = self.backend.complete(ctx, id).await?;
+        let ids = parse_completion_ids(&arguments)?;
+        let msg = self.backend.complete_many(ctx, &ids).await?;
         Ok(ToolResult::Output(stream! { yield ToolOutput::text(msg); }))
     }
 }
@@ -608,6 +712,36 @@ mod tests {
         TodoBatchAddItemRequest, TodoBatchAddRequest, TodoItem,
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn completion_tool_accepts_legacy_and_batch_ids_and_rejects_invalid_batches() {
+        use bot_runtime_core::ToolContext;
+        use remi_agentloop::prelude::Tool;
+        use std::sync::Arc;
+        let tool = super::TodoCompleteTool::new(Arc::new(super::HybridTodoBackend::new(
+            std::path::PathBuf::from("/tmp"),
+        )));
+        for args in [json!({"id":1}), json!({"ids":[1,2,1]})] {
+            let ctx = ToolContext::default();
+            ctx.set_user_state(json!({"__todos":[{"id":1,"content":"a"},{"id":2,"content":"b"}]}));
+            assert!(tool.execute(args.clone(), None, ctx.clone()).await.is_ok());
+            let todos = todos_from_user_state(&ctx.user_state());
+            assert!(todos[0].done);
+            assert_eq!(todos[1].done, args.get("ids").is_some());
+        }
+        for args in [
+            json!({}),
+            json!({"ids":[]}),
+            json!({"ids":[1,-1]}),
+            json!({"id":true}),
+            json!({"ids":"1,2"}),
+        ] {
+            let ctx = ToolContext::default();
+            let before = ctx.user_state();
+            assert!(tool.execute(args, None, ctx.clone()).await.is_err());
+            assert_eq!(ctx.user_state(), before);
+        }
+    }
 
     fn batch_request(title: &str, items: &[(&str, Option<&str>)]) -> TodoBatchAddRequest {
         TodoBatchAddRequest {

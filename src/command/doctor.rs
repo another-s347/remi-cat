@@ -113,16 +113,7 @@ pub(crate) fn run_doctor(profile: &InstanceProfile, data_dir: &Path) -> anyhow::
             );
             println!(
                 "tool_todo: {}",
-                if has_all_tools(
-                    &agent.tools,
-                    &[
-                        "todo__add",
-                        "todo__list",
-                        "todo__complete",
-                        "todo__update",
-                        "todo__remove",
-                    ],
-                ) {
+                if has_todo_tools(&agent.tools) {
                     "enabled"
                 } else {
                     "missing"
@@ -584,6 +575,36 @@ fn has_all_tools(tools: &[String], required: &[&str]) -> bool {
         .all(|required| tools.iter().any(|tool| tool == required))
 }
 
+fn has_todo_tools(tools: &[String]) -> bool {
+    tools.iter().any(|tool| tool == "todo")
+        || has_all_tools(
+            tools,
+            &[
+                "todo__add",
+                "todo__list",
+                "todo__complete",
+                "todo__update",
+                "todo__remove",
+            ],
+        )
+}
+
+#[test]
+fn todo_detection_supports_compact_and_complete_legacy_interfaces() {
+    assert!(has_todo_tools(&["todo".into()]));
+    let legacy = [
+        "todo__add",
+        "todo__list",
+        "todo__complete",
+        "todo__update",
+        "todo__remove",
+    ]
+    .map(str::to_owned);
+    assert!(has_todo_tools(&legacy));
+    assert!(!has_todo_tools(&legacy[..4]));
+    assert!(!has_todo_tools(&[]));
+}
+
 pub(crate) fn sandbox_doctor_report(data_dir: &Path, setup_state: &SetupState) -> String {
     let config = match setup_state {
         SetupState::Initialized { config, .. } => config.clone(),
@@ -939,16 +960,7 @@ pub(crate) fn command_doctor_report(runtime: &Runtime) -> String {
         .into_iter()
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
-    let todo_enabled = has_all_tools(
-        &tools,
-        &[
-            "todo__add",
-            "todo__list",
-            "todo__complete",
-            "todo__update",
-            "todo__remove",
-        ],
-    );
+    let todo_enabled = has_todo_tools(&tools);
     format!(
         "**remi-cat doctor**\n\n```text\nroot_agent_id: {}\ntool_todo: {}\n```",
         runtime.root_agent_id,

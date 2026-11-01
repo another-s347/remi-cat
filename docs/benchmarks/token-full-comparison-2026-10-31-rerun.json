@@ -1,0 +1,1177 @@
+{
+  "dsh": {
+    "passed": 6,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 61,
+      "api_rounds": 61,
+      "aux_rounds": 6,
+      "prompt_tokens": 451412,
+      "completion_tokens": 9085,
+      "cached_tokens": 344064,
+      "aux_input": 1544,
+      "aux_output": 55,
+      "main_rounds": 55,
+      "todo_calls": 11,
+      "todo_rounds": 11,
+      "todo_only_rounds": 11,
+      "uncached_input": 107348
+    },
+    "transport_errors": {},
+    "standard_components_estimate": {
+      "tool_schema": 231336,
+      "system": 31129,
+      "user": 16618,
+      "assistant": 50587,
+      "tool": 179713
+    },
+    "tool_calls": {
+      "read": 15,
+      "glob": 3,
+      "todo_write": 11,
+      "write": 10,
+      "bash": 12,
+      "edit": 3,
+      "grep": 2
+    },
+    "completed": 6,
+    "median_seconds": 59.86270788099864,
+    "rows": [
+      {
+        "id": "dsh-csv-1",
+        "harness": "dsh",
+        "task": "csv",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 77.41025286299919,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 13,
+          "api_rounds": 13,
+          "aux_rounds": 1,
+          "prompt_tokens": 76634,
+          "completion_tokens": 2041,
+          "cached_tokens": 59392,
+          "aux_input": 246,
+          "aux_output": 10,
+          "main_rounds": 12,
+          "todo_calls": 3,
+          "todo_rounds": 3,
+          "todo_only_rounds": 3,
+          "uncached_input": 17242
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 50473,
+          "system": 6755,
+          "user": 3363,
+          "assistant": 16498,
+          "tool": 12410
+        },
+        "tool_calls": {
+          "read": 4,
+          "glob": 1,
+          "todo_write": 3,
+          "write": 2,
+          "bash": 2,
+          "edit": 1
+        },
+        "todo_trace": [
+          {
+            "request": 4,
+            "calls": [
+              {
+                "id": "todo_write_4_fcca0a9d",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement parse_rows with proper CSV parsing (quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields)\",\"status\":\"in_progress\"},{\"content\":\"Add regression tests for parse_rows\",\"status\":\"pending\"},{\"content\":\"Run tests and verify all pass\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_7_57ab67c3",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement parse_rows with proper CSV parsing (quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields)\",\"status\":\"completed\"},{\"content\":\"Add regression tests for parse_rows\",\"status\":\"completed\"},{\"content\":\"Run tests and verify all pass\",\"status\":\"in_progress\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 12,
+            "calls": [
+              {
+                "id": "todo_write_12_36a92aa0",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Implement parse_rows with proper CSV parsing (quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields)\",\"status\":\"completed\"},{\"content\":\"Add regression tests for parse_rows\",\"status\":\"completed\"},{\"content\":\"Run tests and verify all pass\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4402
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "dsh-csv-2",
+        "harness": "dsh",
+        "task": "csv",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 42.315162898998096,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 8,
+          "api_rounds": 8,
+          "aux_rounds": 1,
+          "prompt_tokens": 37884,
+          "completion_tokens": 1454,
+          "cached_tokens": 30720,
+          "aux_input": 246,
+          "aux_output": 9,
+          "main_rounds": 7,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 7164
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 29443,
+          "system": 3990,
+          "user": 2018,
+          "assistant": 5952,
+          "tool": 2518
+        },
+        "tool_calls": {
+          "read": 1,
+          "glob": 1,
+          "todo_write": 2,
+          "write": 2,
+          "bash": 1
+        },
+        "todo_trace": [
+          {
+            "request": 3,
+            "calls": [
+              {
+                "id": "todo_write_2_97b6c4f9",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Rewrite parse_rows in project/csvio.py to parse standard CSV correctly\",\"status\":\"in_progress\"},{\"content\":\"Add regression tests for parse_rows\",\"status\":\"pending\"},{\"content\":\"Run tests and verify they pass\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_6_97956286",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Rewrite parse_rows in project/csvio.py to parse standard CSV correctly\",\"status\":\"completed\"},{\"content\":\"Add regression tests for parse_rows\",\"status\":\"completed\"},{\"content\":\"Run tests and verify they pass\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4402
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "dsh-logs-1",
+        "harness": "dsh",
+        "task": "logs",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 23.64304503099993,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 7,
+          "api_rounds": 7,
+          "main_rounds": 6,
+          "prompt_tokens": 97696,
+          "completion_tokens": 613,
+          "cached_tokens": 73728,
+          "aux_rounds": 1,
+          "aux_input": 243,
+          "aux_output": 8,
+          "uncached_input": 23968
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 25237,
+          "system": 3437,
+          "user": 1742,
+          "assistant": 1310,
+          "tool": 74177
+        },
+        "tool_calls": {
+          "glob": 1,
+          "read": 3,
+          "grep": 1,
+          "write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4399
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "dsh-logs-2",
+        "harness": "dsh",
+        "task": "logs",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 22.64357643299809,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 6,
+          "api_rounds": 6,
+          "main_rounds": 5,
+          "prompt_tokens": 92597,
+          "completion_tokens": 587,
+          "cached_tokens": 69632,
+          "aux_rounds": 1,
+          "aux_input": 243,
+          "aux_output": 8,
+          "uncached_input": 22965
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 21031,
+          "system": 2884,
+          "user": 1474,
+          "assistant": 1109,
+          "tool": 73541
+        },
+        "tool_calls": {
+          "read": 3,
+          "grep": 1,
+          "write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4399
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "dsh-retry-1",
+        "harness": "dsh",
+        "task": "retry",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 78.55976359200213,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 17,
+          "api_rounds": 17,
+          "main_rounds": 16,
+          "prompt_tokens": 95509,
+          "completion_tokens": 2463,
+          "cached_tokens": 73728,
+          "todo_calls": 6,
+          "todo_rounds": 6,
+          "todo_only_rounds": 6,
+          "aux_rounds": 1,
+          "aux_input": 283,
+          "aux_output": 10,
+          "uncached_input": 21781
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 67297,
+          "system": 8967,
+          "user": 5085,
+          "assistant": 17907,
+          "tool": 11852
+        },
+        "tool_calls": {
+          "todo_write": 6,
+          "bash": 5,
+          "read": 2,
+          "write": 2,
+          "edit": 1
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_write_0_c5d9b47e",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Explore workspace structure\",\"status\":\"in_progress\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"pending\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"pending\"},{\"content\":\"Add regression tests\",\"status\":\"pending\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 7,
+            "calls": [
+              {
+                "id": "todo_write_6_b925dc47",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Explore workspace structure\",\"status\":\"completed\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"in_progress\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"pending\"},{\"content\":\"Add regression tests\",\"status\":\"pending\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 9,
+            "calls": [
+              {
+                "id": "todo_write_8_22a74cce",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"Explore workspace structure\",\"status\":\"completed\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"completed\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"in_progress\"},{\"content\":\"Add regression tests\",\"status\":\"pending\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 11,
+            "calls": [
+              {
+                "id": "todo_write_10_adbab9c6",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Explore workspace structure\",\"status\":\"completed\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"completed\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"completed\"},{\"content\":\"Add regression tests\",\"status\":\"in_progress\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 14,
+            "calls": [
+              {
+                "id": "todo_write_13_f89238c9",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Explore workspace structure\",\"status\":\"completed\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"completed\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"completed\"},{\"content\":\"Add regression tests\",\"status\":\"completed\"},{\"content\":\"Run tests\",\"status\":\"in_progress\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 16,
+            "calls": [
+              {
+                "id": "todo_write_15_32f20a36",
+                "name": "todo_write",
+                "arguments": "{\"todos\": [{\"content\":\"Explore workspace structure\",\"status\":\"completed\"},{\"content\":\"Implement retry_call in project/retry.py\",\"status\":\"completed\"},{\"content\":\"Export retry_call from project/__init__.py\",\"status\":\"completed\"},{\"content\":\"Add regression tests\",\"status\":\"completed\"},{\"content\":\"Run tests\",\"status\":\"completed\"}]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4439
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "dsh-retry-2",
+        "harness": "dsh",
+        "task": "retry",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 84.52504732899979,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 10,
+          "api_rounds": 10,
+          "aux_rounds": 1,
+          "prompt_tokens": 51092,
+          "completion_tokens": 1927,
+          "cached_tokens": 36864,
+          "aux_input": 283,
+          "aux_output": 10,
+          "main_rounds": 9,
+          "uncached_input": 14228
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 37855,
+          "system": 5096,
+          "user": 2936,
+          "assistant": 7811,
+          "tool": 5215
+        },
+        "tool_calls": {
+          "bash": 4,
+          "read": 2,
+          "write": 2,
+          "edit": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 25,
+          "standard_tool_tokens_estimate": 4206,
+          "system_tokens_estimate": 519,
+          "api_input": 4439
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      }
+    ]
+  },
+  "opencode": {
+    "passed": 6,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 98,
+      "api_rounds": 97,
+      "aux_rounds": 6,
+      "prompt_tokens": 1233264,
+      "completion_tokens": 23105,
+      "cached_tokens": 1053440,
+      "aux_input": 3356,
+      "aux_output": 67,
+      "main_rounds": 91,
+      "missing_usage": 1,
+      "uncached_input": 179824
+    },
+    "transport_errors": {
+      "200": 1
+    },
+    "standard_components_estimate": {
+      "tool_schema": 254533,
+      "system": 345019,
+      "user": 11855,
+      "assistant": 334111,
+      "tool": 449708
+    },
+    "tool_calls": {
+      "read": 25,
+      "glob": 11,
+      "write": 12,
+      "shell": 36,
+      "edit": 13,
+      "execute": 1,
+      "grep": 2
+    },
+    "completed": 5,
+    "median_seconds": 47.402787999499196,
+    "rows": [
+      {
+        "id": "opencode-csv-1",
+        "harness": "opencode",
+        "task": "csv",
+        "repeat": 1,
+        "exit_code": 130,
+        "timed_out": true,
+        "elapsed": 300.46503364100136,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 29,
+          "api_rounds": 28,
+          "aux_rounds": 1,
+          "prompt_tokens": 367248,
+          "completion_tokens": 11773,
+          "cached_tokens": 321024,
+          "aux_input": 548,
+          "aux_output": 10,
+          "main_rounds": 27,
+          "missing_usage": 1,
+          "uncached_input": 46224
+        },
+        "transport_errors": {
+          "200": 1
+        },
+        "standard_components_estimate": {
+          "tool_schema": 75520,
+          "system": 102032,
+          "user": 3219,
+          "assistant": 146125,
+          "tool": 91191
+        },
+        "tool_calls": {
+          "read": 6,
+          "glob": 6,
+          "write": 3,
+          "shell": 14,
+          "edit": 4
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6071
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": false,
+        "completed": false
+      },
+      {
+        "id": "opencode-csv-2",
+        "harness": "opencode",
+        "task": "csv",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 249.94882041500023,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 41,
+          "api_rounds": 41,
+          "aux_rounds": 1,
+          "prompt_tokens": 582281,
+          "completion_tokens": 7529,
+          "cached_tokens": 522496,
+          "aux_input": 548,
+          "aux_output": 14,
+          "main_rounds": 40,
+          "uncached_input": 59785
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 111881,
+          "system": 150951,
+          "user": 4701,
+          "assistant": 176044,
+          "tool": 224896
+        },
+        "tool_calls": {
+          "read": 9,
+          "glob": 1,
+          "write": 3,
+          "shell": 19,
+          "edit": 7,
+          "execute": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6071
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "opencode-logs-1",
+        "harness": "opencode",
+        "task": "logs",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 14.582721509003022,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 5,
+          "api_rounds": 5,
+          "aux_rounds": 1,
+          "prompt_tokens": 76940,
+          "completion_tokens": 393,
+          "cached_tokens": 53504,
+          "aux_input": 545,
+          "aux_output": 12,
+          "main_rounds": 4,
+          "uncached_input": 23436
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 11189,
+          "system": 15483,
+          "user": 592,
+          "assistant": 707,
+          "tool": 54495
+        },
+        "tool_calls": {
+          "read": 2,
+          "grep": 1,
+          "write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6068
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "opencode-logs-2",
+        "harness": "opencode",
+        "task": "logs",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 17.73689118999755,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 6,
+          "api_rounds": 6,
+          "aux_rounds": 1,
+          "prompt_tokens": 100760,
+          "completion_tokens": 478,
+          "cached_tokens": 76032,
+          "aux_input": 545,
+          "aux_output": 9,
+          "main_rounds": 5,
+          "uncached_input": 24728
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 13986,
+          "system": 19246,
+          "user": 705,
+          "assistant": 1060,
+          "tool": 72990
+        },
+        "tool_calls": {
+          "read": 3,
+          "grep": 1,
+          "write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6068
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "opencode-retry-1",
+        "harness": "opencode",
+        "task": "retry",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 41.567897900997195,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 8,
+          "api_rounds": 8,
+          "aux_rounds": 1,
+          "prompt_tokens": 48889,
+          "completion_tokens": 1395,
+          "cached_tokens": 35072,
+          "aux_input": 585,
+          "aux_output": 11,
+          "main_rounds": 7,
+          "uncached_input": 13817
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 19580,
+          "system": 26772,
+          "user": 1243,
+          "assistant": 4074,
+          "tool": 2627
+        },
+        "tool_calls": {
+          "glob": 1,
+          "read": 2,
+          "write": 2,
+          "edit": 1,
+          "shell": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6108
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "opencode-retry-2",
+        "harness": "opencode",
+        "task": "retry",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 53.2376780980012,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 9,
+          "api_rounds": 9,
+          "aux_rounds": 1,
+          "prompt_tokens": 57146,
+          "completion_tokens": 1537,
+          "cached_tokens": 45312,
+          "aux_input": 585,
+          "aux_output": 11,
+          "main_rounds": 8,
+          "uncached_input": 11834
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 22377,
+          "system": 30535,
+          "user": 1395,
+          "assistant": 6101,
+          "tool": 3509
+        },
+        "tool_calls": {
+          "glob": 3,
+          "read": 3,
+          "write": 2,
+          "edit": 1,
+          "shell": 2
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 2,
+          "tool_count": 12,
+          "standard_tool_tokens_estimate": 2797,
+          "system_tokens_estimate": 3446,
+          "api_input": 6108
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      }
+    ]
+  },
+  "remi": {
+    "passed": 6,
+    "runs": 6,
+    "totals": {
+      "api_attempts": 56,
+      "api_rounds": 56,
+      "main_rounds": 56,
+      "prompt_tokens": 312253,
+      "completion_tokens": 8381,
+      "cached_tokens": 241664,
+      "todo_calls": 6,
+      "todo_rounds": 6,
+      "todo_mixed_rounds": 1,
+      "todo_only_rounds": 5,
+      "uncached_input": 70589
+    },
+    "transport_errors": {},
+    "standard_components_estimate": {
+      "tool_schema": 181048,
+      "system": 77168,
+      "user": 7154,
+      "assistant": 52573,
+      "tool": 42699
+    },
+    "tool_calls": {
+      "fs_read": 18,
+      "fs_ls": 12,
+      "todo": 6,
+      "apply_patch": 5,
+      "fs_write": 10,
+      "bash": 6,
+      "rg": 3,
+      "fs_mkdir": 1
+    },
+    "completed": 6,
+    "median_seconds": 36.89448263000122,
+    "rows": [
+      {
+        "id": "remi-csv-1",
+        "harness": "remi",
+        "task": "csv",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 90.64689239200015,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 14,
+          "api_rounds": 14,
+          "main_rounds": 14,
+          "prompt_tokens": 94232,
+          "completion_tokens": 3289,
+          "cached_tokens": 73728,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_mixed_rounds": 1,
+          "todo_only_rounds": 1,
+          "uncached_input": 20504
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 45262,
+          "system": 19292,
+          "user": 1582,
+          "assistant": 28449,
+          "tool": 14915
+        },
+        "tool_calls": {
+          "fs_read": 5,
+          "fs_ls": 2,
+          "todo": 2,
+          "apply_patch": 3,
+          "fs_write": 2,
+          "bash": 2
+        },
+        "todo_trace": [
+          {
+            "request": 2,
+            "calls": [
+              {
+                "id": "todo_2_e97cc9b3",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Fix parse_rows and add tests\", \"items\": [{\"title\":\"Implement robust CSV parsing in parse_rows\",\"description\":\"Handle quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields. Preserve list-of-lists API.\"},{\"title\":\"Add regression tests for all edge cases\",\"description\":\"Quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields.\"},{\"title\":\"Run tests and verify all pass\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 13,
+            "calls": [
+              {
+                "id": "todo_15_adda61a8",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4187
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "remi-csv-2",
+        "harness": "remi",
+        "task": "csv",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 43.884430213001906,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 10,
+          "api_rounds": 10,
+          "main_rounds": 10,
+          "prompt_tokens": 50911,
+          "completion_tokens": 1574,
+          "cached_tokens": 38912,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 11999
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 32330,
+          "system": 13780,
+          "user": 1130,
+          "assistant": 7710,
+          "tool": 4183
+        },
+        "tool_calls": {
+          "fs_read": 3,
+          "fs_ls": 3,
+          "todo": 2,
+          "apply_patch": 1,
+          "fs_write": 1,
+          "bash": 1
+        },
+        "todo_trace": [
+          {
+            "request": 5,
+            "calls": [
+              {
+                "id": "todo_6_0d7123ae",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Fix parse_rows in project/csvio.py\", \"items\": [{\"title\":\"Implement proper CSV parser in parse_rows\",\"description\":\"Handle quoted commas, escaped quotes, multiline fields, CRLF, empty input, empty fields. Preserve list-of-lists API.\"},{\"title\":\"Add regression tests\",\"description\":\"Create tests covering all edge cases and run them.\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 9,
+            "calls": [
+              {
+                "id": "todo_10_05b01952",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4187
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "remi-logs-1",
+        "harness": "remi",
+        "task": "logs",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 29.151031577999674,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 5,
+          "api_rounds": 5,
+          "main_rounds": 5,
+          "prompt_tokens": 28504,
+          "completion_tokens": 447,
+          "cached_tokens": 20480,
+          "uncached_input": 8024
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 16165,
+          "system": 6890,
+          "user": 560,
+          "assistant": 1058,
+          "tool": 7220
+        },
+        "tool_calls": {
+          "fs_read": 3,
+          "rg": 1,
+          "fs_write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4184
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "remi-logs-2",
+        "harness": "remi",
+        "task": "logs",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 10.229533478999656,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 5,
+          "api_rounds": 5,
+          "main_rounds": 5,
+          "prompt_tokens": 28188,
+          "completion_tokens": 312,
+          "cached_tokens": 18432,
+          "uncached_input": 9756
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 16165,
+          "system": 6890,
+          "user": 560,
+          "assistant": 761,
+          "tool": 7192
+        },
+        "tool_calls": {
+          "fs_read": 3,
+          "rg": 1,
+          "fs_write": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4184
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "remi-retry-1",
+        "harness": "remi",
+        "task": "retry",
+        "repeat": 1,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 44.620631860001595,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 13,
+          "api_rounds": 13,
+          "main_rounds": 13,
+          "prompt_tokens": 68179,
+          "completion_tokens": 1718,
+          "cached_tokens": 55296,
+          "todo_calls": 2,
+          "todo_rounds": 2,
+          "todo_only_rounds": 2,
+          "uncached_input": 12883
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 42029,
+          "system": 17914,
+          "user": 1963,
+          "assistant": 10577,
+          "tool": 7278
+        },
+        "tool_calls": {
+          "todo": 2,
+          "fs_ls": 4,
+          "fs_read": 2,
+          "rg": 1,
+          "bash": 2,
+          "fs_write": 3,
+          "fs_mkdir": 1
+        },
+        "todo_trace": [
+          {
+            "request": 1,
+            "calls": [
+              {
+                "id": "todo_0_9e1313d9",
+                "name": "todo",
+                "arguments": "{\"action\": \"add\", \"title\": \"Implement retry_call\", \"items\": [{\"title\":\"Explore workspace structure\",\"description\":\"Find existing project files and tests\"},{\"title\":\"Implement retry_call in project/retry.py\",\"description\":\"With attempts, retry_on, delay, sleep params\"},{\"title\":\"Export retry_call from project/__init__.py\",\"description\":\"Add to public API\"},{\"title\":\"Add regression tests\",\"description\":\"Cover all requirements and edge cases\"},{\"title\":\"Run tests and verify\",\"description\":\"Ensure everything passes\"}]}"
+              }
+            ]
+          },
+          {
+            "request": 12,
+            "calls": [
+              {
+                "id": "todo_14_07f5d94d",
+                "name": "todo",
+                "arguments": "{\"action\": \"complete\", \"ids\": [1,2,3,4,5]}"
+              }
+            ]
+          }
+        ],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4224
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      },
+      {
+        "id": "remi-retry-2",
+        "harness": "remi",
+        "task": "retry",
+        "repeat": 2,
+        "exit_code": 0,
+        "timed_out": false,
+        "elapsed": 29.904535047000536,
+        "passed": true,
+        "acceptance_version": 2,
+        "totals": {
+          "api_attempts": 9,
+          "api_rounds": 9,
+          "main_rounds": 9,
+          "prompt_tokens": 42239,
+          "completion_tokens": 1041,
+          "cached_tokens": 34816,
+          "uncached_input": 7423
+        },
+        "transport_errors": {},
+        "standard_components_estimate": {
+          "tool_schema": 29097,
+          "system": 12402,
+          "user": 1359,
+          "assistant": 4018,
+          "tool": 1911
+        },
+        "tool_calls": {
+          "fs_ls": 3,
+          "fs_read": 2,
+          "fs_write": 2,
+          "apply_patch": 1,
+          "bash": 1
+        },
+        "todo_trace": [],
+        "first_request": {
+          "request": 1,
+          "tool_count": 21,
+          "standard_tool_tokens_estimate": 3233,
+          "system_tokens_estimate": 1299,
+          "api_input": 4224
+        },
+        "input_data_unchanged": true,
+        "final_reply_observed": true,
+        "completed": true
+      }
+    ]
+  }
+}

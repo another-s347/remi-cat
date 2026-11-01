@@ -4,7 +4,8 @@ pub mod tools;
 pub use backend::HybridTodoBackend;
 pub use tools::{
     current_todo_card_markdown, latest_unfinished_batch_system_prompt, todos_from_user_state,
-    TodoAddTool, TodoCompleteTool, TodoItem, TodoListTool, TodoRemoveTool, TodoUpdateTool,
+    TodoAddTool, TodoCompleteTool, TodoItem, TodoListTool, TodoRemoveTool, TodoTool,
+    TodoUpdateTool,
 };
 
 use remi_agentloop::prelude::ParsedToolCall;
@@ -12,11 +13,20 @@ use serde::Deserialize;
 
 use crate::events::TodoEvent;
 
-/// Register all five todo tools into a registry.
+pub(crate) const LEGACY_TOOLS: &[&str] = &[
+    "todo__add",
+    "todo__list",
+    "todo__complete",
+    "todo__update",
+    "todo__remove",
+];
+
+/// Register the compact entry point and legacy handlers for saved sessions.
 pub fn register_todo_tools(
     registry: &mut remi_agentloop::tool::registry::DefaultToolRegistry,
     backend: std::sync::Arc<HybridTodoBackend>,
 ) {
+    registry.register(TodoTool::new(backend.clone()));
     registry.register(TodoAddTool::new(backend.clone()));
     registry.register(TodoListTool::new(backend.clone()));
     registry.register(TodoCompleteTool::new(backend.clone()));
@@ -37,6 +47,20 @@ struct TodoAddResultItem {
 
 /// Produce `TodoEvent`s for mutation tools (add/complete/update/remove).
 pub fn make_todo_events(tc: &ParsedToolCall, result_str: &str) -> Vec<TodoEvent> {
+    if tc.name == "todo" {
+        let Some(action) = tc.arguments["action"].as_str() else {
+            return vec![];
+        };
+        if !["add", "list", "complete", "update", "remove"].contains(&action) {
+            return vec![];
+        }
+        let legacy = ParsedToolCall {
+            id: tc.id.clone(),
+            name: format!("todo__{action}"),
+            arguments: tc.arguments.clone(),
+        };
+        return make_todo_events(&legacy, result_str);
+    }
     match tc.name.as_str() {
         "todo__add" => serde_json::from_str::<TodoAddResult>(result_str)
             .map(|result| {
@@ -50,11 +74,21 @@ pub fn make_todo_events(tc: &ParsedToolCall, result_str: &str) -> Vec<TodoEvent>
                     .collect()
             })
             .unwrap_or_default(),
-        "todo__complete" => tc.arguments["id"]
-            .as_u64()
-            .map(|id| vec![TodoEvent::Completed { id }])
-            .unwrap_or_default(),
-        "todo__update" => {
+        "todo__complete" if result_str.contains("marked as done") => {
+            let mut ids = tc.arguments["ids"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if let Some(id) = tc.arguments["id"].as_u64() {
+                ids.push(id);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            ids.into_iter()
+                .map(|id| TodoEvent::Completed { id })
+                .collect()
+        }
+        "todo__update" if result_str.starts_with("Updated todo #") => {
             match (
                 tc.arguments["id"].as_u64(),
                 tc.arguments["content"].as_str(),
@@ -66,7 +100,7 @@ pub fn make_todo_events(tc: &ParsedToolCall, result_str: &str) -> Vec<TodoEvent>
                 _ => Vec::new(),
             }
         }
-        "todo__remove" => tc.arguments["id"]
+        "todo__remove" if result_str.starts_with("Removed todo #") => tc.arguments["id"]
             .as_u64()
             .map(|id| vec![TodoEvent::Removed { id }])
             .unwrap_or_default(),
@@ -80,6 +114,82 @@ mod tests {
     use crate::events::TodoEvent;
     use remi_agentloop::prelude::ParsedToolCall;
     use serde_json::json;
+
+    #[test]
+    fn unified_and_legacy_batch_completion_emit_each_successful_item_once() {
+        for name in ["todo", "todo__complete"] {
+            let tc = ParsedToolCall {
+                id: "complete".into(),
+                name: name.into(),
+                arguments: json!({"action":"complete","ids":[2,1,2]}),
+            };
+            assert!(make_todo_events(&tc, "Todo #99 not found.").is_empty());
+            let events =
+                make_todo_events(&tc, "Todos #1, #2 marked as done; completed batch cleared.");
+            assert_eq!(events.len(), 2);
+            assert!(matches!(events[0], TodoEvent::Completed { id: 1 }));
+            assert!(matches!(events[1], TodoEvent::Completed { id: 2 }));
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_todo_lifecycle_preserves_batches_and_events() {
+        use futures::StreamExt;
+        use remi_agentloop::prelude::{Tool, ToolOutput, ToolResult};
+        use std::sync::Arc;
+        let tool = super::TodoTool::new(Arc::new(super::HybridTodoBackend::new(
+            std::path::PathBuf::from("/tmp"),
+        )));
+        let ctx = bot_runtime_core::ToolContext::default();
+        for (args, contains, event_count) in [
+            (
+                json!({"action":"add","title":"Plan","items":[{"title":"One"},{"title":"Two"}]}),
+                "batch_id",
+                2,
+            ),
+            (
+                json!({"action":"update","id":1,"content":"Renamed"}),
+                "Renamed",
+                1,
+            ),
+            (json!({"action":"list"}), "Renamed", 0),
+            (
+                json!({"action":"complete","ids":[1,2]}),
+                "completed batch cleared",
+                2,
+            ),
+            (
+                json!({"action":"add","title":"Next","items":[{"title":"Third"}]}),
+                "batch_id",
+                1,
+            ),
+            (json!({"action":"remove","id":3}), "Removed todo #3", 1),
+        ] {
+            let tc = ParsedToolCall {
+                id: "case".into(),
+                name: "todo".into(),
+                arguments: args.clone(),
+            };
+            let ToolResult::Output(output) = tool.execute(args, None, ctx.clone()).await.unwrap()
+            else {
+                panic!("unexpected interrupt")
+            };
+            let mut output = std::pin::pin!(output);
+            let mut text = String::new();
+            while let Some(item) = output.next().await {
+                if let ToolOutput::Result(c) = item {
+                    text = c.text_content();
+                }
+            }
+            assert!(text.contains(contains), "{text}");
+            assert_eq!(make_todo_events(&tc, &text).len(), event_count);
+        }
+        assert!(super::todos_from_user_state(&ctx.user_state()).is_empty());
+        assert!(tool
+            .execute(json!({"action":"bad"}), None, ctx)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn todo_add_emits_one_event_per_created_item() {

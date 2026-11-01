@@ -442,6 +442,11 @@ fn classify_known_tool_risk(tool_name: &str, args: &serde_json::Value) -> Option
         | "memory__get_detail" | "memory__recall" | "context__manage" | "todo__list"
         | "web_search" | "now" | "instant" | "lazy_wait" | "sleep" | "ask_user_question"
         | "tool_tasks" => Some(ToolRiskLevel::Low),
+        "todo" => Some(if args["action"].as_str() == Some("list") {
+            ToolRiskLevel::Low
+        } else {
+            ToolRiskLevel::Medium
+        }),
         "fetch" => Some(classify_fetch_risk(args)),
         "workspace_bash" | "bash" => Some(classify_bash_risk(args)),
         "ssh" => Some(classify_ssh_risk(args)),
@@ -1537,6 +1542,20 @@ mod tests {
     fn subscription_profile() -> crate::ModelProfileConfig {
         serde_yaml::from_str("id: main\nname: Main\nmodel: gpt-6.1-sol\nprovider: chatgpt\ncontext_tokens: 32768\nmax_output_tokens: 4096\nsupports_images: true\noverflow_bytes: 32768\ncontext_compaction: hard\n").unwrap()
     }
+    #[test]
+    fn compact_todo_risk_matches_legacy_operations() {
+        assert_eq!(
+            classify_tool_risk("todo", &serde_json::json!({"action":"list"})),
+            ToolRiskLevel::Low
+        );
+        for action in ["add", "complete", "update", "remove"] {
+            assert_eq!(
+                classify_tool_risk("todo", &serde_json::json!({"action":action})),
+                classify_tool_risk(&format!("todo__{action}"), &serde_json::json!({}))
+            );
+        }
+    }
+
     #[test]
     fn automatic_luna_profile_does_not_inherit_main_reasoning_or_change_main() {
         let mut main = subscription_profile();

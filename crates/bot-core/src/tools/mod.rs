@@ -30,6 +30,9 @@ pub use bash::{BashMode, WorkspaceBashTool};
 mod redactor;
 pub use redactor::{SecretRedactor, SharedRedactor};
 
+mod read_budget;
+pub(crate) use read_budget::set_output_budget as set_fs_read_output_budget;
+
 mod ssh;
 pub use ssh::WorkspaceSshTool;
 
@@ -317,8 +320,10 @@ impl Tool for RootedFsReadTool {
         "Read a file or directory in the workspace. Text files support `offset` + `length` for byte chunks, \
          or 1-based inclusive `start_line` + `end_line` line ranges. \
          Common images (JPEG, PNG, GIF, WebP) are auto-detected and returned inline as images; \
-         for those files range arguments are ignored. Always check `[total_bytes]` in byte text results \
-         and call again with offset += length if needed."
+         for those files range arguments are ignored. Without a range, text files above 32 KiB start with a 4 KiB preview; \
+         specify length or a line range for more. Text pages fit the active output budget. \
+         Use rg first to locate specific text in large files. Check the returned offset/length and \
+         continue only when needed using the returned next offset."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         let path_description =
@@ -330,7 +335,7 @@ impl Tool for RootedFsReadTool {
                 "offset": { "type": "integer", "description": "Byte offset to start for text files (default 0)" },
                 "length": {
                     "type": "integer",
-                    "description": format!("Max bytes to return for text files (default {DEFAULT_FS_READ_LENGTH})")
+                    "description": format!("Max requested bytes (default {DEFAULT_FS_READ_LENGTH}); omit ranges to preview large files. Explicit ranges are capped to the active output budget. Use the actual returned length to continue.")
                 },
                 "start_line": { "type": "integer", "description": "1-based inclusive line number to start reading text files. Takes precedence over offset/length." },
                 "end_line": { "type": "integer", "description": "1-based inclusive line number to stop reading text files. If omitted with start_line, reads to EOF. If provided without start_line, starts at line 1." }
@@ -355,10 +360,13 @@ impl Tool for RootedFsReadTool {
                 .ok_or_else(|| AgentError::tool("fs_read", "missing 'path'"))?
                 .to_string();
             let offset = arguments["offset"].as_u64().unwrap_or(0) as usize;
+            let output_budget = read_budget::output_budget(&tool_ctx);
             let length = arguments["length"]
                 .as_u64()
-                .unwrap_or(DEFAULT_FS_READ_LENGTH as u64) as usize;
+                .unwrap_or(read_budget::default_length(output_budget) as u64)
+                as usize;
             let line_range = fs_read_line_range(&arguments)?;
+            let preview_allowed = arguments["length"].is_null() && arguments["offset"].is_null();
             Ok(ToolResult::Output(stream! {
                 let started = Instant::now();
                 tracing::info!(
@@ -472,12 +480,34 @@ impl Tool for RootedFsReadTool {
                             r.push_str(&format!(
                                 "\n[start_line={start_line} end_line={returned_end_line} total_lines={total_lines}]"
                             ));
-                            yield ToolOutput::text(r);
+                            if r.len() > output_budget {
+                                let start = bytes.split_inclusive(|b| *b == b'\n')
+                                    .take(start_line.saturating_sub(1)).map(<[u8]>::len).sum::<usize>();
+                                let end = bytes.split_inclusive(|b| *b == b'\n')
+                                    .take(returned_end_line).map(<[u8]>::len).sum::<usize>();
+                                let heading = format!("[Requested lines {start_line}..{returned_end_line} exceed output budget; returning a byte page]\n");
+                                let (page, _) = read_budget::byte_page(
+                                    &bytes, start, end.saturating_sub(start), output_budget,
+                                    &heading, &redactor,
+                                );
+                                yield ToolOutput::text(page);
+                            } else {
+                                yield ToolOutput::text(r);
+                            }
                             return;
                         }
 
                         let start = offset.min(total);
-                        let end   = (start + length).min(total);
+                        let preview = preview_allowed && total > DEFAULT_FS_READ_LENGTH;
+                        let returned_length = if preview {
+                            length.min(read_budget::INITIAL_PREVIEW_BYTES)
+                        } else { length };
+                        let heading = if preview {
+                            "[Large file preview; use rg for specific text, or specify length or a line range to read more]\n"
+                        } else { "" };
+                        let (mut page, end) = read_budget::byte_page(
+                            &bytes, start, returned_length, output_budget, heading, &redactor,
+                        );
                         let duplicate_warning = metadata.as_ref().and_then(|metadata| {
                             fs_read_duplicate_warning(
                                 &tool_ctx,
@@ -492,7 +522,6 @@ impl Tool for RootedFsReadTool {
                                 },
                             )
                         });
-                        let text  = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                         let remaining = total.saturating_sub(end);
                         tracing::info!(
                             path = %path_str,
@@ -505,16 +534,12 @@ impl Tool for RootedFsReadTool {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "fs_read.completed"
                         );
-                        let text = redactor.read().unwrap().redact(&text);
-                        let mut r = text;
                         if let Some(warning) = duplicate_warning {
-                            r = format!("{warning}\n\n{r}");
+                            if warning.len() + 2 + page.len() <= output_budget {
+                                page = format!("{warning}\n\n{page}");
+                            }
                         }
-                        r.push_str(&format!("\n[offset={start} length={} total_bytes={total} remaining={remaining}]", end - start));
-                        if remaining > 0 {
-                            r.push_str(&format!("\n[{remaining} bytes remaining — call fs_read again with offset={end}]"));
-                        }
-                        yield ToolOutput::text(r);
+                        yield ToolOutput::text(page);
                     }
                 }
             }))
@@ -534,7 +559,7 @@ impl Tool for RootedFsWriteTool {
     }
     fn description(&self) -> &str {
         "Write text to a file in the workspace. Path is relative to workspace root. \
-         Parent directories must already exist. Prefer apply_patch for editing existing \
+         Missing parent directories are created automatically. Prefer apply_patch for editing existing \
          files; use fs_write only when creating a new file or intentionally replacing an \
          entire file after reading it."
     }
@@ -576,7 +601,14 @@ impl Tool for RootedFsWriteTool {
                     sandbox_kind = %sandbox.kind(),
                     "fs_write.start"
                 );
-                match sandbox.write(&path_str, content.as_bytes()).await {
+                let written = async {
+                    if let Some(parent) = Path::new(&path_str).parent().filter(|p| !p.as_os_str().is_empty()) {
+                        sandbox.mkdir(&parent.to_string_lossy(), true).await
+                            .context("creating parent directories for file")?;
+                    }
+                    sandbox.write(&path_str, content.as_bytes()).await
+                }.await;
+                match written {
                     Ok(()) => {
                         tracing::info!(
                             path = %path_str,
@@ -1612,6 +1644,7 @@ mod tests {
         validate_ssh_named, NowTool, ParsedPatchOp, PatchHunk, RipgrepTool, RootedFsApplyPatchTool,
         RootedFsReadTool, SecretRedactor, SshTarget, WorkspaceBashTool, WorkspaceSshTool,
     };
+    use super::{set_fs_read_output_budget, RootedFsWriteTool, Sandbox};
     use crate::sandbox::{DockerSandbox, DockerSandboxConfig, NoSandbox};
     use bot_runtime_core::ToolContext;
     use futures::StreamExt;
@@ -1713,7 +1746,12 @@ mod tests {
         let implicit = vec!["profile".to_string(), "current".to_string()];
         assert_eq!(
             super::utility::manage_yourself_argv(&implicit, Some(current)),
-            vec!["--profile", "/tmp/current/profile.yaml", "profile", "current"]
+            vec![
+                "--profile",
+                "/tmp/current/profile.yaml",
+                "profile",
+                "current"
+            ]
         );
         let explicit = vec![
             "--profile".to_string(),
@@ -1772,6 +1810,176 @@ mod tests {
         result: ToolResult<impl futures::Stream<Item = ToolOutput>>,
     ) -> String {
         collect_tool_content(result).await.text_content()
+    }
+
+    #[tokio::test]
+    async fn fs_write_creates_nested_parents_locally_and_in_workspace_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        let sandboxes: Vec<Arc<dyn Sandbox>> = vec![
+            Arc::new(NoSandbox::new(root.path().join("local"))),
+            Arc::new(DockerSandbox::new(DockerSandboxConfig {
+                host_dir: root.path().join("sandbox"),
+                container_dir: "/workspace".into(),
+                image: "unused".into(),
+                container_name: "unused".into(),
+                user: None,
+            })),
+        ];
+        for sandbox in sandboxes {
+            let tool = RootedFsWriteTool {
+                sandbox: sandbox.clone(),
+            };
+            for content in ["created", "updated"] {
+                let result = collect_tool_text(
+                    tool.execute(
+                        json!({"path":"tests/nested/test_case.py", "content":content}),
+                        None,
+                        test_tool_context(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert!(!result.starts_with("error:"), "{result}");
+                assert_eq!(
+                    sandbox.read("tests/nested/test_case.py").await.unwrap(),
+                    content.as_bytes()
+                );
+            }
+            if sandbox.kind() == "docker" {
+                let result = collect_tool_text(
+                    tool.execute(
+                        json!({"path":"../escape/note.txt", "content":"no"}),
+                        None,
+                        test_tool_context(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert!(result.starts_with("error:"));
+                assert!(!root.path().join("escape").exists());
+                #[cfg(unix)]
+                {
+                    let outside = root.path().join("outside");
+                    tokio::fs::create_dir_all(&outside).await.unwrap();
+                    std::os::unix::fs::symlink(&outside, root.path().join("sandbox/link")).unwrap();
+                    let result = collect_tool_text(
+                        tool.execute(
+                            json!({"path":"link/new/file.txt", "content":"no"}),
+                            None,
+                            test_tool_context(),
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                    .await;
+                    assert!(result.starts_with("error:"));
+                    assert!(!outside.join("new").exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_caps_explicit_and_line_reads_to_active_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let body = "first\n".to_string() + &"中".repeat(20_000) + "\nlast\n";
+        tokio::fs::write(root.path().join("large.txt"), &body)
+            .await
+            .unwrap();
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.path().to_path_buf())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        for args in [
+            json!({"path":"large.txt"}),
+            json!({"path":"large.txt", "length":usize::MAX}),
+            json!({"path":"large.txt", "start_line":2, "end_line":2}),
+        ] {
+            let ctx = test_tool_context();
+            set_fs_read_output_budget(&ctx, 24000);
+            let page = collect_tool_text(tool.execute(args, None, ctx).await.unwrap()).await;
+            assert!(page.len() <= 24000, "{}", page.len());
+            assert!(page.contains("remaining="));
+            assert!(page.contains("offset="));
+            assert!(!page.contains("�"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_large_preview_preserves_explicit_ranges_and_full_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let body = "first\n".to_string() + &"0123456789\n".repeat(6000) + "FINAL_MARKER_END\n";
+        tokio::fs::write(root.path().join("large.txt"), &body)
+            .await
+            .unwrap();
+        let tool = RootedFsReadTool {
+            sandbox: Arc::new(NoSandbox::new(root.path().to_path_buf())),
+            redactor: Arc::new(RwLock::new(SecretRedactor::empty())),
+        };
+        let ctx = test_tool_context();
+        set_fs_read_output_budget(&ctx, 24000);
+        let first = collect_tool_text(
+            tool.execute(json!({"path":"large.txt"}), None, ctx.clone())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(first.starts_with("[Large file preview;"));
+        assert!(first.contains("length=4096"));
+        assert!(!first.contains("FINAL_MARKER_END"));
+        let preview_body = first
+            .split_once('\n')
+            .unwrap()
+            .1
+            .split_once("\n[offset=")
+            .unwrap()
+            .0;
+        assert_eq!(preview_body, &body[..4096]);
+        let mut recovered = preview_body.to_string();
+        let mut offset = 4096;
+        while offset < body.len() {
+            let page = collect_tool_text(
+                tool.execute(
+                    json!({"path":"large.txt", "offset":offset,"length":32768}),
+                    None,
+                    ctx.clone(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert!(page.len() <= 24000);
+            assert!(!page.starts_with("[Large file preview;"));
+            let chunk = page.split_once("\n[offset=").unwrap().0;
+            assert!(!chunk.is_empty());
+            recovered.push_str(chunk);
+            offset += chunk.len();
+        }
+        assert_eq!(recovered, body);
+        let explicit = collect_tool_text(
+            tool.execute(
+                json!({"path":"large.txt","length":32768}),
+                None,
+                test_tool_context(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(explicit.starts_with(&body[..32768]));
+        let tail = collect_tool_text(
+            tool.execute(
+                json!({"path":"large.txt","start_line":body.lines().count()}),
+                None,
+                ctx,
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(tail.starts_with("FINAL_MARKER_END\n"));
     }
 
     #[test]
