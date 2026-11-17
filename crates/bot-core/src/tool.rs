@@ -9,7 +9,7 @@ pub use crate::approval::{
     ToolApprovalRequest, ToolRiskLevel, ToolRiskReview,
 };
 pub use crate::im_tools::{ImAttachment, ImDocument, ImFileBridge};
-pub use crate::search::SearchTool;
+pub use crate::search::{SearchTool, WebSearchTool};
 pub use crate::tool_pretty::{tool_success, PrettyToolCall, PrettyToolStatus};
 pub use crate::tools::{
     BashMode, ExaSearchTool, ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool,

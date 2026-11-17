@@ -65,6 +65,29 @@ sub-session events, including tool activity, without relying on a parent TUI.
 You can also enable it with
 `remi-cat config set im.auto_open_sub_session_channel=true`.
 
+### Web search
+
+Both `search` (scopes `web` and `all`) and `web_search` use the active
+profile's `search.backend`. Exa is the default and uses `EXA_API_KEY`. To
+switch to DeepSeek, set `DEEPSEEK_API_KEY` in the runtime environment or
+store it with `remi-cat secrets set DEEPSEEK_API_KEY <key>`, then run:
+
+```bash
+remi-cat config set search.backend=deepseek
+```
+
+You can also set the backend in the active profile's `runtime.yaml`:
+
+```yaml
+search:
+  backend: deepseek
+```
+
+Restart the runtime to apply the change. For a named profile, pass
+`--profile <name>` to both CLI commands. DeepSeek uses its independent
+[Search API](https://api-docs.deepseek.com/guides/search/), so it works
+with any chat model. Search calls are billed separately by DeepSeek.
+
 ## Run
 
 Start the terminal UI (async background-tool handling is enabled by default):

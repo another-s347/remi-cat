@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bot_core::search::{WebSearchBackend, WEB_SEARCH_BACKEND_ENV};
 use figment::{
     providers::{Format, Serialized, Yaml},
     Figment,
@@ -25,6 +26,8 @@ pub struct RuntimeConfig {
     pub experimental_jev_approval: ExperimentalJevApprovalConfig,
     #[serde(default)]
     pub tool_output: ToolOutputConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
     #[serde(default)]
     pub sandbox: RuntimeSandboxConfig,
     #[serde(default)]
@@ -311,6 +314,7 @@ impl RuntimeConfig {
             auto_compress_context_percent: None,
             experimental_jev_approval: ExperimentalJevApprovalConfig::default(),
             tool_output: ToolOutputConfig::default(),
+            search: SearchConfig::default(),
             sandbox: RuntimeSandboxConfig::default_for(data_dir),
             im: ImConfig::default(),
             shell: ShellConfig::default(),
@@ -396,6 +400,7 @@ impl RuntimeConfig {
                 &self.im.event_hook.verification_token,
             );
         }
+        set_env_if_absent(WEB_SEARCH_BACKEND_ENV, self.search.backend.as_str());
         set_env_if_absent("REMI_SHELL_MODE", self.shell.mode.as_env_value());
         set_env_if_absent("REMI_ACP_MODE", self.acp.mode.as_env_value());
         set_env_if_absent("REMI_ACP_CLIENT", self.acp.client.as_str());
@@ -518,6 +523,7 @@ impl RuntimeConfig {
             "REMI_FEISHU_HOOK_VERIFICATION_TOKEN",
             nonempty_str(&self.im.event_hook.verification_token),
         );
+        set_env(WEB_SEARCH_BACKEND_ENV, self.search.backend.as_str());
         set_env("REMI_SHELL_MODE", self.shell.mode.as_env_value());
         set_env("REMI_ACP_MODE", self.acp.mode.as_env_value());
         set_env("REMI_ACP_CLIENT", self.acp.client.as_str());
@@ -586,6 +592,12 @@ pub struct ToolOutputConfig {
     pub foreground_timeout_ms: Option<u64>,
     #[serde(default)]
     pub async_agent: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    pub backend: WebSearchBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1318,6 +1330,9 @@ experimental_jev_approval:
                 foreground_timeout_ms: Some(15_000),
                 async_agent: true,
             },
+            search: super::SearchConfig {
+                backend: bot_core::search::WebSearchBackend::DeepSeek,
+            },
             sandbox: super::RuntimeSandboxConfig::default_for(&dir),
             im: Default::default(),
             shell: Default::default(),
@@ -1626,6 +1641,7 @@ channels:
             std::env::set_var("REMI_ACP_TOOL_NAME", "old_acp");
             std::env::set_var("REMI_ACP_LOCAL_ARGS", r#"["old"]"#);
             std::env::set_var("REMI_SHELL_MODE", "disabled");
+            std::env::set_var(super::WEB_SEARCH_BACKEND_ENV, "exa");
             std::env::set_var("REMI_SANDBOX_KIND", "docker");
             std::env::set_var("REMI_IM_MODE", "feishu");
             std::env::set_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES", "1");
@@ -1637,6 +1653,7 @@ channels:
         cfg.tool_output.foreground_timeout_ms = Some(12_345);
         cfg.sandbox.kind = super::RuntimeSandboxKind::NoSandbox;
         cfg.shell.mode = super::ShellMode::Local;
+        cfg.search.backend = bot_core::search::WebSearchBackend::DeepSeek;
         cfg.im.mode = ImMode::Disabled;
         cfg.acp.client = AcpClient::Remi;
         cfg.acp.tool_name = Some("e2e_acp".to_string());
@@ -1651,6 +1668,10 @@ channels:
             r#"["hello","world"]"#
         );
         assert_eq!(std::env::var("REMI_SHELL_MODE").unwrap(), "local");
+        assert_eq!(
+            std::env::var(super::WEB_SEARCH_BACKEND_ENV).unwrap(),
+            "deepseek"
+        );
         assert_eq!(std::env::var("REMI_SANDBOX_KIND").unwrap(), "no_sandbox");
         assert_eq!(std::env::var("REMI_IM_MODE").unwrap(), "disabled");
         assert_eq!(
@@ -1667,6 +1688,7 @@ channels:
             std::env::remove_var("REMI_ACP_TOOL_NAME");
             std::env::remove_var("REMI_ACP_LOCAL_ARGS");
             std::env::remove_var("REMI_SHELL_MODE");
+            std::env::remove_var(super::WEB_SEARCH_BACKEND_ENV);
             std::env::remove_var("REMI_SANDBOX_KIND");
             std::env::remove_var("REMI_IM_MODE");
             std::env::remove_var("REMI_TOOL_OUTPUT_OVERFLOW_BYTES");

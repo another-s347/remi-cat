@@ -1,16 +1,14 @@
-//! Workspace-rooted filesystem tools, bash executor, and web search.
+//! Workspace-rooted filesystem tools and shell executors.
 //!
 //! All `Rooted*` tools sandbox every path under a root directory so absolute
 //! paths like `/etc/passwd` map to `<root>/etc/passwd`.
 //!
 //! `WorkspaceBashTool` runs real `bash -c` with `current_dir` set to the root.
-//!
-//! `ExaSearchTool` calls the Exa Search API when `EXA_API_KEY` is set.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Context;
 use async_stream::stream;
@@ -23,6 +21,10 @@ use remi_agentloop::prelude::{
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::{Sandbox, SandboxBashOutput, SandboxBashStatus};
+pub use crate::search::WebSearchTool;
+
+/// Compatibility name for the built-in web search tool.
+pub type ExaSearchTool = WebSearchTool;
 
 mod bash;
 pub use bash::{BashMode, WorkspaceBashTool};
@@ -1489,151 +1491,6 @@ fn format_rg_output(
         text.push_str(&format!("\n[truncated to {max_bytes} bytes]"));
     }
     redactor.read().unwrap().redact(&text)
-}
-
-// ── ExaSearchTool ─────────────────────────────────────────────────────────────
-
-const EXA_API_URL: &str = "https://api.exa.ai/search";
-
-pub struct ExaSearchTool {
-    num_results: usize,
-}
-
-impl ExaSearchTool {
-    pub fn new() -> Self {
-        Self { num_results: 5 }
-    }
-}
-
-impl Tool for ExaSearchTool {
-    fn name(&self) -> &str {
-        "web_search"
-    }
-    fn description(&self) -> &str {
-        "Search the web via Exa. Returns titles, URLs, and content highlights. \
-         Use for current events, documentation, or any topic needing fresh data. \
-         Requires EXA_API_KEY secret to be set."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query":       { "type": "string",  "description": "Search query" },
-                "num_results": { "type": "integer", "description": "Max results (default 5)" }
-            },
-            "required": ["query"]
-        })
-    }
-    fn execute(
-        &self,
-        arguments: serde_json::Value,
-        _resume: Option<ResumePayload>,
-        _ctx: ToolContext,
-    ) -> impl std::future::Future<
-        Output = Result<ToolResult<impl Stream<Item = ToolOutput> + 'static>, AgentError>,
-    > {
-        let default_n = self.num_results;
-        async move {
-            let api_key = match std::env::var("EXA_API_KEY") {
-                Ok(k) if !k.is_empty() => k,
-                _ => return Err(AgentError::tool(
-                    "web_search",
-                    "EXA_API_KEY is not set — use `/secrets set EXA_API_KEY <key>` to enable web search",
-                )),
-            };
-            let query = arguments["query"]
-                .as_str()
-                .ok_or_else(|| AgentError::tool("web_search", "missing 'query'"))?
-                .to_string();
-            let num = arguments["num_results"]
-                .as_u64()
-                .map(|n| n as usize)
-                .unwrap_or(default_n);
-
-            Ok(ToolResult::Output(stream! {
-                let started = Instant::now();
-                tracing::info!(
-                    query = %log_preview(&query, 160),
-                    query_len = query.len(),
-                    num_results = num,
-                    "web_search.start"
-                );
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
-                let body = serde_json::json!({
-                    "query": query,
-                    "numResults": num,
-                    "contents": { "text": { "maxCharacters": 1000 } }
-                });
-                match client
-                    .post(EXA_API_URL)
-                    .header("x-api-key", &api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %log_preview(&query, 160),
-                            query_len = query.len(),
-                            num_results = num,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            error = %e,
-                            "web_search.failed"
-                        );
-                        yield ToolOutput::text(format!("search request failed: {e}"));
-                    }
-                    Ok(resp) => {
-                        match resp.json::<serde_json::Value>().await {
-                            Err(e) => {
-                                tracing::warn!(
-                                    query = %log_preview(&query, 160),
-                                    query_len = query.len(),
-                                    num_results = num,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    error = %e,
-                                    "web_search.failed"
-                                );
-                                yield ToolOutput::text(format!("parse error: {e}"));
-                            }
-                            Ok(data) => {
-                                let mut out = String::new();
-                                if let Some(results) = data["results"].as_array() {
-                                    tracing::info!(
-                                        query = %log_preview(&query, 160),
-                                        query_len = query.len(),
-                                        num_results = num,
-                                        results = results.len(),
-                                        elapsed_ms = started.elapsed().as_millis() as u64,
-                                        "web_search.completed"
-                                    );
-                                    for (i, r) in results.iter().enumerate() {
-                                        let title = r["title"].as_str().unwrap_or("(no title)");
-                                        let url   = r["url"].as_str().unwrap_or("");
-                                        let text  = r["text"].as_str().unwrap_or("");
-                                        out.push_str(&format!("{}. **{}**\n   {}\n   {}\n\n", i+1, title, url, text.trim()));
-                                    }
-                                } else {
-                                    tracing::info!(
-                                        query = %log_preview(&query, 160),
-                                        query_len = query.len(),
-                                        num_results = num,
-                                        results = 0,
-                                        elapsed_ms = started.elapsed().as_millis() as u64,
-                                        "web_search.completed"
-                                    );
-                                }
-                                if out.is_empty() { out = "No results found.".into(); }
-                                yield ToolOutput::text(out.trim().to_string());
-                            }
-                        }
-                    }
-                }
-            }))
-        }
-    }
 }
 
 #[cfg(test)]

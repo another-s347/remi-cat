@@ -7,12 +7,12 @@ use crate::im_tools::register_fetch_tool;
 use crate::memory::{
     ContextManageTool, MemoryGetDetailTool, MemoryRecallTool, MemoryUpsertNamedTool,
 };
-use crate::search::SearchTool;
+use crate::search::{SearchTool, WebSearchTool};
 use crate::tool_tasks::ToolTasksTool;
 use crate::tools::{
-    ExaSearchTool, ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool,
-    RootedFsCreateTool, RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool,
-    SleepTool, WorkspaceBashTool, WorkspaceSshTool,
+    ManageYourselfTool, NowTool, RipgrepTool, RootedFsApplyPatchTool, RootedFsCreateTool,
+    RootedFsLsTool, RootedFsReadTool, RootedFsRemoveTool, RootedFsWriteTool, SleepTool,
+    WorkspaceBashTool, WorkspaceSshTool,
 };
 use crate::AskUserQuestionTool;
 
@@ -123,7 +123,7 @@ pub(super) fn register_runtime_tools(
             deps.im_bridge.clone(),
         );
     }
-    local_tools.register(ExaSearchTool::new());
+    local_tools.register(WebSearchTool::new());
     local_tools.register(NowTool);
     local_tools.register(SleepTool);
     local_tools.register(ManageYourselfTool);

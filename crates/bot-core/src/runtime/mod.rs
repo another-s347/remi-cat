@@ -11295,7 +11295,7 @@ fn default_system_prompt() -> String {
     "You are a helpful AI assistant. \
      Use search for discovery and recall: by default scope=local searches local memory and skills; \
      set scope=memory for named/thread memory, scope=skills for skill catalog lookup, \
-     scope=web for Exa web search, or scope=all for every available source. \
+     scope=web for web search, or scope=all for every available source. \
      If the user asks about their own prior facts, preferences, past actions, earlier conversations, \
      saved details, or anything phrased like \"my ...\", you MUST call search with scope=memory \
      and distinctive keywords from the question before giving the final answer. Do not say prior \

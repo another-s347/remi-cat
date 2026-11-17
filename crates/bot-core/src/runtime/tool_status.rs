@@ -53,15 +53,16 @@ pub(crate) fn builtin_tool_catalog() -> &'static [(&'static str, &'static str)] 
         ("todo__list", "List todo items."),
         ("todo__remove", "Remove a todo item."),
         ("todo__update", "Update a todo item."),
-        ("web_search", "Search the web with Exa."),
+        ("web_search", "Search the web."),
     ]
 }
 
 pub(crate) fn tool_warnings(name: &str) -> Vec<String> {
     match name {
-        "search" | "web_search" if !env_present("EXA_API_KEY") => {
-            vec!["web search is unavailable until EXA_API_KEY is set; local memory/skill search still works".to_string()]
-        }
+        "search" | "web_search" => crate::search::web_search_setup_error()
+            .into_iter()
+            .map(|err| format!("web search is unavailable: {err}"))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -109,12 +110,5 @@ fn host_command_available(name: &str) -> bool {
                 candidate.is_file()
             })
         })
-        .unwrap_or(false)
-}
-
-fn env_present(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }

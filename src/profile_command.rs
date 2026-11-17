@@ -2102,6 +2102,7 @@ fn apply_runtime_config_entry(config: &mut RuntimeConfig, entry: &str) -> anyhow
         "async_agent" | "tool_output.async_agent" => {
             config.tool_output.async_agent = parse_bool(value)?
         }
+        "search.backend" => config.search.backend = value.parse().map_err(anyhow::Error::msg)?,
         "telemetry_enabled" | "telemetry.enabled" | "telemetry" => {
             config.telemetry.enabled = parse_bool(value)?
         }
@@ -2400,6 +2401,15 @@ pub fn available_container_name_in_data_root(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn search_backend_config_entry_selects_a_known_backend() {
+        let mut config = RuntimeConfig::default_for(Path::new(".remi-cat"));
+        assert_eq!(config.search.backend.as_str(), "exa");
+        apply_runtime_config_entry(&mut config, "search.backend=deepseek").unwrap();
+        assert!(apply_runtime_config_entry(&mut config, "search.backend=unknown").is_err());
+        assert_eq!(config.search.backend.as_str(), "deepseek");
+    }
+
     #[test]
     fn sub_session_channels_config_entry_accepts_only_booleans() {
         let mut config =
